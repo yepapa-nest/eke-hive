@@ -70,7 +70,11 @@ the scripts that generate the dumps are not included in this repository.
 GLM-5.3-Flash cannot turn thinking off: Z.ai documents `thinking.type` as `enabled` only and `reasoning_effort` as `low` / `high` /
 `max` (default `max`); the chat template always opens `<think>`. A request for no thinking (`reasoning_effort: none`,
 `enable_thinking: false`) is mapped to the official minimum `low` (`HIVE_GLM_NOTHINK=low`, default). `HIVE_GLM_NOTHINK=empty` instead
-prefills an empty thinking block — not an official mode.
+prefills an empty thinking block — not an official mode. Measured against `low` on the same server under the same load (quality suite without the long-context
+items, 144 items each): `empty` scored 136 vs 142 — QA 73 vs 78 / 80 (four of the five misses are right answers without the
+requested "Answer:" line), code 19 vs 20 — and took 1,030 s vs 574 s in all, because its answers are longer (a translation request
+came back as 107 tokens with a preamble instead of 23). At `low` the model already writes little or no reasoning for such requests,
+so `low` stays the default.
 A request without an effort (or with a value the family does not know) runs at `high`, not the template's default `max`:
 community measurements on the official checkpoints (NVIDIA developer forum) put `high` at 36-45 % less time than `max`, at a
 cost of 1-4 benchmark points. Mapping: `none`/`minimal` → `low`, `low` → `low`, `medium`/`high` → `high`,
