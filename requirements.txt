@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+transformers
+tokenizers
+safetensors
+numpy
+Pillow
+av

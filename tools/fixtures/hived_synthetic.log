@@ -1,0 +1,30 @@
+[supervisor] ★ build dir=/hive/engine/build binary=/hive/engine/build/hived sha256=0123456789abcdef elf-build-id=feedface
+[hived] ready in 412.3s · layers 43 · ctx 262144 · chunk 16384 · dspark on(block 5 · conf ≥ -0.50 · max 5)
+[hived] aaaa000000000001: reuse 0/120 via reset (session tokens 0 · common with live 120)
+[hived] aaaa000000000001: prefill chunk 1 M 120 · 0→120/120 · upper on · tail rows 0 · hit 100 streamed 1 cpu 10 dma_rows 5 · cpu wait 10 ms span 11 ms · 300 ms
+[hived] request failed: synthetic admit error
+[hived] bbbb000000000002: reuse 50/400 via live (session tokens 50 · common with live 50)
+[hived] bbbb000000000002: prefill chunk 1 M 350 · 50→400/400 · upper on · tail rows 0 · hit 100 streamed 1 cpu 10 dma_rows 5 · cpu wait 10 ms span 11 ms · 500 ms
+[hived] bbbb000000000002: prefill total 350 rows in 1 chunks · hit 100 streamed 1 cpu 10 dma_rows 5 · cpu wait 10 ms span 11 ms · 505 ms
+[cache] step 1 M=1 routed 240 hit 200 cpu 30 streamed 10 · resident 10 pending 0 / 20 · vram free 1234 MiB · dma.span 1.00 dma.wait - ms (0 layers) · promo 0.0 MiB
+[mtp] pos 400 draft 3.0 ms · gate2 no draft (conf0 -0.50 · T1 20.0 T2 30.0 T6 60.0 ms · skip 4)
+[mtp] batch S 2 draft 9.0 ms · no draft (T(S) 30.0 · T(S+1) 40.0 ms · skip 8)
+[step-graph M=1] host tables 0.10 · params 0.02 · launch 0.30 · wait 2.50 · replay 18.00 ms (host before launch 0.40) | gpu span 17.50 ms · posts 40
+[hived] decode failed: synthetic decode error
+[hived] prefill yield on: requests with <= 2048 prompt ids are admitted at chunk/round boundaries of a longer prefill
+[hived] prefill yield: 2 short requests admitted in 15 ms (active 1 · prefilling 1)
+[hived] batch prefill failed: synthetic batch error — 3 requests retried one by one
+[hived] sleep requested: draining 0 in-flight request(s) · 0 queued stay queued until wake
+[hived] sleep: 950 ms (drain 0 ms) · freed 70000 MiB (store 68000 MiB · 4446 slots · 4446 resident keys saved) · VRAM used 1200 MiB = x
+[hived] wake: 3200 ms (alloc 400 · warm 2800) · slots 4446 (before sleep 4446) · warmed 4446/4446 experts · VRAM used 90000 MiB
+[hived] wake failed: synthetic — still sleeping (retry wake when the VRAM is free)
+[hived] cccc000000000003: reuse 400/400 via prompt-ckpt (session tokens 400 · common with live 400)
+[hived] cccc000000000003: prefill 0 tok 2 ms · decode 10 tok 300 ms (30.0 tok/s, batch 1) · hit 2000 cpu 100 · resident 10/20 · stop
+[hived] graceful stop: signal received — refusing new requests, draining up to 30.0 s
+[hived] dddd000000000004: prefill chunk 1 M 64 · 0→64/64 · upper on · tail rows 0 · hit 10 streamed 0 cpu 1 dma_rows 0 · cpu wait 1 ms span 1 ms · 50 ms
+[hived] graceful stop complete (all replies flushed) — exit 0
+something the parser has never seen 12345
+[hived] ffff000000000006: prefill 64 tok 120 ms · decode 9 tok 200 ms (40.0 tok/s, batch 1) · hit 10 cpu 1 · resident 10/20 · mtp 2/3 in 1 steps · stop · wall t0=1790800000000 t1=1790800000120 t2=1790800000320 queue_ms=35 rid=r-abc
+[cache] step 2 M=1 routed 240 hit 230 cpu 10 streamed 0 · resident 10 pending 0 / 20 · wall 21.50 ms
+[hived] 9999000000000007: reuse 0/80 via reset (session tokens 0 · common with live 80)
+[hived] 9999000000000007: request failed: synthetic admit error with sid

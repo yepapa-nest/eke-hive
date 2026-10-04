@@ -1,0 +1,10 @@
+# TSAN suppressions for KNOWN production races (tools/cpu_fake/harness.py tsan_supp_env reads this file).
+# EMPTY on purpose. The two entries found by an earlier validation run were fixed in
+#   engine/src/expert_store.cpp and removed here:
+#   [items] D2 — start_jobs rebuilt Pool::items while a straggler/stealer read items.size()
+#           (fix: n_items + shared busy quiesce before rebuild).
+#   [dtor]  D6 — ~ExpertStore deleted pool 0 while pool 1's workers could still steal from it
+#           (fix: stop and join every pool before deleting any).
+#   tools/test_pool_cpu.py now runs all stress WITHOUT suppressions and proves the D2 window is
+#   still reached with a mutant (quiesce removed) that TSAN must report.
+# Add a line only for a newly found production race, with a test that reproduces it first.

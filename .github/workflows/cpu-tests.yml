@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The Eke Hive Authors
+# CPU-only test suite (fake CUDA runtime, no GPU, no model). GPU and model-level validation run on maintainer
+# hardware; see docs/validation.md.
+name: cpu-tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ libnuma-dev python3-venv
+      - name: Install Python packages
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -r requirements.txt
+          echo /tmp/venv/bin >> "$GITHUB_PATH"
+      - name: CPU suite
+        env:
+          HIVE_TEST_QUICK: "1"  # reduced engram-SSD matrix on the 2-vCPU runner (the full matrix runs on maintainer machines)
+        run: tools/test_cpu.sh

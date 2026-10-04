@@ -1,0 +1,142 @@
+THIRD-PARTY NOTICES — Eke Hive
+
+Eke Hive (this repository) is licensed under the MIT License (see LICENSE).
+It includes or is derived from the following third-party material.
+
+================================================================================
+1. DeepSeek-V4.1-Flash reference inference code, encoding module and model weights
+   Source: DeepSeek-V4.1-Flash release (inference/model.py, inference/kernel.py,
+           encoding/, model weights) — "This repository and the model weights are
+           licensed under the MIT License."
+   Used by Eke Hive:
+     - oracle/dsv41_oracle.py ports the reference definitions (quantisation,
+       sparse attention, Sinkhorn) from inference/model.py and inference/kernel.py
+       to plain PyTorch;
+     - server/hive_server.py loads the release's encoding/ module at runtime;
+     - the engine (engine/) re-implements the model's computation and loads the
+       released weights. The weights themselves are not part of this repository.
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2023 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+2. JSON for Modern C++ (nlohmann/json) 3.12.0
+   Source: https://github.com/nlohmann/json
+   File:   engine/third_party/nlohmann/json.hpp (included unmodified)
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2013-2025 Niels Lohmann
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+3. GLM-5.3-Flash model weights, chat template and tokenizer (Z.ai), and the
+   NVIDIA ModelOpt NVFP4 checkpoint of it (nvidia/GLM-5.3-Flash-NVFP4)
+   Source: https://huggingface.co/zai-org/GLM-5.3-Flash (license: MIT) and the
+           NVFP4 checkpoint derived from it (model card: license: mit)
+   Used by Eke Hive (GLM family, hived_glm):
+     - the engine (engine/src/glm/) re-implements the model's computation and loads
+       the released weights; optionally the FP8 tensors of the original Z.ai
+       release (DSA attention projections, shared experts) are loaded as well.
+       The weights are not part of this repository;
+     - server/families/glm.py applies the checkpoint's own chat_template.jinja
+       through the tokenizer at runtime.
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 Z.AI Co., Ltd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+4. llama.cpp / ggml — technique of the AVX2 nvfp4 x q8_0 dot product
+   Source: https://github.com/ggml-org/llama.cpp (PR #23961, ggml-cpu x86
+           quants.c ggml_vec_dot_nvfp4_q8_0)
+   Used by Eke Hive: engine/src/cpu/expert_cpu_nvfp4.cpp (W4A8 path,
+     gemv_nvfp4_q8_rows_multi / quantize_q8_nvfp4) follows the same method —
+     a pshufb table of doubled e2m1 values, int8 activation blocks, maddubs/madd
+     integer dot and fp32 block scales — written for Eke Hive's record layout
+     (no code copied verbatim; the 16-entry value table is the same).
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Runtime and build dependencies that are not included in this repository
+(installed separately, each under its own license): NVIDIA CUDA Toolkit, cuBLAS/
+cuBLASLt and driver (NVIDIA CUDA EULA — only relevant when redistributing those
+libraries), libnuma (LGPL-2.1, dynamically linked), PyTorch, FastAPI, Uvicorn,
+NumPy, Hugging Face transformers/tokenizers, safetensors, Pillow, PyAV (BSD-3-Clause;
+its wheels bundle FFmpeg libraries under the LGPL — used for GLM video input), and the
+container images used as build/run environments.
