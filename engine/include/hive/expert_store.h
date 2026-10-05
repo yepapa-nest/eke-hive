@@ -299,6 +299,7 @@ class ExpertStore {
   // Commit waiting promotions as resident once done_evt has completed
   void commit_pending();  // commit batches whose copy has finished (from the queue front, in order)
   void commit_all();      // wait for every batch's copy and commit (synchronous)
+  double commit_wait_ms() const { return commit_wait_ms_; }  // total host time commit_pending waited for paced promotion copies
   // E4 HIVE_DECODE_COPY_PRIO (promotion copy pacing — see the promo_pump header comment in runtime.cpp): when on, promote/
   //   promote_keys decide **what goes into which slot** exactly as before (pending marks, victim release, statistics and the
   //   REUSE_STAGE D2D all at decision time), but only queue the H2D as pieces (the 12 pieces of copy_rec_async — same bytes, same
@@ -428,6 +429,7 @@ class ExpertStore {
   cudaEvent_t reuse_done_ = nullptr;
   bool reuse_join_pending_ = false;
   void join_reuse(cudaStream_t side);  // if this batch had a D2D, make side wait for it (right before recording the batch event)
+  double commit_wait_ms_ = 0;  // commit_wait_ms()
   // E4: paced = paced batch (H2D pieces issued later) · issued = batch event recorded (always true for non-paced batches) · pieces_left = pieces not yet issued · st = promotion stream at decision time
   struct PromoBatch { cudaEvent_t evt; std::vector<int> slots; bool paced = false, issued = true; int pieces_left = 0; cudaStream_t st = nullptr; };
   struct PromoPiece { uint8_t* dst; const uint8_t* src; size_t n; };

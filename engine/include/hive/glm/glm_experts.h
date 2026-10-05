@@ -34,6 +34,7 @@ struct GlmCacheStats {
   uint64_t cpu_jobs = 0, cpu_bytes = 0;  // decode: distinct experts computed by the CPU and the record bytes they read
   int workers = 0;                      // CPU worker threads (constant)
   double ms_busy1 = 0, ms_busy2 = 0;     // summed task time of all workers in phase 1 / 2 (utilization = busy / (phase wall × workers))
+  double ms_defer_wait = 0;             // host time deferred_wait blocked for the helper thread (expert deferral)
 };
 
 class GlmExperts {
@@ -106,12 +107,18 @@ class GlmExperts {
   int row_hit(int m) const { return row_hit_[m]; }
   int row_cpu(int m) const { return row_cpu_[m]; }
   int n_experts() const { return E_; }
+  int n_pending() const { return (int)promos_.size(); }  // promotion copies in flight
+  // HIVE_PROFILE sample steps (GlmEngine): CUDA events recorded on the decode stream inside decode_layer — GPU experts launched (exp) and
+  //   finished (gend), CPU results added (acc, only when the layer had CPU work: cpu = true). nullptr = no marks (every other step).
+  struct LayerMarks { cudaEvent_t exp = nullptr, gend = nullptr, acc = nullptr; bool cpu = false; };
+  void set_layer_marks(LayerMarks* m) { marks_ = m; }
 
  private:
   void cpu_experts(int li, const std::vector<std::pair<int, std::vector<std::pair<int, float>>>>& jobs, const float* x_host, float* y_host);
   void commit_ready();
   void promote_key(int key, const std::vector<int>& victims, size_t& next);
   std::vector<int> vic_;  // after_step: victim candidates of this step, ascending (score, slot)
+  LayerMarks* marks_ = nullptr;
   GlmModel& m_;
   int H_, I_, E_, K_, n_moe_;
   float limit_;

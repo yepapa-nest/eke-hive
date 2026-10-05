@@ -15,7 +15,9 @@ DeepSeek ([docs/performance.md](docs/performance.md), steps 22–23):
 - Layer yields also admit a request of up to 16K rows when it is at most half of what the paused prefill still has to do
   (`HIVE_LAYER_YIELD_MID`); its own prefill yields once more for decode steps. A 12K request behind an 85K prefill: 14.6 → 4.4 s to
   the first token.
-- Rejected after measurement: a lower promotion threshold for the `seq` cache policy (c1 −2.5 to −4 %).
+- Rejected after measurement: a lower promotion threshold for the `seq` cache policy (c1 −2.5 to −4 %), and committing paced
+  promotions one step head later (c4 and decode after a 54K prompt lower in both runs).
+- `[decode-host]` gives the step-head promotion commit wait (`promo wait … ms/step`).
 
 GLM ([docs/glm.md](docs/glm.md), steps 17–21):
 - Layer yields inside a prefill (short requests served, decoders keep stepping): short request 14.0 → 0.65 s, decoder stall 14.4 → 1.6 s.
@@ -23,6 +25,10 @@ GLM ([docs/glm.md](docs/glm.md), steps 17–21):
 - Promotion victims sorted once per step instead of a scan of every slot per used expert (the host held the GPU idle 1.88 ms per
   verify step): c1 67.3 → 70.4, c4 88.1 → 96.6 tok/s.
 - CPU-expert chunks sized to the worker count (`HIVE_GLM_CPU_ADAPT`, CPU phase 70 → 81 GB/s); logits into a pinned buffer.
+- Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`, the DeepSeek post-and-gate code): output identical; c4 95.3 → 99.4,
+  c2 86.7 → 85.2 tok/s.
+- Monitoring lines in the DeepSeek formats (`HIVE_TRACE_CACHE`, `HIVE_PROFILE`): `[cache]`, `[profile]`, `[decode-host]` (GPU idle
+  by cause, deferral wait) and `[early-route]`, read by `tools/hive_monitor.py`.
 
 Tools: `tests/bench_moe_lowm.cu` (low-row expert launch timing), `tests/test_head_rows.cu` (head kernel bit comparison).
 

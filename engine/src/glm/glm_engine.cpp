@@ -69,6 +69,13 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
   if (probe_every_ > 0) {
     for (auto& e : probe_ev_) CUDA_CHECK(cudaEventCreate(&e));
   }
+  if (const char* p = getenv("HIVE_PROFILE"); p && atoi(p) > 0 && prof_ == 0) {  // sample steps (glm_engine.h)
+    sample_every_ = atoi(p);
+    dh_.resize(c_.n_layers);
+    for (DhLayer& d : dh_)
+      for (cudaEvent_t* e : {&d.start, &d.front, &d.end, &d.x.exp, &d.x.gend, &d.x.acc}) CUDA_CHECK(cudaEventCreate(e));
+    CUDA_CHECK(cudaEventCreate(&dh_head_));
+  }
   fused_ = !(getenv("HIVE_GLM_DECODE_FUSED") && strcmp(getenv("HIVE_GLM_DECODE_FUSED"), "0") == 0);  // default on; "0" = off
   early_route_ = fused_ && !(getenv("HIVE_GLM_EARLY_ROUTE") && strcmp(getenv("HIVE_GLM_EARLY_ROUTE"), "0") == 0);
   if (early_route_) {
@@ -632,6 +639,7 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
   lin(w.sh_down, sh_y_.as<bf16>(), I, rows, mlp_out_.as<bf16>(), H);
   }
   CUDA_CHECK(cudaMemsetAsync(mlp_out_f32_.p, 0, (size_t)rows * H * 4, stream_));
+  if (sample_ && !prefill_streams) { CUDA_CHECK(cudaEventRecord(dh_[l].front, stream_)); dh_[l].moe = true; }
   if (!er) {
     if (!prefill_streams) dcopy(xin_pin_, xn, (size_t)rows * H * 2, stream_);  // CPU expert input: pinned host rows (UVA), ready at the sync below
     CUDA_CHECK(cudaStreamSynchronize(stream_));  // routing on the host
@@ -642,6 +650,11 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
       if (e != cudaErrorNotReady) CUDA_CHECK(e);
       return e == cudaSuccess;
     }) : (int)er::kMissing;
+    if (sample_) {
+      ++er_layers_;
+      if (res == er::kOk && cudaEventQuery(er_front_) == cudaErrorNotReady) ++er_ahead_;  // the host had the routing before the front ended
+      if (res != er::kOk) ++er_abs_;
+    }
     if (res != er::kOk) {  // absorbed: wait for the shared expert's end (the routing and the rows are on the host by then) and take the number as is
       CUDA_CHECK(cudaEventSynchronize(er_front_));
       er_gate_.resync(er_flag_h_);
@@ -670,7 +683,9 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
       hc_inject(hb(), post_def_.as<float>(), ex_.deferred_y(), ex_.deferred_rows(), c_.hc, H, stream_);
     }
     const bool allow_defer = !prefill && ex_.defer_enabled() && next_moe_[l] >= 0;
+    if (sample_) ex_.set_layer_marks(&dh_[l].x);
     ex_.decode_layer(li, rows, h_ids_.data(), h_w_.data(), xn, mlp_out_f32_.as<float>(), stream_, xin_pin_, allow_defer);
+    if (sample_) ex_.set_layer_marks(nullptr);
     if (ex_.deferred_pending()) dcopy(post_def_.p, post_.p, (size_t)rows * c_.hc * 4, stream_);  // this FFN's post coefficients (post_ is reused)
   }
   f32_to_bf16(mlp_out_f32_.as<float>(), (size_t)rows * H, attn_.as<bf16>(), stream_);
@@ -679,11 +694,63 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
   prof_mark(&st_.ms_experts);
 }
 
+// HIVE_PROFILE sample step (glm_engine.h): called after the forward's final synchronization (prof_flush has turned the marks into times).
+//   [profile]      section times of this forward (GPU time between marks; "shared" also holds the wait for the host's routing, "experts" the
+//                  wait for the CPU experts — the marks sit on the stream).
+//   [decode-host]  sync  = front end → GPU experts launched (routing to the host, host tables, deferral wait)
+//                  cpu W vs gpu V = host time of the CPU experts vs GPU time of the GPU experts
+//                  tail  = GPU experts done → CPU results added (the stream waited for the CPU); cpu-bound layers = layers with tail > 5 µs
+//                  next  = layer end → next layer start (host work between layers; the head for the last one)
+//                  defer wait = host time deferred_wait blocked · gpu-idle = sync + tail + next, of = first layer start → head
+void GlmEngine::sample_report(int rows, const GlmForwardStats& s0, const GlmCacheStats& x0) {
+  auto d = [&](double GlmForwardStats::*f) { return st_.*f - s0.*f; };
+  const double sec[] = {d(&GlmForwardStats::ms_embed), d(&GlmForwardStats::ms_hc),
+                        d(&GlmForwardStats::ms_kda) + d(&GlmForwardStats::ms_kda_proj) + d(&GlmForwardStats::ms_kda_core), d(&GlmForwardStats::ms_dsa),
+                        d(&GlmForwardStats::ms_dense), d(&GlmForwardStats::ms_router), d(&GlmForwardStats::ms_shared), d(&GlmForwardStats::ms_predict),
+                        d(&GlmForwardStats::ms_experts), d(&GlmForwardStats::ms_head)};
+  double total = 0;
+  for (double v : sec) total += v;
+  fprintf(stderr, "[profile M=%d] total %.2f ms: embed %.2f hc %.2f kda %.2f dsa %.2f dense %.2f router %.2f shared %.2f predict %.2f experts %.2f head %.2f\n",
+          rows, total, sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7], sec[8], sec[9]);
+  auto el = [](cudaEvent_t a, cudaEvent_t b) { float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, a, b)); return (double)std::max(0.f, ms); };
+  double sync = 0, gpu = 0, tail = 0, next = 0;
+  int layers = 0, cpu_layers = 0, cpu_bound = 0;
+  const int nL = (int)dh_.size();
+  for (int l = 0; l < nL; ++l) {
+    const DhLayer& L = dh_[l];
+    if (L.moe) {
+      ++layers;
+      sync += el(L.front, L.x.exp); gpu += el(L.x.exp, L.x.gend);
+      if (L.x.cpu) { const double t = el(L.x.gend, L.x.acc); tail += t; ++cpu_layers; if (t > 0.005) ++cpu_bound; }
+    }
+    next += el(L.end, l + 1 < nL ? dh_[l + 1].start : dh_head_);
+  }
+  const GlmCacheStats& x = ex_.stats();
+  fprintf(stderr, "[decode-host M=%d%s] sync %.2f · cpu %.2f vs gpu %.2f (cpu-bound layers %d/%d) · tail %.2f ms · next %.2f · defer wait %.2f · "
+                  "gpu-idle %.2f of %.2f ms (cpu layers %d)\n",
+          rows, verify_ ? " verify" : "", sync, x.ms_cpu - x0.ms_cpu, gpu, cpu_bound, layers, tail, next, x.ms_defer_wait - x0.ms_defer_wait,
+          sync + tail + next, el(dh_[0].start, dh_head_), cpu_layers);
+  if (er_layers_ > 0) {  // totals since the last line, except resync / missing / untrusted (gate totals) — the DeepSeek line's meaning
+    fprintf(stderr, "[early-route M=%d] layers %ld · host ahead of front end %ld · absorbed %ld (resync %ld · missing %ld · untrusted %ld)\n", rows,
+            er_layers_, er_ahead_, er_abs_, er_gate_.n_resync, er_gate_.n_missing, er_gate_.n_untrusted);
+    er_layers_ = er_ahead_ = er_abs_ = 0;
+  }
+}
+
 void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, bool prefill, float* logits_host, bool all_logits) {
   const int H = c_.hidden, rows = prefill ? T : M;
   int64_t pos_before[8] = {};
   if (prefill) pos_before[0] = seqs[0]->pos; else for (int m = 0; m < M && m < 8; ++m) pos_before[m] = seqs[m]->pos;
   const double t0 = now_ms();
+  // HIVE_PROFILE sample step (glm_engine.h): the event marks of HIVE_GLM_PROF=2 for this forward only, plus the per-layer events
+  sample_ = !prefill && sample_every_ > 0 && prof_ == 0 && st_.steps % sample_every_ == 0;
+  struct SampleOff {  // also on an exception: no marks left armed for the next forward
+    GlmEngine& e; bool on;
+    ~SampleOff() { if (on) { e.prof_ = 0; e.ev_marks_.clear(); e.ex_.set_layer_marks(nullptr); e.sample_ = false; } }
+  } sample_off{*this, sample_};
+  const GlmForwardStats s0 = st_;
+  const GlmCacheStats x0 = ex_.stats();
+  if (sample_) prof_ = 2;
   prof_t_ = t0;
   if (prof_ == 2) { ev_marks_.clear(); prof_mark(nullptr); }
   // embeddings: gather on the host (table in RAM), upload, replicate into the hc streams
@@ -725,6 +792,7 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   double probe_host = 0;
   for (int l = 0; l < c_.n_layers; ++l) {
     const LayerW& L = m_.layer(l);
+    if (sample_) { CUDA_CHECK(cudaEventRecord(dh_[l].start, stream_)); dh_[l].moe = false; dh_[l].x.cpu = false; }
     double ph0 = 0;
     if (probe >= 0) {
       CUDA_CHECK(cudaEventRecord(probe_ev_[2 * l], stream_));
@@ -752,9 +820,11 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
     if (fast) { if (l + 1 == c_.n_layers) glm_hc_post_decode(attn_.as<bf16>(), post_.as<float>(), comb_.as<float>(), rows, H, hb(), stream_); }
     else hc_post_apply(rows);
     prof_mark(&st_.ms_hc);
+    if (sample_) CUDA_CHECK(cudaEventRecord(dh_[l].end, stream_));
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, hb(), rows); }
     if (prefill && layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);
   }
+  if (sample_) CUDA_CHECK(cudaEventRecord(dh_head_, stream_));
   // head: mean over streams → norm → lm_head (only the rows whose logits are needed)
   const int r0 = all_logits ? 0 : rows - 1, nr = all_logits ? rows : 1;
   HIVE_CHECK(nr <= 64, "logits rows");
@@ -773,6 +843,7 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   prof_mark(&st_.ms_head);
   prof_flush();
+  if (sample_) sample_report(rows, s0, x0);
   if (probe >= 0) {  // HIVE_GLM_LAUNCH_PROBE totals (the stream was synchronized above)
     double gpu = 0;
     for (int l = 0; l < c_.n_layers; ++l) { float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, probe_ev_[2 * l], probe_ev_[2 * l + 1])); gpu += ms; }

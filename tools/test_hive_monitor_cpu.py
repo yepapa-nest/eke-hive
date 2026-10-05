@@ -282,6 +282,33 @@ class Parse(unittest.TestCase):
             if name == "on":
                 self.assertEqual((m["layer_yields"], m["layer_yield_steps"], m["layer_yield_ms"]), (2, 2, 60.0))
 
+    def test_glm_sample_lines_and_promo_wait(self):
+        """GLM sample-step lines (glm_engine.cpp sample_report · glm_runtime.cpp cache_line — the DeepSeek formats) and the DeepSeek
+        [decode-host] promo wait clause: parsed into the same metric fields (exact printf formats of 2026-10-05)."""
+        d = Path(self.tmp)
+        glm = ("[cache] step 0 M=1 routed 1824 hit 1610 cpu 214 streamed 0 · resident 4420 pending 3 / 4446 · vram free 2400 MiB · wall 14.21 ms\n"
+               "[profile M=4] total 41.20 ms: embed 0.02 hc 1.10 kda 6.40 dsa 3.20 dense 0.40 router 0.90 shared 4.10 predict 0.00 experts 23.98 head 1.10\n"
+               "[decode-host M=4 verify] sync 2.10 · cpu 18.40 vs gpu 9.20 (cpu-bound layers 30/76) · tail 6.30 ms · next 1.40 · defer wait 0.80 · "
+               "gpu-idle 9.80 of 40.10 ms (cpu layers 70)\n"
+               "[early-route M=4] layers 76 · host ahead of front end 51 · absorbed 1 (resync 0 · missing 1 · untrusted 0)\n"
+               "[cache] step 1 M=4 routed 7296 hit 6500 cpu 796 streamed 0 · resident 4420 pending 0 / 4446 · wall 42.00 ms\n")
+        ds = ("[decode-host M=1 verify] sync 0.10 · prep 0.20 · launch 0.30 · cpu 1.00 vs gpu 2.00 (cpu-bound layers 3/80) · tail 0.40 ms · next 0.50 · "
+              "front 0.60 · post 0.10 · hprep 0.20 · gpu-idle 1.20 of 18.00 ms (cpu layers 20) · promo wait 0.437 ms/step\n")
+        (d / "hived.log").write_text(glm + ds)
+        run(d / "hived.log", d / "out", flush=True)
+        m = [json.loads(l) for p in (d / "out" / "metrics").glob("*.jsonl") for l in p.read_text().splitlines()][0]
+        self.assertEqual(sum(m["unparsed"].values()), 0, m["unparsed"])
+        self.assertEqual((m["routed"], m["hit"], m["cpu"], m["decode_steps"]), (1824 + 7296, 1610 + 6500, 214 + 796, 2))
+        self.assertEqual((m["dh_n"], m["dh_verify_n"], m["dh_layers"], m["dh_cpu_bound_layers"]), (2, 2, 156, 33))
+        self.assertAlmostEqual(m["dh_gpu_idle_ms"], 11.0)
+        self.assertAlmostEqual(m["dh_tail_ms"], 6.7)
+        self.assertAlmostEqual(m["dh_defer_wait_ms"], 0.8)
+        self.assertEqual(m["dh_promo_wait_n"], 1)
+        self.assertAlmostEqual(m["dh_promo_wait_ms"], 0.437)
+        self.assertEqual((m["eroute"]["layers"], m["eroute"]["ahead"], m["eroute"]["absorbed"], m["eroute"]["missing"]), (76, 51, 1, 1))
+        self.assertAlmostEqual(m["prof_sections_ms"]["experts"], 23.98)
+        self.assertEqual(m["vram_free_min"], 2400)
+
 
 class Report(unittest.TestCase):
     def test_report_and_compare(self):

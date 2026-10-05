@@ -200,6 +200,21 @@ void Runtime::stats_delta(ForwardStats* st, const GlmCacheStats& b) const {
   st->n_streamed += (int)(a.streamed - b.streamed); st->n_promoted += (int)(a.promoted - b.promoted);
 }
 
+// HIVE_TRACE_CACHE (the DeepSeek switch and line format — tools/hive_monitor.py): one [cache] line per decode / verify step, with the VRAM
+//   headroom every 64 steps and the wall time of the step (hived's call, candidates included)
+void Runtime::cache_line(int M, const GlmCacheStats& b, double t0) {
+  static const bool on = getenv("HIVE_TRACE_CACHE") && *getenv("HIVE_TRACE_CACHE") && strcmp(getenv("HIVE_TRACE_CACHE"), "0") != 0;
+  if (!on) return;
+  GlmExperts& x = store_.experts();
+  const GlmCacheStats& a = x.stats();
+  size_t vfree = 0, vtot = 0;
+  if ((cache_step_ & 63) == 0) cudaMemGetInfo(&vfree, &vtot);
+  fprintf(stderr, "[cache] step %ld M=%d routed %d hit %d cpu %d streamed %d · resident %d pending %d / %d%s · wall %.2f ms\n", cache_step_, M,
+          (int)(a.routed - b.routed), (int)(a.hit - b.hit), (int)(a.cpu - b.cpu), (int)(a.streamed - b.streamed), x.n_resident(), x.n_pending(), x.n_slots(),
+          vtot ? (" · vram free " + std::to_string(vfree >> 20) + " MiB").c_str() : "", hive::mono_ms() - t0);
+  ++cache_step_;
+}
+
 void Runtime::cands_dev(int M) {
   const int NC = opt_.sampler_cands, V = model_.glm().cfg().vocab;
   cudaStream_t st = eng_->stream();
@@ -312,7 +327,7 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
     stats->row_hit.assign(M, 0); stats->row_cpu.assign(M, 0); stats->row_dma.assign(M, 0);
     for (int m = 0; m < M; ++m) { stats->row_hit[m] = store_.experts().row_hit(m); stats->row_cpu[m] = store_.experts().row_cpu(m); }
     stats->ms_total += hive::mono_ms() - t0;
-  }
+  }  cache_line(M, before, t0);
 }
 
 void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats* stats) {
@@ -346,7 +361,7 @@ void Runtime::forward_verify(Seq& seq, const int32_t* ids, int M, std::vector<fl
   if (since_prefill_ < (1 << 30)) ++since_prefill_;
   cands_dev(M);  // candidates of every verify row (row_inv_temp set by the caller)
   stats_delta(stats, before);
-  if (stats) stats->ms_total += hive::mono_ms() - t0;
+  if (stats) stats->ms_total += hive::mono_ms() - t0;  cache_line(M, before, t0);
 }
 
 void Runtime::rollback(Seq& seq, int n_keep) {
@@ -378,7 +393,7 @@ void Runtime::forward_verify_batch(std::vector<VerifyPart>& parts, std::vector<f
   cands_dev(R);
   stats_delta(stats, before);
   if (stats) stats->ms_total += hive::mono_ms() - t0;
-  vb_seqs_ = seqs;
+  vb_seqs_ = seqs;  cache_line(R, before, t0);
 }
 
 void Runtime::rollback_batch(const std::vector<int>& n_keep) {

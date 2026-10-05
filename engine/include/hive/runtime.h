@@ -455,6 +455,7 @@ class Runtime {
   void decode_layers_ubatch(std::vector<Seq*>& seqs, int M, ForwardStats* stats);
   void ub_view(int h, int M, bool on);  // map half h's row range into Work (row-based pointer offset); on=false restores
   void dh_report(int M);                // [decode-host] line (HIVE_PROFILE sample steps)
+  double dh_cw_ms_ = 0; long dh_cw_step_ = 0;  // [decode-host] promo wait: commit_wait_ms and step_ at the last line
   // HIVE_DECODE_SPLIT=balance (hive/decode_split.h): cost-model state for the decode miss DMA/CPU split (runtime.cpp DecodeSplit — created only when enabled; incomplete type)
   struct DecodeSplit;
   std::shared_ptr<DecodeSplit> dsplit_;

@@ -473,9 +473,11 @@ void GlmExperts::cpu_experts(int li, const std::vector<std::pair<int, std::vecto
 
 void GlmExperts::deferred_wait() {
   if (!dpending_) return;
+  const auto t0 = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lk(dmu_);
   dcv_.wait(lk, [&] { return ddone_; });
   dpending_ = false;
+  stats_.ms_defer_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void GlmExperts::decode_layer(int li, int M, const int32_t* ids, const float* w, const bf16* x_dev, float* out_dev, cudaStream_t st, const bf16* x_host,
@@ -532,6 +534,7 @@ void GlmExperts::decode_layer(int li, int M, const int32_t* ids, const float* w,
     for (size_t i = 0; i < (size_t)M * H_; ++i) hx[i] = bf2f(src[i]);
     stats_.ms_wait_x += ms_since0(T0);
   }
+  if (marks_) CUDA_CHECK(cudaEventRecord(marks_->exp, st));
   if (!gpu.empty()) {
     if ((int)gpu.size() > dpairs_cap_) {
       dev_scratch_free(dpairs_);
@@ -544,6 +547,7 @@ void GlmExperts::decode_layer(int li, int M, const int32_t* ids, const float* w,
     CUDA_CHECK(cudaMemcpyAsync(dpairs_, staged.data(), gpu.size() * sizeof(MoePair), cudaMemcpyHostToDevice, st));
     moe_decode(L_, dpairs_, (int)gpu.size(), x_dev, H_, I_, limit_, out_dev, moe_ws_, st);
   }
+  if (marks_) CUDA_CHECK(cudaEventRecord(marks_->gend, st));
   if (!cpu_jobs.empty()) {
     std::memset(host_y_, 0, (size_t)M * H_ * 4);
     const auto T1 = std::chrono::steady_clock::now();
@@ -552,6 +556,7 @@ void GlmExperts::decode_layer(int li, int M, const int32_t* ids, const float* w,
     stats_.cpu_jobs += cpu_jobs.size(); stats_.cpu_bytes += cpu_jobs.size() * L_.total;
     // the add kernel reads the pinned host buffer directly (UVA): a cudaMemcpy here queued behind the bulk promotion / prefetch copies
     //   on the H2D copy engine (measured: up to ~10 ms per token right after a prefill, when warm promotions run)
+    if (marks_) { CUDA_CHECK(cudaEventRecord(marks_->acc, st)); marks_->cpu = true; }
     add_f32(out_dev, host_y_, (size_t)M * H_, st);
     CUDA_CHECK(cudaStreamSynchronize(st));  // host_y_ reused by the next layer
   }

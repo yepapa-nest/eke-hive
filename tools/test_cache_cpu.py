@@ -11,6 +11,7 @@ src = (ROOT / 'engine/src/expert_store.cpp').read_text()
 code = r'''
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -47,6 +48,7 @@ struct ExpertStore {
  uint64_t promotions_=0,commits_=0,evictions_=0,duplicate_skips_=0,h2d_records_=0,d2d_records_=0;
  struct CacheStats {int resident=0,unique=0,pending=0,duplicates=0,invalid_mappings=0;uint64_t promotions=0,commits=0,evictions=0,duplicate_skips=0,h2d_records=0,d2d_records=0;};
  struct PromoBatch {int evt;std::vector<int> slots;bool paced=false,issued=true;int pieces_left=0;int st=0;};
+ double commit_wait_ms_=0;  // commit_pending: host time waited for paced batches
  // E4 HIVE_DECODE_COPY_PRIO members (same names as expert_store.h); mock record = 12 pieces {5,1,5,1,5,1}×2 bytes into a real buffer
  bool pace_=false; struct PromoPiece{uint8_t* dst;const uint8_t* src;size_t n;}; std::deque<PromoPiece> pace_pieces_;
  size_t pace_bytes_=0; int pace_unissued_=0,pace_batch_pieces_=0; uint64_t promo_h2d_bytes_=0;

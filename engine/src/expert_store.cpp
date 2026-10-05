@@ -1382,7 +1382,11 @@ void ExpertStore::commit_pending() {
     // E4 coordinated batch: there is no event until all its pieces are issued (querying an unrecorded event reports "done" — we must stop here). Once issued, wait instead of querying —
     //   this pins the residency point to "the first commit_pending after issuing finished" (step head); with a query the step would depend on copy speed — not deterministic.
     if (!b.issued) return;
-    if (b.paced) CUDA_CHECK(cudaEventSynchronize(b.evt));
+    if (b.paced) {
+      const auto w0 = std::chrono::steady_clock::now();
+      CUDA_CHECK(cudaEventSynchronize(b.evt));
+      commit_wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    }
     const auto status = cudaEventQuery(b.evt);
     if (status == cudaErrorNotReady) return;
     CUDA_CHECK(status);  // A failed transfer is not an indefinitely pending transfer.

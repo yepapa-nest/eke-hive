@@ -3412,8 +3412,12 @@ void Runtime::dh_report(int M) {
   if (layers == 0) return;  // steps that did not take the per-layer path (e.g. the G1 step graph)
   const double span = D.el(0, O::kPre, head, O::kPre);
   fprintf(stderr, "[decode-host M=%d%s] sync %.2f · prep %.2f · launch %.2f · cpu %.2f vs gpu %.2f (cpu-bound layers %d/%d) · tail %.2f ms · next %.2f · front %.2f · "
-                  "post %.2f · hprep %.2f · gpu-idle %.2f of %.2f ms (cpu layers %d)\n",
-          M, D.ub ? " ubatch" : vdec_ ? " verify" : "", sync, prep, launch, cpu, gpu, cpu_bound, layers, tail, next, front, post, D.h_hprep, sync + gap + tail + next, span, cpu_layers);  // R1 verify rows (verify_decode) are marked " verify"
+                  "post %.2f · hprep %.2f · gpu-idle %.2f of %.2f ms (cpu layers %d) · promo wait %.3f ms/step\n",
+          M, D.ub ? " ubatch" : vdec_ ? " verify" : "", sync, prep, launch, cpu, gpu, cpu_bound, layers, tail, next, front, post, D.h_hprep, sync + gap + tail + next, span, cpu_layers,
+          (store_.commit_wait_ms() - dh_cw_ms_) / std::max<long>(1, (long)step_ - dh_cw_step_));
+  // promo wait = host time the step-head commits (ExpertStore::commit_pending) waited for paced promotion copies, averaged over every step
+  //   since the last line (host timestamps, real chat c1, 2026-10-05: 0.44 ms per verify head — copies issued during the MTP draft)
+  dh_cw_ms_ = store_.commit_wait_ms(); dh_cw_step_ = (long)step_;  // R1 verify rows (verify_decode) are marked " verify"
 }
 // ---- O1 C END
 

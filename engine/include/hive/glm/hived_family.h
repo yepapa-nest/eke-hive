@@ -284,6 +284,8 @@ class Runtime {
  private:
   void cands_dev(int M);
   void stats_delta(ForwardStats* st, const GlmCacheStats& before) const;
+  void cache_line(int M, const GlmCacheStats& before, double t0);  // HIVE_TRACE_CACHE: the [cache] line of a decode / verify step
+  long cache_step_ = 0;
   Model& model_;
   ExpertStore& store_;
   RuntimeOptions opt_;

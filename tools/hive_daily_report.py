@@ -246,9 +246,10 @@ def summarize(reqs, mets, top=10, server=None):
     agg = {k: 0 for k in ("decode_steps", "routed", "hit", "cpu", "streamed", "reclaims", "reclaim_evicted", "snapshots", "warm_n",
                           "mtp_steps", "mtp_nodraft", "mtp_drafted", "mtp_accepted", "mtp_tokens", "mtp_batch_n", "mtp_batch_nodraft",
                           "stall_n", "prefill_chunks", "batch_rounds", "batch_windows", "requests_done", "warnings", "dh_n",
-                          "dh_cpu_bound_layers", "dh_layers", "dsync_n", "dma_samples", "dma_wait_samples")}
+                          "dh_cpu_bound_layers", "dh_layers", "dsync_n", "dma_samples", "dma_wait_samples", "dh_promo_wait_n")}
     fl = {k: 0.0 for k in ("dma_span_ms", "dma_wait_ms", "mtp_draft_ms", "mtp_verify_ms", "mtp_saved_ms", "stall_ms_sum", "reclaim_ms",
-                           "dh_gpu_idle_ms", "dh_of_ms", "dh_cpu_ms", "dh_gpu_ms", "dsync_wait_ms", "warm_ms", "prefill_chunk_ms", "promo_mib")}
+                           "dh_gpu_idle_ms", "dh_of_ms", "dh_cpu_ms", "dh_gpu_ms", "dsync_wait_ms", "warm_ms", "prefill_chunk_ms", "promo_mib",
+                           "dh_tail_ms", "dh_promo_wait_ms", "dh_defer_wait_ms")}
     conc, batch, step_all, verify, stall_h, gidle = {}, {}, {}, {}, {}, {}
     step_m: dict = {}
     wall_m: dict = {}
@@ -295,6 +296,9 @@ def summarize(reqs, mets, top=10, server=None):
                          "cpu_bound_layer_share": round(agg["dh_cpu_bound_layers"] / agg["dh_layers"], 4) if agg["dh_layers"] else None,
                          "cpu_vs_gpu_ms": [round(fl["dh_cpu_ms"], 1), round(fl["dh_gpu_ms"], 1)],
                          "decode_sync_wait_ms_mean": round(fl["dsync_wait_ms"] / agg["dsync_n"], 2) if agg["dsync_n"] else None,
+                         "cpu_tail_ms_mean": round(fl["dh_tail_ms"] / agg["dh_n"], 3) if agg["dh_n"] else None,
+                         "promo_wait_ms_per_step": round(fl["dh_promo_wait_ms"] / agg["dh_promo_wait_n"], 3) if agg["dh_promo_wait_n"] else None,
+                         "defer_wait_ms_mean": round(fl["dh_defer_wait_ms"] / agg["dh_n"], 3) if agg["dh_n"] and fl["dh_defer_wait_ms"] else None,
                          "note": "step ms covers only HIVE_PROFILE sample steps ([cache] after [profile]) — the sampling period is the HIVE_PROFILE value"}
     R = agg["routed"] or 1
     dec = [r for r in done if (r.get("decode_hit", 0) + r.get("decode_cpu", 0)) > 0]
@@ -431,7 +435,9 @@ def render_md(day, S, cmp_, prev_day):
     L += ["", f"- engine decode steps {f(es['decode_steps'])} · sampled step ms p50 {f(es['step_ms_all']['p50'],2)} / p95 {f(es['step_ms_all']['p95'],2)} "
               f"· MTP verify step p50 {f(es['mtp_verify_ms']['p50'],2)} ms",
           f"- GPU idle (decode-host) total ratio {f(es['gpu_idle_pct']['sum_ratio'],1)}% (step p50 {f(es['gpu_idle_pct']['p50'],1)}% · p95 {f(es['gpu_idle_pct']['p95'],1)}%) · "
-          f"CPU-bound layer share {f(es['cpu_bound_layer_share'] and 100*es['cpu_bound_layer_share'],1)}% · cpu/gpu ms {es['cpu_vs_gpu_ms']} · decode-sync wait mean {f(es['decode_sync_wait_ms_mean'],2)} ms", ""]
+          f"CPU-bound layer share {f(es['cpu_bound_layer_share'] and 100*es['cpu_bound_layer_share'],1)}% · cpu/gpu ms {es['cpu_vs_gpu_ms']} · decode-sync wait mean {f(es['decode_sync_wait_ms_mean'],2)} ms",
+          f"- per sampled step: wait for CPU experts {f(es['cpu_tail_ms_mean'],3)} ms · promotion commit wait {f(es['promo_wait_ms_per_step'],3)} ms/step · "
+          f"deferral wait {f(es['defer_wait_ms_mean'],3)} ms", ""]
     c = S["concurrency"]
     L += ["## Concurrency", "", "| open requests (at decode step) | share |", "|---:|---:|"]
     L += [f"| {k} | {f(100*v,1)}% |" for k, v in c["open_requests_at_decode_step"].items()]

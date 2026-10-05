@@ -355,10 +355,10 @@ None of these is needed in production. Tracing has overhead; keep it off when me
 
 | Switch | Default | hive.env | Meaning |
 | --- | --- | --- | --- |
-| `HIVE_PROFILE` | off | (monitoring: `64`) | Per-phase timings; N = profile every N steps |
-| `HIVE_TRACE_CACHE` | off | (monitoring: `1`) | Per-token cache hit/resident lines and snapshot lines |
+| `HIVE_PROFILE` | off | (monitoring: `64`) | Per-phase timings; N = profile every N steps. The `[decode-host]` line also gives the step-head promotion commit wait (`promo wait … ms/step`, mean over every step since the previous line). GLM: `[profile]`, `[decode-host]` and `[early-route]` in the same formats, from CUDA events on the sample step (no host synchronization added); its `[decode-host]` adds `defer wait` (host time blocked on deferred CPU experts) |
+| `HIVE_TRACE_CACHE` | off | (monitoring: `1`) | Per-token cache hit/resident lines and snapshot lines (GLM: the `[cache]` line of every decode / verify step) |
 | `HIVE_TRACE_MTP` | off | (monitoring: `1`) | Per-step draft/accept/confidence log |
-| `HIVE_PREFILL_PROF` | off | (monitoring: `1`) | Per-chunk `[prefill-prof]` phase breakdown |
+| `HIVE_PREFILL_PROF` | off | (monitoring: `1`) | Per-chunk `[prefill-prof]` phase breakdown (DeepSeek only) |
 | `HIVE_EXPERT_TRACE` | off | (monitoring: a path) | Append a binary expert-routing trace to this file (input for cache replay) |
 | `HIVE_CACHE_EVENTS` | off | — | Append cache transitions (use/evict/issue/commit/place) as CSV to this file; checked by `tools/check_cache_events.py` |
 | `HIVE_LOAD_CHECKSUM` | off | — | After loading, print a 64-bit hash of every host copy (expert arenas, Engram tables) to compare loaders |

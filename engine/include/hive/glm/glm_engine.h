@@ -225,6 +225,18 @@ class GlmEngine {
   cudaEvent_t probe_ev_[2 * 64] = {};
   std::vector<std::pair<cudaEvent_t, double*>> ev_marks_;
   void prof_flush();
+  // HIVE_PROFILE=N (the DeepSeek runtime's switch; same line formats, read by tools/hive_monitor.py): every N-th decode / verify forward is
+  //   a sample step. Its section times come from the HIVE_GLM_PROF=2 event marks (CUDA events, no host synchronization added) → [profile M=…];
+  //   per layer, events at the layer start, at the end of the front (attention, router, shared expert — before the host takes the routing),
+  //   around the GPU experts (GlmExperts::LayerMarks) and at the layer end → [decode-host M=…], the time the decode stream sat empty; the
+  //   early-route posts of the step → [early-route M=…]. Off (0) when HIVE_GLM_PROF is set (that one owns the marks).
+  int sample_every_ = 0;
+  bool sample_ = false;
+  struct DhLayer { cudaEvent_t start = nullptr, front = nullptr, end = nullptr; GlmExperts::LayerMarks x; bool moe = false; };
+  std::vector<DhLayer> dh_;
+  cudaEvent_t dh_head_ = nullptr;
+  long er_layers_ = 0, er_ahead_ = 0, er_abs_ = 0;  // sample steps since the last [early-route] line
+  void sample_report(int rows, const GlmForwardStats& s0, const GlmCacheStats& x0);
 };
 
 }  // namespace hive::glm

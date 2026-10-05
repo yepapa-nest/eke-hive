@@ -122,7 +122,9 @@ RE_KV = re.compile(r"([A-Za-z][\w.\-]*) (-?[\d.]+)")
 RE_DH = {k: re.compile(p) for k, p in {
     "sync": r"sync ([\d.]+)", "prep": r"· prep ([\d.]+)", "launch": r"launch ([\d.]+)", "cpu": r"cpu ([\d.]+) vs gpu ([\d.]+)",
     "cpu_bound": r"cpu-bound layers (\d+)/(\d+)", "tail": r"tail ([\d.]+) ms", "front": r"front ([\d.]+)",
-    "gpu_idle": r"gpu-idle ([\d.]+) of ([\d.]+) ms", "cpu_layers": r"\(cpu layers (\d+)\)"}.items()}
+    "gpu_idle": r"gpu-idle ([\d.]+) of ([\d.]+) ms", "cpu_layers": r"\(cpu layers (\d+)\)",
+    "promo_wait": r"promo wait ([\d.]+) ms/step",  # DeepSeek: step-head commit wait for paced promotions, mean per step since the previous line
+    "defer_wait": r"defer wait ([\d.]+)"}.items()}     # GLM: host time blocked on deferred CPU experts in this sample step
 RE_SHAPE_NUM = re.compile(r"[0-9a-f]{8,}|\d+(?:\.\d+)?")
 
 DIAG_PREFIXES = ("[decode-host", "[decode-sync", "[decode-miss", "[decode-split", "[early-route", "[step-graph", "[pregate")
@@ -192,6 +194,7 @@ def new_bucket(minute: str) -> dict:
         # [decode-host]
         "dh_n": 0, "dh_verify_n": 0, "dh_gpu_idle_ms": 0.0, "dh_of_ms": 0.0, "dh_cpu_ms": 0.0, "dh_gpu_ms": 0.0,
         "dh_cpu_bound_layers": 0, "dh_layers": 0, "dh_tail_ms": 0.0, "dh_front_ms": 0.0, "gpu_idle_pct_hist": {},
+        "dh_promo_wait_n": 0, "dh_promo_wait_ms": 0.0, "dh_defer_wait_ms": 0.0,
         "dsync_n": 0, "dsync_wait_ms": 0.0,
         "dmiss_n": 0, "dmiss": {},
         "eroute": {"layers": 0, "ahead": 0, "own_stream": 0, "absorbed": 0, "resync": 0, "missing": 0, "untrusted": 0},
@@ -488,6 +491,12 @@ class Parser:
                 f = RE_DH["front"].search(body)
                 if f:
                     b["dh_front_ms"] += float(f[1])
+                pw = RE_DH["promo_wait"].search(body)
+                if pw:
+                    b["dh_promo_wait_n"] += 1; b["dh_promo_wait_ms"] += float(pw[1])
+                dw = RE_DH["defer_wait"].search(body)
+                if dw:
+                    b["dh_defer_wait_ms"] += float(dw[1])
                 return
         elif head.startswith("[decode-sync M="):
             m = RE["dsync"].match(line)
