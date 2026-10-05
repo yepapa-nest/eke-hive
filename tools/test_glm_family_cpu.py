@@ -64,5 +64,52 @@ want = pair[:, :, 14:28, 0:14].transpose(1, 0, 2, 3).reshape(-1)  # third row of
 ok = p.shape == (16, 1176) and gh == 4 and gw == 4 and np.array_equal(p[2], want)
 fails += not ok
 print(f"{'ok  ' if ok else 'FAIL'} patchify 56x56 -> {p.shape}, merge-block order")
+# ---- tool-call arguments: schema-typed strings stay raw, output is always valid JSON (no model) ----
+import json  # noqa: E402
+
+TOOLS = [{"type": "function", "function": {"name": "job_wait", "parameters": {"type": "object", "properties": {
+    "job_id": {"type": "string"}, "code": {"type": ["string", "null"]}, "timeout_seconds": {"type": "number"},
+    "flag": {"type": "boolean"}, "ids": {"type": "array"}}}}}]
+
+
+def _strict(s):
+    return json.loads(s, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+
+
+def check_args(args_xml, want, tools=TOOLS, name="job_wait"):
+    global fails
+    text = f"<tool_call>{name}" + "".join(f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in args_xml) + "</tool_call>"
+    calls = glm.parse_tool_calls(text, tools)
+    try:
+        got = _strict(calls[0]["function"]["arguments"])
+        ok = got == want and all(type(got[k]) is type(want[k]) for k in want)
+    except (ValueError, IndexError) as e:
+        got, ok = repr(e), False
+    fails += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} tool args {args_xml} -> {got}" + ("" if ok else f" (want {want})"))
+
+
+check_args([("job_id", "3e382151")], {"job_id": "3e382151"})          # 2026-10-05 incident: was inf / Infinity
+check_args([("code", "0123")], {"code": "0123"})                      # string|null: leading zero kept
+check_args([("job_id", "true")], {"job_id": "true"})
+check_args([("job_id", "null")], {"job_id": "null"})
+check_args([("timeout_seconds", "600")], {"timeout_seconds": 600})    # number: decoded
+check_args([("flag", "true")], {"flag": True})
+check_args([("ids", '["a", 1]')], {"ids": ["a", 1]})
+check_args([("timeout_seconds", "1e999")], {"timeout_seconds": "1e999"})   # non-finite: raw text, never Infinity
+check_args([("x", "1e999")], {"x": "1e999"}, tools=None)              # no schema
+check_args([("x", "3e382151")], {"x": "3e382151"}, tools=None)
+check_args([("x", "NaN")], {"x": "NaN"}, tools=None)
+check_args([("x", "-Infinity")], {"x": "-Infinity"}, tools=None)
+check_args([("x", "[1, Infinity]")], {"x": "[1, Infinity]"}, tools=None)
+check_args([("x", "[1, 1e999]")], {"x": "[1, 1e999]"}, tools=None)
+check_args([("x", "42")], {"x": 42}, tools=None)                      # no schema, finite: decoded as before
+check_args([("job_id", "3e382151")], {"job_id": "3e382151"}, tools=[{"name": "job_wait", "parameters": {"properties": {"job_id": {"type": "string"}}}}])
+check_args([("job_id", "3e382151")], {"job_id": "3e382151"}, tools=[{"type": "function", "function": {"name": "job_wait", "parameters": {"properties": {"job_id": {"enum": ["3e382151", "x"]}}}}}])
+msg = glm.parse_message_from_completion_text("hm</think><tool_call>job_wait<arg_key>job_id</arg_key><arg_value>3e382151</arg_value></tool_call>", tools=TOOLS)
+ok = _strict(msg["tool_calls"][0]["function"]["arguments"]) == {"job_id": "3e382151"}
+fails += not ok
+print(f"{'ok  ' if ok else 'FAIL'} parse_message_from_completion_text passes tools to the argument parser")
+
 print("RESULT:", "PASS" if not fails else f"FAIL ({fails})")
 sys.exit(1 if fails else 0)

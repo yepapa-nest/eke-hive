@@ -10,7 +10,8 @@ Thinking: GLM-5.3-Flash has no way to turn thinking off — Z.ai documents `thin
     HIVE_GLM_NOTHINK=low   (default) — the official minimum: reasoning_effort "low", output still starts in the thinking block
     HIVE_GLM_NOTHINK=empty — an empty thinking block is prefilled (`<think></think>`), the model answers directly (not an official mode)
 Tool calls: <tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call> (the template's own instruction).
-  Values are JSON when they parse as JSON (the template writes non-string arguments with tojson), else the raw string.
+  Values: the raw text when the request's schema types the argument as string; otherwise JSON when they parse as finite JSON
+  (the template writes non-string arguments with tojson), else the raw string.
 """
 from __future__ import annotations
 
@@ -126,26 +127,83 @@ def encode_messages(messages: list[dict], thinking_mode: str = "thinking", reaso
     return (prompt, {"images": media}) if return_multi_modal_data else prompt
 
 
-def _arg_value(v: str):
+def _reject_constant(name: str):
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+def _finite(x) -> bool:
+    if isinstance(x, float):
+        return math.isfinite(x)
+    if isinstance(x, list):
+        return all(_finite(y) for y in x)
+    if isinstance(x, dict):
+        return all(_finite(y) for y in x.values())
+    return True
+
+
+def _schema_types(sch) -> set:
+    """JSON types a parameter schema allows ("type" as a string or a list, or the branches of anyOf / oneOf); empty = unknown."""
+    if not isinstance(sch, dict):
+        return set()
+    t = sch.get("type")
+    out = {t} if isinstance(t, str) else {x for x in t if isinstance(x, str)} if isinstance(t, list) else set()
+    for k in ("anyOf", "oneOf"):
+        for b in sch.get(k) or []:
+            out |= _schema_types(b)
+    if not out and isinstance(sch.get("enum"), list) and sch["enum"] and all(isinstance(e, str) for e in sch["enum"]):
+        out = {"string"}
+    return out
+
+
+def tool_param_schemas(tools) -> dict:
+    """{tool name: {argument name: parameter schema}} from a request's tools (OpenAI {type, function} or bare {name, parameters})."""
+    out = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        props = ((fn.get("parameters") or fn.get("input_schema") or {}) if isinstance(fn, dict) else {}).get("properties")
+        if isinstance(fn.get("name"), str) and isinstance(props, dict):
+            out[fn["name"]] = props
+    return out
+
+
+def _arg_value(v: str, schema=None):
+    """One <arg_value>. The template writes string arguments raw and everything else with tojson, and carries no type marker, so a
+    string that happens to read as JSON was decoded: job id '3e382151' became inf (json.loads reads it as 3e382151 = overflow) and
+    the arguments became {"job_id": Infinity} — not JSON; the client got 'inf' and the agent looped on "unknown job_id 'inf'"
+    (2026-10-05, a production agent: 136+ job_wait calls). Same path: '0123' -> 123, 'true' / 'null' meant as text.
+    So: a parameter whose schema allows only string (plus null) keeps the raw text; otherwise JSON is tried, but NaN / Infinity
+    constants and non-finite numbers (1e999) keep the raw text, so the arguments are always valid JSON."""
+    types = _schema_types(schema) - {"null"}
+    if types == {"string"}:
+        return v
     s = v.strip()
     try:
-        return json.loads(s)
+        x = json.loads(s, parse_constant=_reject_constant)
     except ValueError:
         return v
+    return x if _finite(x) else v
 
 
-def parse_tool_calls(text: str) -> list[dict]:
+def parse_tool_calls(text: str, tools=None) -> list[dict]:
+    schemas = tool_param_schemas(tools)
     calls = []
     for body in _TOOL_RE.findall(text):
         name, _, rest = body.partition("<arg_key>")
         name = name.strip()
-        args = {k.strip(): _arg_value(v) for k, v in _ARG_RE.findall("<arg_key>" + rest)} if rest else {}
+        props = schemas.get(name) or {}
+        args = {}
+        for k, v in (_ARG_RE.findall("<arg_key>" + rest) if rest else []):
+            k = k.strip()
+            args[k] = _arg_value(v, props.get(k))
         if name:
-            calls.append({"type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+            calls.append({"type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False)}})
     return calls
 
 
-def parse_message_from_completion_text(text: str, thinking_mode: str = "thinking") -> dict:
+def parse_message_from_completion_text(text: str, thinking_mode: str = "thinking", tools=None) -> dict:
+    """tools: the request's tool list — argument types come from its schemas (see _arg_value)."""
     for e in EOS_TEXTS:
         text = text.replace(e, "")
     reasoning = ""
@@ -159,7 +217,7 @@ def parse_message_from_completion_text(text: str, thinking_mode: str = "thinking
     out: dict[str, Any] = {"content": content.strip()}
     if reasoning.strip():
         out["reasoning_content"] = reasoning.strip()
-    calls = parse_tool_calls(tool_part) if tool_part else []
+    calls = parse_tool_calls(tool_part, tools) if tool_part else []
     if calls:
         out["tool_calls"] = calls
     return out

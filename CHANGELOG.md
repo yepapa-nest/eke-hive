@@ -20,6 +20,9 @@ DeepSeek ([docs/performance.md](docs/performance.md), steps 22–23):
 - `[decode-host]` gives the step-head promotion commit wait (`promo wait … ms/step`).
 
 GLM ([docs/glm.md](docs/glm.md), steps 17–21):
+- Fix: tool-call arguments typed `string` in the request's schema are kept as written. The parser decoded every argument as
+  JSON, so a job id `3e382151` became `inf` (and the arguments `{"job_id": Infinity}`, which is not JSON), `0123` became 123.
+  Untyped arguments still decode as JSON, but NaN / Infinity and non-finite numbers stay text; the arguments are always valid JSON.
 - Layer yields inside a prefill (short requests served, decoders keep stepping): short request 14.0 → 0.65 s, decoder stall 14.4 → 1.6 s.
 - 8 sequences per decode step and batched MTP verify by default: c2 66.6 → 79.5, c8 93.2 → 125.7 tok/s.
 - Promotion victims sorted once per step instead of a scan of every slot per used expert (the host held the GPU idle 1.88 ms per

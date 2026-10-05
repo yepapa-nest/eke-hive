@@ -665,6 +665,14 @@ def session_id_for(messages: list[dict], explicit: str | None) -> str:
     return hashlib.sha1(((explicit or "") + "\x00" + head).encode()).hexdigest()[:16]
 
 
+def parse_completion(text: str, thinking_mode: str, tools):
+    """The family parser. GLM also takes the request's tools — its tool-call format has no type marker, so argument types come from
+    the schemas (server/families/glm.py _arg_value); DeepSeek's DSML marks string arguments itself (string="true")."""
+    if FAMILY == "glm5_next":
+        return ENC.parse_message_from_completion_text(text, thinking_mode=thinking_mode, tools=tools)
+    return ENC.parse_message_from_completion_text(text, thinking_mode=thinking_mode)
+
+
 def openai_tool_calls(calls) -> list[dict]:
     """tool_calls from the reference parse_message_from_completion_text are already in OpenAI format ({type, function:{name,
     arguments}}) — converting them again raises KeyError 'name'. Here we only add an id and ensure arguments is a string."""
@@ -1282,7 +1290,7 @@ async def chat(request: Request):
                     return JSONResponse({"error": {"message": val, "type": "server_error"}, 'partial_content': ''.join(text_parts)}, status_code=502)
         text = strip_eos("".join(text_parts))
         try:
-            parsed = ENC.parse_message_from_completion_text(text + TOK.eos_token if done.get("finish") == "stop" else text, thinking_mode=thinking_mode)
+            parsed = parse_completion(text + TOK.eos_token if done.get("finish") == "stop" else text, thinking_mode, tools)
         except Exception:
             # If the reference parser rejects the text (e.g. cut at max_tokens): thinking mode without </think> = all thinking; with it, split before/after
             if thinking_mode == "thinking":
@@ -1395,7 +1403,7 @@ async def chat(request: Request):
         if tool_buf:
             try:
                 # the reference parser's tool start marker is "\n\n<｜DSML｜ calls" — re-attach the newlines stripped from the stream so it finds the block
-                parsed = ENC.parse_message_from_completion_text(("\n\n" if not tool_buf.startswith("\n") else "") + tool_buf + TOK.eos_token, thinking_mode="chat")
+                parsed = parse_completion(("\n\n" if not tool_buf.startswith("\n") else "") + tool_buf + TOK.eos_token, "chat", tools)
                 calls = openai_tool_calls(parsed.get("tool_calls") or [])
             except Exception:
                 calls = []
