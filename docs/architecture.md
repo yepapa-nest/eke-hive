@@ -293,7 +293,8 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   `engine/src/cpu/expert_cpu_nvfp4.cpp`) while the next layer's predicted expert is copied ahead (`HIVE_GLM_PREFETCH`); up to 4
   sequences per step.
 - **Prefill.** 16K blocks run layer-major over up to 64K rows in buffers borrowed from the expert cache; experts used by few rows
-  are computed by the CPU, the rest streamed over PCIe. Batched prefill and layer yields are not implemented for GLM.
+  are computed by the CPU, the rest streamed over PCIe. Layer yields work as on DeepSeek (short requests admitted and decode steps run at layer boundaries); nothing is
+  parked — the forwards run inside a yield use hc-stream rows the paused prefill does not hold. Batched prefill is not implemented for GLM.
 - **Speculative decoding.** The NextN layer drafts up to 3 tokens; a rejected tail is undone by restoring the KDA state saved
   after each verified row. The shared gate runs with its measured cost tables (`HIVE_MTP_GATE2/3`).
 - **API server.** The checkpoint's `chat_template.jinja`; thinking cannot be switched off (levels `low` / `high` / `max`, default

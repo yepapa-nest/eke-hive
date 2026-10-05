@@ -363,14 +363,15 @@ static void fake_work_check(const std::vector<uint64_t>& vals, int salt, size_t 
 }
 struct Runtime::LyPark { std::vector<uint64_t> rows; };
 void Runtime::ly_begin(std::vector<std::pair<Seq*, int>> owners) {
-  if (ly_.depth > 0) return;
-  ly_.last = fake_now_ms();
-  ly_owner_ = std::move(owners);
+  if (ly_.depth > 1) return;
+  if (ly_.depth == 0) ly_.last = fake_now_ms();
+  ly_owner_[ly_.depth] = std::move(owners);
 }
 void Runtime::layer_yield_point() {
-  if (!ly_.on() || ly_.depth > 0) return;
-  if (!lypark_) lypark_ = std::make_shared<LyPark>();
-  LyPark& P = *lypark_;
+  if (!ly_.on() || ly_.depth >= ly_.h.max_depth) return;
+  const int lvl = std::min(ly_.depth, 1);
+  if (!lypark_[lvl]) lypark_[lvl] = std::make_shared<LyPark>();
+  LyPark& P = *lypark_[lvl];
   static const bool no_park = fake_env("FAKE_LY_NO_PARK", 0) > 0;
   bool pend = false;
   ly::yield_point(ly_,
@@ -418,7 +419,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   // Production forward's yield eligibility (runtime.cpp ly_ok — here without the GPU-only conditions) + Work rows from row 0
   //   HIVE_LAYER_YIELD_SMALL (production: also HIVE_PREFILL_SMALL forwards below the threshold) — here: any forward below the threshold
   static const bool ly_small = [] { const char* v = getenv("HIVE_LAYER_YIELD_SMALL"); return v && *v && strcmp(v, "0") != 0; }();
-  const bool ly_ok = ly_.on() && ly_.depth == 0 && !verify_ && (M >= opt_.prefill_threshold || ly_small);
+  const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && !verify_ && (M >= opt_.prefill_threshold || ly_small);
   if (ly_ok) ly_begin({{&seq, M}});
   fake_work_put(*vals, 0, (size_t)opt_.max_chunk);
   fake_cpu_experts(store_, model_.cfg(), M);
@@ -467,7 +468,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   struct BrokenGuard { std::vector<PrefillPart>* ps; int ex; ~BrokenGuard() { if (std::uncaught_exceptions() > ex) for (auto& p : *ps) p.seq->broken = true; } } guard{&parts, std::uncaught_exceptions()};
   fake_cpu_experts(store_, model_.cfg(), rows);
   // forward_multi is always a prefill (production ly_ok) — slot 0 = the first part's first max_chunk rows
-  const bool ly_ok = ly_.on() && ly_.depth == 0;
+  const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth;
   if (ly_ok) { std::vector<std::pair<Seq*, int>> own; for (auto& p : parts) own.push_back({p.seq, p.M}); ly_begin(std::move(own)); }
   std::vector<uint64_t> vals0(parts[0].M);
   for (int m = 0; m < parts[0].M; ++m) vals0[m] = content_at(nullptr, parts[0].ids, m);

@@ -722,6 +722,7 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
     else hc_post_apply(rows);
     prof_mark(&st_.ms_hc);
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, hb(), rows); }
+    if (prefill && layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);
   }
   // head: mean over streams → norm → lm_head (only the rows whose logits are needed)
   const int r0 = all_logits ? 0 : rows - 1, nr = all_logits ? rows : 1;
@@ -754,6 +755,28 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   if (prefill) { seqs[0]->pos += T; seqs[0]->tokens.insert(seqs[0]->tokens.end(), ids, ids + T); }
   else for (int m = 0; m < M; ++m) { seqs[m]->pos += 1; seqs[m]->tokens.push_back(ids[m]); }
   st_.ms_total += now_ms() - t0;
+}
+
+void GlmEngine::alloc_yield_rows(int rows) {
+  if (rows <= hy_rows_) return;
+  hy_.alloc((size_t)rows * c_.hc * c_.hidden * 2);
+  hy_rows_ = rows;
+}
+
+bool GlmEngine::yield_enter(YieldSave& sv) {
+  // the paused forward's rows: hall_ (layer-major) → inner forwards take h_ · h_ (chunked) → hy_ · hy_ (a forward already inside a yield whose
+  //   outer one holds h_) → none left: skip. A second level inside a layer-major prefill gets hy_ (h_ holds the first inner forward).
+  if (hcur_ && hcur_ == hy_.as<bf16>()) return false;
+  if (!hcur_ && !hy_.p) return false;
+  sv.hcur = hcur_; sv.emb = std::move(emb_over_); sv.emb_base = emb_base_; sv.on = true;
+  emb_over_.clear(); emb_base_ = 0;
+  hcur_ = sv.hcur ? nullptr : hy_.as<bf16>();
+  return true;
+}
+
+void GlmEngine::yield_exit(YieldSave& sv) {
+  if (!sv.on) return;
+  hcur_ = sv.hcur; emb_over_ = std::move(sv.emb); emb_base_ = sv.emb_base; sv.on = false;
 }
 
 void GlmEngine::prefill(GlmSeq& s, const int32_t* ids, int T, float* logits_last) {

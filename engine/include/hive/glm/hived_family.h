@@ -248,11 +248,15 @@ class Runtime {
     return n;
   }
   bool asleep() const { return const_cast<ExpertStore&>(store_).experts().asleep(); }
-  void set_layer_yield(ly::Hooks) {}
-  bool layer_yield_on() const { return false; }
-  bool in_layer_yield() const { return false; }
-  const ly::Stats& layer_yield_stats() const { return ly_st_; }
-  double layer_yield_resume_ms() const { return 0; }
+  // Layer yield (HIVE_LAYER_YIELD — hive/layer_yield.h, the same hooks hived gives the DeepSeek runtime): a prefill forward pauses at layer
+  //   boundaries (GlmEngine::layer_boundary) so hived can admit short requests and run decode steps of the active set. Nothing is copied:
+  //   the inner forwards use rows the outer prefill does not hold (GlmEngine::yield_enter).
+  void set_layer_yield(ly::Hooks h) { ly_.h = std::move(h); }
+  bool layer_yield_on() const { return ly_.on(); }
+  bool in_layer_yield() const { return ly_.depth > 0; }
+  const ly::Stats& layer_yield_stats() const { return ly_.st; }
+  double layer_yield_resume_ms() const { return ly_.last; }
+  double layer_yield_progress() const { return ly_progress_; }  // (layers done) / layers of the paused prefill forward
   const RuntimeOptions& opt() const { return opt_; }
   int n_cands() const { return opt_.sampler_cands; }
   float* row_inv_temp() { return cand_it_h_; }
@@ -289,7 +293,11 @@ class Runtime {
   static constexpr int kWarmSteps = 32;
   long warm_samples_ = 0;
   int since_prefill_ = 1 << 30;
-  ly::Stats ly_st_;
+  ly::State ly_;
+  bool ly_small_ = false;                  // HIVE_LAYER_YIELD_SMALL: also yield inside prefills below prefill_threshold (above the decode-path size)
+  std::vector<float> prefill_logits_;      // logits of a prefill's last row (not logits_h_: decode steps run inside its layer yields resize that)
+  double ly_progress_ = 0;
+  void layer_yield_point();
   int rows_cap_ = 0;
   bool mtp_batch_ = false;                 // HIVE_MTP_BATCH (constructor)
   std::vector<GlmSeq*> vb_seqs_;           // parts of the last forward_verify_batch (for rollback_batch)
@@ -297,7 +305,9 @@ class Runtime {
   int32_t* cand_idx_h_ = nullptr; float* cand_val_h_ = nullptr; float* cand_max_h_ = nullptr; float* cand_sum_h_ = nullptr;
   int32_t* next_h_ = nullptr;
   DevBuf cand_idx_, cand_val_, cand_max_, cand_sum_, next_d_;
-  std::vector<float> logits_h_;
+  // logits of the last decode / verify step, pinned: a copy into pageable memory that hived had just allocated took ~4.5 ms per verify step
+  //   (CUPTI timeline, real chat c1: 66 gaps of 4.47 ms in 3 s between the head GEMM and the candidate kernels — ~10 % of the step time)
+  float* logits_pin_ = nullptr;
 };
 
 }  // namespace hive::glm::fam

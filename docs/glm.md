@@ -88,33 +88,33 @@ Expert cache: about 4,690 slots (38.8 % of the 12,096 experts) with `config/glm.
 
 ### Through hived (the API), non-thinking requests — current defaults (`config/glm.env`)
 
-Measured in one run, every adopted change on (262,144 context with KV memory
-that follows use, 32 CPU threads, cache-aware routing λ 0.1, expert deferral, KDA verify rows, MTP k ≤ 3, prefix sharing), with the
-real-chat benchmark `tools/bench_chat.py` — the headline harness for both families: twelve different chat prompts (5 Korean,
-3 English, 2 code, 2 creative), answers up to 600 tokens, `reasoning_effort: none`, decode speed after the first token:
+Measured in two runs (2026-10-05), every adopted change on (262,144 context with KV memory that follows use, 32 CPU threads, cache-aware
+routing λ 0.1, expert deferral, KDA verify rows, MTP k ≤ 3, prefix sharing, 8 seats with batched MTP verify, layer yields, sorted
+promotion victims), with the real-chat benchmark `tools/bench_chat.py` — the headline harness for both families: twelve different
+chat prompts (5 Korean, 3 English, 2 code, 2 creative), answers up to 600 tokens, `reasoning_effort: none`, decode speed after the first token:
 
 | Streams | Total | Per stream | Time to first token (median / max) |
 |---|---|---|---|
-| 1 | **65.2 tok/s** (Korean 69.6 · English 64.2 · code 62.1 · creative 55.7) | 65.5 | 0.50 / 0.68 s |
-| 2 | 66.6 | 33.9 | 0.50 / 1.00 s |
-| 4 | 89.3 | 24.6 | 0.52 / 1.58 s |
-| 8 | 88.8 | 22.8 | 24.0 / 28.4 s (`HIVE_MAX_BATCH` 4 — the rest wait) |
-| 16 | 91.6 | 23.6 | 32.6 / 70.4 s |
-| 32 | 93.3 | 23.6 | 77.6 / 157.2 s |
+| 1 | **70.3 tok/s** (Korean 72.2 · English 68.8 · code 78.2 · creative 55.8) | 71.5 | 0.51 / 0.80 s |
+| 2 | 85.2 | 47.0 | 0.54 / 0.99 s |
+| 4 | 97.9 | 27.7 | 0.55 / 1.72 s |
+| 8 | 129.1 | 17.4 | 0.94 / 3.62 s |
+| 16 | 128.3 | 17.3 | 12.8 / 39.8 s (`HIVE_MAX_BATCH` 8 — the rest wait) |
+| 32 | 129.6 | 16.9 | 45.1 / 108.6 s |
 
-With two or more streams a step decodes several sequences without MTP drafts, so two streams add up to about one stream with drafts.
-One-stream runs of the same build read 65.2–68.4 tok/s; the code prompts vary most between runs.
+Before 2026-10-05 (4 seats, no batched verify, one run): 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3 tok/s. With two streams both drafts
+are verified in one step; with more each step decodes several sequences without drafts.
 
 | Prompt | First token | Prefill | Decode after it |
 |---|---|---|---|
-| 17K tokens | 7.2 s | 2,400 tok/s | 53.6 tok/s |
-| 42K tokens | 11.6 s | 3,697 tok/s | 53.2 tok/s |
-| 54K tokens | 13.7 s | 3,966 tok/s | 48.2 tok/s |
+| 17K tokens | 7.3 s | 2,328 tok/s | 54.3 tok/s |
+| 42K tokens | 11.8 s | 3,649 tok/s | 48.9 tok/s |
+| 54K tokens | 13.9 s | 3,917 tok/s | 50.5 tok/s |
 | 100K tokens | 26.4 s | 3,833 tok/s | 45.1 tok/s |
 | 200K tokens | 53.7 s | 3,787 tok/s | 43.4 tok/s |
 | 250K tokens | 66.3 s | 3,837 tok/s | 40.0 tok/s |
 
-Decode after a long prompt slows with its length: the DSA indexer scores every earlier position at each step, and the expert
+The 100K–250K rows are from the previous build (one request's prefill — that path did not change). Decode after a long prompt slows with its length: the DSA indexer scores every earlier position at each step, and the expert
 cache is smaller while that conversation holds its KV (below).
 
 Context limit: 262,144 tokens (`HIVE_MAX_CTX`). Quality suite (163 items, `--effort low`): 158 / 163; needle retrieval at 64K,
@@ -169,6 +169,9 @@ Changes from that breakdown (A/B, interleaved, restart per configuration, 12 cha
 | 32 CPU threads instead of 24 (`config/glm.env`) | CPU phase 79 → 86 GB/s; c1 median 45.6 → 47.0 tok/s (two pairs) |
 | CPU-expert scratch reused instead of allocated per layer | CPU phase per 3-row verify 21-22 → 19-20 ms |
 | KDA verify rows in one launch (`HIVE_GLM_KDA_ROWS`, bit-identical) | one layer, 4 rows: 36.9 → 16.4 µs; 3-row verify call 44.0 / 44.5 → 43.1 / 43.4 ms (outside the CPU phase 23.1-23.3 → 22.2-22.4 ms) |
+| CPU-expert chunks sized to the worker count (`HIVE_GLM_CPU_ADAPT`, bit-identical) — after cache-aware routing and deferral a CPU layer had 1.5 jobs, fewer 128-row chunks per node than workers | gate/up workers busy 58 → 80 %, CPU expert phase 70.0 → 81.2 GB/s (0.203 → 0.174 ms per expert, 4-row verify); real-chat c1/c4/c8 unchanged (68.6 / 89.0 / 93.3 vs 68.2 / 88.5 / 93.2 tok/s — the CPU phase mostly overlaps the GPU at these loads) |
+| Decode/verify logits into a pinned buffer, hived's verify row vector reused (values unchanged) | removes a pageable copy into freshly allocated memory each verify step (rows × 154,880 × 4 B); real-chat c1 69.4 / 67.8 vs 68.2 tok/s — kept for the host work it saves |
+| Promotion victims sorted once per step instead of a scan of every slot for each used expert (same choices) — host timestamps showed `after_step` holding the GPU idle 1.88 ms per verify step | real-chat, interleaved ×2 at 8 seats + batched MTP: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s; promotions per verify unchanged (28 vs 25–29) |
 
 ### Lossy changes measured with quality (on top of each other)
 
@@ -178,7 +181,8 @@ Changes from that breakdown (A/B, interleaved, restart per configuration, 12 cha
 | same, λ 0.2 | 63.5 tok/s, hits 97.9 % | 157 (a long-context item flipped) | not adopted |
 | Expert deferral (`HIVE_GLM_DEFER`, after KTransformers SOSP'25) | 60.6 → 63.6 tok/s | 157 / 157 | adopted |
 | Skip low-weight misses (`HIVE_GLM_SKIP_MISS`) 0.05 / 0.1 | +0 / +2 % (noise) | 158 / 160 | kept off |
-| Batched MTP verify across sequences (`HIVE_MTP_BATCH`) | c4 82.4 / 82.5 → 84.4 / 82.8 | (lossless) | kept off |
+| Batched MTP verify across sequences (`HIVE_MTP_BATCH`) | c4 82.4 / 82.5 → 84.4 / 82.8 (4 seats); with 8 seats c2 66.6 → 79.5 tok/s (two runs) | (lossless) | adopted with `HIVE_MAX_BATCH=8` |
+| 8 sequences per step instead of 4 (`HIVE_MAX_BATCH=8`) | c8 93.2 → 127.8 tok/s, c8 first token 23 → 0.7–0.9 s; c1–c4 within the base spread | (lossless) | adopted |
 | MTP k 4 / 5 instead of 3 | 46.7 / 45.8 vs 48.1 tok/s | | kept at 3 |
 
 ### What did not help (measured, kept off)
@@ -291,11 +295,12 @@ The reference comparison (next-token top-1 and hidden states) passes on every pa
 | `HIVE_GLM_DEFER` | 0 (`config/glm.env`: 1) | CPU misses ranked 3rd or lower computed while the GPU goes on, added one MoE layer later |
 | `HIVE_GLM_SKIP_MISS` | 0 | skip missed experts ranked 3rd or lower whose weight is below this fraction of the row (measured within noise) |
 | `HIVE_GLM_PROMOTE` | 8 | misses promoted per token of a step (4 / 16 measured equal / slower) |
-| `HIVE_MTP_BATCH` | off | verify the drafts of several sequences in one step (measured within noise) |
+| `HIVE_MTP_BATCH` | off (`config/glm.env`: 1) | verify the drafts of several sequences in one step: c2 66.6 → 79.5 tok/s with `HIVE_MAX_BATCH=8` (earlier, at 4 seats, c4 within noise) |
 | `HIVE_GLM_LAUNCH_PROBE` | 0 | measurement: every N-th decode step, GPU time vs host enqueue time of each layer's front (totals every 50 probed steps) |
 | `HIVE_GLM_NOTHINK` | `low` | API server setting: what a no-thinking request becomes — `low` (official minimum effort) or `empty` (prefilled empty thinking block) |
 | `HIVE_GLM_PROF` | 0 | 1 = host-synchronized phase timings, 2 = CUDA-event phase timings; hived prints a per-call breakdown (phases, cache hits, CPU expert GB/s) every 400 calls of a kind (measurement only) |
 | `HIVE_GLM_KDA_ROWS` | on | KDA recurrence of a verify step's rows in one launch (bit-identical); `0` = one launch per row plus snapshot copies |
+| `HIVE_GLM_CPU_ADAPT` | on | CPU-expert row chunks halve (not below 32 rows) until every worker of a node has one; `0` = fixed 128-row chunks (bit-identical either way) |
 | `HIVE_GLM_CPU_BALANCE` | 0 | `1` = equal row ranges per CPU worker instead of 128-row chunks (measured within noise) |
 | `HIVE_GLM_PREDICT_EVAL` | 0 | measure next-layer expert prediction recall (outputs unchanged) |
 | `HIVE_GLM_KV_BASE` | `max_chunk` (16384) | positions of KV memory every sequence keeps (mapped at creation, kept on reset) |

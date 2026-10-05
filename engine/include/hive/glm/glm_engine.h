@@ -101,6 +101,18 @@ class GlmEngine {
   cudaStream_t stream() const { return stream_; }
   // Validation hook: called after every layer with the hc streams h [rows, hc, hidden] (device, bf16, stream synchronized).
   std::function<void(int layer, const bf16* h_dev, int rows)> layer_hook;
+  // Layer yield (hived HIVE_LAYER_YIELD, through fam::Runtime): a prefill calls this between layers — every layer's work issued, nothing of
+  //   the next one yet, never after the last layer. The callback may run other forwards on this engine (short prefills, decode steps of other
+  //   sequences) between yield_enter and yield_exit. At a layer boundary the outer prefill keeps its state in its hc-stream rows (hall_ blocks
+  //   in a layer-major prefill, h_ in a chunked one), in its sequence (KDA state and DSA caches, which inner work never touches) and in the
+  //   embedding override; every other work buffer is rewritten inside each layer. yield_enter therefore points inner forwards at rows the outer
+  //   prefill does not use (h_ when the outer state is in hall_, the yield rows hy_ otherwise) and parks the embedding override.
+  std::function<void(int layer)> layer_boundary;
+  struct YieldSave { bf16* hcur = nullptr; std::vector<EmbedOverride> emb; int64_t emb_base = 0; bool on = false; };
+  bool yield_enter(YieldSave& s);  // false = no free rows at this level (the yield is skipped)
+  void yield_exit(YieldSave& s);
+  int yield_rows_cap() const { return hcur_ ? max_chunk_ : hy_rows_; }  // rows an inner forward may use at the current boundary
+  void alloc_yield_rows(int rows);                                      // hy_ (fam::Runtime, when layer yields are on)
 
  private:
   void forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, bool prefill, float* logits_host, bool all_logits);
@@ -112,6 +124,7 @@ class GlmEngine {
   // current hc-stream rows: the work buffer h_, or a block of the whole-prompt buffer hall_ during a layer-major prefill
   bf16* hcur_ = nullptr;
   bf16* hb() const { return hcur_ ? hcur_ : h_.as<bf16>(); }
+  DevBuf hy_; int hy_rows_ = 0;   // layer yield: hc-stream rows for inner forwards while a chunked prefill keeps its state in h_
   // Layer-major prefill (HIVE_GLM_PREFILL_TILES blocks of max_chunk rows per call, default 4): every layer runs over all blocks before the
   //   next layer, and its MoE runs once over all rows — each routed expert crosses PCIe once per layer per call instead of once per block.
   void prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float* logits_last);

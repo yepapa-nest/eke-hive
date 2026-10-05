@@ -217,6 +217,7 @@ void merge_image(bf16* h, int hc, int dim, int start, int span, const int8_t* ty
 // ---- output head --------------------------------------------------------------------------------------------------------
 // logits[m, v] = Σ_d x[m,d]·head[v,d]  (x fp32 [M,dim], head bf16 [V,dim], fp32 accumulation)
 void head_logits(const float* x, const bf16* head, int M, int V, int dim, float* logits, cudaStream_t st);
+void head_logits_per_row(const float* x, const bf16* head, int M, int V, int dim, float* logits, cudaStream_t st);  // previous kernel (bit-identity test)
 void argmax_rows(const float* logits, int M, int V, int32_t* out, cudaStream_t st);
 void bf16_to_f32(const bf16* src, int n, float* dst, cudaStream_t st);
 

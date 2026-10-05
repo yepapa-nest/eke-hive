@@ -611,6 +611,9 @@ __global__ void __launch_bounds__(DF_WARPS * 32) moe_decode_fused2_kernel(const 
 
 // ---- FUSED3 (HIVE_DECODE_FUSED3): per-warp work items · stages of 128 B contiguous per row · per-warp cp.async ring
 //   (design rationale and value identity: the HIVE_DECODE_FUSED3 section of the file header). piece = one 8-row tile · stage = per piece 8 rows × 8 blocks (128 B contiguous per row).
+#ifndef HIVE_DF3_AD
+#define HIVE_DF3_AD 1  // activation prefetch distance in stages (Df3Tile::run) — 1 measured best (bench_moe_lowm: 2 and 3 no faster)
+#endif
 constexpr int DF3_WARPS = 4;
 constexpr int DF3_CB = 8;                 // blocks per stage (128 B per row = one L2 line)
 constexpr int DF3_P = 2;                  // pieces per stage: w13 = one tile of w1·w3 · w2 = 2 tiles (DF3_W2_T)
@@ -629,7 +632,7 @@ constexpr int df3_smem_bytes(int S) { return DF3_WARPS * S * DF3_P * (DF3_WPIECE
 //   Loads: 64 slots per piece (8 rows × 8 blocks of 16 B) — lane l loads slot idx = it·32 + l (it = 0,1) → row idx>>3, block idx&7: one warp instruction = 4 rows × 128 B contiguous.
 //   smem slot = row·8 + (block ^ row) — the reader (lane (r,q) reads word q of block u) hits each of the 32 banks once per u (row r selects the 4-bank group (u^r)·4, q the bank within it).
 //   Scales: per piece 8 rows × 8 bytes = 16 u32 slots — lanes 0..15 load 4 B each (row l>>1, half l&1). Lane (r,q) reads word h of row r (blocks 4h..4h+3) as a broadcast.
-template <int NM, int T, bool A_CG, int S>
+template <int NM, int T, bool A_CG, int S, int AD = HIVE_DF3_AD>
 struct Df3Tile {
   static constexpr int P = NM * T;
   static_assert(P == DF3_P, "F3 stage size assumes 2 pieces");
@@ -686,7 +689,7 @@ struct Df3Tile {
     const int sfa_src = sfa_row < nrows ? sfa_row : 0;
     const uint8_t* sa_row = sa + (size_t)(rows ? rows[row0 + sfa_src] : row0 + sfa_src) * nb;
     const uint8_t* a_row = A + (size_t)(rows ? rows[row0 + (have_a ? r : 0)] : row0 + r) * K;
-    const int nq4 = nb / 4;  // number of 4-block steps (activations run one 4-block step ahead, as in Df2Tile)
+    const int nq4 = nb / 4;  // number of 4-block steps
     auto load_a = [&](int g, uint32_t (&a0)[4], uint32_t (&a2)[4], uint32_t& sfa4) {
       const int kb0 = g * 4;
 #pragma unroll
@@ -696,19 +699,26 @@ struct Df3Tile {
       }
       sfa4 = ld_s4<A_CG>(sa_row + kb0);
     };
-    uint32_t a0[4], a2[4], sfa4;
-    load_a(0, a0, a2, sfa4);
+    // Activations run AD stages (2·AD 4-block steps) ahead of their use: at the start of stage st the two steps of stage st+AD are loaded into the
+    //   last ring entry, and the ring rotates after the stage. Same addresses and values as loading them one step ahead — only the issue time moves
+    //   (the dependent L2 round trip per step was the critical path of a work item when a launch has few items). Measured (S = 4, L2 flushed):
+    //   bench_moe_lowm one expert 53.0 → 37.8 µs, five 114.6 → 94.2 µs; test_decode_moe M=1 811 → 912 GB/s, M=8 1349 → 1372 GB/s; AD 2 and 3
+    //   no faster than 1; deeper weight rings (S 6/8/10) did not help with AD 0 or 1. Values are bit-identical (test_decode_moe).
+    uint32_t c0[AD + 1][2][4], c2[AD + 1][2][4], cs[AD + 1][2];
+#pragma unroll
+    for (int d = 0; d < AD; ++d)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) { const int g = d * 2 + h; load_a(g < nq4 ? g : nq4 - 1, c0[d][h], c2[d][h], cs[d][h]); }
     const uint32_t* const wb32 = reinterpret_cast<const uint32_t*>(wb);
     for (int st = 0; st < nst; ++st) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) { const int g = (st + AD) * 2 + h; load_a(g < nq4 ? g : nq4 - 1, c0[AD][h], c2[AD][h], cs[AD][h]); }
       df2_wait<S - 2>();  // this lane's share of stage st has arrived
       __syncwarp();       // make slots received by other lanes visible + the issue below overwrites slot (st−1)%S only after the previous iteration finished reading it
       issue(st + S - 1, wb, sb);
       const int slot = st % S;
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
-        const int g = st * 2 + h;
-        uint32_t n0v[4], n2v[4], nsf;
-        load_a(g + 1 < nq4 ? g + 1 : g, n0v, n2v, nsf);
 #pragma unroll
         for (int j = 0; j < NM; ++j)
 #pragma unroll
@@ -719,14 +729,19 @@ struct Df3Tile {
             for (int u = 0; u < 4; ++u) {
               const int ub = 4 * h + u;  // block within the stage = 8st + ub
               const uint32_t wv = wb32[(size_t)(pc * DF3_WPIECE + r * 8 + (ub ^ r)) * 4 + q];
-              mma_e4m3_e2m1(acc[j][i], a0[u], a2[u], e2m1x4_bytes(wv & 0xFFFFu), e2m1x4_bytes(wv >> 16), (sfa4 >> (8 * u)) & 0xFFu,
+              mma_e4m3_e2m1(acc[j][i], c0[0][h][u], c2[0][h][u], e2m1x4_bytes(wv & 0xFFFFu), e2m1x4_bytes(wv >> 16), (cs[0][h] >> (8 * u)) & 0xFFu,
                             (sbw >> (8 * u)) & 0xFFu);
             }
           }
-#pragma unroll
-        for (int u = 0; u < 4; ++u) { a0[u] = n0v[u]; a2[u] = n2v[u]; }
-        sfa4 = nsf;
       }
+#pragma unroll
+      for (int d = 0; d < AD; ++d)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+#pragma unroll
+          for (int u = 0; u < 4; ++u) { c0[d][h][u] = c0[d + 1][h][u]; c2[d][h][u] = c2[d + 1][h][u]; }
+          cs[d][h] = cs[d + 1][h];
+        }
     }
     df2_wait<0>();
   }

@@ -70,14 +70,22 @@ Runtime::Runtime(Model& model, ExpertStore& store, const void*, const RuntimeOpt
   for (int i = 0; i < rows_cap_; ++i) cand_it_h_[i] = 1.f;
   cand_idx_h_ = pinned<int32_t>((size_t)rows_cap_ * NC); cand_val_h_ = pinned<float>((size_t)rows_cap_ * NC);
   cand_max_h_ = pinned<float>(rows_cap_); cand_sum_h_ = pinned<float>(rows_cap_); next_h_ = pinned<int32_t>(rows_cap_);
+  logits_pin_ = pinned<float>((size_t)rows_cap_ * model_.glm().cfg().vocab);
   cand_idx_.alloc((size_t)rows_cap_ * NC * 4); cand_val_.alloc((size_t)rows_cap_ * NC * 4);
   cand_max_.alloc((size_t)rows_cap_ * 4); cand_sum_.alloc((size_t)rows_cap_ * 4); next_d_.alloc((size_t)rows_cap_ * 4);
+  // HIVE_LAYER_YIELD: hc-stream rows for the forwards run inside a yield while a chunked prefill keeps its rows in h_ — the largest of them
+  //   is a short request hived admits there (below prefill_threshold rows) or a decode / verify step
+  if (ly::parse_period(getenv("HIVE_LAYER_YIELD")) > 0) {
+    eng_->alloc_yield_rows(std::max(opt_.prefill_threshold, rows_cap_));
+    const char* v = getenv("HIVE_LAYER_YIELD_SMALL");
+    ly_small_ = v && *v && strcmp(v, "0") != 0;
+  }
   fprintf(stderr, "[glm] runtime: family %s · max batch %d · chunk %d · context %lld · sampler candidates %d\n", kFamily, opt_.max_batch,
           std::max(opt_.max_chunk, 64), (long long)opt_.max_ctx, opt_.sampler_cands);
 }
 
 Runtime::~Runtime() {
-  for (void* p : {(void*)cand_it_h_, (void*)cand_idx_h_, (void*)cand_val_h_, (void*)cand_max_h_, (void*)cand_sum_h_, (void*)next_h_})
+  for (void* p : {(void*)cand_it_h_, (void*)cand_idx_h_, (void*)cand_val_h_, (void*)cand_max_h_, (void*)cand_sum_h_, (void*)next_h_, (void*)logits_pin_})
     if (p) cudaFreeHost(p);
 }
 
@@ -246,9 +254,20 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   const GlmConfig& c = model_.glm().cfg();
   const GlmCacheStats before = store_.experts().stats();
   const double t0 = hive::mono_ms();
+  // layer yields: only an outer prefill (not one run inside a yield) of at least prefill_threshold rows — or, with HIVE_LAYER_YIELD_SMALL,
+  //   of more rows than the decode-path size (64: those run in tens of milliseconds)
+  const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && (M >= opt_.prefill_threshold || (ly_small_ && M > 64));
+  struct LyHook {  // restores the hook of the forward this one runs inside (a level-2 yield)
+    GlmEngine& e; bool on; std::function<void(int)> prev;
+    ~LyHook() { if (on) e.layer_boundary = std::move(prev); }
+  } ly_hook{*eng_, ly_ok, ly_ok ? eng_->layer_boundary : std::function<void(int)>{}};
+  if (ly_ok) {
+    if (ly_.depth == 0) ly_.last = hive::mono_ms();
+    eng_->layer_boundary = [this](int l) { ly_progress_ = (l + 1.0) / std::max(1, model_.glm().cfg().n_layers); layer_yield_point(); };
+  }
   try {
-    logits_h_.resize(c.vocab);
-    eng_->prefill(seq, ids, M, logits_h_.data());
+    prefill_logits_.resize(c.vocab);
+    eng_->prefill(seq, ids, M, prefill_logits_.data());
   } catch (...) { seq.broken = true; throw; }
   if (has_images) {  // the encoder outputs are no longer needed: free them and let the expert cache take that memory back
     eng_->set_embed_override({});
@@ -258,7 +277,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   since_prefill_ = 0;
   cand_it_h_[0] = 1.f;
   cands_dev(1);
-  if (logits_out) *logits_out = logits_h_;
+  if (logits_out) *logits_out = prefill_logits_;
   seq.mtp_hidden_valid = seq.h_last_valid && eng_->mtp_on();
   stats_delta(stats, before);
   if (stats) stats->ms_total += hive::mono_ms() - t0;
@@ -274,11 +293,10 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
   const double t0 = hive::mono_ms();
   std::vector<GlmSeq*> gs(M);
   for (int m = 0; m < M; ++m) gs[m] = seqs[m];
-  logits_h_.resize((size_t)M * V);
   store_.experts().reset_row_stats();
   const GlmForwardStats e0 = eng_->stats();
   try {
-    eng_->decode(gs.data(), ids, M, logits_h_.data());
+    eng_->decode(gs.data(), ids, M, logits_pin_);
   } catch (...) { for (Seq* s : seqs) s->broken = true; throw; }
   if (prof_on()) prof_add("decode M=" + std::to_string(M), hive::mono_ms() - t0, e0, eng_->stats(), before, store_.experts().stats());
   if (since_prefill_ < (1 << 30)) ++since_prefill_;
@@ -287,7 +305,7 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
   next.assign(next_h_, next_h_ + M);
   if (logits_out) {
     logits_out->assign(M, std::vector<float>());
-    for (int m = 0; m < M; ++m) (*logits_out)[m].assign(logits_h_.begin() + (size_t)m * V, logits_h_.begin() + (size_t)(m + 1) * V);
+    for (int m = 0; m < M; ++m) (*logits_out)[m].assign(logits_pin_ + (size_t)m * V, logits_pin_ + (size_t)(m + 1) * V);
   }
   stats_delta(stats, before);
   if (stats) {
@@ -317,11 +335,11 @@ void Runtime::forward_verify(Seq& seq, const int32_t* ids, int M, std::vector<fl
   const int V = model_.glm().cfg().vocab;
   const GlmCacheStats before = store_.experts().stats();
   const double t0 = hive::mono_ms();
-  logits_rows.resize((size_t)M * V);
   const GlmForwardStats e0 = eng_->stats();
   try {
-    eng_->verify(seq, ids, M, logits_rows.data());
+    eng_->verify(seq, ids, M, logits_pin_);
   } catch (...) { seq.broken = true; throw; }
+  logits_rows.assign(logits_pin_, logits_pin_ + (size_t)M * V);
   if (prof_on()) prof_add(std::string(since_prefill_ < kWarmSteps ? "verify(warm) M=" : "verify M=") + std::to_string(M), hive::mono_ms() - t0, e0, eng_->stats(), before,
                           store_.experts().stats());
   if (since_prefill_ < kWarmSteps) ++warm_samples_;  // cache still warming: not a representative step cost (see graph_captures)
@@ -349,10 +367,10 @@ void Runtime::forward_verify_batch(std::vector<VerifyPart>& parts, std::vector<f
   const GlmCacheStats before = store_.experts().stats();
   const GlmForwardStats e0 = eng_->stats();
   const double t0 = hive::mono_ms();
-  logits_rows.resize((size_t)R * V);
   try {
-    eng_->verify_batch(seqs.data(), Ms.data(), S, ids.data(), logits_rows.data());
+    eng_->verify_batch(seqs.data(), Ms.data(), S, ids.data(), logits_pin_);
   } catch (...) { for (auto& p : parts) p.seq->broken = true; throw; }
+  logits_rows.assign(logits_pin_, logits_pin_ + (size_t)R * V);
   if (prof_on()) prof_add("verify-batch S=" + std::to_string(S) + " R=" + std::to_string(R), hive::mono_ms() - t0, e0, eng_->stats(), before,
                           store_.experts().stats());
   if (since_prefill_ < kWarmSteps) ++warm_samples_;
@@ -368,6 +386,27 @@ void Runtime::rollback_batch(const std::vector<int>& n_keep) {
   eng_->rollback_batch(n_keep.data(), (int)n_keep.size());
   for (GlmSeq* s : vb_seqs_) static_cast<Seq*>(s)->mtp_hidden_valid = s->h_last_valid && eng_->mtp_on();
   vb_seqs_.clear();
+}
+
+// A layer boundary of an outer prefill: yield_point decides (period, hived's want) and runs hived's yield body between yield_enter and yield_exit.
+//   floor = the most rows a decode / verify step uses; cap = the rows the inner forwards may use at this boundary. The stream is drained first so
+//   the time hived measures as prefill ends here.
+void Runtime::layer_yield_point() {
+  if (!ly_.on() || ly_.depth >= ly_.h.max_depth) return;
+  ly_.floor = rows_cap_;
+  ly_.cap = eng_->yield_rows_cap();
+  GlmEngine::YieldSave sv;
+  ly::yield_point(
+      ly_,
+      [&](int) {
+        CUDA_CHECK(cudaStreamSynchronize(eng_->stream()));
+        return eng_->yield_enter(sv);
+      },
+      [&](int) {
+        cudaStreamSynchronize(eng_->stream());  // (no throw — this also runs while an exception from the yield body unwinds)
+        eng_->yield_exit(sv);
+      },
+      [] { return hive::mono_ms(); });
 }
 
 void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats) {

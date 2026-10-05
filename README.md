@@ -30,11 +30,11 @@ the first token; [docs/benchmarks.md](docs/benchmarks.md#real-chat-benchmark-hea
 | Inputs | text and images | text, images and video |
 | Thinking off | yes (`reasoning_effort: none`) | no — the model always thinks; "off" maps to its lowest effort |
 | Context | 262,144 | 262,144 |
-| Decode, 1 stream | **76.9 tok/s** (Korean 82.5 · English 71.6 · code 82.9 · creative 61.1) | 65.2 tok/s (69.6 · 64.2 · 62.1 · 55.7) |
-| Decode, 2 / 4 streams (total) | **92.6 / 124.0 tok/s** | 66.6 / 89.3 tok/s |
-| Decode, 8 / 16 / 32 streams (total) | **173.0 / 172.7 / 174.3 tok/s** (8 at a time) | 88.8 / 91.6 / 93.3 tok/s (4 at a time) |
-| Time to first token, 1 stream | **0.23 s** | 0.50 s |
-| Time to first token, 17K / 42K / 54K prompt | **4.95 / 7.48 / 9.63 s** | 7.2 / 11.6 / 13.7 s |
+| Decode, 1 stream | **85.3 tok/s** (Korean 87.2 · English 82.7 · code 106.2 · creative 62.4) | 70.3 tok/s (72.2 · 68.8 · 78.2 · 55.8) |
+| Decode, 2 / 4 streams (total) | **92.9 / 124.6 tok/s** | 85.2 / 97.9 tok/s |
+| Decode, 8 / 16 / 32 streams (total) | **175.0 / 178.1 / 181.5 tok/s** (8 at a time) | 129.1 / 128.3 / 129.6 tok/s (8 at a time) |
+| Time to first token, 1 stream | **0.23 s** | 0.51 s |
+| Time to first token, 17K / 42K / 54K prompt | **5.05 / 7.53 / 9.69 s** | 7.3 / 11.8 / 13.9 s |
 | Time to first token, 100K / 200K / 250K prompt | — | 26.4 / 53.7 / 66.3 s |
 | Quality suite (bundled) | 175 / 179 | 158 / 163 (thinking at its lowest level) |
 | Sleep / wake (level 3, a 120K conversation open, GPU memory back to ~1 GB) | 0.7 s / 3.2 s | 3.8 s / 3.0 s |
@@ -55,9 +55,9 @@ Both models get the same treatment, but on this machine DeepSeek comes out ahead
   over PCIe 4.0 on every decode step, so its misses are not also streamed to the GPU the way DeepSeek's are.
 - **The same two routing changes paid off more on DeepSeek.** Cache-aware routing and expert deferral
   ([docs/configuration.md](docs/configuration.md)) took DeepSeek from 53.8 to 76.9 tok/s for one stream and from 100.2 to
-  173.0 for eight. DeepSeek also runs 8 requests at a time, GLM 4.
-- **Speculative decoding only helps one stream.** GLM's draft layer gives 2.5 tokens per step for a single user; with several
-  users at once each step is plain decoding bound by the CPU.
+  173.0 for eight (the same benchmark, before the later decode-kernel step).
+- **Speculative decoding helps one or two streams.** GLM's draft layer gives 2.5 tokens per step for a single user, and with two
+  users both drafts are verified in one step (`HIVE_MTP_BATCH`); with more users at once each step is plain decoding bound by the CPU.
 - **Thinking cannot be switched off** on GLM-5.3-Flash, so a "no thinking" request still produces some reasoning tokens.
 
 If you can only run one, run DeepSeek. GLM is there because it is a good model and the engine can serve it.

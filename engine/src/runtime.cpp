@@ -1780,7 +1780,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   struct PrefillFlag { bool* f; ~PrefillFlag() { *f = false; } } prefill_flag{&in_prefill_}, small_flag{&small_fwd_};
   // T11 HIVE_LAYER_YIELD: only the outer prefill forward (original rows ≥ prefill_threshold; not verify, batched decode, SMALL, dump/inject) yields at layer boundaries.
   //   Forwards called inside a yield have ly_.depth > 0 and are not eligible (no recursion). Off (not installed) = ly_ok false = base path.
-  const bool ly_ok = ly_.on() && ly_.depth == 0 && in_prefill_ && (!small_fwd || ly_small_) && !batch_ && (M_orig >= opt_.prefill_threshold || small_fwd) &&
+  const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && in_prefill_ && (!small_fwd || ly_small_) && !batch_ && (M_orig >= opt_.prefill_threshold || small_fwd) &&
                      opt_.dump_dir.empty() && opt_.inject_dir.empty();
   if (ly_ok) ly_begin({{&seq, M_orig}});
   const int tail_layer = c.kv_source_layers.empty() ? -1 : *std::max_element(c.kv_source_layers.begin(), c.kv_source_layers.end());
@@ -1811,7 +1811,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       if (pprof_) pprof_->moe_done();
       for (int s = 0; s < T; ++s) { tile_select(s); layer_tail(l, tM[s]); }
       if (pprof_) pprof_->layer_end(stats, prefetch_issued_, st_);
-      if (ly_ok) layer_yield_point();  // T11 (after the layer tails are issued — the yield point switches the slot to 0 and back)
+      if (ly_ok) { ly_progress_ = ly_prog(l, tail_layer, model_.n_loaded_layers(), true); layer_yield_point(); }  // T11 (after the layer tails are issued — the yield point switches the slot to 0 and back)
     }
     // Layer 20 (last kv source): compressed KV and indexer keys of all sub-chunks (all rows) → keep the last sub-chunk in Work and continue with the tail loop below (TileGuard resets to 0 at the end)
     for (int s = 0; s < T - 1; ++s) { tile_select(s); prepare_decoder_tail(seq, tail_layer, tM[s], tStart[s], 0); }
@@ -1836,7 +1836,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       if (opt_.decoder_replay) win_min_pos_ = start_pos;
     }
     layer_forward(seq, l, M, start_pos, stats, skip);
-    if (ly_ok && l + 1 < model_.n_loaded_layers()) layer_yield_point();  // T11 (after the layer tail; no yield after the last layer, only the head remains)
+    if (ly_ok && l + 1 < model_.n_loaded_layers()) { ly_progress_ = ly_prog(l, tail_layer, model_.n_loaded_layers(), tail_mode); layer_yield_point(); }  // T11 (after the layer tail; no yield after the last layer, only the head remains)
   }
   win_min_pos_ = 0;
   if (pprof_) pprof_->layers_done(st_);
@@ -2013,7 +2013,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   struct ScoreFlag { bool& f; ~ScoreFlag() { f = false; } } score_flag{score_prefill_};
   struct PrefillFlag { bool* f; ~PrefillFlag() { *f = false; } } prefill_flag{&in_prefill_};
   // T11 HIVE_LAYER_YIELD: forward_multi is always a prefill (injection was rejected at the head) — yield at layer boundaries (after the expert stage, where every unit has left via unit_select(-1)).
-  const bool ly_ok = ly_.on() && ly_.depth == 0 && opt_.dump_dir.empty();
+  const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && opt_.dump_dir.empty();
   if (ly_ok) {
     std::vector<std::pair<Seq*, int>> own;
     for (auto& p : parts) own.push_back({p.seq, p.M});
@@ -2115,7 +2115,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     });
     moe_experts_multi(model_.layer(l), l, subs, stats);
     pmark("moe");
-    if (ly_ok) layer_yield_point();  // T11 (tail l is done by the next pass's visit — acc, post_f, comb_f and h are the inter-layer state to park)
+    if (ly_ok) { ly_progress_ = ly_prog(l, L, nl, L < nl); layer_yield_point(); }  // T11 (tail l is done by the next pass's visit — acc, post_f, comb_f and h are the inter-layer state to park)
   }
   // ---- Tail layer L (last kv source): earlier units only produce compressed KV and indexer keys (all rows); the last unit shrinks to the tail rows (ends here with C1) or continues with all rows
   std::vector<int> up;
@@ -2153,7 +2153,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     });
     for (size_t u = 0; u < units_.size(); ++u) if (units_[u].up) up.push_back((int)u);
     if (!subs.empty()) { up_experts(L); pmark("moe"); }  // Q3 (off = plain moe_experts_multi(L, subs))
-    if (ly_ok && !subs.empty()) layer_yield_point();  // T11
+    if (ly_ok && !subs.empty()) { ly_progress_ = ly_prog(L, L, nl, true); layer_yield_point(); }  // T11
     // ---- upper layers (L, nl): the last units that continue
     for (int l = L + 1; l < nl; ++l) {
       if (up.empty()) break;
@@ -2169,7 +2169,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
       });
       up_experts(l);  // Q3 (off = plain moe_experts_multi(l, subs))
       pmark("moe");
-      if (ly_ok) layer_yield_point();  // T11 (upper layers — 128 tail rows make layers short: until the period is reached it only reads the clock)
+      if (ly_ok) { ly_progress_ = ly_prog(l, L, nl, true); layer_yield_point(); }  // T11 (upper layers — 128 tail rows make layers short: until the period is reached it only reads the clock)
     }
   } else {
     for (size_t u = 0; u < units_.size(); ++u) if (units_[u].last) { units_[u].up = true; up.push_back((int)u); }
@@ -2254,15 +2254,16 @@ struct Runtime::LyPark {
 };
 
 void Runtime::ly_begin(std::vector<std::pair<Seq*, int>> owners) {
-  if (ly_.depth > 0) return;
-  ly_.last = now_ms();
-  ly_owner_ = std::move(owners);
+  if (ly_.depth > 1) return;
+  if (ly_.depth == 0) ly_.last = now_ms();  // a forward inside a yield keeps the clock of that yield's resume
+  ly_owner_[ly_.depth] = std::move(owners);
 }
 
 void Runtime::layer_yield_point() {
-  if (!ly_.on() || ly_.depth > 0 || capturing_) return;
-  if (!lypark_) lypark_ = std::make_shared<LyPark>();
-  LyPark& P = *lypark_;
+  if (!ly_.on() || ly_.depth >= ly_.h.max_depth || capturing_) return;
+  const int lvl = std::min(ly_.depth, 1);
+  if (!lypark_[lvl]) lypark_[lvl] = std::make_shared<LyPark>();
+  LyPark& P = *lypark_[lvl];
   Work& w = *w_;
   const Config& c = model_.cfg();
   auto drain = [&] {
@@ -2320,7 +2321,7 @@ void Runtime::layer_yield_point() {
     pprof_ = std::move(P.pprof);
     pf_.clear(); pf_l_ = -1;  // the outer pre-copies were consumed (this point is after the expert stage) — drop the inner work's pre-copy markers too (the next layer head issues them again)
     tile_select(P.tile_cur);
-    for (auto& [sq, m] : ly_owner_) { Seq* sp = sq; xtrace_step(1, m, &sp, 1); }
+    for (auto& [sq, m] : ly_owner_[lvl]) { Seq* sp = sq; xtrace_step(1, m, &sp, 1); }
     CUDA_CHECK(cudaStreamSynchronize(st_));
   };
   ly::yield_point(ly_, park, unpark, [] { return now_ms(); });

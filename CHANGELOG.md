@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+Real-chat benchmark (`tools/bench_chat.py`, two runs each; [docs/benchmarks.md](docs/benchmarks.md)):
+
+| | DeepSeek-V4.1-Flash | GLM-5.3-Flash |
+| --- | --- | --- |
+| Decode, 1 / 2 / 4 / 8 / 16 / 32 streams (total) | 85.3 / 92.9 / 124.6 / 175.0 / 178.1 / 181.5 tok/s | 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6 tok/s |
+| Time to first token, 17K / 42K / 54K prompt | 5.05 / 7.53 / 9.69 s | 7.3 / 11.8 / 13.9 s |
+
+DeepSeek ([docs/performance.md](docs/performance.md), steps 22–23):
+- Decode kernels: the fused expert kernel loads its activations a stage ahead, and the head reads each vocabulary row once for all
+  rows of a step (`HIVE_HEAD_ROWS`) — both bit-identical; interleaved with the previous build c1 83.9 → 86.0 tok/s, c8 171.4 → 173.7.
+- Layer yields also admit a request of up to 16K rows when it is at most half of what the paused prefill still has to do
+  (`HIVE_LAYER_YIELD_MID`); its own prefill yields once more for decode steps. A 12K request behind an 85K prefill: 14.6 → 4.4 s to
+  the first token.
+- Rejected after measurement: a lower promotion threshold for the `seq` cache policy (c1 −2.5 to −4 %).
+
+GLM ([docs/glm.md](docs/glm.md), steps 17–21):
+- Layer yields inside a prefill (short requests served, decoders keep stepping): short request 14.0 → 0.65 s, decoder stall 14.4 → 1.6 s.
+- 8 sequences per decode step and batched MTP verify by default: c2 66.6 → 79.5, c8 93.2 → 125.7 tok/s.
+- Promotion victims sorted once per step instead of a scan of every slot per used expert (the host held the GPU idle 1.88 ms per
+  verify step): c1 67.3 → 70.4, c4 88.1 → 96.6 tok/s.
+- CPU-expert chunks sized to the worker count (`HIVE_GLM_CPU_ADAPT`, CPU phase 70 → 81 GB/s); logits into a pinned buffer.
+
+Tools: `tests/bench_moe_lowm.cu` (low-row expert launch timing), `tests/test_head_rows.cu` (head kernel bit comparison).
+
 ## v0.1.0 (first public release)
 
 Eke Hive runs two mixture-of-experts models on one 96 GB Blackwell GPU, with the routed experts in host RAM:

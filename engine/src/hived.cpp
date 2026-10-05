@@ -540,6 +540,20 @@ int main(int argc, char** argv) {
     return v && *v && end && *end == 0 && x > 0 ? (size_t)std::min<long long>(x, 1LL << 30) : (size_t)0;
   }();
   const bool layer_yield = ly_period > 0;
+  // HIVE_LAYER_YIELD_MID (optional; unset/""/"0"/non-numeric = off; N = row cap): at a layer yield also admit a request of more than
+    //   HIVE_LAYER_YIELD_MAX rows (up to N, and up to the rows the runtime parked) when it is much smaller than what the paused prefill still has
+    //   to do — shortest remaining work first. Measured on the service log (10-01..10-05, benchmarks excluded): 114 requests of >= 4K rows waited
+    //   > 2 s behind another prefill of >= 4K rows, e.g. three 22K-row requests 5.3 s behind a 20K one and an 11K one 5.4 s behind a 109K one;
+    //   the layer yield admitted only <= 1,023-row requests, so they waited for the whole forward. Rule: rows x 2 <= the paused forward's
+    //   remaining rows (its rows x (1 - progress at this layer) + its later chunks), and the rows admitted this way during one forward stay <=
+    //   that forward's rows (the paused prompt is delayed by at most about its own prefill time). The factor 2 covers the admitted request's
+    //   own expert pass, which it does not share.
+  static const size_t ly_mid = ly_period <= 0 ? 0 : [] {
+    const char* v = getenv("HIVE_LAYER_YIELD_MID");
+    char* end = nullptr;
+    const long long x = v && *v ? strtoll(v, &end, 10) : 0;
+    return v && *v && end && *end == 0 && x > 0 ? (size_t)std::min<long long>(x, 1LL << 30) : (size_t)0;
+  }();
   // Arrival coalescing (HIVE_BATCH_COALESCE_MS, HIVE_BATCH_PREFILL path): before the first round of a batched prefill, if the head request is
     //   streaming-sized and seats/slots remain, wait until following arrivals pause (no new arrival for this many ms after the last one; cap =
     //   this many ms x prefill slots) and put them in the same forward.
@@ -1086,8 +1100,12 @@ int main(int argc, char** argv) {
   if (prefill_yield) fprintf(stderr, "[hived] prefill yield on: requests with <= %zu rows to prefill (ids minus the reusable prefix) are admitted at chunk/round boundaries of a longer prefill\n", yield_max);
   const size_t ly_max = !layer_yield ? 0 : ly_max_env ? ly_max_env : stream_floor - 1;  // HIVE_LAYER_YIELD: prompt id cap for requests admitted by layer yielding (further limited by R)
   if (layer_yield)
-    fprintf(stderr, "[hived] layer yield on: every %.0f ms at layer boundaries of a long prefill · decode share %.2f · <= %d steps · admits requests with <= %zu rows to prefill (ids minus the reusable prefix)\n",
-            ly_period, ly_share, ly_steps, ly_max);
+    fprintf(stderr, "[hived] layer yield on: every %.0f ms at layer boundaries of a long prefill · decode share %.2f · <= %d steps · admits requests with <= %zu rows to prefill (ids minus the reusable prefix)%s\n",
+            ly_period, ly_share, ly_steps, ly_max,
+            ly_mid > ly_max ? (" · up to " + std::to_string(ly_mid) + " rows when <= half of the paused forward's remaining rows (HIVE_LAYER_YIELD_MID)").c_str() : "");
+  // HIVE_LAYER_YIELD_MID: the forward a layer yield pauses — its rows, the rows of the request's later chunks, and the rows admitted by the mid rule
+  //   during it (set by the outer admission right before rt.forward / rt.forward_multi; never from inside a yield)
+  size_t ly_fwd_rows = 0, ly_rest_rows = 0, ly_mid_used = 0;
   // Rows a text request will actually prefill = its ids minus the prefix the daemon can resume from. This is a lower bound of what admit
   //   chooses (the session's live state, prompt checkpoint, history frames or archived last state, with the same token and image checks;
   //   shared boundary snapshots are not counted, so the real reuse can only be larger and the forward only shorter). Used by the yield
@@ -1738,6 +1756,7 @@ int main(int argc, char** argv) {
       if (!chunk_begin(J, SIZE_MAX, false)) return;
       const double tc0 = now_ms();
       const ly::Stats ly0 = rt.layer_yield_stats();
+      if (!rt.in_layer_yield()) { ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0; }  // HIVE_LAYER_YIELD_MID
       rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
       const double tend = now_ms();
       // HIVE_LAYER_YIELD: tc = the prefill share (minus layer-yield time — so the EMA and the decode_between budget do not count yield time as prefill)
@@ -1975,6 +1994,11 @@ int main(int argc, char** argv) {
         ForwardStats rs{};
         const double tc0 = now_ms();
         const ly::Stats ly0 = rt.layer_yield_stats();
+        {  // HIVE_LAYER_YIELD_MID: this round's rows and what every job of the batch still has after it
+          ly_fwd_rows = rows; ly_rest_rows = 0; ly_mid_used = 0;
+          for (auto& Jp : jobs) if (Jp) ly_rest_rows += Jp->ids.size() - Jp->i;
+          ly_rest_rows -= std::min(ly_rest_rows, rows);
+        }
         try {
           rt.forward_multi(ps, &rs);
         } catch (const std::exception& e) {
@@ -2015,6 +2039,7 @@ int main(int argc, char** argv) {
         bool cont = false;
         try {
           const ly::Stats ly0 = rt.layer_yield_stats();
+          ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0;  // HIVE_LAYER_YIELD_MID (solo forward of a batch round)
           rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
           const double tend = now_ms();
           J.ly_n = rt.layer_yield_stats().yields - ly0.yields;  // HIVE_LAYER_YIELD (same as the single path)
@@ -2155,7 +2180,7 @@ int main(int argc, char** argv) {
       } else {
         std::vector<int32_t> ids(1, tok);
         ids.insert(ids.end(), drafts.begin(), drafts.begin() + k);
-        std::vector<float> rows;
+        static thread_local std::vector<float> rows;  // reused: a fresh vector per verify step page-faulted while the runtime copied rows × vocab logits into it
         ForwardStats ds{};
         for (int i = 0; i <= k; ++i) rt.row_inv_temp()[i] = A.temperature > 0.f ? 1.f / A.temperature : 1.f;
         const long cap_v = rt.graph_captures();  // HIVE_MTP_GATE3
@@ -2425,30 +2450,42 @@ int main(int argc, char** argv) {
     //   Logs: header line "[hived] layer yield: <prefilling sid> · prefill X ms since resume ..." (counted as a gap by monitors) -> admit line
     //   (same format as HIVE_PREFILL_YIELD + " · layer") -> done line.
   if (layer_yield) {
-    auto ly_rows_of = [&](const Request& r, size_t cap) -> size_t {
+    auto h_nested_ok = [&] { return ly_mid > ly_max && rt.in_layer_yield(); };  // in_yield from a layer yield (not HIVE_PREFILL_YIELD) with level 2 on
+    auto ly_mid_ok = [&](size_t rows) {  // HIVE_LAYER_YIELD_MID (see its comment): much smaller than the paused forward's remaining rows
+      if (ly_mid <= ly_max || rows <= ly_max || rows > ly_mid) return false;
+      const double p = std::min(1.0, std::max(0.0, rt.layer_yield_progress()));
+      const double rem = (double)ly_fwd_rows * (1.0 - p) + (double)ly_rest_rows;
+      return 2.0 * (double)rows <= rem && ly_mid_used + rows <= ly_fwd_rows;
+    };
+    auto ly_rows_of = [&, ly_mid_ok](const Request& r, size_t cap) -> size_t {
       const json& q = r.req;
       if (q.contains("images") && q["images"].is_array() && !q["images"].empty()) return 0;  // do not lazily load the vision encoder (VRAM) in the middle of a long prefill
       const std::string sid = q.value("session", "default");
       if (active_sids.count(sid) || prefilling_sids.count(sid)) return 0;
       const size_t rows = rows_to_prefill(sid, q);  // ids minus the reusable prefix (lower bound): what the forward will really hold
       if (rows == 0 || rows > cap) return 0;
+      if (rows > ly_max && !ly_mid_ok(rows)) return 0;
       return rows;
     };
     auto ly_seat = [&] { return (int)(active.size() + prefilling_sids.size()) + 1 <= rt.max_batch(); };
     ly::Hooks h;
     h.period_ms = ly_period;
-    h.want = [&, ly_rows_of, ly_seat]() -> int {
-      if (in_yield) return 0;
+    // HIVE_LAYER_YIELD_MID: a mid-size prompt admitted at a yield prefills for seconds — its own forward yields once more (level 2), for decode
+    //   steps only (measured without it: the running decoder's longest stall 1.83 → 5.13 s while a 12K-row prompt was admitted into an 85K prefill)
+    h.max_depth = ly_mid > ly_max ? 2 : 1;
+    h.want = [&, ly_rows_of, ly_seat, h_nested_ok]() -> int {
+      if (in_yield) return h_nested_ok() && !active.empty() ? 1 : 0;
       int need = active.empty() ? 0 : 1;
       if (ly_max > 0 && ly_seat()) {
         std::lock_guard<std::mutex> lk(mu);
         if (stop_state.load() == 0 && !sleep_asked.load())
-          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, ly_max), (size_t)INT32_MAX));
+          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));
       }
       return need;
     };
     h.run = [&, ly_rows_of, ly_seat](int R, double gap_ms) {
-      struct InYield { bool& f; ~InYield() { f = false; } } in_yield_guard{in_yield};
+      const bool nested = in_yield;  // level 2 (inside a forward admitted by a yield): decode steps only
+      struct InYield { bool& f; bool was; ~InYield() { f = was; } } in_yield_guard{in_yield, in_yield};
       in_yield = true;
       const double t0 = now_ms();
       const double saved_tc = last_prefill_tc;  // HIVE_PREFILL_FAIR looks at the outer admission's last prefill forward
@@ -2457,25 +2494,28 @@ int main(int argc, char** argv) {
         const auto it = ly_rows.find(sid);
         who += (who.empty() ? "" : ",") + sid + ":" + (it != ly_rows.end() ? std::to_string(it->second) : std::string("?"));
       }
-      fprintf(stderr, "[hived] layer yield: %s · prefill %.0f ms since resume · rows %d · active %zu\n", who.empty() ? "-" : who.c_str(), gap_ms, R, active.size());
-      const size_t cap = std::min(ly_max, (size_t)std::max(0, R));
-      int n = 0;
+      fprintf(stderr, "[hived] layer yield: %s · prefill %.0f ms since resume · rows %d · active %zu%s\n", who.empty() ? "-" : who.c_str(), gap_ms, R, active.size(),
+              nested ? " · level 2 (decode only)" : "");
+      const size_t cap = nested ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));
+      int n = 0, n_mid = 0;
       while (cap > 0 && ly_seat()) {
         Request r;
         bool got = false;
+        size_t rows = 0;
         {
           std::lock_guard<std::mutex> lk(mu);
           if (stop_state.load() != 0 || sleep_asked.load()) break;
           for (auto it = queue.begin(); it != queue.end(); ++it)
-            if (ly_rows_of(*it, cap)) { r = std::move(*it); queue.erase(it); got = true; break; }
+            if ((rows = ly_rows_of(*it, cap)) > 0) { r = std::move(*it); queue.erase(it); got = true; break; }
         }
         if (!got) break;
+        if (rows > ly_max) { ly_mid_used += rows; ++n_mid; }  // HIVE_LAYER_YIELD_MID
         admit(std::move(r));
         ++n;
       }
       const double ta = now_ms();
-      if (n) fprintf(stderr, "[hived] prefill yield: %d short request%s admitted in %.0f ms (active %zu · prefilling %zu) · layer\n", n, n > 1 ? "s" : "", ta - t0,
-                     active.size(), prefilling_sids.size());
+      if (n) fprintf(stderr, "[hived] prefill yield: %d short request%s admitted in %.0f ms (active %zu · prefilling %zu) · layer%s\n", n, n > 1 ? "s" : "", ta - t0,
+                     active.size(), prefilling_sids.size(), n_mid ? (" · " + std::to_string(n_mid) + " by the mid rule").c_str() : "");
       int steps = 0;
       if (!active.empty()) {
         const double budget = ly::decode_budget_ms(gap_ms, ly_share);

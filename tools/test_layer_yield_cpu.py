@@ -37,7 +37,7 @@ BASE = {'FAKE_LAYERS': str(LAYERS), 'FAKE_PREFILL_MS': str(FWD_MS * SLOW), 'FAKE
 ON = {**BASE, 'HIVE_LAYER_YIELD': str(PERIOD)}
 LY_RE = re.compile(r'^\[hived\] layer yield: (\S+) · prefill ([\d.]+) ms since resume · rows (\d+) · active (\d+)$')
 LYDONE_RE = re.compile(r'^\[hived\] layer yield done: admitted (\d+) · decode steps (\d+) · ([\d.]+) ms$')
-ADMIT_RE = re.compile(r'^\[hived\] prefill yield: (\d+) short requests? admitted in ([\d.]+) ms \(active \d+ · prefilling \d+\) · layer$')
+ADMIT_RE = re.compile(r'^\[hived\] prefill yield: (\d+) short requests? admitted in ([\d.]+) ms \(active \d+ · prefilling \d+\) · layer(?: · (\d+) by the mid rule)?$')
 CHUNK_RE = re.compile(r'^\[hived\] (\S+): prefill chunk (\d+) M (\d+) · .* · ([\d.]+) ms(?: · layer yields (\d+) last ([\d.]+) ms)?$')
 
 
@@ -122,6 +122,48 @@ def sc_decoder(h, ck, on, tag, sid='D', mtp=False):
     else:
         ck.true(f'{tag} control: decoder stalls for the whole forward', gmax > FWD_MS * .8 / 1000 * SLOW, f'{gmax:.3f}s')
     return gmax, t1 - t0
+
+
+def sc_mid(h, ck, tag, nested=True):
+    """HIVE_LAYER_YIELD_MID (300 here; default max 127): a 250-row request arriving 0.25 s into a 700-row forward is admitted at a yield
+    (2 x 250 <= 700 remaining rows); its own 800 ms forward yields once more for decode only, so a running decoder's longest gap stays about one
+    layer. Control: behind a 400-row forward the same request waits (2 x 250 > 400)."""
+    D = t.tokens(100, 1170)
+    times, res = [], {}
+    th = t.launch(h, 'D', D, 3000, res, 'D', on_token=lambda k: times.append(time.monotonic()))
+    deadline = time.monotonic() + 10 * SLOW
+    while len(times) < 5 and time.monotonic() < deadline:
+        time.sleep(.01)
+    mid0 = sum(int(m[3] or 0) for m in (ADMIT_RE.match(l) for l in lines(h)) if m)
+    L, M = t.tokens(700, 1171), t.tokens(250, 1172)
+    t0 = time.monotonic()
+    r2, first, sent = staggered(h, L, [('M', M, {})], long_sid='ML')
+    t1 = time.monotonic()
+    res.update(r2)
+    t.done_ok(ck, f'{tag} long', res['ML'], L, 3, 0)
+    t.done_ok(ck, f'{tag} 250-row request', res['M'], M, 3, 0)
+    mid1 = sum(int(m[3] or 0) for m in (ADMIT_RE.match(l) for l in lines(h)) if m)
+    ck.eq(f'{tag}: one admission by the mid rule', mid1 - mid0, 1)
+    ck.true(f'{tag}: 250-row request first token before the long one', first.get('M', 1e9) < first.get('ML', 0), repr(first))
+    win = [x for x in times if t0 <= x <= t1]
+    gaps = [b - a for a, b in zip([t0] + win, win + [t1])]
+    gmax = max(gaps) if gaps else t1 - t0
+    lim = (FWD_MS / LAYERS + PERIOD + 250) / 1000 * SLOW
+    if nested:
+        ck.true(f'{tag}: decoder gap stays about one layer while the admitted request prefills (level-2 yield)', gmax < lim, f'{gmax:.3f}s')
+        ck.true(f'{tag}: level-2 (decode only) yield lines', any('level 2 (decode only)' in l for l in lines(h)), '')
+    # control: a shorter paused forward — the same-size request waits for it
+    L2, M2 = t.tokens(400, 1173), t.tokens(250, 1174)
+    r3, f3, _ = staggered(h, L2, [('M2', M2, {})], long_sid='ML2')
+    t.done_ok(ck, f'{tag} control long', r3['ML2'], L2, 3, 0)
+    t.done_ok(ck, f'{tag} control request', r3['M2'], M2, 3, 0)
+    mid2 = sum(int(m[3] or 0) for m in (ADMIT_RE.match(l) for l in lines(h)) if m)
+    ck.eq(f'{tag} control: not admitted (2 x 250 > 400 remaining rows)', mid2 - mid1, 0)
+    h.cancel('D')
+    th.join(60 * SLOW)
+    ck.true(f'{tag}: decoder ok', res['D']['error'] is None, repr(res['D']['error']))
+    ck.eq(f'{tag}: decoder tokens follow its oracle', res['D']['tokens'], t.oracle(D, len(res['D']['tokens'])))
+    return gmax
 
 
 def sc_reuse(h, ck, tag):
@@ -337,6 +379,7 @@ def run(exe, td):
         ('small-off', {**ON, 'FAKE_PREFILL_SHORT_MS': str(FWD_MS * SLOW)}, TILE3, lambda h: sc_small_fwd(h, ck, False, 'small-off')),
         ('single-off', BASE, TILE3, lambda h: (sc_short(h, ck, False, 'single-off'), sc_decoder(h, ck, False, 'single-off'))),
         ('max300', {**ON, 'HIVE_LAYER_YIELD_MAX': '300'}, TILE3, lambda h: sc_limits(h, ck, 'max300', True)),
+        ('mid300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: (sc_mid(h, ck, 'mid'), sc_short(h, ck, True, 'mid+short'))),
         ('batch-on', {**ON, **batch}, TILE3, lambda h: (sc_short(h, ck, True, 'batch'), sc_batch(h, ck, 'batch'), sc_decoder(h, ck, True, 'batch'))),
         ('mtp-on', {**ON, 'FAKE_MTP': '3', 'FAKE_MTP_DRAFT_MS': '1'}, TILE3, lambda h: sc_decoder(h, ck, True, 'mtp', mtp=True)),
         ('t3+t11', {**ON, 'HIVE_PREFILL_YIELD': '1'}, TILE3, lambda h: (sc_short(h, ck, True, 't3+t11'), sc_decoder(h, ck, True, 't3+t11'))),
@@ -385,10 +428,10 @@ def run_mutants(exe, td):
     # 1) park/unpark disabled in the fake runtime: the decoder (rows [0, floor)) clobbers the long forward's rows
     out.append(('fake park disabled', *mutant_case(exe, td, {**ON, 'FAKE_LY_NO_PARK': '1'}, lambda h, ck: sc_decoder(h, ck, True, 'np'))))
     # 2) hived admits beyond R: want() reports only decoders (R = floor 64) and run() ignores R → 200-row admission overwrites rows 64..199
-    want_scan = "          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, ly_max), (size_t)INT32_MAX));"
-    cap_line = "      const size_t cap = std::min(ly_max, (size_t)std::max(0, R));"
+    want_scan = "          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));"
+    cap_line = "      const size_t cap = nested ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));"
     assert src.count(want_scan) == 1 and src.count(cap_line) == 1, 'hived T11 lines drifted'
-    m2 = src.replace(want_scan, "          (void)ly_rows_of;").replace(cap_line, "      const size_t cap = ly_max;")
+    m2 = src.replace(want_scan, "          (void)ly_rows_of;").replace(cap_line, "      const size_t cap = nested ? 0 : std::max(ly_max, ly_mid);")
     exe2 = t.build_daemon(td, name='hived_mut_rows', hived_source=m2)
 
     def beyond_r(h, ck):
@@ -429,6 +472,11 @@ def run_mutants(exe, td):
     assert src.count(w_line) == 1
     exe5 = t.build_daemon(td, name='hived_mut_burst', hived_source=src.replace(w_line, "    bool window_done = !(batch_window_ms > 0);"))
     out.append(('no arrival coalescing', *mutant_case(exe5, td, {**ON, **t.BATCH}, lambda h, ck: sc_burst(h, ck, 'mut-burst', True))))
+    # 6) no level-2 yield (HIVE_LAYER_YIELD_MID admits, but the admitted forward never yields): the decoder stalls for that whole forward
+    d_line = "    h.max_depth = ly_mid > ly_max ? 2 : 1;"
+    assert src.count(d_line) == 1
+    exe6 = t.build_daemon(td, name='hived_mut_depth', hived_source=src.replace(d_line, "    h.max_depth = 1;"))
+    out.append(('no level-2 yield under the mid rule', *mutant_case(exe6, td, {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, lambda h, ck: sc_mid(h, ck, 'mut-depth'))))
     return out
 
 

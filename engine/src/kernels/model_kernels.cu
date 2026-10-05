@@ -3,6 +3,8 @@
 // Model body kernels — numeric semantics follow the reference model.py location noted above each function.
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
+#include <cstring>
 
 #include "hive/model_kernels.h"
 #include "hive/warp_reduce.cuh"
@@ -1136,6 +1138,61 @@ __global__ void head_logits_kernel(const float* __restrict__ x, const bf16* __re
   }
 }
 
+// Head for M ≥ 2 rows (HIVE_HEAD_ROWS, default on): the kernel above reads a vocabulary row once per input row and every warp reads the
+//   whole input again for each row — measured (CUPTI, real chat, c8): 1.68 ms per call at M = 8 against 1.03 ms at the mix of M of a single
+//   stream and ~0.74 ms for one pass over the 1.32 GB head. Here a warp takes HR vocabulary rows and keeps HR × MR accumulators, so a vocabulary
+//   row is read once for all input rows, and the block stages the input rows in shared memory one 1,024-column slice at a time (the 8 warps of
+//   a block share it). Per (vocabulary row, input row) every lane accumulates the same products in the same order as head_logits_kernel —
+//   d = 2·lane + 64·k ascending, x[d]·h[d] then x[d+1]·h[d+1], one fmaf each — and the same warp_sum follows, so the logits are bit-identical.
+constexpr int kHeadHR = 4, kHeadChunk = 1024;
+template <int MR>
+__global__ void __launch_bounds__(256) head_logits_rows_kernel(const float* __restrict__ x, const bf16* __restrict__ head, int M, int V, int dim,
+                                                               float* __restrict__ logits) {
+  __shared__ float xs[MR * kHeadChunk];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int v0 = (blockIdx.x * 8 + warp) * kHeadHR;
+  float acc[kHeadHR][MR];
+#pragma unroll
+  for (int r = 0; r < kHeadHR; ++r)
+#pragma unroll
+    for (int m = 0; m < MR; ++m) acc[r][m] = 0.f;
+  const bf16* hr[kHeadHR];
+#pragma unroll
+  for (int r = 0; r < kHeadHR; ++r) hr[r] = head + (size_t)min(v0 + r, V - 1) * dim;
+  for (int c0 = 0; c0 < dim; c0 += kHeadChunk) {
+    const int cn = min(kHeadChunk, dim - c0);
+    __syncthreads();
+    for (int i = threadIdx.x; i < MR * kHeadChunk; i += 256) {
+      const int m = i / kHeadChunk, d = i % kHeadChunk;
+      xs[i] = m < M && d < cn ? x[(size_t)m * dim + c0 + d] : 0.f;
+    }
+    __syncthreads();
+    if (v0 >= V) continue;
+    for (int d = lane * 2; d < cn; d += 64) {
+      float h0[kHeadHR], h1[kHeadHR];
+#pragma unroll
+      for (int r = 0; r < kHeadHR; ++r) {
+        const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(hr[r] + c0 + d);
+        h0[r] = __bfloat162float(b.x); h1[r] = __bfloat162float(b.y);
+      }
+#pragma unroll
+      for (int m = 0; m < MR; ++m) {
+        const float xa = xs[m * kHeadChunk + d], xb = xs[m * kHeadChunk + d + 1];
+#pragma unroll
+        for (int r = 0; r < kHeadHR; ++r) { acc[r][m] = fmaf(xa, h0[r], acc[r][m]); acc[r][m] = fmaf(xb, h1[r], acc[r][m]); }
+      }
+    }
+  }
+  if (v0 >= V) return;
+#pragma unroll
+  for (int r = 0; r < kHeadHR; ++r)
+#pragma unroll
+    for (int m = 0; m < MR; ++m) {
+      const float a = warp_sum(acc[r][m]);
+      if (lane == 0 && m < M && v0 + r < V) logits[(size_t)m * V + v0 + r] = a;
+    }
+}
+
 __global__ void argmax_rows_kernel(const float* __restrict__ logits, int V, int32_t* __restrict__ out) {
   __shared__ float bv[1024];
   __shared__ int bi[1024];
@@ -1427,6 +1484,18 @@ void merge_image(bf16* h, int hc, int dim, int start, int span, const int8_t* ty
   merge_image_kernel<<<grid1d((size_t)span * dim), 256, 0, st>>>(h, hc, dim, start, span, types, row_of, rows, v_start, v_newline, v_end);
 }
 void head_logits(const float* x, const bf16* head, int M, int V, int dim, float* logits, cudaStream_t st) {
+  static const bool rows = !(getenv("HIVE_HEAD_ROWS") && strcmp(getenv("HIVE_HEAD_ROWS"), "0") == 0);  // default on; "0" = the per-row kernel
+  if (rows && M >= 1 && M <= 8 && dim % 2 == 0) {
+    const int blocks = (V + 8 * kHeadHR - 1) / (8 * kHeadHR);
+    if (M == 1) head_logits_rows_kernel<1><<<blocks, 256, 0, st>>>(x, head, M, V, dim, logits);
+    else if (M == 2) head_logits_rows_kernel<2><<<blocks, 256, 0, st>>>(x, head, M, V, dim, logits);
+    else if (M <= 4) head_logits_rows_kernel<4><<<blocks, 256, 0, st>>>(x, head, M, V, dim, logits);
+    else head_logits_rows_kernel<8><<<blocks, 256, 0, st>>>(x, head, M, V, dim, logits);
+    return;
+  }
+  head_logits_kernel<<<grid1d((size_t)V * 32), 256, 0, st>>>(x, head, M, V, dim, logits);
+}
+void head_logits_per_row(const float* x, const bf16* head, int M, int V, int dim, float* logits, cudaStream_t st) {  // the previous kernel (tests)
   head_logits_kernel<<<grid1d((size_t)V * 32), 256, 0, st>>>(x, head, M, V, dim, logits);
 }
 void argmax_rows(const float* logits, int M, int V, int32_t* out, cudaStream_t st) {

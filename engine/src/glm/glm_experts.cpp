@@ -391,7 +391,15 @@ void GlmExperts::cpu_experts(int li, const std::vector<std::pair<int, std::vecto
   const int P0 = split_ ? (cpu_threads_ + 1) / 2 : cpu_threads_, P1 = split_ ? cpu_threads_ - P0 : 0;
   auto phase = [&](int rows, const std::function<void(int, int, int, int)>& body) {
     if (!balance) {
-      const int CH = split_ ? 128 : 256, chunks = (rows + CH - 1) / CH, n = (int)nj * chunks;
+      // HIVE_GLM_CPU_ADAPT (default on; "0" = fixed 128/256-row chunks): with few jobs a layer had fewer chunks per node than workers — measured
+      //   (HIVE_GLM_PROF, real chat c1, after cache-aware routing and deferral): 1.5 jobs per CPU layer, gate/up workers busy 58 %, the CPU phase at
+      //   70 GB/s. Chunks shrink (halving, not below 32 rows) until every worker of a node has one; an output row is one dot product, so the
+      //   values do not depend on the chunking.
+      static const bool adapt = !(getenv("HIVE_GLM_CPU_ADAPT") && strcmp(getenv("HIVE_GLM_CPU_ADAPT"), "0") == 0);
+      int CH = split_ ? 128 : 256;
+      const int per_node = split_ ? std::max(P0, P1) : cpu_threads_;
+      if (adapt) while (CH > 32 && (long)nj * ((rows + CH - 1) / CH) < per_node) CH /= 2;
+      const int chunks = (rows + CH - 1) / CH, n = (int)nj * chunks;
       run_tasks(n, split_ ? n : 0, [&](int node, int t) { const int j = t / chunks, c = t % chunks; body(node, j, c * CH, std::min(rows, (c + 1) * CH)); });
       return;
     }
@@ -747,18 +755,16 @@ void GlmExperts::commit_ready() {
   }
 }
 
-void GlmExperts::promote_key(int key) {
+void GlmExperts::promote_key(int key, const std::vector<int>& vic, size_t& vp) {
   if (slot_of_[key] >= 0 || n_slots_ == 0) return;
   for (auto& p : promos_) if (p.key == key) return;
-  // victim: lowest-score non-pending slot (empty first)
-  int victim = -1; float vs = 1e30f;
-  for (int s = 0; s < n_slots_; ++s) {
-    if (pending_[s]) continue;
-    const int k = key_of_slot_[s];
-    const float sc = k < 0 ? -1.f : score_[k];
-    if (sc < vs) { vs = sc; victim = s; if (sc < 0) break; }
-  }
-  if (victim < 0 || vs >= score_[key]) return;
+  // victim: lowest-score non-pending slot (empty first, the lowest slot index among equal scores) — the next entry of the list after_step sorted
+  //   once (a slot leaves the candidates only by being chosen here, so the next entry is what a fresh scan would find)
+  if (vp >= vic.size()) return;
+  const int victim = vic[vp];
+  const float vs = key_of_slot_[victim] < 0 ? -1.f : score_[key_of_slot_[victim]];
+  if (vs >= score_[key]) return;
+  ++vp;
   if (key_of_slot_[victim] >= 0) { slot_of_[key_of_slot_[victim]] = -1; ++stats_.evicted; }
   key_of_slot_[victim] = -1;
   pending_[victim] = 1;
@@ -836,8 +842,17 @@ void GlmExperts::after_step(int tokens) {
   step_used_.erase(std::unique(step_used_.begin(), step_used_.end()), step_used_.end());
   std::sort(step_used_.begin(), step_used_.end(), [&](int a, int b) { return score_[a] > score_[b]; });
   int budget = promote_per_step_ * std::max(1, tokens) + (warm_left_ > 0 ? std::min(warm_left_, warm_per_step_) : 0);
+  // Victim candidates sorted once per step: non-pending slots by (score, slot index), the first `budget` of them. promote_key used to scan every
+  //   slot for each used key — measured (host timestamps, real chat c1): 1.88 ms per verify step with the GPU idle, ~5 % of the step. Same choices.
+  vic_.clear();
+  for (int s2 = 0; s2 < n_slots_; ++s2) if (!pending_[s2]) vic_.push_back(s2);
+  auto vsc = [&](int s2) { const int k2 = key_of_slot_[s2]; return k2 < 0 ? -1.f : score_[k2]; };
+  const size_t vk = std::min<size_t>(vic_.size(), (size_t)std::max(0, budget));
+  std::partial_sort(vic_.begin(), vic_.begin() + vk, vic_.end(), [&](int a, int b) { const float x = vsc(a), y = vsc(b); return x < y || (x == y && a < b); });
+  vic_.resize(vk);
+  size_t vp = 0;
   int issued = 0;
-  for (int k : step_used_) { if (issued >= budget) break; const uint64_t before = stats_.promoted; promote_key(k); issued += stats_.promoted > before; }
+  for (int k : step_used_) { if (issued >= budget) break; const uint64_t before = stats_.promoted; promote_key(k, vic_, vp); issued += stats_.promoted > before; }
   if (warm_left_ > 0 && issued < budget) {
     // warm: top scores among non-resident keys
     std::vector<int> cand;
@@ -845,7 +860,7 @@ void GlmExperts::after_step(int tokens) {
     const int need = budget - issued;
     if ((int)cand.size() > need) std::partial_sort(cand.begin(), cand.begin() + need, cand.end(), [&](int a, int b) { return score_[a] > score_[b]; });
     int n = 0;
-    for (int k : cand) { if (n >= need) break; const uint64_t before = stats_.promoted; promote_key(k); n += stats_.promoted > before; }
+    for (int k : cand) { if (n >= need) break; const uint64_t before = stats_.promoted; promote_key(k, vic_, vp); n += stats_.promoted > before; }
     warm_left_ = n == 0 ? 0 : warm_left_ - n;
   }
   step_used_.clear();

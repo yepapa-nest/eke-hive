@@ -238,6 +238,9 @@ class Runtime {
   bool in_layer_yield() const { return ly_.depth > 0; }
   const ly::Stats& layer_yield_stats() const { return ly_.st; }
   double layer_yield_resume_ms() const { return ly_.last; }  // time of the last resume (or of the outer forward's start) (now_ms)
+  // Share of the paused forward's work done at the current layer boundary (0..1) — hived's HIVE_LAYER_YIELD_MID estimates the forward's remaining rows
+  //   from it. Encoder layers (all rows) carry 90 % of a decoder-tail forward, the tail layers (128 rows) the rest; without the tail, layers are equal.
+  double layer_yield_progress() const { return ly_progress_; }
   const RuntimeOptions& opt() const { return opt_; }
   // ---- DSpark speculative decoding (single sequence) ----
   //   Draft: target-layer hidden at seq's last processed position (seq.mtp_pos) + next token tok (position seq.pos) -> a block of B drafts d1..dB (positions pos+1..) and confidences.
@@ -581,9 +584,14 @@ class Runtime {
   void mtp_attention(Seq& seq, int s, int B, int64_t pos0, int filled);
   // HIVE_LAYER_YIELD ("T11" header comment in runtime.cpp)
   ly::State ly_;
-  std::vector<std::pair<Seq*, int>> ly_owner_;  // (sequence, rows) of the outer prefill forward — after a yield, xtrace header and row owners are rewritten
+  double ly_progress_ = 0;                       // layer_yield_progress (set right before each layer_yield_point call)
+  double ly_prog(int l, int L, int nl, bool tail) const {  // progress after layer l (L = tail layer, nl = layers)
+    if (!tail || L <= 0 || L >= nl) return (l + 1.0) / std::max(1, nl);
+    return l < L ? 0.9 * (l + 1.0) / L : 0.9 + 0.1 * (l + 1.0 - L) / std::max(1, nl - L);
+  }
+  std::vector<std::pair<Seq*, int>> ly_owner_[2];  // per yield level  // (sequence, rows) of the outer prefill forward — after a yield, xtrace header and row owners are rewritten
   struct LyPark;                                 // runtime.cpp (pinned storage — incomplete type: shared_ptr so the fake runtime compiles)
-  std::shared_ptr<LyPark> lypark_;
+  std::shared_ptr<LyPark> lypark_[2];            // per yield level (ly::Hooks::max_depth ≤ 2)
   void ly_begin(std::vector<std::pair<Seq*, int>> owners);  // outer prefill forward start: clock and owners (forwards inside a yield do not touch it)
   void layer_yield_point();                      // layer boundary (called only by the outer prefill forward)
 };

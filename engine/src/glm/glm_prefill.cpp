@@ -43,6 +43,11 @@ void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float*
     hall = hall_.as<bf16>(); xnall = xnall_.as<bf16>(); outall = outall_.as<float>(); postall = postall_.as<float>(); comball = comball_.as<float>();
     rlog_all = rlog_all_.as<float>(); rids_all = rids_all_.as<int32_t>(); rw_all = rw_all_.as<float>();
   }
+  // on an exception (e.g. from work run inside a layer yield) give the lent slots back and leave hcur_ cleared — the caller marks the sequence broken
+  struct Lent {
+    GlmEngine& e; bool on;
+    ~Lent() { if (!on) return; cudaStreamSynchronize(e.stream_); if (e.elastic_) e.ex_.return_tail_slots(); e.hcur_ = nullptr; }
+  } lent{*this, true};
   // embeddings → hc streams of every row
   {
     static thread_local std::vector<bf16> emb;
@@ -75,6 +80,7 @@ void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float*
     D("attention blocks", l);
     if (!L.moe) {
       if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, hall, T); }
+      if (layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);  // layer yield (see glm_engine.h — hcur_ still points into hall)
       continue;
     }
     // MoE over all T rows: router, then every expert once
@@ -112,6 +118,7 @@ void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float*
       hc_post_apply(n);
     }
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, hall, T); }  // all T rows of the hc streams (validation)
+    if (layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);  // layer yield
   }
   // head of the last row; MTP entries for every row (final hidden per block)
   s.pos = pos0;
@@ -138,6 +145,7 @@ void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float*
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   if (elastic_) ex_.return_tail_slots();
   hcur_ = nullptr;
+  lent.on = false;
   s.pos = pos0 + T;
   s.tokens.insert(s.tokens.end(), ids, ids + T);
 }

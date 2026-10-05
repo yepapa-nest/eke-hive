@@ -111,6 +111,10 @@ struct Hooks {
   std::function<int()> want;                 // hived: 0 = nothing to do · n ≥ 1 = max short-prefill rows (1 for decode only)
   std::function<void(int, double)> run;      // hived: (usable rows R, preceding prefill ms)
   double period_ms = 0;                      // 0 = off
+  // Yield levels: 1 = forwards run inside a yield never yield themselves (default). 2 = they may yield once more — hived uses it with
+  //   HIVE_LAYER_YIELD_MID so a mid-size prompt admitted at a yield (seconds of prefill) still gives the running decoders their steps; its
+  //   want() then reports decode work only.
+  int max_depth = 1;
 };
 struct Stats { long yields = 0, skipped_park = 0; double inner_ms = 0, park_ms = 0, max_gap_ms = 0; };
 struct State {
@@ -123,7 +127,7 @@ struct State {
 };
 // park(R) → bool (parked?) · unpark(R) · now() are supplied by the caller (runtime/fake). Returns whether it yielded.
 template <class Park, class Unpark, class Now> bool yield_point(State& s, Park&& park_fn, Unpark&& unpark_fn, Now&& now) {
-  if (!s.on() || s.depth > 0) return false;
+  if (!s.on() || s.depth >= std::max(1, s.h.max_depth)) return false;
   const double t = now();
   if (t - s.last < s.h.period_ms) return false;
   const int want = s.h.want();

@@ -20,9 +20,11 @@
   are exact implementations of the same function; results are not bit-reproducible run to run. Cache-aware routing
   (`HIVE_CACHE_PRIOR`, on in both shipped configurations) also makes the chosen experts depend on what is in the cache.
 - **Long prefill.** A very long prompt is processed in large chunks. On DeepSeek, short requests that arrive meanwhile are
-  served at layer boundaries (first token in ~1–1.5 s during an 85K prefill), but several long prompts are processed one after
-  another. On GLM a new request waits until the running prefill has finished (a 250K-token prompt takes about 66 s).
-- **Concurrency.** DeepSeek decodes up to 8 requests at a time, GLM up to 4; more wait in the daemon's queue.
+  served at layer boundaries (first token in ~1–1.5 s during an 85K prefill), and a request of up to 16K rows joins at a yield
+  when it is much smaller than what the running prefill still has to do (`HIVE_LAYER_YIELD_MID`); larger prompts are still
+  processed one after another. On GLM short requests are served at layer boundaries too (`HIVE_LAYER_YIELD`); requests above
+  1,023 rows wait until the running prefill has finished (a 250K-token prompt takes about 66 s).
+- **Concurrency.** Both models decode up to 8 requests at a time (`HIVE_MAX_BATCH`); more wait in the daemon's queue.
 - **GLM thinking.** GLM-5.3-Flash cannot switch thinking off; "off" maps to its lowest level (`low`).
 - **GLM without the FP8 tensors.** Without `HIVE_GLM_FP8_DIR` (fetched by `scripts/glm-fetch-fp8.py`), GLM runs its attention
   projections and shared experts from the BF16 copies of the NVFP4 checkpoint and has no speculative decoding.

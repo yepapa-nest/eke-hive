@@ -42,16 +42,17 @@ The headline numbers (real chat prompts, both models) are in [benchmarks.md](ben
 ### Result
 
 Headline (the real-chat benchmark, `tools/bench_chat.py` — [benchmarks.md](benchmarks.md#real-chat-benchmark-headline)),
-before and after step 21:
+before and after step 21, and with steps 22–23 (two runs; the step-21 column is one run — one-stream runs of the step-21 build
+measured 82.2–84.9 tok/s on 2026-10-05, so the step-22 gain is the interleaved 83.9 → 86.0 of its row, not the difference of the columns):
 
-| Streams | Steps 1–20 | Step 21 (current) |
-| --- | --- | --- |
-| 1 | 53.8 tok/s | **76.9 tok/s** (+43 %) |
-| 2 / 4 | 68.4 / 81.1 | **92.6 / 124.0** |
-| 8 / 16 / 32 | 100.2 / 98.4 / 105.1 | **173.0 / 172.7 / 174.3** |
-| Decode after a 17K / 42K / 54K prompt | 36.9 / 43.8 / 44.5 | **64.1 / 72.6 / 77.4** |
-| Time to first token, 17K / 42K / 54K | 4.94 / 7.38 / 9.63 s | 4.95 / 7.48 / 9.63 s |
-| Quality suite | 172 / 179 | 175 / 179 |
+| Streams | Steps 1–20 | Step 21 | Steps 22–23 (current) |
+| --- | --- | --- | --- |
+| 1 | 53.8 tok/s | 76.9 tok/s | **85.3 tok/s** |
+| 2 / 4 | 68.4 / 81.1 | 92.6 / 124.0 | **92.9 / 124.6** |
+| 8 / 16 / 32 | 100.2 / 98.4 / 105.1 | 173.0 / 172.7 / 174.3 | **175.0 / 178.1 / 181.5** |
+| Decode after a 17K / 42K / 54K prompt | 36.9 / 43.8 / 44.5 | 64.1 / 72.6 / 77.4 | 63.4 / 79.1 / 75.8 |
+| Time to first token, 17K / 42K / 54K | 4.94 / 7.38 / 9.63 s | 4.95 / 7.48 / 9.63 s | 5.05 / 7.53 / 9.69 s |
+| Quality suite | 172 / 179 | 175 / 179 | (steps 22–23 do not change outputs) |
 
 The development history below uses the development benchmark `tools/bench_tune.py` ([How it is measured](#how-it-is-measured);
 it reads lower than the chat benchmark and was not re-run after step 21):
@@ -123,6 +124,8 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | 19 | Post-prefill cache warm handed to the decode steps (`HIVE_WARM_DEFER`) | After every prefill the engine refilled the VRAM cache with the top-score experts in one synchronous upload (738–1,065 experts, 0.46–0.69 s each) — every running decoder stalled for it and the new request's first token waited behind it. Now the quota is handed to the following decode steps: each step's promotion runs with the warm's cap (N experts) and threshold until the quota is spent, on the side stream next to the step (the promotion pacing of step 3 kept) | Chat shape — 4 decoders + cached follow-up turns + a fresh 3.9K prompt (bench_turns, off ×3 vs 16/step ×2 vs 32/step ×2): decoder 17.0 → 19.0–19.2 → **21.5–21.6 tok/s**; follow-up turns 3.1–3.3 / 2.3 / 2.3 → 1.9–2.1 / 1.7–1.9 / 1.7 s; fresh 3.9K prompt 2.2 → 1.3–1.5 s; the decoders' longest gap 1.43–1.45 → 1.05–1.07 s (what remains is that turn's own prefill). Answers, long-prompt TTFT (6.7–7.0 s) and errors (0) unchanged. At 32/step the 2048-expert quota completes in 64–85 steps; at 16/step the next prefill resets it first; 64/step changes nothing more (21.5 tok/s, 32–69 steps) |
 | 20 | Layer-boundary yields inside small prefills (`HIVE_LAYER_YIELD_SMALL`) | With step 19 in place, the longest stall the running decoders see is a follow-up turn's own short prefill (a few hundred rows, ~1 s, below the prefill threshold, so the step-14 yield never fired inside it); the yield now also fires at layer boundaries of those forwards | Same scenario as step 19, 32/step ×2 vs 32/step + yields ×2: the decoders' longest gap 1.05–1.07 → 0.59–0.60 s (p95 unchanged, 0.05–0.06 s); cost: decoder 21.5–21.6 → 21.2 tok/s, follow-up turns +0.05–0.1 s. Without step 19 it showed no gain — the warm stall dominated |
 | 21 | Cache-aware routing (`HIVE_CACHE_PRIOR=0.1`) and expert deferral (`HIVE_DECODE_DEFER`) | Decode only. Each router's selection scores get λ × the layer's running score range for experts already in VRAM, with the top 2 by the original scores always kept and the routing weights left as the model's (idea: Skliar et al., TMLR 2025) — fewer misses reach the CPU. CPU misses ranked 3rd or lower in their row are no longer waited for: they run while the next layer starts and are added to the hidden streams one layer later (idea: KTransformers, SOSP 2025); ~1.5 rows per layer took that path. Both first proved on GLM-5.3 ([below](#glm-53-flash), [glm.md](glm.md#lossy-changes-measured-with-quality-on-top-of-each-other)) | Real-chat benchmark: c1 53.8 → 76.9, c4 81.1 → 124.0, c8 100.2 → 173.0 tok/s; decode after 17–54K prompts +66–74 %; prefill unchanged; quality 172 → 175 / 179 (McNemar p = 0.375; long-context items byte-identical). The first build hung on the first decode: the next layer's job list was rebuilt while the deferred batch still read it — fixed by adding the batch before the list is rebuilt |
+| 22 | Decode kernels: expert activations a stage ahead, multi-row head (both bit-identical) | The fused expert kernel (FUSED3) loaded its activation operand only one 4-block step before use, so in launches with few work items (one stream, MTP verify rows) every step waited on an L2 round trip: one expert 53.0 → 37.8 µs, five experts 114.6 → 94.2 µs (`tests/bench_moe_lowm.cu`, L2 flushed); `test_decode_moe` M=1 811 → 912 GB/s. The head kernel read each vocabulary row once per input row (`HIVE_HEAD_ROWS`): 4 rows 1,169 → 911 µs, 8 rows 2,170 → 950 µs (`tests/test_head_rows.cu`) — it serves the verify rows and the MTP draft block | Real-chat benchmark, 7 base runs vs 6, interleaved: c1 83.9 → 86.0 tok/s (+2.5 %), c2 92.4 → 92.9, c4 123.6 → 124.2, c8 171.4 → 173.7; prefill unchanged |
+| 23 | Mid-size prompts admitted at layer yields by remaining work (`HIVE_LAYER_YIELD_MID=16384`) | Service log (10-01..10-05): 114 requests of ≥ 4K rows waited > 2 s behind another prefill of ≥ 4K rows (e.g. three 22K-row requests 5.3 s behind a 20K one) — a layer yield admitted only ≤ 1,023-row requests. Now a request of up to 16,384 rows is admitted when it is at most half of the paused forward's remaining rows (its rows × (1 − progress) + its later chunks), at most that forward's rows per forward; its own forward yields once more for decode steps only (`ly::Hooks::max_depth` 2) | 85K prompt + 12K request 3 s later + a decoder (`tools/layer_yield_check.py`, two runs each): request 14.6 → 4.4 s to the first token, the long prompt 13.9 → 18.2 s, mean of the two 14.3 → 11.3 s; decoder's longest stall 1.83 → 2.05 s (5.13 s without the second level) |
 
 ### Rejected (measured, not adopted)
 
@@ -143,6 +146,7 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | Larger VRAM reservation (1.8 GB) | Image requests ran out of VRAM |
 | Capped post-prefill warm while others decode (`HIVE_WARM_BUSY_CAP=1`) | Decoders' longest gap 1.44 → 1.04 s, but the cache went stale: 17.0 → 10.3 tok/s per decoder (the warm is the general refill after a prefill, not only the new request's experts) — replaced by step 19 |
 | Tuning sweeps | CPU threads 8/12/24, MTP draft depth 2/3, 4 host tiles, promote 4/16, larger cache: no gain or loss |
+| Lower promotion threshold of the `seq` cache policy (`HIVE_CACHE_POLICY=seq:min=0.0125` / `0.008`, on top of step 22) | Replay of two service traces predicted 4–13 % fewer decode miss jobs, but promotions per step went from 2–4 to 6–7 and the copies compete with demand DMA: real-chat c1 86.4 → 84.2 / 82.9 tok/s, c8 172.8 → 174.6 / 174.0 (two runs each) — kept at 0.025 |
 | Larger per-step promotion budget after step 19 (`--promote 16/32`) | Cache replay of a real trace predicted +0.9 / +1.5 points decode hit rate, but on the service (interleaved ×2 each) the four-stream chat scenario gave 21.7–21.9 (8) vs 20.5–21.4 (16) vs 20.9–21.3 (32) tok/s and c1/c4/c8 stayed within noise — the extra promotion copies cost what the hits save; kept at 8 |
 
 ### The Engram tables on SSD
@@ -181,8 +185,9 @@ full record, with every A/B, is in [glm.md](glm.md#performance); this section is
 ### Result
 
 Real-chat benchmark (`tools/bench_chat.py`, shipped `config/glm.env`; [benchmarks.md](benchmarks.md#real-chat-benchmark-headline)):
-decode 65.2 / 66.6 / 89.3 / 88.8 tok/s with 1 / 2 / 4 / 8 streams (one-stream runs of the same build 65.2–68.4), time to first
-token 7.2 / 11.6 / 13.7 / 26.4 / 53.7 / 66.3 s for 17K / 42K / 54K / 100K / 200K / 250K-token prompts, quality 158 / 163.
+decode 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6 tok/s with 1 / 2 / 4 / 8 / 16 / 32 streams (two runs; before steps 17–21
+65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3), time to first token 7.3 / 11.8 / 13.9 / 26.4 / 53.7 / 66.3 s for 17K / 42K / 54K / 100K /
+200K / 250K-token prompts, quality 158 / 163 (steps 17–21 do not change outputs).
 
 ### Where the time goes
 
@@ -219,6 +224,11 @@ with the headline benchmark.
 | 14 | Expert deferral (`HIVE_GLM_DEFER`) | daemon, c1 60.6 → 63.6 tok/s; quality 157 / 157 |
 | 15 | Prefix sharing across conversations (boundary snapshots including the KDA state) | same 8.6K system prompt in a new conversation: 5.8 → 0.52 s to the first token |
 | 16 | 262,144-token context with KV memory that follows use (`GrowBuf`, CUDA VMM) | session pool 4 × 1,370 → 4 × 458 MiB, expert cache 4,420 → 4,693 slots; prompts up to 250K; quality 157 → 158 / 163 |
+| 17 | Layer yields inside a prefill (`HIVE_LAYER_YIELD`, as on DeepSeek; nothing parked — inner forwards use rows the paused prefill does not hold) | 60K prompt + 64-row requests + a decoder: first short requests 14.0 / 12.5 → 0.65 / 0.59 s, decoder's longest stall 14.4 → 1.6 s, the long prompt 14.5 → 16.5 s |
+| 18 | 8 sequences per step (`HIVE_MAX_BATCH=8`) and batched MTP verify (`HIVE_MTP_BATCH`) | real-chat, 4 base runs vs 2: c8 93.2 → 125.7 tok/s, c8 first token 23 → 0.6–0.9 s; c2 66.6 → 79.5; c1 / c4 inside the base spread |
+| 19 | CPU-expert chunks sized to the workers (`HIVE_GLM_CPU_ADAPT`, bit-identical) | gate/up workers busy 58 → 80 %, CPU phase 70 → 81 GB/s; real-chat unchanged |
+| 20 | Logits into a pinned buffer, hived's verify row vector reused | no pageable copy into fresh memory per verify step; real-chat unchanged |
+| 21 | Promotion victims sorted once per step (same choices) — `after_step` scanned every slot for each used expert and held the GPU idle 1.88 ms per verify step (host timestamps, CUPTI timeline) | real-chat, interleaved ×2: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s |
 
 Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 
@@ -228,7 +238,7 @@ Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 | --- | --- |
 | Cache-aware routing λ 0.2 | 63.5 tok/s (hits 97.9 %), but a long-context item flipped (157) — kept at 0.1 |
 | Skipping low-weight CPU misses (`HIVE_GLM_SKIP_MISS` 0.05 / 0.1) | +0 / +2 % (noise), lossy — kept off |
-| Batched speculative decoding across sequences (`HIVE_MTP_BATCH`) | c4 82.4 / 82.5 → 84.4 / 82.8 — kept off |
+| CPU workers spinning 1,000 / 300 µs instead of 3,000 after a batch (`HIVE_GLM_SPIN_US`) | c1 69.0 / 67.7 vs 68.3 tok/s — no effect |
 | MTP depth 4 / 5 | 46.7 / 45.8 vs 48.1 tok/s at 3 |
 | More than one expert copied ahead per layer | 2 → 30.7 tok/s; for verify steps 44.5 / 42.0 / 36.3 vs 53.1 tok/s — the copies compete for DRAM bandwidth |
 | W4A8 CPU kernel | 49.4 → 44.8 GB/s on one node, lower accuracy |
@@ -239,6 +249,7 @@ Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 ### Open problem
 
 With cache-aware routing the CPU share of a decode step is under a quarter; what remains is mostly GPU work outside the
-experts, led by the 34 KDA layers whose projections are BF16, and the hyper-connection mixing. Prefill stays bound by PCIe 4.0.
-With several streams a step decodes several sequences without drafts, so 2 streams add up to about one stream with drafts and
-throughput levels off at 4 (`HIVE_MAX_BATCH`).
+experts, led by the 34 KDA layers whose projections are BF16 (5.2 ms of a 34 ms 4-row verify, at the HBM limit for those
+weights), and the hyper-connection mixing. A CUPTI timeline of one stream still shows the GPU idle about a quarter of the time:
+waits for CPU experts and for deferred experts, and the host work around routing each MoE layer (the routing comes back with a
+stream synchronization; DeepSeek publishes it early instead). Prefill stays bound by PCIe 4.0.

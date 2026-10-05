@@ -110,7 +110,8 @@ class GlmExperts {
  private:
   void cpu_experts(int li, const std::vector<std::pair<int, std::vector<std::pair<int, float>>>>& jobs, const float* x_host, float* y_host);
   void commit_ready();
-  void promote_key(int key);
+  void promote_key(int key, const std::vector<int>& victims, size_t& next);
+  std::vector<int> vic_;  // after_step: victim candidates of this step, ascending (score, slot)
   GlmModel& m_;
   int H_, I_, E_, K_, n_moe_;
   float limit_;
