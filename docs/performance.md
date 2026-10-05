@@ -147,6 +147,7 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | Capped post-prefill warm while others decode (`HIVE_WARM_BUSY_CAP=1`) | Decoders' longest gap 1.44 → 1.04 s, but the cache went stale: 17.0 → 10.3 tok/s per decoder (the warm is the general refill after a prefill, not only the new request's experts) — replaced by step 19 |
 | Tuning sweeps | CPU threads 8/12/24, MTP draft depth 2/3, 4 host tiles, promote 4/16, larger cache: no gain or loss |
 | Lower promotion threshold of the `seq` cache policy (`HIVE_CACHE_POLICY=seq:min=0.0125` / `0.008`, on top of step 22) | Replay of two service traces predicted 4–13 % fewer decode miss jobs, but promotions per step went from 2–4 to 6–7 and the copies compete with demand DMA: real-chat c1 86.4 → 84.2 / 82.9 tok/s, c8 172.8 → 174.6 / 174.0 (two runs each) — kept at 0.025 |
+| Commit paced promotions one step head later (opt-in `HIVE_PROMO_COMMIT_LAG=1`, prototype) | Host timestamps showed the verify head waiting 0.44 ms per cycle for promotion copies issued during the MTP draft (up to ~6 ms of copies against a 3.6 ms draft). Delaying the deterministic commit by one head: real-chat c1 85.1 → 85.9, c2 92.7 → 92.7, c4 124.9 → 123.4, c8 172.8 → 173.5 tok/s, decode after 54K tokens 91.1 → 86.6 (two interleaved runs each; c4 and long-context decode lower in both runs) — not adopted, code not kept |
 | Larger per-step promotion budget after step 19 (`--promote 16/32`) | Cache replay of a real trace predicted +0.9 / +1.5 points decode hit rate, but on the service (interleaved ×2 each) the four-stream chat scenario gave 21.7–21.9 (8) vs 20.5–21.4 (16) vs 20.9–21.3 (32) tok/s and c1/c4/c8 stayed within noise — the extra promotion copies cost what the hits save; kept at 8 |
 
 ### The Engram tables on SSD
@@ -229,6 +230,7 @@ with the headline benchmark.
 | 19 | CPU-expert chunks sized to the workers (`HIVE_GLM_CPU_ADAPT`, bit-identical) | gate/up workers busy 58 → 80 %, CPU phase 70 → 81 GB/s; real-chat unchanged |
 | 20 | Logits into a pinned buffer, hived's verify row vector reused | no pageable copy into fresh memory per verify step; real-chat unchanged |
 | 21 | Promotion victims sorted once per step (same choices) — `after_step` scanned every slot for each used expert and held the GPU idle 1.88 ms per verify step (host timestamps, CUPTI timeline) | real-chat, interleaved ×2: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s |
+| 22 | Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`) — the DeepSeek post-and-gate (`er_route_post`, `er::Gate`) after the router; the host classifies and launches experts while the shared expert runs | outputs identical; real-chat, interleaved ×2: c4 95.3 → 99.4 tok/s, c1 / c2 / c8 +0.4 / −1.7 / −0.1 % |
 
 Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 
@@ -251,5 +253,4 @@ Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 With cache-aware routing the CPU share of a decode step is under a quarter; what remains is mostly GPU work outside the
 experts, led by the 34 KDA layers whose projections are BF16 (5.2 ms of a 34 ms 4-row verify, at the HBM limit for those
 weights), and the hyper-connection mixing. A CUPTI timeline of one stream still shows the GPU idle about a quarter of the time:
-waits for CPU experts and for deferred experts, and the host work around routing each MoE layer (the routing comes back with a
-stream synchronization; DeepSeek publishes it early instead). Prefill stays bound by PCIe 4.0.
+waits for CPU experts and for deferred experts (routing is posted early since step 22). Prefill stays bound by PCIe 4.0.

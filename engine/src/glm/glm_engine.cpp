@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
 #include "hive/glm/glm_engine.h"
+#include "hive/decode_handshake.h"
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +70,15 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
     for (auto& e : probe_ev_) CUDA_CHECK(cudaEventCreate(&e));
   }
   fused_ = !(getenv("HIVE_GLM_DECODE_FUSED") && strcmp(getenv("HIVE_GLM_DECODE_FUSED"), "0") == 0);  // default on; "0" = off
+  early_route_ = fused_ && !(getenv("HIVE_GLM_EARLY_ROUTE") && strcmp(getenv("HIVE_GLM_EARLY_ROUTE"), "0") == 0);
+  if (early_route_) {
+    CUDA_CHECK(cudaHostAlloc(&er_flag_h_, sizeof(uint32_t), cudaHostAllocMapped));
+    *er_flag_h_ = 0;
+    CUDA_CHECK(cudaMalloc((void**)&er_ctr_d_, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(er_ctr_d_, 0, sizeof(uint32_t)));
+    CUDA_CHECK(cudaEventCreateWithFlags(&er_front_, cudaEventDisableTiming));
+    fprintf(stderr, "[glm] decode early route on (routing posted after the router · experts launched while the shared expert runs)\n");
+  }
   hc_sync_.alloc(kGlmDecodeSyncInts * 4); CUDA_CHECK(cudaMemset(hc_sync_.p, 0, kGlmDecodeSyncInts * 4));
   rlog_.alloc(glm_router_logits_floats(8, c_.n_routed, c_.hidden) * 4);
   CUDA_CHECK(cudaHostAlloc(&rids_h_, 8 * c_.n_act * 4, cudaHostAllocMapped));
@@ -598,6 +608,13 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
                  nullptr, nullptr, stream_);
   }
   const bool mapped_route = dec_fast(prefill, rows) && (!pf || pf_fast);
+  const bool er = early_route_ && mapped_route && !prefill_streams;
+  bool er_trust = true;
+  if (er) {  // CPU input rows first, then the post (after both routers in stream order — their mapped writes are done before it)
+    dcopy(xin_pin_, xn, (size_t)rows * H * 2, stream_);
+    er_trust = er_gate_.begin();
+    k::er_route_post(router_ids_.as<int32_t>(), router_w_.as<float>(), rows * K, rids_h_, rw_h_, er_ctr_d_, er_flag_h_, stream_);
+  }
   h_ids_.resize((size_t)rows * K); h_w_.resize((size_t)rows * K);
   if (!mapped_route) {
     CUDA_CHECK(cudaMemcpyAsync(h_ids_.data(), router_ids_.p, (size_t)rows * K * 4, cudaMemcpyDeviceToHost, stream_));
@@ -615,8 +632,22 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
   lin(w.sh_down, sh_y_.as<bf16>(), I, rows, mlp_out_.as<bf16>(), H);
   }
   CUDA_CHECK(cudaMemsetAsync(mlp_out_f32_.p, 0, (size_t)rows * H * 4, stream_));
-  if (!prefill_streams) dcopy(xin_pin_, xn, (size_t)rows * H * 2, stream_);  // CPU expert input: pinned host rows (UVA), ready at the sync below
-  CUDA_CHECK(cudaStreamSynchronize(stream_));  // routing on the host
+  if (!er) {
+    if (!prefill_streams) dcopy(xin_pin_, xn, (size_t)rows * H * 2, stream_);  // CPU expert input: pinned host rows (UVA), ready at the sync below
+    CUDA_CHECK(cudaStreamSynchronize(stream_));  // routing on the host
+  } else {
+    CUDA_CHECK(cudaEventRecord(er_front_, stream_));
+    const int res = er_trust ? er_gate_.wait(er_flag_h_, [&] {
+      const cudaError_t e = cudaEventQuery(er_front_);
+      if (e != cudaErrorNotReady) CUDA_CHECK(e);
+      return e == cudaSuccess;
+    }) : (int)er::kMissing;
+    if (res != er::kOk) {  // absorbed: wait for the shared expert's end (the routing and the rows are on the host by then) and take the number as is
+      CUDA_CHECK(cudaEventSynchronize(er_front_));
+      er_gate_.resync(er_flag_h_);
+      if (er_fix_++ < 4) fprintf(stderr, "[glm] early route: layer %d post %s — waited for the front instead (absorbed)\n", l, !er_trust ? "untrusted" : "out of step");
+    }
+  }
   prof_mark(&st_.ms_shared);
   if (mapped_route) { std::memcpy(h_ids_.data(), rids_h_, (size_t)rows * K * 4); std::memcpy(h_w_.data(), rw_h_, (size_t)rows * K * 4); }
   if (pf) {

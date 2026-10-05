@@ -171,6 +171,7 @@ Changes from that breakdown (A/B, interleaved, restart per configuration, 12 cha
 | KDA verify rows in one launch (`HIVE_GLM_KDA_ROWS`, bit-identical) | one layer, 4 rows: 36.9 → 16.4 µs; 3-row verify call 44.0 / 44.5 → 43.1 / 43.4 ms (outside the CPU phase 23.1-23.3 → 22.2-22.4 ms) |
 | CPU-expert chunks sized to the worker count (`HIVE_GLM_CPU_ADAPT`, bit-identical) — after cache-aware routing and deferral a CPU layer had 1.5 jobs, fewer 128-row chunks per node than workers | gate/up workers busy 58 → 80 %, CPU expert phase 70.0 → 81.2 GB/s (0.203 → 0.174 ms per expert, 4-row verify); real-chat c1/c4/c8 unchanged (68.6 / 89.0 / 93.3 vs 68.2 / 88.5 / 93.2 tok/s — the CPU phase mostly overlaps the GPU at these loads) |
 | Decode/verify logits into a pinned buffer, hived's verify row vector reused (values unchanged) | removes a pageable copy into freshly allocated memory each verify step (rows × 154,880 × 4 B); real-chat c1 69.4 / 67.8 vs 68.2 tok/s — kept for the host work it saves |
+| Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`, the DeepSeek post-and-gate code): routing and the CPU input rows reach the host right after the router, the experts are launched while the shared expert runs | output identical to off (300-token greedy streams; off vs off diverged at token 2); real-chat, interleaved ×2: c1 69.7 → 70.0, c2 86.7 → 85.2, c4 95.3 → 99.4, c8 128.3 → 128.2 tok/s |
 | Promotion victims sorted once per step instead of a scan of every slot for each used expert (same choices) — host timestamps showed `after_step` holding the GPU idle 1.88 ms per verify step | real-chat, interleaved ×2 at 8 seats + batched MTP: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s; promotions per verify unchanged (28 vs 25–29) |
 
 ### Lossy changes measured with quality (on top of each other)
@@ -300,6 +301,7 @@ The reference comparison (next-token top-1 and hidden states) passes on every pa
 | `HIVE_GLM_NOTHINK` | `low` | API server setting: what a no-thinking request becomes — `low` (official minimum effort) or `empty` (prefilled empty thinking block) |
 | `HIVE_GLM_PROF` | 0 | 1 = host-synchronized phase timings, 2 = CUDA-event phase timings; hived prints a per-call breakdown (phases, cache hits, CPU expert GB/s) every 400 calls of a kind (measurement only) |
 | `HIVE_GLM_KDA_ROWS` | on | KDA recurrence of a verify step's rows in one launch (bit-identical); `0` = one launch per row plus snapshot copies |
+| `HIVE_GLM_EARLY_ROUTE` | on | fast decode path: routing posted right after the router, experts launched while the shared expert runs; `0` = stream synchronization after the shared expert |
 | `HIVE_GLM_CPU_ADAPT` | on | CPU-expert row chunks halve (not below 32 rows) until every worker of a node has one; `0` = fixed 128-row chunks (bit-identical either way) |
 | `HIVE_GLM_CPU_BALANCE` | 0 | `1` = equal row ranges per CPU worker instead of 128-row chunks (measured within noise) |
 | `HIVE_GLM_PREDICT_EVAL` | 0 | measure next-layer expert prediction recall (outputs unchanged) |

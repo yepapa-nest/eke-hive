@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "hive/cublas_ops.h"
+#include "hive/early_route.h"
 #include "hive/grow_buf.h"
 #include "hive/glm/dsa.h"
 #include "hive/glm/glm_decode.h"
@@ -195,6 +196,14 @@ class GlmEngine {
   int32_t* rids_h_ = nullptr; float* rw_h_ = nullptr;   // mapped host router outputs
   int32_t* pf_ids_map_ = nullptr; float* pf_w_map_ = nullptr;  // mapped host next-layer predictions
   bool dec_fast(bool prefill, int rows) const { return fused_ && !prefill && rows <= 8 && !layer_hook; }
+  // HIVE_GLM_EARLY_ROUTE (default on; "0" = off): on the fast decode path the routing and the CPU experts' input rows reach the host right
+  //   after the router (er_route_post, the DeepSeek HIVE_DECODE_EARLY_ROUTE kernel and gate — hive/early_route.h); the host classifies and
+  //   launches the experts while the shared expert runs instead of waiting for a stream synchronization. Same kernels, inputs and order.
+  bool early_route_ = true;
+  uint32_t* er_flag_h_ = nullptr; uint32_t* er_ctr_d_ = nullptr;
+  cudaEvent_t er_front_ = nullptr;
+  er::Gate er_gate_;
+  long er_fix_ = 0;
   DevBuf pf_ids_d_, pf_w_d_;
   int pf_n_ = 0;
   std::vector<int> next_moe_;
