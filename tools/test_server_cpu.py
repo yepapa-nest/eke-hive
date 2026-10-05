@@ -530,7 +530,33 @@ class ToolStreamSseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c['choices'][0]['finish_reason'] for c in ch if c.get('choices') and c['choices'][0]['finish_reason']], ['tool_calls'])
         self.assertEqual(self.recs[-1].get('tool_stream'), 'match')
         self.assertEqual(len(self.recs), 1, 'one request-log line per stream')
+        self.assertNotIn('tool_args_invalid', self.recs[-1], 'valid arguments: no field')
         self.assertNotIn('_defer_log', self.recs[-1])
+    def setup_mislabeled(self):
+        """A string value the model marked string="false": the reference rule copies it as written -> {"job_id": 3e382151}."""
+        text='ok\n\n' + f'<{D} calls>\n<{D} invoke name="job_wait">\n<{D} parameter name="job_id" string="false">3e382151</{D} parameter>\n</{D} invoke>\n</{D} calls>'
+        s.TOK=CharTok(text)
+        s.ENC=type('Enc', (), {'parse_message_from_completion_text': staticmethod(lambda t, **kw: {'content': 'ok', 'tool_calls': [
+            {'type': 'function', 'function': {'name': 'job_wait', 'arguments': '{"job_id": 3e382151}'}}]})})()
+        s.DAEMON=FlagDaemon(list(range(100, len(text) + 100)) + [99])
+    async def test_invalid_arguments_recorded_stream(self):
+        self.setup_mislabeled()
+        r=await s.chat(Request({**BODY, 'stream': True}))
+        ch=sse_json([x async for x in r.body_iterator])
+        args=''.join(d['function'].get('arguments') or '' for c in ch if c.get('choices') for d in (c['choices'][0]['delta'].get('tool_calls') or []))
+        self.assertEqual(args, '{"job_id": 3e382151}', 'recorded only: the call is sent unchanged')
+        self.assertEqual((len(self.recs), self.recs[-1].get('tool_args_invalid')), (1, ['job_wait']))
+    async def test_invalid_arguments_recorded_once_without_stream(self):
+        self.setup_mislabeled()
+        r=await s.chat(Request({**BODY, 'stream': False}))
+        self.assertEqual(r['choices'][0]['message']['tool_calls'][0]['function']['arguments'], '{"job_id": 3e382151}')
+        self.assertEqual((len(self.recs), self.recs[-1].get('tool_args_invalid')), (1, ['job_wait']), 'one log line, after the parse')
+        self.assertNotIn('_defer_log', self.recs[-1])
+    def test_invalid_tool_args_rule(self):
+        f=s.invalid_tool_args
+        self.assertEqual(f([('a', '{"x": 1}'), ('b', '{}'), ('c', '{"s": "3e382151"}')]), [])
+        self.assertEqual(f([('a', '{"x": 3e382151}'), ('b', '{"x": NaN}'), ('c', '{"x": [Infinity]}'), ('d', '{x}'), ('e', '[1]'), ('f', None)]),
+                         ['a', 'b', 'c', 'd', 'e', 'f'])
     async def test_disconnect_still_logs_once(self):
         self.setup_call([('f', {'a': 'z' * 200})])
         r=await s.chat(Request({**BODY, 'stream': True}))

@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -673,6 +674,36 @@ def parse_completion(text: str, thinking_mode: str, tools):
     return ENC.parse_message_from_completion_text(text, thinking_mode=thinking_mode)
 
 
+def _reject_constant(name: str):
+    raise ValueError(name)
+
+
+def _finite_json(x) -> bool:
+    if isinstance(x, float):
+        return math.isfinite(x)
+    if isinstance(x, list):
+        return all(_finite_json(y) for y in x)
+    if isinstance(x, dict):
+        return all(_finite_json(y) for y in x.values())
+    return True
+
+
+def invalid_tool_args(calls) -> list:
+    """Names of the tool calls whose arguments the client cannot read as a JSON object (not JSON, NaN / Infinity, non-finite).
+    Recorded only (request log field tool_args_invalid), the calls are sent unchanged. DeepSeek copies a value marked
+    string="false" into the arguments as written, so a string the model marks false would land here; none was found in 23,029
+    production tool calls (2026-09-28..10-05) — this field shows whether it ever happens before a schema correction is added."""
+    bad = []
+    for name, args in calls:
+        try:
+            x = json.loads(args, parse_constant=_reject_constant) if isinstance(args, str) else None
+        except ValueError:
+            x = None
+        if not isinstance(x, dict) or not _finite_json(x):
+            bad.append(name)
+    return bad
+
+
 def openai_tool_calls(calls) -> list[dict]:
     """tool_calls from the reference parse_message_from_completion_text are already in OpenAI format ({type, function:{name,
     arguments}}) — converting them again raises KeyError 'name'. Here we only add an id and ensure arguments is a string."""
@@ -1274,7 +1305,7 @@ async def chat(request: Request):
             finally:
                 release_session()
 
-    if not stream:
+    async def complete_once():
         text_parts, done = [], {}
         async with aclosing(run()) as source:
             async for kind, val in source:
@@ -1303,6 +1334,9 @@ async def chat(request: Request):
             message["reasoning_content"] = parsed["reasoning_content"]
         if parsed.get("tool_calls"):
             message["tool_calls"] = openai_tool_calls(parsed["tool_calls"])
+            bad = invalid_tool_args([(c["function"]["name"], c["function"]["arguments"]) for c in message["tool_calls"]])
+            if bad:
+                req_rec["tool_args_invalid"] = bad
         return {
             "id": rid, "object": "chat.completion", "created": created, "model": "hive",
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else ("stop" if done.get("finish") == "stop" else "length"),
@@ -1312,6 +1346,15 @@ async def chat(request: Request):
             "hive": {k: done.get(k) for k in ("prefill_ms", "decode_ms", "cached_prefix", "decode_hit", "decode_cpu", "decode_dma_rows", "cpu_wait_ms", "cpu_span_ms", "timing_scope", "batch_rows", "mtp_steps", "mtp_drafted", "mtp_accepted")
                      + (("think_cap", "think_tokens", "think_forced") if "think_forced" in done else ())},  # only requests with a thinking cap
         }
+
+    if not stream:
+        # One request-log line, written after the parse (tool_args_invalid) — also on the early returns.
+        req_rec["_defer_log"] = True
+        try:
+            return await complete_once()
+        finally:
+            req_rec.pop("_defer_log", None)
+            log_request(req_rec)
 
     async def sse():
         # One request-log line per stream, written after the tail below (tool-call comparison) — also when the client disconnects.
@@ -1400,6 +1443,7 @@ async def chat(request: Request):
         if buf:
             key = "reasoning_content" if in_think else "content"
             yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {key: buf}, 'finish_reason': None}]})}\n\n"
+        sent = []
         if tool_buf:
             try:
                 # the reference parser's tool start marker is "\n\n<｜DSML｜ calls" — re-attach the newlines stripped from the stream so it finds the block
@@ -1411,14 +1455,19 @@ async def chat(request: Request):
                 # calls were already streamed: they stay (a client cannot take them back) — record whether they equal the reference parse
                 ref = [(c["function"]["name"], c["function"]["arguments"]) for c in calls]
                 req_rec["tool_stream"] = "match" if ref == tstream.result() else ("incomplete" if not tstream.complete() else "mismatch")
+                sent = tstream.result()
                 if tstream.complete():
                     finish = "tool_calls"
             elif calls:
+                sent = [(c["function"]["name"], c["function"]["arguments"]) for c in calls]
                 deltas = [{"index": i, "id": c["id"], "type": "function", "function": c["function"]} for i, c in enumerate(calls)]
                 yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'tool_calls': deltas}, 'finish_reason': None}]})}\n\n"
                 finish = "tool_calls"
             else:
                 yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'content': tool_buf}, 'finish_reason': None}]})}\n\n"
+        bad = invalid_tool_args(sent) if tool_buf and sent else []
+        if bad:
+            req_rec["tool_args_invalid"] = bad
         last = {'index': 0, 'delta': {}, 'finish_reason': finish, **({'stop_reason': done['stop_sequence']} if done.get('stop_sequence') and finish == 'stop' else {})}  # D11
         yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [last], 'usage': openai_usage(len(ids), done)})}\n\n"
         yield "data: [DONE]\n\n"
