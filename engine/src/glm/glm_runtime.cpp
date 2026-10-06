@@ -102,27 +102,86 @@ void Runtime::reset_seq(Seq& s) const {
   s.mtp_hidden_valid = false;
 }
 
-// Image layout: per KDA layer conv, state (whole) · per DSA layer c, kI, gs rows [0, pos) and pooled rows [0, pos/pool).
-void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage*) const {
+// Image layout: per KDA layer conv, state (whole) · per DSA layer c, kI, gs rows [0, pos) and pooled rows [0, pos/pool) · with MTP: its c, kI, gs,
+//   pooled rows and the last hidden.
+// HIVE_CKPT_DELTA (the DeepSeek switch): when `base` is an earlier image of the same sequence (same generation, its tokens a prefix of the
+//   sequence's), the rows it already holds are still exact — rows below a committed position are never rewritten (rollbacks stay above it; an
+//   edit resets the generation or breaks the token prefix) — so their segments are shared and only the new rows are copied. MTP rows are
+//   shared only below the base's mtp_written (rows above it may be rewritten); KDA conv / state change every step and are always copied.
+//   Measured motivation (2026-10-05 GLM hived.log, service traffic): the full copy put 1,097 ms on the TTFT of 64K+ prompts (41 ms below 4K).
+void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) const {
   const GlmConfig& c = model_.glm().cfg();
+  const double t0 = hive::mono_ms();
+  const size_t n_bufs = s.conv.size() * 2 + s.c.size() * 4 + (s.h_last.p ? 5 : 0);
+  static const bool delta = [] { const char* v = getenv("HIVE_CKPT_DELTA"); return v && *v && strcmp(v, "0") != 0; }();  // env_on convention
+  if (!delta || !base || base == &img || base->generation != s.generation || base->pos > s.pos || base->bufs.size() != n_bufs ||
+      base->tokens.size() > s.tokens.size() || !std::equal(base->tokens.begin(), base->tokens.end(), s.tokens.begin())) base = nullptr;
   CUDA_CHECK(cudaStreamSynchronize(eng_->stream()));
-  img.pos = s.pos; img.generation = s.generation; img.tokens = s.tokens; img.engram_history.clear(); img.mtp_hidden_valid = s.mtp_hidden_valid;
-  img.h_last_valid = s.h_last_valid; img.mtp_written = s.mtp_written;
-  img.bufs.clear();
-  auto grab = [&](const auto& b, size_t bytes) {
-    img.bufs.emplace_back(bytes);
-    if (bytes) CUDA_CHECK(cudaMemcpy(img.bufs.back().data(), b.p, bytes, cudaMemcpyDeviceToHost));
+  SeqImage out;
+  out.pos = s.pos; out.generation = s.generation; out.tokens = s.tokens; out.mtp_hidden_valid = s.mtp_hidden_valid;
+  out.h_last_valid = s.h_last_valid; out.mtp_written = s.mtp_written;
+  out.bufs.reserve(n_bufs);
+  size_t copied = 0, total = 0;
+  // HIVE_CKPT_VERIFY=N: every N-th image that shares a prefix compares the shared bytes with the device rows they stand for (a full copy of
+  //   those rows — only on the checked images) and prints the result as a [glm-ckpt] verify line — the delta's exactness claim, checked on
+  //   live traffic
+  static const int verify_every = getenv("HIVE_CKPT_VERIFY") ? std::max(0, atoi(getenv("HIVE_CKPT_VERIFY"))) : 0;
+  static long n_shared = 0;
+  const bool verify = base && verify_every > 0 && n_shared++ % verify_every == 0;
+  size_t v_bytes = 0, v_bad = 0;
+  int v_first = -1;
+  std::vector<uint8_t> vtmp;
+  auto grab = [&](const auto& b, size_t bytes, size_t keep) {  // keep = leading bytes of the base's buffer that are still exact
+    HostImageBuffer dst;
+    size_t prefix = 0;
+    if (base) {
+      keep = std::min(keep, bytes);
+      for (const auto& sg : base->bufs[out.bufs.size()].segments) {
+        if (prefix >= keep) break;
+        const size_t n = std::min(sg.n, keep - prefix);  // a leading part of a segment: same allocation, shorter length
+        dst.segments.push_back({sg.data, n});
+        prefix += n;
+      }
+    }
+    if (verify && prefix) {
+      vtmp.resize(prefix);
+      CUDA_CHECK(cudaMemcpy(vtmp.data(), b.p, prefix, cudaMemcpyDeviceToHost));
+      size_t off = 0;
+      for (const auto& sg : dst.segments) {
+        if (std::memcmp(vtmp.data() + off, sg.data.get(), sg.n) != 0) { ++v_bad; if (v_first < 0) v_first = (int)out.bufs.size(); break; }
+        off += sg.n;
+      }
+      v_bytes += prefix;
+    }
+    if (bytes > prefix) {
+      std::shared_ptr<uint8_t> p(new uint8_t[bytes - prefix], std::default_delete<uint8_t[]>());
+      CUDA_CHECK(cudaMemcpy(p.get(), static_cast<const uint8_t*>(b.p) + prefix, bytes - prefix, cudaMemcpyDeviceToHost));
+      dst.segments.push_back({std::move(p), bytes - prefix});
+      copied += bytes - prefix;
+    }
+    total += bytes;
+    out.bufs.push_back(std::move(dst));
   };
-  for (size_t i = 0; i < s.conv.size(); ++i) { grab(s.conv[i], s.conv[i].n); grab(s.state[i], s.state[i].n); }
-  const size_t P = (size_t)s.pos;
+  const size_t P = (size_t)s.pos, BP = base ? (size_t)base->pos : 0, pool = (size_t)c.index_kpool;
+  const size_t BM = base ? (size_t)std::min<int64_t>(base->pos, base->mtp_written) : 0;
+  const size_t row_c = (size_t)c.kv_lora * 2, row_i = (size_t)c.index_dim * 2;
+  for (size_t i = 0; i < s.conv.size(); ++i) { grab(s.conv[i], s.conv[i].n, 0); grab(s.state[i], s.state[i].n, 0); }
   for (size_t i = 0; i < s.c.size(); ++i) {
-    grab(s.c[i], P * c.kv_lora * 2); grab(s.kI[i], P * c.index_dim * 2); grab(s.gs[i], P * c.index_dim * 2);
-    grab(s.pooled[i], (P / c.index_kpool) * c.index_dim * 2);
+    grab(s.c[i], P * row_c, BP * row_c); grab(s.kI[i], P * row_i, BP * row_i); grab(s.gs[i], P * row_i, BP * row_i);
+    grab(s.pooled[i], (P / pool) * row_i, (BP / pool) * row_i);
   }
   if (s.h_last.p) {  // MTP cache (entries < mtp_written are exact; copy up to pos) + last hidden
-    grab(s.mtp_c, P * c.kv_lora * 2); grab(s.mtp_kI, P * c.index_dim * 2); grab(s.mtp_gs, P * c.index_dim * 2);
-    grab(s.mtp_pooled, (P / c.index_kpool) * c.index_dim * 2); grab(s.h_last, s.h_last.n);
+    grab(s.mtp_c, P * row_c, BM * row_c); grab(s.mtp_kI, P * row_i, BM * row_i); grab(s.mtp_gs, P * row_i, BM * row_i);
+    grab(s.mtp_pooled, (P / pool) * row_i, (BM / pool) * row_i); grab(s.h_last, s.h_last.n, 0);
   }
+  img = std::move(out);
+  static const bool trace = getenv("HIVE_PROFILE") && atoi(getenv("HIVE_PROFILE")) > 0;
+  if (trace)  // [glm-ckpt] (tools/hive_monitor.py): one line per image — what was copied against the image size, and the host time
+    fprintf(stderr, "[glm-ckpt] pos %lld base %lld · copied %.1f of %.1f MB · %.1f ms\n", (long long)s.pos, base ? (long long)base->pos : -1LL, copied / 1e6,
+            total / 1e6, hive::mono_ms() - t0);
+  if (verify)
+    fprintf(stderr, "[glm-ckpt] verify pos %lld base %lld · shared %.1f MB · %s\n", (long long)s.pos, (long long)base->pos, v_bytes / 1e6,
+            v_bad ? ("⚠️MISMATCH in " + std::to_string(v_bad) + " buffers (first " + std::to_string(v_first) + ")").c_str() : "ok");
 }
 
 void Runtime::load_image(Seq& s, const SeqImage& img) const {
@@ -131,7 +190,11 @@ void Runtime::load_image(Seq& s, const SeqImage& img) const {
   size_t k = 0;
   auto put = [&](auto& b) {
     HIVE_CHECK(k < img.bufs.size() && img.bufs[k].size() <= b.n, "GLM image layout mismatch");
-    if (!img.bufs[k].empty()) CUDA_CHECK(cudaMemcpy(b.p, img.bufs[k].data(), img.bufs[k].size(), cudaMemcpyHostToDevice));
+    size_t off = 0;
+    for (const auto& sg : img.bufs[k].segments) {
+      CUDA_CHECK(cudaMemcpy(static_cast<uint8_t*>(b.p) + off, sg.data.get(), sg.n, cudaMemcpyHostToDevice));
+      off += sg.n;
+    }
     ++k;
   };
   for (size_t i = 0; i < s.conv.size(); ++i) { put(s.conv[i]); put(s.state[i]); }
@@ -198,6 +261,21 @@ void Runtime::stats_delta(ForwardStats* st, const GlmCacheStats& b) const {
   const GlmCacheStats& a = store_.experts().stats();
   st->n_routed += (int)(a.routed - b.routed); st->n_hit += (int)(a.hit - b.hit); st->n_cpu += (int)(a.cpu - b.cpu);
   st->n_streamed += (int)(a.streamed - b.streamed); st->n_promoted += (int)(a.promoted - b.promoted);
+}
+
+// HIVE_PROFILE=N [call-host <kind>] (hived_family.h CallHost)
+void Runtime::call_host(int kind, int rows, double t0, double eng_ms, double logits_ms, double cands_ms) {
+  static const int every = getenv("HIVE_PROFILE") ? std::max(0, atoi(getenv("HIVE_PROFILE"))) : 0;
+  if (every <= 0) return;
+  static const char* const names[3] = {"decode", "verify", "verify-batch"};
+  CallHost& c = call_host_[kind];
+  const double t1 = hive::mono_ms();
+  ++c.n; c.rows += rows; c.eng += eng_ms; c.logits += logits_ms; c.cands += cands_ms; c.total += t1 - t0;
+  if (c.n < every) return;
+  const double n = (double)c.n;
+  fprintf(stderr, "[call-host %s] calls %ld · rows %.2f · eng %.3f · logits %.3f · cands %.3f · rest %.3f ms/call\n", names[kind], c.n, c.rows / n, c.eng / n,
+          c.logits / n, c.cands / n, (c.total - c.eng - c.logits - c.cands) / n);
+  c = CallHost{};
 }
 
 // HIVE_TRACE_CACHE (the DeepSeek switch and line format — tools/hive_monitor.py): one [cache] line per decode / verify step, with the VRAM
@@ -313,21 +391,26 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
   try {
     eng_->decode(gs.data(), ids, M, logits_pin_);
   } catch (...) { for (Seq* s : seqs) s->broken = true; throw; }
-  if (prof_on()) prof_add("decode M=" + std::to_string(M), hive::mono_ms() - t0, e0, eng_->stats(), before, store_.experts().stats());
+  const double t_eng = hive::mono_ms();
+  if (prof_on()) prof_add("decode M=" + std::to_string(M), t_eng - t0, e0, eng_->stats(), before, store_.experts().stats());
   if (since_prefill_ < (1 << 30)) ++since_prefill_;
+  const double t_c0 = hive::mono_ms();
   cands_dev(M);
+  const double t_c1 = hive::mono_ms();
   for (Seq* q : seqs) q->mtp_hidden_valid = q->h_last_valid && eng_->mtp_on();
   next.assign(next_h_, next_h_ + M);
   if (logits_out) {
     logits_out->assign(M, std::vector<float>());
     for (int m = 0; m < M; ++m) (*logits_out)[m].assign(logits_pin_ + (size_t)m * V, logits_pin_ + (size_t)(m + 1) * V);
   }
+  const double t_lg = hive::mono_ms();
   stats_delta(stats, before);
   if (stats) {
     stats->row_hit.assign(M, 0); stats->row_cpu.assign(M, 0); stats->row_dma.assign(M, 0);
     for (int m = 0; m < M; ++m) { stats->row_hit[m] = store_.experts().row_hit(m); stats->row_cpu[m] = store_.experts().row_cpu(m); }
     stats->ms_total += hive::mono_ms() - t0;
   }  cache_line(M, before, t0);
+  call_host(0, M, t0, t_eng - t0, t_lg - t_c1, t_c1 - t_c0);
 }
 
 void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats* stats) {
@@ -354,14 +437,19 @@ void Runtime::forward_verify(Seq& seq, const int32_t* ids, int M, std::vector<fl
   try {
     eng_->verify(seq, ids, M, logits_pin_);
   } catch (...) { seq.broken = true; throw; }
+  const double t_eng = hive::mono_ms();
   logits_rows.assign(logits_pin_, logits_pin_ + (size_t)M * V);
+  const double t_lg = hive::mono_ms();
   if (prof_on()) prof_add(std::string(since_prefill_ < kWarmSteps ? "verify(warm) M=" : "verify M=") + std::to_string(M), hive::mono_ms() - t0, e0, eng_->stats(), before,
                           store_.experts().stats());
   if (since_prefill_ < kWarmSteps) ++warm_samples_;  // cache still warming: not a representative step cost (see graph_captures)
   if (since_prefill_ < (1 << 30)) ++since_prefill_;
+  const double t_c0 = hive::mono_ms();
   cands_dev(M);  // candidates of every verify row (row_inv_temp set by the caller)
+  const double t_c1 = hive::mono_ms();
   stats_delta(stats, before);
   if (stats) stats->ms_total += hive::mono_ms() - t0;  cache_line(M, before, t0);
+  call_host(1, M, t0, t_eng - t0, t_lg - t_eng, t_c1 - t_c0);
 }
 
 void Runtime::rollback(Seq& seq, int n_keep) {
@@ -385,15 +473,20 @@ void Runtime::forward_verify_batch(std::vector<VerifyPart>& parts, std::vector<f
   try {
     eng_->verify_batch(seqs.data(), Ms.data(), S, ids.data(), logits_pin_);
   } catch (...) { for (auto& p : parts) p.seq->broken = true; throw; }
+  const double t_eng = hive::mono_ms();
   logits_rows.assign(logits_pin_, logits_pin_ + (size_t)R * V);
+  const double t_lg = hive::mono_ms();
   if (prof_on()) prof_add("verify-batch S=" + std::to_string(S) + " R=" + std::to_string(R), hive::mono_ms() - t0, e0, eng_->stats(), before,
                           store_.experts().stats());
   if (since_prefill_ < kWarmSteps) ++warm_samples_;
   if (since_prefill_ < (1 << 30)) ++since_prefill_;
+  const double t_c0 = hive::mono_ms();
   cands_dev(R);
+  const double t_c1 = hive::mono_ms();
   stats_delta(stats, before);
   if (stats) stats->ms_total += hive::mono_ms() - t0;
   vb_seqs_ = seqs;  cache_line(R, before, t0);
+  call_host(2, R, t0, t_eng - t0, t_lg - t_eng, t_c1 - t_c0);
 }
 
 void Runtime::rollback_batch(const std::vector<int>& n_keep) {
@@ -411,13 +504,17 @@ void Runtime::layer_yield_point() {
   ly_.floor = rows_cap_;
   ly_.cap = eng_->yield_rows_cap();
   GlmEngine::YieldSave sv;
+  double t_body = 0;  // [glm-prefill] yield time (glm_engine.h pf_yield_body_ms): entry after the stream is drained → exit
   ly::yield_point(
       ly_,
       [&](int) {
         CUDA_CHECK(cudaStreamSynchronize(eng_->stream()));
-        return eng_->yield_enter(sv);
+        const bool ok = eng_->yield_enter(sv);
+        if (ok) t_body = hive::mono_ms();
+        return ok;
       },
       [&](int) {
+        if (t_body > 0) { eng_->pf_yield_body_ms += hive::mono_ms() - t_body; t_body = 0; }
         cudaStreamSynchronize(eng_->stream());  // (no throw — this also runs while an exception from the yield body unwinds)
         eng_->yield_exit(sv);
       },

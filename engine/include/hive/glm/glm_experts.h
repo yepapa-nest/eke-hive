@@ -112,6 +112,16 @@ class GlmExperts {
   //   finished (gend), CPU results added (acc, only when the layer had CPU work: cpu = true). nullptr = no marks (every other step).
   struct LayerMarks { cudaEvent_t exp = nullptr, gend = nullptr, acc = nullptr; bool cpu = false; };
   void set_layer_marks(LayerMarks* m) { marks_ = m; }
+  // [glm-prefill] (GlmEngine::prefill with HIVE_PROFILE): host time of prefill_layer between its own synchronizations — prep = routing table,
+  //   CPU-share selection and the CPU rows' gather (GPU idle) · gpu = issuing the GPU experts plus the final synchronization (expert
+  //   compute and the streamed copies) · join = waiting for the CPU share after issuing. The engine points this at its own record per
+  //   prefill call (a prefill admitted inside a layer yield has its own); nullptr = not measured.
+  struct PfMoe { double prep = 0, gpu = 0, join = 0; long layers = 0, hit = 0, streamed = 0, cpu = 0; };  // hit / cpu = expert rows · streamed = records
+  void set_prefill_moe(PfMoe* p) { pf_moe_ = p; }
+  PfMoe* prefill_moe() const { return pf_moe_; }
+  size_t record_bytes() const { return L_.total; }
+  double prefill_copy_ms() const { return pf_copy_ms_; }  // HIVE_GLM_PREFILL_ADAPT estimates (printed on [glm-prefill])
+  double prefill_pass_ms() const { return pf_pass_ms_; }
 
  private:
   void cpu_experts(int li, const std::vector<std::pair<int, std::vector<std::pair<int, float>>>>& jobs, const float* x_host, float* y_host);
@@ -185,6 +195,8 @@ class GlmExperts {
   std::vector<float> scr_g_, scr_u_, scr_y_, scr_o_;  // cpu_experts scratch (reused across calls)
   std::vector<size_t> job_off_;
   GlmCacheStats stats_;
+  PfMoe* pf_moe_ = nullptr;
+  double pf_copy_ms_ = 0.507, pf_pass_ms_ = 0.17;  // HIVE_GLM_PREFILL_ADAPT: measured cost of a streamed record / a CPU 8-row pass (prefill_layer)
   int row_hit_[64] = {}, row_cpu_[64] = {};
   void* blas_ = nullptr;
 };

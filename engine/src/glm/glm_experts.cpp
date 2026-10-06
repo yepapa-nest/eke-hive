@@ -570,7 +570,14 @@ void GlmExperts::decode_layer(int li, int M, const int32_t* ids, const float* w,
   stats_.ms_layer += ms_since0(T0);
 }
 
+namespace {
+double pf_now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+}  // namespace
+
 void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w, const bf16* x_dev, float* out_dev, cudaStream_t st) {
+  PfMoe* const pm = pf_moe_;  // [glm-prefill] (set_prefill_moe)
+  const double tp0 = pm ? pf_now_ms() : 0;
+  const GlmCacheStats s0 = pm ? stats_ : GlmCacheStats{};
   commit_ready();
   Blas& blas = *static_cast<Blas*>(blas_);
   blas.set_stream(st);
@@ -617,7 +624,13 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
   //   ~0.17 ms with the whole pool) than over PCIe (0.507 ms per record, measured). Fewest-rows-first up to 24 rows, while the CPU
   //   estimate stays below the GPU's remaining transfer time; the CPU part runs on a helper thread while this thread issues the GPU part.
   static const bool pf_cpu = !(getenv("HIVE_GLM_PREFILL_CPU") && strcmp(getenv("HIVE_GLM_PREFILL_CPU"), "0") == 0);
-  constexpr double kPcieMs = 0.507, kCpuPassMs = 0.17;
+  // HIVE_GLM_PREFILL_ADAPT (default on; "0" = the fixed estimates below): the split uses the measured cost of a streamed record and of a CPU
+  //   pass (moving averages over the previous prefill layers) instead of the fixed 0.507 / 0.17 ms. Measured motivation (2026-10-06 service
+  //   traffic, [glm-prefill]): a record took 0.65-0.85 ms, the CPU finished its share early (cpu-join ~0) and the GPU streamed 1,257
+  //   records per 65-256-row prefill = 1,072 of its 1,135 ms. An expert goes to the CPU while its CPU cost stays below one record's copy;
+  //   only which path computes an expert changes — the CPU (fp32) and GPU (bf16) results can differ by rounding, as before when the cache state moved the split.
+  static const bool adapt = !(getenv("HIVE_GLM_PREFILL_ADAPT") && strcmp(getenv("HIVE_GLM_PREFILL_ADAPT"), "0") == 0);
+  const double kPcieMs = adapt ? pf_copy_ms_ : 0.507, kCpuPassMs = adapt ? pf_pass_ms_ : 0.17;
   std::vector<char> on_cpu(E_, 0);
   std::vector<std::pair<int, std::vector<std::pair<int, float>>>> cjobs;
   std::vector<int32_t> crow;  // compact row → chunk row
@@ -628,8 +641,8 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
     double gpu_t = miss.size() * kPcieMs, cpu_t = 0;
     for (int e : miss) {
       const size_t R = per[e].size();
-      if (R > 24) break;
       const double cc = ((R + 7) / 8) * kCpuPassMs;
+      if (adapt ? cc >= kPcieMs : R > 24) break;  // fewest rows first: once one expert is cheaper to copy, the rest are too
       if (cpu_t + cc > gpu_t - kPcieMs) break;
       on_cpu[e] = 1; cpu_t += cc; gpu_t -= kPcieMs;
     }
@@ -645,6 +658,8 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
     }
   }
   const int nc = (int)crow.size();
+  size_t pf_passes = 0;
+  double pf_cpu_ms = 0;
   std::thread cpu_thread;
   if (nc > 0) {
     if ((size_t)nc > pf_c_cap_) {
@@ -661,7 +676,11 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
     gather_rows(x_dev, pf_crow_d_, nc, H_, pf_cx_d_, st);           // the CPU rows, compacted on the GPU
     dcopy(pf_cx_h_, pf_cx_d_, (size_t)nc * H_ * 2, st);              // → pinned host (SM copy, UVA)
     CUDA_CHECK(cudaStreamSynchronize(st));
-    cpu_thread = std::thread([this, li, nc, &cjobs] {
+    for (auto& j : cjobs) pf_passes += (j.second.size() + 7) / 8;
+    cpu_thread = std::thread([this, li, nc, &cjobs, &pf_cpu_ms] {
+      const auto tc0 = std::chrono::steady_clock::now();
+      struct Done { const std::chrono::steady_clock::time_point& t; double& ms;
+        ~Done() { ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } } done{tc0, pf_cpu_ms};
       pf_cxf_.resize((size_t)nc * H_);
       for (size_t i = 0; i < (size_t)nc * H_; ++i) pf_cxf_[i] = bf2f(pf_cx_h_[i]);
       std::memset(pf_cy_h_, 0, (size_t)nc * H_ * 4);
@@ -671,6 +690,8 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
   }
   // one upload of the whole table at the start of the layer (the previous layer's staging copies have finished — synchronized at its end;
   //   kernels reading the table from pinned host memory instead re-read every index per element over PCIe: 15K prefill 8.0 → 11.2 s)
+  const double tp1 = pf_now_ms();
+  const uint64_t streamed0 = stats_.streamed;
   CUDA_CHECK(cudaMemcpyAsync(pf_idx_d_, pf_idx_h_, total * 4, cudaMemcpyHostToDevice, st));
   CUDA_CHECK(cudaMemcpyAsync(pf_w_d_, pf_w_h_, total * 4, cudaMemcpyHostToDevice, st));
   int stage_next = 0;
@@ -703,11 +724,25 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
     scatter_add_rows(rows_o_, ri, rwp, R, H_, out_dev, st);
     if (si >= 0) CUDA_CHECK(cudaEventRecord(stage_ev_[si], st));
   }
+  const double tp2 = pf_now_ms();
   if (cpu_thread.joinable()) {
     cpu_thread.join();
     scatter_add_f32_rows(pf_cy_h_, pf_crow_d_, nc, H_, out_dev, st);  // CPU results (route weights applied), read from pinned memory
   }
+  const double tp3 = pf_now_ms();
   CUDA_CHECK(cudaStreamSynchronize(st));  // the pinned index table is rewritten by the next layer
+  {  // HIVE_GLM_PREFILL_ADAPT samples: a record = GPU span / records streamed (enough records that copies dominate the span), a CPU pass =
+     //   the CPU share's host time / its 8-row passes; clamped so one odd layer cannot swing the split
+    const double gpu_ms = (tp2 - tp1) + (pf_now_ms() - tp3);
+    const uint64_t ns = stats_.streamed - streamed0;
+    if (ns >= 16) pf_copy_ms_ = 0.8 * pf_copy_ms_ + 0.2 * std::min(3.0, std::max(0.2, gpu_ms / ns));
+    if (pf_passes >= 16) pf_pass_ms_ = 0.8 * pf_pass_ms_ + 0.2 * std::min(2.0, std::max(0.02, pf_cpu_ms / pf_passes));
+  }
+  if (pm) {
+    const double tp4 = pf_now_ms();
+    pm->prep += tp1 - tp0; pm->gpu += (tp2 - tp1) + (tp4 - tp3); pm->join += tp3 - tp2; ++pm->layers;
+    pm->hit += stats_.hit - s0.hit; pm->streamed += stats_.streamed - s0.streamed; pm->cpu += stats_.cpu - s0.cpu;
+  }
 }
 
 uint8_t* GlmExperts::lend_tail_slots(int n) {

@@ -6,9 +6,10 @@
 // Requests (one JSON object per line):
 //   {"op":"generate","rid":"<client request id>","session":"s1","ids":[...],"max_tokens":256 (omitted or 0 = the rest of the context),"temperature":1.0,"top_p":0.95,"top_k":0,"min_p":0,
 //    "stop_ids":[1],"seed":0, "images":[{"start":12,"n_vit_h":..,"n_vit_w":..,"nbytes":..,"types":[...]}], "bin":<byte count of the bf16 image patches>,
-//    optional thinking cap: "think_cap":N,"think_end_id":id,"think_start_id":id,"think_open":true,"think_exit_ids":[...]; optional "prefix_extra":1}
+//    optional thinking cap: "think_cap":N,"think_end_id":id,"think_start_id":id,"think_open":true,"think_exit_ids":[...]; optional "prefix_extra":1;
+//    optional "stages":true (adds {"admitted":true,"cached":c,"total":n} once the reuse is decided — sent only to requests that ask)}
 //   {"op":"cancel","rid":...} · {"op":"flush"} · {"op":"sleep","level":1|2|3} · {"op":"wake"} · {"op":"stats"}
-//   -> response lines: {"id":123} ... {"done":true,"n":k,"finish":"stop|length","prefill_ms":..,"decode_ms":..,"cached_prefix":p}
+//   -> response lines: [{"admitted":...} with "stages"] {"progress":i,"total":n} after each prefill chunk · {"id":123} ... {"done":true,"n":k,"finish":"stop|length","prefill_ms":..,"decode_ms":..,"cached_prefix":p}
 //   {"op":"cancel","session":"s1"}  -> {"ok":true}
 //   {"op":"cancel","session":"s1","rid":"r1"}  -> {"ok":true}  (with rid: only the request that passed the same rid to generate)
 //   {"op":"stats"} -> cache and routing statistics ("state": ready|draining|sleeping|waking, "vram", the last "sleep"/"wake" report)
@@ -1092,6 +1093,7 @@ int main(int argc, char** argv) {
   };
   // Admit one request: prefill it and put it in active (on failure or cancel: respond and drop it)
   std::function<void()> decode_step;  // defined below (declared first because it is called between prefill chunks)
+  long prefill_epoch = 0;  // [step-host]: bumped before every prefill forward and at every layer-yield run — a decode-step gap that saw a change is not counted
   double last_prefill_tc = 0;  // HIVE_PREFILL_FAIR: wall clock of this admission's (admit or admit_batch) last prefill forward (a round for batches) — read only by HIVE_PREFILL_FAIR
   // values shared by the admit stages
   static const bool image_ckpt = getenv("HIVE_IMAGE_CKPT") && *getenv("HIVE_IMAGE_CKPT") && strcmp(getenv("HIVE_IMAGE_CKPT"), "0") != 0;  // env_on convention (unset/""/"0" = off — atoi would read "true" as off)
@@ -1460,6 +1462,10 @@ int main(int argc, char** argv) {
       if (k == (size_t)S->live->pos && ids.size() > k) { common = k; pick = 3; }
     }
     if (!S->seq) S->seq = take_seq();
+    // the session's token count before the decision below rewrites it — the log line used to print the count after a reset (always 0), which
+    //   read as "the session lost its state" when the client had in fact rewritten an earlier part of the prompt (2026-10-06 audit of 145 such
+    //   lines: 88 rewritten prompts, 50 identical re-sends, 4 changed outputs, 3 after a cancel — none was a lost session)
+    const size_t session_tokens = S->tokens.size();
     if (pick == 0 || pick == 2 || pick == 3) {
       if (pick == 0) { rt.reset_seq(*S->seq); S->img_sig.clear(); }
       else { rt.load_image(*S->seq, pick == 2 ? *S->ckpt : *S->live); S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig; }
@@ -1468,7 +1474,7 @@ int main(int argc, char** argv) {
     S->live.reset();  // an archived last state is used once (or dropped on mismatch) — the session is live again
     if (!S->tokens.empty() || live_lcp)
       fprintf(stderr, "[hived] %s: reuse %zu/%zu via %s (session tokens %zu · common with live %zu)\n", A->sid.c_str(), common, ids.size(),
-              pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : "reset", S->tokens.size(), live_lcp);
+              pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : "reset", session_tokens, live_lcp);
     S->last_used = now_ms();
     A->cancel = A->r.cancel.get();
     // Images: metadata + bin (concatenated bf16 patches). A span must fit entirely in one prefill chunk (chunk boundaries are cut before the span).
@@ -1577,6 +1583,11 @@ int main(int argc, char** argv) {
     }
     A->common = common;
     A->prompt_len = ids.size();
+    // "stages": true (the API server's HIVE_STAGE_STATUS — the engine status of a request): one line once the reuse is decided, before the
+    //   prefill — how much of the prompt is reused and how much will be read. Requests without it get no new line.
+    if (q.contains("stages") && q["stages"].is_boolean() && q["stages"].get<bool>() &&
+        !send_json(A->r.fd, {{"admitted", true}, {"cached", (int)common}, {"total", (int)ids.size()}}))
+      A->client_ok = false;
     // Boundaries supplied by the server (the request's "boundaries") — integers only, inside (0, length), sorted and deduplicated. Unknown formats are dropped (absorbed).
     auto& hints = J.hints;
     if (prefix_share && !fake_head && (!has_images || image_ckpt) && q.contains("boundaries") && q["boundaries"].is_array()) {
@@ -1757,6 +1768,7 @@ int main(int argc, char** argv) {
       const double tc0 = now_ms();
       const ly::Stats ly0 = rt.layer_yield_stats();
       if (!rt.in_layer_yield()) { ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0; }  // HIVE_LAYER_YIELD_MID
+      ++prefill_epoch;
       rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
       const double tend = now_ms();
       // HIVE_LAYER_YIELD: tc = the prefill share (minus layer-yield time — so the EMA and the decode_between budget do not count yield time as prefill)
@@ -2000,6 +2012,7 @@ int main(int argc, char** argv) {
           ly_rest_rows -= std::min(ly_rest_rows, rows);
         }
         try {
+          ++prefill_epoch;
           rt.forward_multi(ps, &rs);
         } catch (const std::exception& e) {
           fprintf(stderr, "[hived] batch prefill failed: %s — %zu requests retried one by one\n", e.what(), jobs.size());
@@ -2040,6 +2053,7 @@ int main(int argc, char** argv) {
         try {
           const ly::Stats ly0 = rt.layer_yield_stats();
           ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0;  // HIVE_LAYER_YIELD_MID (solo forward of a batch round)
+          ++prefill_epoch;
           rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
           const double tend = now_ms();
           J.ly_n = rt.layer_yield_stats().yields - ly0.yields;  // HIVE_LAYER_YIELD (same as the single path)
@@ -2077,6 +2091,20 @@ int main(int argc, char** argv) {
     if (stop) { A.finish = "stop"; return false; }
     return A.n < A.max_tokens;
   };
+  // HIVE_PROFILE=N: host time of decode steps, one [step-host <kind>] line per N steps of a kind (tools/hive_monitor.py). Kinds: spec (one
+  //   request, MTP verify) · spec-batch (HIVE_MTP_BATCH verify) · plain (forward_batch, including a declined draft). Per step:
+  //   gap   = previous step's end → this step's start, counted only while requests stayed active and no prefill forward or layer-yield run
+  //           happened in between (prefill_epoch) — the main loop's host work between steps (n = counted gaps)
+  //   pre   = step start → the forward, minus draft time (sampling the pending token, emit/send, deferred checkpoints, gate decisions)
+  //   draft = MTP draft calls · fwd = the runtime's forward call (verify / batch — split further by [call-host])
+  //   post  = forward end → step end (row sampling and acceptance, rollback, bookkeeping, [mtp] lines, finished requests)
+  struct StepHost { long n = 0, gap_n = 0; double gap = 0, pre = 0, draft = 0, fwd = 0, post = 0; };
+  static const int step_host_every = getenv("HIVE_PROFILE") ? std::max(0, atoi(getenv("HIVE_PROFILE"))) : 0;
+  StepHost step_host[3];
+  double sh_draft = 0, sh_f0 = -1, sh_f1 = -1, sh_prev_end = 0;
+  int sh_kind = -1, sh_depth = 0;  // sh_depth: only the outermost decode step is accounted
+  bool sh_nested = false;  // a nested decode step ran inside the outer one and overwrote its marks — the outer step is not accounted
+  long sh_prev_epoch = -1;
   decode_step = [&] {
     // refresh the warm-start file (every 60 s) — at the very top because the speculative path returns from the middle of this function
         // (placed at the end, it was never saved with a single stream)
@@ -2154,6 +2182,7 @@ int main(int argc, char** argv) {
       ForwardStats dst{};
       rt.mtp_draft(seq, tok, drafts, conf, &dst);
       const double tv = now_ms();
+      sh_draft += tv - td;
       draft_routed += dst.n_routed; draft_hit += dst.n_hit; draft_cpu += dst.n_cpu; draft_dma_rows += dst.n_dma_rows; draft_ms += tv - td;
       ema(ema_draft_ms, tv - td);
       if (mtp_gate2) gate2.observe_draft(tv - td);
@@ -2184,7 +2213,9 @@ int main(int argc, char** argv) {
         ForwardStats ds{};
         for (int i = 0; i <= k; ++i) rt.row_inv_temp()[i] = A.temperature > 0.f ? 1.f / A.temperature : 1.f;
         const long cap_v = rt.graph_captures();  // HIVE_MTP_GATE3
+        sh_f0 = now_ms();
         rt.forward_verify(seq, ids.data(), (int)ids.size(), rows, &ds);
+        sh_f1 = now_ms(); sh_kind = 0;
         ema(ema_verify_ms[std::min(8, k + 1)], now_ms() - tv);
         const int V = c.vocab;
         int n_keep = 1, n_cmp = 0;  // n_cmp: drafts compared (for gate 2 acceptance learning)
@@ -2281,6 +2312,7 @@ int main(int argc, char** argv) {
         ++n_drafts_made;
       }
       const double tv = now_ms();
+      sh_draft += tv - td;
       draft_ms += tv - td;
       if (n_drafts_made > 0) gate_b.observe_draft((tv - td) / n_drafts_made);
       bool smp[mtpg::kMaxRows];
@@ -2313,7 +2345,9 @@ int main(int argc, char** argv) {
         std::vector<float> brows;
         ForwardStats ds{};
         const long cap_v = rt.graph_captures(), eag_v = rt.graph_eager_runs();  // filter captures and first uses
+        sh_f0 = now_ms();
         rt.forward_verify_batch(parts, brows, &ds);
+        sh_f1 = now_ms(); sh_kind = 1;
         const int V = c.vocab;
         std::vector<int32_t> bnxt(S, -1);
         std::vector<char> bcont(S, 1);
@@ -2380,7 +2414,9 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < stepping.size(); ++i) rt.row_inv_temp()[i] = stepping[i]->temperature > 0.f ? 1.f / stepping[i]->temperature : 1.f;
       const double tb = now_ms();
       const long cap_b = rt.graph_captures(), eag_b = rt.graph_eager_runs();  // HIVE_MTP_GATE3 · HIVE_MTP_BATCH (first uses as well)
+      sh_f0 = tb;
       rt.forward_batch(step_seqs, step_ids.data(), step_next, &step_logits, &ds);
+      sh_f1 = now_ms(); sh_kind = 2;
       const bool cap_clean = rt.graph_captures() == cap_b;
       const bool eag_clean = rt.graph_eager_runs() == eag_b;
       if (stepping.size() == 1) { ema(ema_single_ms, now_ms() - tb); if (stepping[0]->mtp_skip > 0) --stepping[0]->mtp_skip; if (mtp_gate2 && (!mtp_gate3 || cap_clean)) gate2.observe_step(1, now_ms() - tb); }
@@ -2408,8 +2444,37 @@ int main(int argc, char** argv) {
   // Wrap the callable itself, so both the main loop and interleaved prefill decode
   // use the same failure boundary. CUDA_CHECK remains fatal for a broken context.
   auto decode_inner = std::move(decode_step);
+  auto step_host_end = [&](double t_in, double gap) {  // [step-host] accounting of the step that just returned (see StepHost)
+    const double t_out = now_ms();
+    if (sh_kind >= 0) {
+      StepHost& h = step_host[sh_kind];
+      ++h.n; h.pre += sh_f0 - t_in - sh_draft; h.draft += sh_draft; h.fwd += sh_f1 - sh_f0; h.post += t_out - sh_f1;
+      if (gap >= 0) { ++h.gap_n; h.gap += gap; }
+      if (h.n >= step_host_every) {
+        static const char* const names[3] = {"spec", "spec-batch", "plain"};
+        const double n = (double)h.n;
+        fprintf(stderr, "[step-host %s] steps %ld · gap %.3f (n %ld) · pre %.3f · draft %.3f · fwd %.3f · post %.3f ms/step\n", names[sh_kind], h.n,
+                h.gap_n ? h.gap / h.gap_n : 0.0, h.gap_n, h.pre / n, h.draft / n, h.fwd / n, h.post / n);
+        h = StepHost{};
+      }
+    }
+    sh_prev_end = active.empty() ? 0 : t_out;
+    sh_prev_epoch = prefill_epoch;
+  };
   decode_step = [&] {
-    try { decode_inner(); }
+    struct Depth { int& d; ~Depth() { --d; } } depth{++sh_depth};
+    const bool sh_on = step_host_every > 0 && sh_depth == 1;
+    double t_in = 0, gap = -1;
+    if (sh_on) {
+      t_in = now_ms();
+      if (sh_prev_end > 0 && sh_prev_epoch == prefill_epoch) gap = t_in - sh_prev_end;
+      sh_draft = 0; sh_f0 = sh_f1 = -1; sh_kind = -1; sh_nested = false;
+    } else if (step_host_every > 0) sh_nested = true;
+    try {
+      decode_inner();
+      if (sh_on && !sh_nested) step_host_end(t_in, gap);
+      else if (sh_on) { sh_prev_end = active.empty() ? 0 : now_ms(); sh_prev_epoch = prefill_epoch; }
+    }
     catch (const std::exception& e) {
       fprintf(stderr, "[hived] decode failed: %s\n", e.what());
       rt.quiesce_after_host_error();
@@ -2487,6 +2552,7 @@ int main(int argc, char** argv) {
       const bool nested = in_yield;  // level 2 (inside a forward admitted by a yield): decode steps only
       struct InYield { bool& f; bool was; ~InYield() { f = was; } } in_yield_guard{in_yield, in_yield};
       in_yield = true;
+      ++prefill_epoch;  // prefill layers ran since the last decode step
       const double t0 = now_ms();
       const double saved_tc = last_prefill_tc;  // HIVE_PREFILL_FAIR looks at the outer admission's last prefill forward
       std::string who;

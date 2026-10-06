@@ -1096,6 +1096,77 @@ async def models():
     return {"object": "list", "data": [{"id": "hive", "object": "model", "owned_by": "eke-hive"}]}
 
 
+# HIVE_STAGE_STATUS (default off): the engine-side stage of each request, for clients that want to show what a response is waiting on.
+#   GET /v1/hive/requests/{id} (id = the response id, "chatcmpl-…", sent in the first stream chunk) →
+#   {"id", "stage": queued | prefill | thinking | tool_call | answer | done | error, "prompt_tokens", "cached_tokens", "prefill_total",
+#    "prefill_done", "tool_name", "updated"}. queued = waiting for the engine to admit it (other requests run), prefill = reading the
+#   prompt (cached_tokens reused, prefill_total to read, prefill_done after each chunk), then the generated text's stage. Off = the route
+#   answers 404 and nothing else changes (responses are byte-identical; the daemon line "admitted" is only sent when asked for).
+#   Entries live while the request runs and STAGE_KEEP_S after it ends.
+STAGE_STATUS = env_on("HIVE_STAGE_STATUS")
+STAGE_KEEP_S = 120.0
+STAGES: dict = {}
+
+
+def stage_open(rid: str, prompt_tokens: int) -> None:
+    now = time.time()
+    for k in [k for k, v in STAGES.items() if v.get("_ended") and now - v["_ended"] > STAGE_KEEP_S]:
+        STAGES.pop(k, None)
+    STAGES[rid] = {"stage": "queued", "prompt_tokens": prompt_tokens, "updated": round(now, 3)}
+
+
+def stage_update(rid: str, ended: bool = False, **kw) -> None:
+    st = STAGES.get(rid)
+    if st is None:
+        return
+    st.update(kw)
+    st["updated"] = round(time.time(), 3)
+    if ended:
+        st["_ended"] = time.time()
+
+
+class StageText:
+    """Stage of the generated text (HIVE_STAGE_STATUS): thinking until </think> in thinking mode, then answer; tool_call from the family's
+    tool-call start on, with the tool name once the format has written it (GLM `<tool_call>name<arg_key>`, DeepSeek DSML `invoke name="…"`).
+    feed() returns True when the stage or the tool name changed."""
+
+    _DS_NAME = re.compile(r'invoke name="([^"]+)"')
+    _GLM_NAME = re.compile(r"^\s*([^<\s]+)\s*<")
+
+    def __init__(self, thinking: bool):
+        self.stage = "thinking" if thinking else "answer"
+        self.tool = None
+        self.buf = ""
+
+    def feed(self, text: str) -> bool:
+        if not text or (self.stage == "tool_call" and self.tool):
+            return False
+        before = (self.stage, self.tool)
+        self.buf = (self.buf + text)[-8192:]
+        if self.stage == "thinking":
+            j = self.buf.find("</think>")
+            if j < 0:
+                return False
+            self.stage, self.buf = "answer", self.buf[j + len("</think>"):]
+        if self.stage == "answer":
+            j = self.buf.find(DSML_START)
+            if j >= 0:
+                self.stage, self.buf = "tool_call", self.buf[j + len(DSML_START):]
+        if self.stage == "tool_call" and not self.tool:
+            m = self._DS_NAME.search(self.buf) or self._GLM_NAME.match(self.buf)
+            if m:
+                self.tool = m.group(1)[:80]
+        return (self.stage, self.tool) != before
+
+
+@app.get("/v1/hive/requests/{rid}")
+async def stage_status(rid: str):
+    st = STAGES.get(rid) if STAGE_STATUS else None
+    if st is None:
+        return JSONResponse({"error": {"message": "not found", "type": "not_found"}}, status_code=404)
+    return {"id": rid, **{k: v for k, v in st.items() if not k.startswith("_")}}
+
+
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     t_recv = time.time() * 1000.0
@@ -1107,14 +1178,23 @@ async def chat(request: Request):
     tools = body.get("tools")
     thinking_mode, effort = effort_from_request(body)
     try:
+        prep_ms = {}  # request record "prep_ms": where the server's time before the engine goes (lock wait, chat template, tokenizer, boundary hints)
         def prepare():
+            t0 = time.perf_counter()
             with ENCODE_LOCK:
+                t1 = time.perf_counter()
                 prompt, media = encode_prompt(messages, tools, thinking_mode, effort)
+                t2 = time.perf_counter()
                 ids, images, blob = tokenize_with_images(prompt, media)
+                t3 = time.perf_counter()
                 # H5: boundary hints are computed only with HIVE_PREFIX_SHARE (same container env as hived — off = zero cost, no field)
                 hints = boundary_hints(messages, tools, thinking_mode, effort, prompt, ids) if env_on("HIVE_PREFIX_SHARE") and not media else []
-                return ids, images, blob, hints
+                t4 = time.perf_counter()
+            prep_ms.update(lock=round((t1 - t0) * 1000, 1), template=round((t2 - t1) * 1000, 1), tokenize=round((t3 - t2) * 1000, 1), hints=round((t4 - t3) * 1000, 1))
+            return ids, images, blob, hints
+        t_prep = time.perf_counter()
         ids, images, blob, hints = await asyncio.to_thread(prepare)
+        prep_ms["total"] = round((time.perf_counter() - t_prep) * 1000, 1)
     except Exception as e:
         log_request({"t_recv": t_recv, "t_done": time.time() * 1000.0, "endpoint": endpoint, "status": 400, "outcome": "bad_request", "error": str(e)[:300],
                      "stream": bool(body.get("stream")), "client": client_tags(request, body)})
@@ -1169,6 +1249,9 @@ async def chat(request: Request):
                              **({"think_exit_ids": ex} if (ex := think_exit_ids()) else {})})
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
+    if STAGE_STATUS:  # GET /v1/hive/requests/{rid} (stage_status) — the daemon adds its "admitted" line only to requests that ask
+        stage_open(rid, len(ids))
+        sampling["stages"] = True
     stream = bool(body.get("stream"))
     # Reserve before yielding the response; two streams may be created before either
     # body iterator starts. The daemon still validates the exact token/image prefix.
@@ -1207,6 +1290,7 @@ async def chat(request: Request):
 
     req_rec = {"t_recv": t_recv, "t_first": None, "endpoint": endpoint, "stream": stream, "max_tokens": sampling["max_tokens"], "session": session,
                "rid": rid, "daemon_rid": daemon_rid, "prompt_tokens": len(ids), "client": client_tags(request, body), "outcome": "closed", "done": None,
+               "prep_ms": prep_ms,
                # record thinking mode and effort so it can be checked whether the requested effort actually arrived
                "thinking_mode": thinking_mode, "effort": effort,
                # thinking cap as received (null if none) — whether it was forced is done.think_forced (daemon), also lifted to the top level below
@@ -1215,6 +1299,7 @@ async def chat(request: Request):
 
     async def run():
         det = Detok()
+        stage_text = StageText(thinking_mode == "thinking") if STAGE_STATUS else None
         stop_ids = set(sampling["stop_ids"])
         stop_text = VisibleStop(body.get('stop'), thinking_mode == "thinking")  # D12: content only
         terminal = False
@@ -1244,7 +1329,10 @@ async def chat(request: Request):
                         generated += 1
                         if msg["id"] in stop_ids:
                             continue
-                        piece = stop_text.push(det.push(msg["id"]))
+                        raw = det.push(msg["id"])
+                        if stage_text is not None and (stage_text.feed(raw) or generated == 1):  # the first id ends the prefill stage
+                            stage_update(rid, stage=stage_text.stage, **({"tool_name": stage_text.tool} if stage_text.tool else {}))
+                        piece = stop_text.push(raw)
                         if piece: yield ("delta", piece)
                         if stop_text.stopped:
                             terminal = True
@@ -1252,6 +1340,14 @@ async def chat(request: Request):
                             await asyncio.shield(send_cancel())
                             yield ('done', {'done': True, 'n': generated, 'finish': 'stop', 'stop_sequence': stop_text.matched})
                             break
+                    elif "admitted" in msg or "progress" in msg:  # sent with "stages" (admitted) / after each prefill chunk (progress)
+                        if STAGE_STATUS:
+                            if "admitted" in msg:
+                                stage_update(rid, stage="prefill", cached_tokens=int(msg.get("cached") or 0), prefill_done=0,
+                                             prefill_total=max(0, int(msg.get("total") or 0) - int(msg.get("cached") or 0)))
+                            elif STAGES.get(rid, {}).get("stage") == "prefill":
+                                stage_update(rid, prefill_done=max(0, int(msg.get("progress") or 0) - int(STAGES[rid].get("cached_tokens") or 0)))
+                        continue
                     elif msg.get("done"):
                         terminal = True
                         req_rec["done"] = msg
@@ -1290,6 +1386,8 @@ async def chat(request: Request):
             req_rec["error"] = str(e)[:300]
             yield ('error', str(e))
         finally:
+            if STAGE_STATUS:
+                stage_update(rid, stage="done" if req_rec["outcome"] in ("done", "stop_sequence") else "error", ended=True)
             # HTTP status: streams are always 200 (errors are in-stream error events); non-stream: done/stop 200, error/cancel 502, closed midway (client disconnect) 499
             req_rec["t_done"] = time.time() * 1000.0
             req_rec["status"] = 200 if stream else {"done": 200, "stop_sequence": 200, "closed": 499, "context_length_exceeded": 400}.get(req_rec["outcome"], 502)

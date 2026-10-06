@@ -23,6 +23,7 @@
 #include "hive/glm/glm_experts.h"
 #include "hive/glm/glm_model.h"
 #include "hive/glm/glm_vision.h"
+#include "hive/host_image.h"
 #include "hive/layer_yield.h"
 
 namespace hive::glm::fam {
@@ -171,11 +172,12 @@ struct SeqImage {
   std::vector<int32_t> tokens;
   std::vector<int64_t> engram_history;
   bool mtp_hidden_valid = false;
-  std::vector<std::vector<uint8_t>> bufs;  // in Runtime::save_image order
+  // in Runtime::save_image order; HIVE_CKPT_DELTA shares the still-exact prefix segments of the previous image (host_image.h)
+  std::vector<HostImageBuffer> bufs;
   size_t allocated_bytes(std::set<const void*>& seen) const {
     if (!seen.insert(this).second) return 0;
-    size_t b = sizeof(*this) + tokens.capacity() * 4;
-    for (auto& v : bufs) b += v.capacity();
+    size_t b = sizeof(*this) + tokens.capacity() * 4 + bufs.capacity() * sizeof(HostImageBuffer);
+    for (auto& v : bufs) b += v.allocated_bytes(seen);
     return b;
   }
   size_t bytes() const { std::set<const void*> seen; return allocated_bytes(seen); }
@@ -286,6 +288,13 @@ class Runtime {
   void stats_delta(ForwardStats* st, const GlmCacheStats& before) const;
   void cache_line(int M, const GlmCacheStats& before, double t0);  // HIVE_TRACE_CACHE: the [cache] line of a decode / verify step
   long cache_step_ = 0;
+  // HIVE_PROFILE=N: host time inside a decode / verify call, one [call-host <kind>] line per N calls of a kind (tools/hive_monitor.py) —
+  //   eng = the engine's forward call (its GPU part is in [fwd-host]) · logits = copying the pinned logits into the caller's vectors ·
+  //   cands = sampler candidates on the GPU and their copy back (cands_dev) · rest = the remainder of the call (stats, [cache] line).
+  //   Kinds: 0 decode (forward_batch) · 1 verify · 2 verify-batch.
+  struct CallHost { long n = 0, rows = 0; double eng = 0, logits = 0, cands = 0, total = 0; };
+  CallHost call_host_[3];
+  void call_host(int kind, int rows, double t0, double eng_ms, double logits_ms, double cands_ms);  // t0 = call start (mono_ms)
   Model& model_;
   ExpertStore& store_;
   RuntimeOptions opt_;

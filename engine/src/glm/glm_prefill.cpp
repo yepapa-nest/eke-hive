@@ -68,8 +68,11 @@ void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float*
       int r0, n; blk(b, r0, n);
       hcur_ = hall + (size_t)r0 * HC;
       s.pos = pos0 + r0;
+      cudaEvent_t pf_a0 = nullptr;  // [glm-prefill] attention GPU time (glm_engine.h)
+      if (pf_) { pf_a0 = pf_event(); CUDA_CHECK(cudaEventRecord(pf_a0, stream_)); }
       hc_pre_norm(L.hc_attn, L.in_norm, n);
       if (L.kda) kda_layer(l, sp, 1, n, true); else dsa_layer(l, sp, 1, n, true);
+      if (pf_a0) { cudaEvent_t a1 = pf_event(); CUDA_CHECK(cudaEventRecord(a1, stream_)); pf_->attn[L.kda ? 0 : 1].push_back({pf_a0, a1}); }
       hc_post_apply(n);
       hc_pre_norm(L.hc_ffn, L.post_norm, n);
       if (!L.moe) { mlp_layer(l, n, true); hc_post_apply(n); continue; }

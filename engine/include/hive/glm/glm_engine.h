@@ -109,6 +109,7 @@ class GlmEngine {
   //   embedding override; every other work buffer is rewritten inside each layer. yield_enter therefore points inner forwards at rows the outer
   //   prefill does not use (h_ when the outer state is in hall_, the yield rows hy_ otherwise) and parks the embedding override.
   std::function<void(int layer)> layer_boundary;
+  double pf_yield_body_ms = 0;  // [glm-prefill]: time spent running other work inside layer yields (added by the runtime's yield exit)
   struct YieldSave { bf16* hcur = nullptr; std::vector<EmbedOverride> emb; int64_t emb_base = 0; bool on = false; };
   bool yield_enter(YieldSave& s);  // false = no free rows at this level (the yield is skipped)
   void yield_exit(YieldSave& s);
@@ -235,6 +236,22 @@ class GlmEngine {
   struct DhLayer { cudaEvent_t start = nullptr, front = nullptr, end = nullptr; GlmExperts::LayerMarks x; bool moe = false; };
   std::vector<DhLayer> dh_;
   cudaEvent_t dh_head_ = nullptr;
+  // [fwd-host M=…] (same sample step): the forward's host wall (entry → after the final synchronization) against the GPU timeline —
+  //   entry = forward start → first layer start (embedding, KDA pointer upload, launch lead) · window = the [decode-host] span · head = head start →
+  //   logits copied to the host. host − (entry + window + head) is host time the GPU timeline does not cover.
+  cudaEvent_t dh_entry_ = nullptr, dh_done_ = nullptr;
+  // HIVE_PROFILE > 0: one [glm-prefill T=… pos=…] line per prefill call (tools/hive_monitor.py) — wall = the call's host time · yield = other
+  //   work run inside its layer yields (pf_yield_body_ms) · moe prep / gpu / cpu-join = GlmExperts::PfMoe · attn kda / dsa = GPU time from
+  //   each layer's start to the end of its attention (CUDA events per layer and block; no synchronization added) · other = the rest (router,
+  //   shared expert, hyper-connections, head, host gaps; also the MoE of short prefills that take the decode expert path). A prefill admitted
+  //   inside a layer yield prints its own line and counts as yield time of the outer call.
+  struct PfFrame { GlmExperts::PfMoe moe; std::vector<std::pair<cudaEvent_t, cudaEvent_t>> attn[2]; bool layer_major = false; };
+  bool pf_prof_ = false;
+  PfFrame* pf_ = nullptr;
+  std::vector<cudaEvent_t> pf_ev_free_;
+  cudaEvent_t pf_event();
+  void prefill_body(GlmSeq& s, const int32_t* ids, int T, float* logits_last);
+  double fwd_t0_ = 0;
   long er_layers_ = 0, er_ahead_ = 0, er_abs_ = 0;  // sample steps since the last [early-route] line
   void sample_report(int rows, const GlmForwardStats& s0, const GlmCacheStats& x0);
 };

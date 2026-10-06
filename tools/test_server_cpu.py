@@ -225,6 +225,84 @@ class FlagDaemon:
 def sse_json(chunks):
     return [json.loads(c[6:]) for c in chunks if c.startswith('data: {')]
 
+class StageTokenizer(Tokenizer):
+    PIECES = {1: '<think>', 2: 'hm', 3: '</think>', 4: '<tool_call>', 5: 'read_file', 6: '<arg_key>', 7: 'p', 8: '</arg_key>', 9: '</tool_call>',
+              21: 'x', 22: '<｜DSML｜function_calls>\n<｜DSML｜invoke name="web_search">', 99: '<EOS>'}
+    def decode(self, ids, **kw): return ''.join(self.PIECES[i] for i in ids)
+
+class StageDaemon(Daemon):
+    """admitted (only when asked) → progress → generated ids; records the request's keyword arguments and the stage seen after each id."""
+    def __init__(self, ids, seen): super().__init__(); self.ids = ids; self.seen = seen; self.kw = None
+    async def generate(self, session, *args, **kw):
+        self.kw = kw
+        if kw.get('stages'):
+            yield {'admitted': True, 'cached': 900, 'total': 1000}
+        yield {'progress': 1000, 'total': 1000}
+        for i in self.ids:
+            await asyncio.sleep(0)
+            yield {'id': i}
+            self.seen.append(dict(s.STAGES.get(next(iter(s.STAGES)), {})) if s.STAGES else None)
+        yield {'done': True, 'n': len(self.ids), 'finish': 'stop'}
+
+def strip_ids(chunks):
+    return [json.dumps({k: v for k, v in json.loads(c[6:]).items() if k not in ('id', 'created')}) if c.startswith('data: {') else c for c in chunks]
+
+class StageTests(unittest.IsolatedAsyncioTestCase):
+    """HIVE_STAGE_STATUS: off = nothing changes (no "stages" field, the route answers 404); on = the same response bytes (apart from the random
+    id) plus a status entry that follows queued → prefill (reused / to read / read) → thinking → tool_call (name) → done."""
+    def setUp(self):
+        s.TOK = StageTokenizer(); s.ENC = Encoder(); s.INFLIGHT.clear(); s.STAGES.clear()
+        s.encode_prompt = lambda *a: ('prompt', [])
+        s.tokenize_with_images = lambda *a: (list(range(1000)), [], b'')
+        self.saved = (s.STAGE_STATUS, s.DSML_START)
+    def tearDown(self):
+        s.STAGE_STATUS, s.DSML_START = self.saved; s.STAGES.clear()
+
+    async def stream(self, ids, on):
+        s.STAGE_STATUS = on
+        seen = []
+        s.DAEMON = StageDaemon(ids, seen)
+        response = await s.chat(Request({**BODY, 'stream': True, 'reasoning_effort': 'high'}))
+        chunks = [x async for x in response.body_iterator]
+        return chunks, seen, s.DAEMON.kw
+
+    async def test_off_changes_nothing(self):
+        s.DSML_START = '<tool_call>'
+        chunks_off, seen, kw = await self.stream([1, 2, 3, 4, 5, 6, 7, 8, 9], False)
+        self.assertNotIn('stages', kw)
+        self.assertFalse(s.STAGES)
+        rid = json.loads(chunks_off[0][6:])['id']
+        self.assertEqual((await s.stage_status(rid)).status_code, 404)
+        s.STAGES.clear()
+        chunks_on, seen, kw = await self.stream([1, 2, 3, 4, 5, 6, 7, 8, 9], True)
+        self.assertTrue(kw.get('stages'))
+        self.assertEqual(strip_ids(chunks_on), strip_ids(chunks_off))  # the status is a side channel: same stream either way
+
+    async def test_glm_stages(self):
+        s.DSML_START = '<tool_call>'
+        chunks, seen, kw = await self.stream([1, 2, 3, 4, 5, 6, 7, 8, 9], True)
+        rid = json.loads(chunks[0][6:])['id']
+        stages = [x and x['stage'] for x in seen]
+        self.assertEqual(seen[0]['cached_tokens'], 900); self.assertEqual(seen[0]['prefill_total'], 100); self.assertEqual(seen[0]['prefill_done'], 100)
+        self.assertEqual(stages[:2], ['thinking', 'thinking'])
+        self.assertIn('tool_call', stages)
+        self.assertEqual(seen[-1].get('tool_name'), 'read_file')
+        final = await s.stage_status(rid)
+        self.assertEqual(final['stage'], 'done'); self.assertEqual(final['id'], rid)
+
+    async def test_ds_tool_name_and_answer(self):
+        s.DSML_START = '<｜DSML｜'
+        chunks, seen, kw = await self.stream([3, 21, 22], True)
+        self.assertEqual([x['stage'] for x in seen], ['answer', 'answer', 'tool_call'])
+        self.assertEqual(seen[-1].get('tool_name'), 'web_search')
+
+    async def test_entries_expire(self):
+        s.STAGE_STATUS = True
+        s.stage_open('old', 1); s.stage_update('old', stage='done', ended=True)
+        s.STAGES['old']['_ended'] -= s.STAGE_KEEP_S + 1
+        s.stage_open('new', 1)
+        self.assertNotIn('old', s.STAGES); self.assertIn('new', s.STAGES)
+
 class ReviewTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         s.TOK=VocTokenizer(); s.ENC=ThinkEncoder(); s.INFLIGHT.clear()

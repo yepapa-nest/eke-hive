@@ -97,6 +97,14 @@ RE = {
     "snapshot": re.compile(r"^\[snapshot\] pos (\d+) d2h_bytes (\d+) host_bytes (\d+) async (\d+) delta (\d+)"),
     "stepgraph": re.compile(r"^\[step-graph M=(\d+)\] .*?wait ([\d.]+) · replay ([\d.]+) ms.*?gpu span ([\d.]+) ms"),
     "pprof": re.compile(r"^\[prefill-prof M=(\d+) pos=(\d+) tail=(\d+)\] wall ([\d.]+) ms"),
+    # HIVE_PROFILE host-time lines (hived.cpp [step-host] every N steps of a kind · GLM runtime [call-host] every N calls · GLM engine [fwd-host] on sample steps)
+    "step_host": re.compile(r"^\[step-host ([\w-]+)\] steps (\d+) · gap ([\d.]+) \(n (\d+)\) · pre (-?[\d.]+) · draft ([\d.]+) · fwd ([\d.]+) · post ([\d.]+) ms/step"),
+    "call_host": re.compile(r"^\[call-host ([\w-]+)\] calls (\d+) · rows ([\d.]+) · eng ([\d.]+) · logits ([\d.]+) · cands ([\d.]+) · rest (-?[\d.]+) ms/call"),
+    "glm_prefill": re.compile(r"^\[glm-prefill T=(\d+) pos=(\d+)\] wall ([\d.]+) · yield ([\d.]+) · moe prep ([\d.]+) gpu ([\d.]+) cpu-join ([\d.]+) · "
+                             r"attn kda ([\d.]+) dsa ([\d.]+) · other (-?[\d.]+) ms · rows hit (\d+) cpu (\d+) · streamed (\d+) \(([\d.]+) GB"),
+    "glm_ckpt": re.compile(r"^\[glm-ckpt\] pos (\d+) base (-?\d+) · copied ([\d.]+) of ([\d.]+) MB · ([\d.]+) ms"),
+    "glm_ckpt_verify": re.compile(r"^\[glm-ckpt\] verify pos (\d+) base (\d+) · shared ([\d.]+) MB · (.*)$"),
+    "fwd_host": re.compile(r"^\[fwd-host M=(\d+)( verify)?\] host ([\d.]+) · entry ([\d.]+) · window ([\d.]+) · head ([\d.]+) ms"),
     # hived.cpp MTP(HIVE_TRACE_MTP)
     "mtp_pos": re.compile(r"^\[mtp\] pos (\d+) draft ([\d.]+) ms · verify (\d+) rows ([\d.]+) ms · accepted (\d+)/(\d+)"),
     "mtp_nodraft": re.compile(r"^\[mtp\] pos (\d+) draft ([\d.]+) ms · (?:gate2 )?no draft"),
@@ -124,7 +132,8 @@ RE_DH = {k: re.compile(p) for k, p in {
     "cpu_bound": r"cpu-bound layers (\d+)/(\d+)", "tail": r"tail ([\d.]+) ms", "front": r"front ([\d.]+)",
     "gpu_idle": r"gpu-idle ([\d.]+) of ([\d.]+) ms", "cpu_layers": r"\(cpu layers (\d+)\)",
     "promo_wait": r"promo wait ([\d.]+) ms/step",  # DeepSeek: step-head commit wait for paced promotions, mean per step since the previous line
-    "defer_wait": r"defer wait ([\d.]+)"}.items()}     # GLM: host time blocked on deferred CPU experts in this sample step
+    "defer_wait": r"defer wait ([\d.]+)",
+    "next": r"· next ([\d.]+)"}.items()}     # GLM: host time blocked on deferred CPU experts in this sample step
 RE_SHAPE_NUM = re.compile(r"[0-9a-f]{8,}|\d+(?:\.\d+)?")
 
 DIAG_PREFIXES = ("[decode-host", "[decode-sync", "[decode-miss", "[decode-split", "[early-route", "[step-graph", "[pregate")
@@ -194,7 +203,13 @@ def new_bucket(minute: str) -> dict:
         # [decode-host]
         "dh_n": 0, "dh_verify_n": 0, "dh_gpu_idle_ms": 0.0, "dh_of_ms": 0.0, "dh_cpu_ms": 0.0, "dh_gpu_ms": 0.0,
         "dh_cpu_bound_layers": 0, "dh_layers": 0, "dh_tail_ms": 0.0, "dh_front_ms": 0.0, "gpu_idle_pct_hist": {},
-        "dh_promo_wait_n": 0, "dh_promo_wait_ms": 0.0, "dh_defer_wait_ms": 0.0,
+        "dh_promo_wait_n": 0, "dh_promo_wait_ms": 0.0, "dh_defer_wait_ms": 0.0, "dh_sync_ms": 0.0, "dh_next_ms": 0.0,
+        # HIVE_PROFILE host time — sums (a line's means × its count): [step-host kind] · [call-host kind] · [fwd-host]
+        "step_host": {}, "call_host": {}, "fwd_host": {"n": 0, "host_ms": 0.0, "entry_ms": 0.0, "window_ms": 0.0, "head_ms": 0.0},
+        # [glm-prefill] per context bucket (pos + T at the end of the call): sums
+        "glm_prefill": {},
+        # [glm-ckpt] prompt / boundary / archive images (GLM save_image): count, with a shared prefix, host ms, copied and image MB · verify lines
+        "ckpt": {"n": 0, "delta_n": 0, "ms": 0.0, "ms_max": 0.0, "copied_mb": 0.0, "total_mb": 0.0, "verify_n": 0, "verify_bad": 0},
         "dsync_n": 0, "dsync_wait_ms": 0.0,
         "dmiss_n": 0, "dmiss": {},
         "eroute": {"layers": 0, "ahead": 0, "own_stream": 0, "absorbed": 0, "resync": 0, "missing": 0, "untrusted": 0},
@@ -497,7 +512,16 @@ class Parser:
                 dw = RE_DH["defer_wait"].search(body)
                 if dw:
                     b["dh_defer_wait_ms"] += float(dw[1])
+                sy = RE_DH["sync"].match(body)
+                if sy:
+                    b["dh_sync_ms"] += float(sy[1])
+                nx = RE_DH["next"].search(body)
+                if nx:
+                    b["dh_next_ms"] += float(nx[1])
                 return
+        elif head.startswith(("[step-host ", "[call-host ", "[fwd-host M=", "[glm-prefill T=", "[glm-ckpt] ")):
+            self._host_time(line, b)
+            return
         elif head.startswith("[decode-sync M="):
             m = RE["dsync"].match(line)
             if m:
@@ -586,6 +610,61 @@ class Parser:
             return
         elif line.startswith("cudaMalloc"):
             b["errors"].append({"kind": "oom", "msg": line[:300]})
+            return
+        self._unparsed(b, line)
+
+    def _host_time(self, line, b):
+        """HIVE_PROFILE host-time lines → sums in the minute bucket (means × count, so minutes and days add up)."""
+        m = RE["step_host"].match(line)
+        if m:
+            n, gn = int(m[2]), int(m[4])
+            d = b["step_host"].setdefault(m[1], {"steps": 0, "gap_n": 0, "gap_ms": 0.0, "pre_ms": 0.0, "draft_ms": 0.0, "fwd_ms": 0.0, "post_ms": 0.0})
+            d["steps"] += n; d["gap_n"] += gn; d["gap_ms"] += float(m[3]) * gn
+            for i, k in ((5, "pre_ms"), (6, "draft_ms"), (7, "fwd_ms"), (8, "post_ms")):
+                d[k] += float(m[i]) * n
+            return
+        m = RE["call_host"].match(line)
+        if m:
+            n = int(m[2])
+            d = b["call_host"].setdefault(m[1], {"calls": 0, "rows": 0.0, "eng_ms": 0.0, "logits_ms": 0.0, "cands_ms": 0.0, "rest_ms": 0.0})
+            d["calls"] += n
+            for i, k in ((3, "rows"), (4, "eng_ms"), (5, "logits_ms"), (6, "cands_ms"), (7, "rest_ms")):
+                d[k] += float(m[i]) * n
+            return
+        m = RE["glm_prefill"].match(line)
+        if m:
+            T, end = int(m[1]), int(m[1]) + int(m[2])
+            bk = "<16K" if end < 16384 else "16-64K" if end < 65536 else "64K+"
+            d = b["glm_prefill"].setdefault(bk, {"n": 0, "rows": 0, "wall_ms": 0.0, "yield_ms": 0.0, "moe_prep_ms": 0.0, "moe_gpu_ms": 0.0,
+                                                 "cpu_join_ms": 0.0, "attn_kda_ms": 0.0, "attn_dsa_ms": 0.0, "other_ms": 0.0,
+                                                 "hit_rows": 0, "cpu_rows": 0, "streamed": 0, "streamed_gb": 0.0})
+            d["n"] += 1; d["rows"] += T
+            for i, k in ((3, "wall_ms"), (4, "yield_ms"), (5, "moe_prep_ms"), (6, "moe_gpu_ms"), (7, "cpu_join_ms"), (8, "attn_kda_ms"),
+                         (9, "attn_dsa_ms"), (10, "other_ms"), (14, "streamed_gb")):
+                d[k] += float(m[i])
+            for i, k in ((11, "hit_rows"), (12, "cpu_rows"), (13, "streamed")):
+                d[k] += int(m[i])
+            return
+        m = RE["glm_ckpt"].match(line)
+        if m:
+            k = b["ckpt"]
+            k["n"] += 1; k["delta_n"] += int(m[2]) >= 0; k["ms"] += float(m[5]); k["ms_max"] = max(k["ms_max"], float(m[5]))
+            k["copied_mb"] += float(m[3]); k["total_mb"] += float(m[4])
+            return
+        m = RE["glm_ckpt_verify"].match(line)
+        if m:
+            k = b["ckpt"]
+            k["verify_n"] += 1
+            if not m[4].startswith("ok"):
+                k["verify_bad"] += 1; b["warnings"] += 1
+                b["errors"].append({"kind": "ckpt_verify", "msg": line[:300]})
+            return
+        m = RE["fwd_host"].match(line)
+        if m:
+            f = b["fwd_host"]
+            f["n"] += 1
+            for i, k in ((3, "host_ms"), (4, "entry_ms"), (5, "window_ms"), (6, "head_ms")):
+                f[k] += float(m[i])
             return
         self._unparsed(b, line)
 

@@ -108,6 +108,7 @@ Endpoints:
 | `GET /health`, `GET /live` | Daemon state (`loading`, `ready`, `sleeping`, ...) and liveness |
 | `POST /release_memory_occupation`, `POST /resume_memory_occupation` | Sleep / wake (below) |
 | `POST /flush_cache` | Drop cached prompt state (benchmarks); 400 while a request runs |
+| `GET /v1/hive/requests/{id}` | Engine-side stage of a request (only with `HIVE_STAGE_STATUS`, see [configuration](configuration.md)) |
 
 Reasoning (DeepSeek): thinking is on by default at effort 75 (the model's documented default, "high"). `reasoning_effort`
 accepts `none` (no thinking), `minimal` (25), `low` (50), `medium`/`high` (75), `xhigh`/`max` (100) or a number

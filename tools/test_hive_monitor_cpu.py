@@ -308,6 +308,78 @@ class Parse(unittest.TestCase):
         self.assertEqual((m["eroute"]["layers"], m["eroute"]["ahead"], m["eroute"]["absorbed"], m["eroute"]["missing"]), (76, 51, 1, 1))
         self.assertAlmostEqual(m["prof_sections_ms"]["experts"], 23.98)
         self.assertEqual(m["vram_free_min"], 2400)
+        self.assertAlmostEqual(m["dh_sync_ms"], 2.2)  # GLM 2.10 + DeepSeek 0.10
+        self.assertAlmostEqual(m["dh_next_ms"], 1.9)
+
+    def test_host_time_lines(self):
+        """HIVE_PROFILE host-time lines (hived.cpp [step-host] · glm_runtime.cpp [call-host] · glm_engine.cpp [fwd-host] — exact printf formats
+        of 2026-10-06): summed as mean × count so minutes add up, none unparsed, and the daily report's per-step means equal the weighted means."""
+        d = Path(self.tmp)
+        lines = ("[step-host spec] steps 64 · gap 2.500 (n 60) · pre 0.300 · draft 4.300 · fwd 38.000 · post 1.200 ms/step\n"
+                 "[step-host spec] steps 64 · gap 3.500 (n 20) · pre 0.500 · draft 4.100 · fwd 40.000 · post 1.000 ms/step\n"
+                 "[step-host plain] steps 64 · gap 0.000 (n 0) · pre 0.200 · draft 0.000 · fwd 30.000 · post 0.400 ms/step\n"
+                 "[call-host verify] calls 64 · rows 3.50 · eng 36.000 · logits 0.800 · cands 0.700 · rest 0.100 ms/call\n"
+                 "[fwd-host M=4 verify] host 36.10 · entry 0.40 · window 33.00 · head 1.20 ms\n"
+                 "[fwd-host M=1] host 30.10 · entry 0.30 · window 28.00 · head 1.00 ms\n"
+                 "[glm-prefill T=8000 pos=100000] wall 6000.0 · yield 1000.0 · moe prep 300.0 gpu 3000.0 cpu-join 100.0 · attn kda 500.0 dsa 700.0 · "
+                 "other 400.0 ms · rows hit 1200000 cpu 13000 · streamed 6600 (100.00 GB · 33.3 GB/s) · moe layers 44 · layer-major 0\n"
+                 "[glm-prefill T=29 pos=169454] wall 377.0 · yield 0.0 · moe prep 30.0 gpu 200.0 cpu-join 10.0 · attn kda 50.0 dsa 60.0 · "
+                 "other 27.0 ms · rows hit 5433 cpu 4311 · streamed 0 (0.00 GB · 0.0 GB/s) · moe layers 44 · layer-major 0\n"
+                 "[glm-prefill T=500 pos=0] wall 900.0 · yield 0.0 · moe prep 100.0 gpu 600.0 cpu-join 0.0 · attn kda 80.0 dsa 70.0 · "
+                 "other 50.0 ms · rows hit 9000 cpu 0 · streamed 300 (4.50 GB · 7.5 GB/s) · moe layers 44 · layer-major 1\n"
+                 "[glm-ckpt] pos 100000 base -1 · copied 1800.0 of 1800.0 MB · 700.0 ms\n"
+                 "[glm-ckpt] pos 102000 base 100000 · copied 110.0 of 1836.0 MB · 20.0 ms\n"
+                 "[glm-ckpt] verify pos 102000 base 100000 · shared 1726.0 MB · ok\n"
+                 "[glm-ckpt] verify pos 104000 base 102000 · shared 1760.0 MB · ⚠️MISMATCH in 1 buffers (first 70)\n")
+        (d / "hived.log").write_text(lines)
+        run(d / "hived.log", d / "out", now=time.mktime((2026, 10, 6, 12, 0, 0, 0, 0, -1)), flush=True)
+        mets = [json.loads(l) for p in (d / "out" / "metrics").glob("*.jsonl") for l in p.read_text().splitlines()]
+        self.assertEqual(sum(sum(m["unparsed"].values()) for m in mets), 0)
+        sh = {}
+        for m in mets:
+            for kind, v in m["step_host"].items():
+                for k, x in v.items():
+                    sh.setdefault(kind, {}).setdefault(k, 0); sh[kind][k] += x
+        self.assertEqual((sh["spec"]["steps"], sh["spec"]["gap_n"]), (128, 80))
+        self.assertAlmostEqual(sh["spec"]["gap_ms"], 2.5 * 60 + 3.5 * 20)
+        self.assertAlmostEqual(sh["spec"]["fwd_ms"], 64 * 78.0)
+        self.assertEqual(sh["plain"]["gap_n"], 0)
+        day = sorted((d / "out" / "metrics").glob("*.jsonl"))[0].stem
+        self.assertEqual(hr.main(["--root", str(d / "out"), "--day", day]), 0)
+        H = json.loads((d / "out" / "reports" / f"{day}.json").read_text())["summary"]["host_time"]
+        self.assertAlmostEqual(H["step"]["spec"]["gap_ms"], (2.5 * 60 + 3.5 * 20) / 80, places=3)
+        self.assertAlmostEqual(H["step"]["spec"]["fwd_ms"], 39.0, places=3)
+        self.assertIsNone(H["step"]["plain"]["gap_ms"])
+        self.assertAlmostEqual(H["call"]["verify"]["logits_ms"], 0.8, places=3)
+        self.assertEqual(H["fwd"]["n"], 2)
+        self.assertAlmostEqual(H["fwd"]["window_ms"], 30.5, places=3)
+        self.assertIn("Decode host time", (d / "out" / "reports" / f"{day}.md").read_text())
+        P = json.loads((d / "out" / "reports" / f"{day}.json").read_text())["summary"]["prefill_breakdown"]
+        self.assertEqual(set(P), {"<16K", "64K+"})
+        self.assertEqual((P["64K+"]["calls"], P["64K+"]["rows"]), (2, 8029))
+        self.assertAlmostEqual(P["64K+"]["yield_share"], 1000.0 / 6377.0, places=4)
+        self.assertAlmostEqual(P["64K+"]["tok_s"], 8029 * 1000.0 / 5377.0, places=1)  # yield time excluded
+        self.assertAlmostEqual(P["64K+"]["stream_gb_s"], 100.0 / 3.2, delta=0.06)  # rounded to 0.1
+        self.assertAlmostEqual(P["<16K"]["moe_gpu_share"], 600.0 / 900.0, places=4)
+        self.assertIn("Prefill time breakdown", (d / "out" / "reports" / f"{day}.md").read_text())
+        C = json.loads((d / "out" / "reports" / f"{day}.json").read_text())["summary"]["checkpoints"]
+        self.assertEqual((C["n"], C["delta_n"], C["verify_n"], C["verify_bad"]), (2, 1, 2, 1))
+        self.assertAlmostEqual(C["ms_mean"], 360.0)
+        self.assertEqual(C["ms_max"], 700.0)
+        self.assertTrue(any(e.get("kind") == "ckpt_verify" for m in mets for e in m["errors"]))  # a mismatch is an error, not a quiet counter
+
+    def test_ttft_breakdown(self):
+        """Report TTFT breakdown: engine request joined to its server record by daemon request id; the parts add up to the server TTFT."""
+        req = {"id": "s#1", "rid": "d1", "prompt_tokens": 70000, "prefill_tokens": 29, "cached_prefix_tokens": 69971, "prefill_ms": 3585.0, "ttft_ms": 3585.0, "queue_ms": 4.0, "prefill_total_ms": 377.0,
+               "prefill_chunk_ms": 376.0, "finish": "stop", "decode_tokens": 10, "decode_tok_s": 15.0}
+        srv = {"daemon_rid": "d1", "t_recv": 1_000_000.0, "t_first": 1_000_000.0 + 4200.0}
+        S = hr.summarize([req], [], server=[srv])
+        v = S["ttft_breakdown"]["64K+"]
+        self.assertEqual(v["n"], 1)
+        self.assertAlmostEqual(v["server_ttft_ms_mean"], 4200.0)
+        self.assertAlmostEqual(v["server_ms_mean"] + v["queue_ms_mean"] + v["prefill_ms_mean"] + v["between_ms_mean"] + v["after_ms_mean"], 4200.0)
+        self.assertAlmostEqual(v["after_ms_mean"], 3585.0 - 377.0)
+        self.assertEqual(hr.summarize([req], [], server=[])["ttft_breakdown"], {})  # no server record: no row
 
 
 class Report(unittest.TestCase):

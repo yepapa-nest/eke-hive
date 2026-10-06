@@ -100,8 +100,14 @@ int main(){
 }
 '''
 recovery=src[src.index('  auto decode_inner ='):src.index('  // ---- sleep / wake (engine thread)')]  # the Z1 block (sleep state machine) stays outside this slice
+# the [step-host] state the wrapper reads (HIVE_PROFILE) is declared right before decode_step's body — taken from hived.cpp as well
+step_host_state=src[src.index('  struct StepHost {'):src.index('  decode_step = [&] {')]
 RECOVERY=r'''
+#include "hive/clock.h"
+double now_ms() { return hive::mono_ms(); }
 int main(){
+ long prefill_epoch=0;
+'''+step_host_state+r'''
  struct Sequence {bool broken=false;};struct Session {std::unique_ptr<Sequence> seq=std::make_unique<Sequence>();} session;
  struct Active {Session* S;Request r;std::string sid;std::atomic<bool>* cancel;bool client_ok=true;};
  struct Runtime {int count=0;void quiesce_after_host_error(){++count;}} rt;

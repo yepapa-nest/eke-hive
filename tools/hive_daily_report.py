@@ -232,6 +232,31 @@ def summarize(reqs, mets, top=10, server=None):
                     "cached_share": round(sum(r.get("cached_prefix_tokens") or 0 for r in rs) / max(1, sum(r.get("prompt_tokens") or 0 for r in rs)), 4),
                     "decode_tok_s_p50": pct([r["decode_tok_s"] for r in rs if r.get("decode_tokens", 0) >= 16], .5)}
     S["by_prompt_bucket"] = pb
+    # TTFT breakdown (server receipt → first token at the server), joined to the server record by daemon request id; means are additive:
+    #   server = server TTFT − (queue + engine TTFT) (request handling, template/tokenizer, socket, first token back) · queue = waiting for
+    #   admission · prefill compute = the prefill forwards · between chunks = prefill span − forwards (other requests' decode steps, layer
+    #   yields, snapshots) · after prefill = engine TTFT − prefill span (until this request's first decode step — another queued request's
+    #   prefill admitted in between runs first: hived.log 2026-10-05, a 29-row prefill of 377 ms gave TTFT 3,585 ms behind a 7,881-row one)
+    idx = {x.get("daemon_rid"): x for x in (server or []) if x.get("daemon_rid")}
+    tb = {}
+    for name, _, _ in BUCKETS:
+        rows = []
+        for r in done:
+            if bucket_of(r.get("prompt_tokens")) != name or r.get("rid") not in idx:
+                continue
+            sv = idx[r["rid"]]
+            tr, tf = _ms(sv.get("t_recv")), _ms(sv.get("t_first"))
+            if not (tr and tf) or r.get("queue_ms") is None or r.get("prefill_total_ms") is None:
+                continue
+            stt = tf - tr
+            rows.append({"server_ttft": stt, "server": stt - r["queue_ms"] - r["ttft_ms"], "queue": r["queue_ms"],
+                         "prefill": r.get("prefill_chunk_ms") or 0.0, "between": r["prefill_total_ms"] - (r.get("prefill_chunk_ms") or 0.0),
+                         "after": r["ttft_ms"] - r["prefill_total_ms"]})
+        if rows:
+            n = len(rows)
+            tb[name] = {"n": n, "server_ttft_p50_ms": pct([x["server_ttft"] for x in rows], .5), "server_ttft_p95_ms": pct([x["server_ttft"] for x in rows], .95),
+                        **{k + "_ms_mean": round(sum(x[k] for x in rows) / n, 1) for k in ("server_ttft", "server", "queue", "prefill", "between", "after")}}
+    S["ttft_breakdown"] = tb
     # decode speed per batch
     bb: dict = {}
     for r in done:
@@ -249,7 +274,12 @@ def summarize(reqs, mets, top=10, server=None):
                           "dh_cpu_bound_layers", "dh_layers", "dsync_n", "dma_samples", "dma_wait_samples", "dh_promo_wait_n")}
     fl = {k: 0.0 for k in ("dma_span_ms", "dma_wait_ms", "mtp_draft_ms", "mtp_verify_ms", "mtp_saved_ms", "stall_ms_sum", "reclaim_ms",
                            "dh_gpu_idle_ms", "dh_of_ms", "dh_cpu_ms", "dh_gpu_ms", "dsync_wait_ms", "warm_ms", "prefill_chunk_ms", "promo_mib",
-                           "dh_tail_ms", "dh_promo_wait_ms", "dh_defer_wait_ms")}
+                           "dh_tail_ms", "dh_promo_wait_ms", "dh_defer_wait_ms", "dh_sync_ms", "dh_next_ms")}
+    step_host: dict = {}
+    call_host: dict = {}
+    fwd_host = {"n": 0, "host_ms": 0.0, "entry_ms": 0.0, "window_ms": 0.0, "head_ms": 0.0}
+    glm_pf: dict = {}
+    ckpt = {"n": 0, "delta_n": 0, "ms": 0.0, "ms_max": 0.0, "copied_mb": 0.0, "total_mb": 0.0, "verify_n": 0, "verify_bad": 0}
     conc, batch, step_all, verify, stall_h, gidle = {}, {}, {}, {}, {}, {}
     step_m: dict = {}
     wall_m: dict = {}
@@ -279,6 +309,19 @@ def summarize(reqs, mets, top=10, server=None):
             unparsed[k] = unparsed.get(k, 0) + v
         for k, v in (m.get("pregate") or {}).items():
             pg[k] = pg.get(k, 0) + (v or 0)
+        for src, dst in ((m.get("step_host") or {}, step_host), (m.get("call_host") or {}, call_host)):
+            for kind, d in src.items():
+                t = dst.setdefault(kind, {})
+                for k, v in d.items():
+                    t[k] = t.get(k, 0) + (v or 0)
+        for k, v in (m.get("fwd_host") or {}).items():
+            fwd_host[k] = fwd_host.get(k, 0) + (v or 0)
+        for k, v in (m.get("ckpt") or {}).items():
+            ckpt[k] = max(ckpt[k], v or 0) if k == "ms_max" else ckpt.get(k, 0) + (v or 0)
+        for bk, d in (m.get("glm_prefill") or {}).items():
+            t = glm_pf.setdefault(bk, {})
+            for k, v in d.items():
+                t[k] = t.get(k, 0) + (v or 0)
     tot_steps = sum(conc.values()) or 1
     S["concurrency"] = {"open_requests_at_decode_step": {k: round(v / tot_steps, 4) for k, v in sorted(conc.items(), key=lambda kv: int(kv[0]))},
                         "decode_batch_M": {k: round(v / max(1, sum(batch.values())), 4) for k, v in sorted(batch.items(), key=lambda kv: int(kv[0]))},
@@ -299,7 +342,33 @@ def summarize(reqs, mets, top=10, server=None):
                          "cpu_tail_ms_mean": round(fl["dh_tail_ms"] / agg["dh_n"], 3) if agg["dh_n"] else None,
                          "promo_wait_ms_per_step": round(fl["dh_promo_wait_ms"] / agg["dh_promo_wait_n"], 3) if agg["dh_promo_wait_n"] else None,
                          "defer_wait_ms_mean": round(fl["dh_defer_wait_ms"] / agg["dh_n"], 3) if agg["dh_n"] and fl["dh_defer_wait_ms"] else None,
+                         "sync_ms_mean": round(fl["dh_sync_ms"] / agg["dh_n"], 3) if agg["dh_n"] and fl["dh_sync_ms"] else None,
+                         "next_ms_mean": round(fl["dh_next_ms"] / agg["dh_n"], 3) if agg["dh_n"] and fl["dh_next_ms"] else None,
                          "note": "step ms covers only HIVE_PROFILE sample steps ([cache] after [profile]) — the sampling period is the HIVE_PROFILE value"}
+    # HIVE_PROFILE host time: means per step / call (sums ÷ counts) — hived [step-host], GLM [call-host] and [fwd-host]
+    def per(d, n_key, keys):
+        n = d.get(n_key) or 0
+        return {k: round(d.get(k, 0) / n, 3) if n else None for k in keys}
+    S["prefill_breakdown"] = {bk: {"calls": d["n"], "rows": d["rows"], "wall_ms_per_call": round(d["wall_ms"] / d["n"], 1),
+                                   "tok_s": round(d["rows"] * 1000.0 / max(1e-9, d["wall_ms"] - d["yield_ms"]), 1),
+                                   **{k[:-3] + "_share": round(d[k] / d["wall_ms"], 4) if d["wall_ms"] else None
+                                      for k in ("yield_ms", "moe_prep_ms", "moe_gpu_ms", "cpu_join_ms", "attn_kda_ms", "attn_dsa_ms", "other_ms")},
+                                   "streamed_gb": round(d["streamed_gb"], 2),
+                                   "stream_gb_s": round(d["streamed_gb"] / (d["moe_gpu_ms"] / 1000.0), 1) if d["moe_gpu_ms"] else None,
+                                   "cpu_row_share": round(d["cpu_rows"] / max(1, d["cpu_rows"] + d["hit_rows"]), 4)}
+                              for bk, d in sorted(glm_pf.items(), key=lambda kv: ["<16K", "16-64K", "64K+"].index(kv[0]) if kv[0] in ("<16K", "16-64K", "64K+") else 9)
+                              if d.get("n")}
+    S["checkpoints"] = {**ckpt, "ms_mean": round(ckpt["ms"] / ckpt["n"], 1) if ckpt["n"] else None,
+                        "copied_mb_mean": round(ckpt["copied_mb"] / ckpt["n"], 1) if ckpt["n"] else None,
+                        "image_mb_mean": round(ckpt["total_mb"] / ckpt["n"], 1) if ckpt["n"] else None}
+    S["host_time"] = {
+        "step": {kind: {"steps": d.get("steps", 0), "gap_n": d.get("gap_n", 0),
+                        "gap_ms": round(d["gap_ms"] / d["gap_n"], 3) if d.get("gap_n") else None,
+                        **per(d, "steps", ("pre_ms", "draft_ms", "fwd_ms", "post_ms"))} for kind, d in sorted(step_host.items())},
+        "call": {kind: {"calls": d.get("calls", 0), **per(d, "calls", ("rows", "eng_ms", "logits_ms", "cands_ms", "rest_ms"))}
+                 for kind, d in sorted(call_host.items())},
+        "fwd": {"n": fwd_host["n"], **per(fwd_host, "n", ("host_ms", "entry_ms", "window_ms", "head_ms"))},
+    }
     R = agg["routed"] or 1
     dec = [r for r in done if (r.get("decode_hit", 0) + r.get("decode_cpu", 0)) > 0]
     S["cache"] = {"decode_hit_pct": round(100 * agg["hit"] / R, 2) if agg["routed"] else None,
@@ -425,7 +494,38 @@ def render_md(day, S, cmp_, prev_day):
         L.append(f"| {name} | {v['n']} | {f(v['ttft_p50_ms'],0)} | {f(v['ttft_p95_ms'],0)} | {f(v['ttft_p99_ms'],0)} | {f(v['ttft_max_ms'],0)} | "
                  f"{f(v.get('ttft_with_queue_p50_ms'),0)} | {f(v.get('ttft_with_queue_p95_ms'),0)} | "
                  f"{f(v['prefill_tok_s_p50'])} | {f(v['prefill_tok_s_p5'])} | {f(100*v['cached_share'])}% | {f(v['decode_tok_s_p50'])} |")
-    L += ["", "TTFT = engine prefill start → first token (ms). TTFT+queue adds the wait for admission (a free decode slot).", "", "## Decode speed by batch (requests, ≥16 tokens)", "",
+    L += ["", "TTFT = engine prefill start → first token (ms). TTFT+queue adds the wait for admission (a free decode slot).", ""]
+    if S.get("ttft_breakdown"):
+        L += ["## TTFT breakdown (server receipt → first token, ms)", "",
+              "Means add up to the server TTFT mean: server = request handling, template/tokenizer and delivery · queue = waiting for admission · "
+              "prefill = prefill forwards · between chunks = other work inside the prefill span (decode steps of others, layer yields, snapshots) · "
+              "after prefill = from the end of its own prefill to its first token (other requests' prefills admitted in between run first).", "",
+              "| bucket | n | server TTFT p50 | p95 | mean | server | queue | prefill | between chunks | after prefill |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for name, v in S["ttft_breakdown"].items():
+            L.append(f"| {name} | {v['n']} | {f(v['server_ttft_p50_ms'],0)} | {f(v['server_ttft_p95_ms'],0)} | {f(v['server_ttft_ms_mean'],0)} | "
+                     f"{f(v['server_ms_mean'],0)} | {f(v['queue_ms_mean'],0)} | {f(v['prefill_ms_mean'],0)} | {f(v['between_ms_mean'],0)} | {f(v['after_ms_mean'],0)} |")
+        L.append("")
+    ck = S.get("checkpoints") or {}
+    if ck.get("n"):
+        L += [f"- session images (GLM [glm-ckpt]): {ck['n']} · with a shared prefix {ck['delta_n']} · host {f(ck['ms_mean'],1)} ms mean / {f(ck['ms_max'],0)} max · "
+              f"copied {f(ck['copied_mb_mean'],1)} of {f(ck['image_mb_mean'],1)} MB mean · shared-prefix verify {ck['verify_n']} "
+              f"({'⚠️' + str(ck['verify_bad']) + ' MISMATCH' if ck['verify_bad'] else 'all ok'})", ""]
+    if S.get("prefill_breakdown"):
+        L += ["## Prefill time breakdown (HIVE_PROFILE, per prefill call)", "",
+              "Bucket = context length at the end of the call. Shares of the call's wall time: yield = other requests' work inside layer yields · "
+              "MoE prep = routing tables and CPU-share selection (GPU idle) · MoE GPU = expert compute and streamed copies · CPU join = waiting for "
+              "the CPU share · attention = GPU time of the KDA / DSA attention · other = router, shared expert, hyper-connections, head, gaps. "
+              "tok/s excludes yield time.", "",
+              "| context | calls | rows | wall ms/call | tok/s | yield | MoE prep | MoE GPU | CPU join | attn KDA | attn DSA | other | streamed GB | GB/s | CPU rows |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        pc = lambda x: f"{f(100 * x, 1)}%" if x is not None else "–"
+        for bk, v in S["prefill_breakdown"].items():
+            L.append(f"| {bk} | {v['calls']} | {v['rows']} | {f(v['wall_ms_per_call'],0)} | {f(v['tok_s'],0)} | {pc(v['yield_share'])} | {pc(v['moe_prep_share'])} | "
+                     f"{pc(v['moe_gpu_share'])} | {pc(v['cpu_join_share'])} | {pc(v['attn_kda_share'])} | {pc(v['attn_dsa_share'])} | {pc(v['other_share'])} | "
+                     f"{f(v['streamed_gb'],1)} | {f(v['stream_gb_s'],1)} | {pc(v['cpu_row_share'])} |")
+        L.append("")
+    L += ["## Decode speed by batch (requests, ≥16 tokens)", "",
           "| batch | n | tok/s p50 | p5 | p95 | engine step ms p50 | p95 |", "|---:|---:|---:|---:|---:|---:|---:|"]
     sm = S["engine_steps"]["step_ms_by_M"]
     for bs, v in S["decode_by_batch"].items():
@@ -437,7 +537,26 @@ def render_md(day, S, cmp_, prev_day):
           f"- GPU idle (decode-host) total ratio {f(es['gpu_idle_pct']['sum_ratio'],1)}% (step p50 {f(es['gpu_idle_pct']['p50'],1)}% · p95 {f(es['gpu_idle_pct']['p95'],1)}%) · "
           f"CPU-bound layer share {f(es['cpu_bound_layer_share'] and 100*es['cpu_bound_layer_share'],1)}% · cpu/gpu ms {es['cpu_vs_gpu_ms']} · decode-sync wait mean {f(es['decode_sync_wait_ms_mean'],2)} ms",
           f"- per sampled step: wait for CPU experts {f(es['cpu_tail_ms_mean'],3)} ms · promotion commit wait {f(es['promo_wait_ms_per_step'],3)} ms/step · "
-          f"deferral wait {f(es['defer_wait_ms_mean'],3)} ms", ""]
+          f"deferral wait {f(es['defer_wait_ms_mean'],3)} ms · routing sync {f(es.get('sync_ms_mean'),3)} ms · between layers {f(es.get('next_ms_mean'),3)} ms", ""]
+    ht = S.get("host_time") or {}
+    if ht.get("step") or ht.get("call") or (ht.get("fwd") or {}).get("n"):
+        L += ["## Decode host time (HIVE_PROFILE)", "",
+              "gap = previous step end → this step start (main loop; only gaps with requests active and no prefill in between) · pre = step start → forward minus draft · "
+              "post = forward end → step end (row sampling, acceptance, rollback, bookkeeping).", "",
+              "| step kind | steps | gap ms (n) | pre | draft | fwd | post | cycle ms/step |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for kind, v in ht.get("step", {}).items():
+            cyc = sum(x for x in (v.get("gap_ms"), v.get("pre_ms"), v.get("draft_ms"), v.get("fwd_ms"), v.get("post_ms")) if x is not None)
+            L.append(f"| {kind} | {v['steps']} | {f(v.get('gap_ms'),3)} ({v['gap_n']}) | {f(v.get('pre_ms'),3)} | {f(v.get('draft_ms'),3)} | "
+                     f"{f(v.get('fwd_ms'),3)} | {f(v.get('post_ms'),3)} | {f(cyc,2)} |")
+        if ht.get("call"):
+            L += ["", "| runtime call | calls | rows | engine | logits copy | candidates | rest |", "|---|---:|---:|---:|---:|---:|---:|"]
+            for kind, v in ht["call"].items():
+                L.append(f"| {kind} | {v['calls']} | {f(v.get('rows'),2)} | {f(v.get('eng_ms'),3)} | {f(v.get('logits_ms'),3)} | {f(v.get('cands_ms'),3)} | {f(v.get('rest_ms'),3)} |")
+        fh = ht.get("fwd") or {}
+        if fh.get("n"):
+            L += ["", f"- forward on sample steps (n {fh['n']}): host {f(fh.get('host_ms'),2)} ms · GPU entry {f(fh.get('entry_ms'),2)} · window {f(fh.get('window_ms'),2)} · "
+                      f"head + logits copy {f(fh.get('head_ms'),2)} ms"]
+        L.append("")
     c = S["concurrency"]
     L += ["## Concurrency", "", "| open requests (at decode step) | share |", "|---:|---:|"]
     L += [f"| {k} | {f(100*v,1)}% |" for k, v in c["open_requests_at_decode_step"].items()]

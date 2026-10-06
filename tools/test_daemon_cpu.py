@@ -1644,6 +1644,46 @@ def run_mutants(td):
     return out
 
 
+def run_step_host(exe, td):
+    """HIVE_PROFILE=N [step-host <kind>] lines (hived.cpp decode_step wrapper): one line per N steps, the monitor's format, outputs unchanged,
+    and a gap that spans another request's prefill is not counted (prefill_epoch) — with a 300 ms fake prefill admitted while a request
+    decodes, a counted gap that large means the exclusion is broken. No lines without HIVE_PROFILE."""
+    import hive_monitor as hm
+    ck = Checker('step-host')
+    pre_ms = 300 * SLOW
+    h = Hived(exe, td, {'HIVE_PROFILE': '4', 'FAKE_PREFILL_MS': str(pre_ms)}, name='stephost')
+    A, B = tokens(40, 11), tokens(60, 12)
+    out = {}
+    t = threading.Thread(target=lambda: out.__setitem__('a', h.generate('sa', A, 160)))
+    t.start()
+    time.sleep(pre_ms / 1000 + .15 * SLOW)  # a is decoding when b's prefill runs
+    done_ok(ck, 'b (admitted while a decodes)', h.generate('sb', B, 8), B, 8, 0)
+    t.join()
+    done_ok(ck, 'a (decoding across b\'s prefill)', out['a'], A, 160, 0)
+    h.stop()
+    lines = [l for l in h.log_path.read_text(errors='replace').splitlines() if l.startswith('[step-host')]
+    ms = [hm.RE['step_host'].match(l) for l in lines]
+    ck.checks += 1
+    if not lines or not all(ms):
+        ck.failures.append(f'[step-host] lines missing or not in the monitor format: {lines[:3]}')
+    else:
+        ck.checks += 3
+        if any(int(m[2]) != 4 for m in ms):
+            ck.failures.append('a [step-host] line does not cover HIVE_PROFILE=4 steps')
+        if any(int(m[4]) > int(m[2]) for m in ms):
+            ck.failures.append('more counted gaps than steps')
+        worst = max(float(m[3]) * int(m[4]) for m in ms)  # the line's counted gap total (a mean over 4 steps would hide one 300 ms gap)
+        if worst >= pre_ms / 2:
+            ck.failures.append(f'a gap spanning a prefill was counted (gaps of one line total {worst:.1f} ms ≥ {pre_ms / 2:.0f} ms)')
+    h2 = Hived(exe, td, name='stephost-off')
+    done_ok(ck, 'no HIVE_PROFILE', h2.generate('s', A, 12), A, 12, 0)
+    h2.stop()
+    ck.checks += 1
+    if any(l.startswith('[step-host') for l in h2.log_path.read_text(errors='replace').splitlines()):
+        ck.failures.append('[step-host] printed without HIVE_PROFILE')
+    return ck
+
+
 def main():
     if os.environ.get('HIVE_DAEMON_NEGATIVE') == 'mutants':
         with tempfile.TemporaryDirectory(prefix='hive-daemon-mut-') as td:
@@ -1660,7 +1700,7 @@ def main():
             print(f'negative control {kind}: {"DETECTED (expected)" if detected else "NOT DETECTED"}')
             sys.exit(0 if detected else 1)
     names = [n for n in os.environ.get('HIVE_DAEMON_CONFIGS', ','.join(CONFIGS)).split(',') if n]
-    extra = os.environ.get('HIVE_DAEMON_EXTRA', 'failures,sigterm,review,round2,graceful,batch,p1,hosttiles').split(',')
+    extra = os.environ.get('HIVE_DAEMON_EXTRA', 'failures,sigterm,review,round2,graceful,batch,p1,hosttiles,stephost').split(',')
     with tempfile.TemporaryDirectory(prefix='hive-daemon-test-') as td:
         t0 = time.monotonic()
         exe = build_daemon(td)
@@ -1697,6 +1737,8 @@ def main():
             checkers.append(run_p1(exe, td))
         if 'hosttiles' in extra:
             checkers.append(run_host_tiles(td))
+        if 'stephost' in extra:
+            checkers.append(run_step_host(exe, td))
         for ck in checkers[len(names):]:
             print(f'  {ck.name}: {ck.checks} checks, {len(ck.failures)} failures')
         bad = [(ck.name, f) for ck in checkers for f in ck.failures]

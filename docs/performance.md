@@ -231,6 +231,8 @@ with the headline benchmark.
 | 20 | Logits into a pinned buffer, hived's verify row vector reused | no pageable copy into fresh memory per verify step; real-chat unchanged |
 | 21 | Promotion victims sorted once per step (same choices) — `after_step` scanned every slot for each used expert and held the GPU idle 1.88 ms per verify step (host timestamps, CUPTI timeline) | real-chat, interleaved ×2: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s |
 | 22 | Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`) — the DeepSeek post-and-gate (`er_route_post`, `er::Gate`) after the router; the host classifies and launches experts while the shared expert runs | outputs identical; real-chat, interleaved ×2: c4 95.3 → 99.4 tok/s, c1 / c2 / c8 +0.4 / −1.7 / −0.1 % |
+| 23 | Session snapshots copy only the rows added since the previous one (`HIVE_CKPT_DELTA`) and the prompt checkpoint is taken after the first token is sent (`HIVE_DEFER_CKPT`); shared prefixes checked against the device rows (`HIVE_CKPT_VERIFY=16`) | service log, before / after: time between the end of the prefill and the first token, mean 746 ms (1,097 ms at 64K+) → 0; every prefix check ok |
+| 24 | Prefill CPU / streaming split from measured costs (`HIVE_GLM_PREFILL_ADAPT`) — a streamed record took 0.65–0.85 ms instead of the assumed 0.507 ms and the CPU finished its share early | service log, before / after, same size ranges: 65–256-row prefill 1,115 → 862 ms (records streamed 1,241 → 766), 257–1,024 rows 2.99 → 2.85 ms/row, 1K–4K 1.49 → 1.47 ms/row; the CPU (fp32) and GPU (bf16) results of an expert can differ by rounding |
 
 Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 

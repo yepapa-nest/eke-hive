@@ -69,12 +69,13 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
   if (probe_every_ > 0) {
     for (auto& e : probe_ev_) CUDA_CHECK(cudaEventCreate(&e));
   }
+  pf_prof_ = getenv("HIVE_PROFILE") && atoi(getenv("HIVE_PROFILE")) > 0;  // [glm-prefill] (glm_engine.h)
   if (const char* p = getenv("HIVE_PROFILE"); p && atoi(p) > 0 && prof_ == 0) {  // sample steps (glm_engine.h)
     sample_every_ = atoi(p);
     dh_.resize(c_.n_layers);
     for (DhLayer& d : dh_)
       for (cudaEvent_t* e : {&d.start, &d.front, &d.end, &d.x.exp, &d.x.gend, &d.x.acc}) CUDA_CHECK(cudaEventCreate(e));
-    CUDA_CHECK(cudaEventCreate(&dh_head_));
+    for (cudaEvent_t* e : {&dh_head_, &dh_entry_, &dh_done_}) CUDA_CHECK(cudaEventCreate(e));
   }
   fused_ = !(getenv("HIVE_GLM_DECODE_FUSED") && strcmp(getenv("HIVE_GLM_DECODE_FUSED"), "0") == 0);  // default on; "0" = off
   early_route_ = fused_ && !(getenv("HIVE_GLM_EARLY_ROUTE") && strcmp(getenv("HIVE_GLM_EARLY_ROUTE"), "0") == 0);
@@ -702,6 +703,7 @@ void GlmEngine::mlp_layer(int l, int rows, bool prefill) {
 //                  tail  = GPU experts done → CPU results added (the stream waited for the CPU); cpu-bound layers = layers with tail > 5 µs
 //                  next  = layer end → next layer start (host work between layers; the head for the last one)
 //                  defer wait = host time deferred_wait blocked · gpu-idle = sync + tail + next, of = first layer start → head
+//   [fwd-host]     host = forward entry → now (after the final synchronization) · entry / window / head = GPU spans (glm_engine.h dh_entry_)
 void GlmEngine::sample_report(int rows, const GlmForwardStats& s0, const GlmCacheStats& x0) {
   auto d = [&](double GlmForwardStats::*f) { return st_.*f - s0.*f; };
   const double sec[] = {d(&GlmForwardStats::ms_embed), d(&GlmForwardStats::ms_hc),
@@ -730,6 +732,8 @@ void GlmEngine::sample_report(int rows, const GlmForwardStats& s0, const GlmCach
                   "gpu-idle %.2f of %.2f ms (cpu layers %d)\n",
           rows, verify_ ? " verify" : "", sync, x.ms_cpu - x0.ms_cpu, gpu, cpu_bound, layers, tail, next, x.ms_defer_wait - x0.ms_defer_wait,
           sync + tail + next, el(dh_[0].start, dh_head_), cpu_layers);
+  fprintf(stderr, "[fwd-host M=%d%s] host %.2f · entry %.2f · window %.2f · head %.2f ms\n", rows, verify_ ? " verify" : "", now_ms() - fwd_t0_,
+          el(dh_entry_, dh_[0].start), el(dh_[0].start, dh_head_), el(dh_head_, dh_done_));
   if (er_layers_ > 0) {  // totals since the last line, except resync / missing / untrusted (gate totals) — the DeepSeek line's meaning
     fprintf(stderr, "[early-route M=%d] layers %ld · host ahead of front end %ld · absorbed %ld (resync %ld · missing %ld · untrusted %ld)\n", rows,
             er_layers_, er_ahead_, er_abs_, er_gate_.n_resync, er_gate_.n_missing, er_gate_.n_untrusted);
@@ -753,6 +757,7 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   if (sample_) prof_ = 2;
   prof_t_ = t0;
   if (prof_ == 2) { ev_marks_.clear(); prof_mark(nullptr); }
+  if (sample_) { fwd_t0_ = t0; CUDA_CHECK(cudaEventRecord(dh_entry_, stream_)); }
   // embeddings: gather on the host (table in RAM), upload, replicate into the hc streams
   if (!prefill && rows <= 8) {
     // decode: rows gathered into a pinned buffer and expanded into the hc streams by a kernel that reads it directly (UVA) — no H2D
@@ -793,6 +798,8 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   for (int l = 0; l < c_.n_layers; ++l) {
     const LayerW& L = m_.layer(l);
     if (sample_) { CUDA_CHECK(cudaEventRecord(dh_[l].start, stream_)); dh_[l].moe = false; dh_[l].x.cpu = false; }
+    cudaEvent_t pf_a0 = nullptr;
+    if (prefill && pf_) { pf_a0 = pf_event(); CUDA_CHECK(cudaEventRecord(pf_a0, stream_)); }
     double ph0 = 0;
     if (probe >= 0) {
       CUDA_CHECK(cudaEventRecord(probe_ev_[2 * l], stream_));
@@ -806,6 +813,7 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
     prof_mark(&st_.ms_hc);
     if (L.kda) { kda_layer(l, seqs, M, T, prefill); prof_mark(&st_.ms_kda); }
     else { dsa_layer(l, seqs, M, T, prefill); prof_mark(&st_.ms_dsa); }
+    if (pf_a0) { cudaEvent_t a1 = pf_event(); CUDA_CHECK(cudaEventRecord(a1, stream_)); pf_->attn[L.kda ? 0 : 1].push_back({pf_a0, a1}); }
     if (fast) glm_hc_pre_decode(hb(), rows, H, L.hc_ffn.fn.as<float>(), L.hc_ffn.scale.as<float>(), L.hc_ffn.base.as<float>(), L.post_norm.as<bf16>(),
                                 c_.rms_eps, c_.hc_eps, c_.sinkhorn_iters, mixes_.as<float>(), rsq_.as<float>(), pre_.as<float>(), post_.as<float>(),
                                 comb_.as<float>(), x_.as<bf16>(), xn_.as<bf16>(), hc_sync_.as<int>(), stream_, attn_.as<bf16>());
@@ -840,6 +848,7 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   }
   blas_.gemm_bf16_f32out(head_in, m_.lm_head().p(), logits_dev_.as<float>(), nr, c_.vocab, H);
   if (logits_host) CUDA_CHECK(cudaMemcpyAsync(logits_host, logits_dev_.p, (size_t)nr * c_.vocab * 4, cudaMemcpyDeviceToHost, stream_));
+  if (sample_) CUDA_CHECK(cudaEventRecord(dh_done_, stream_));
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   prof_mark(&st_.ms_head);
   prof_flush();
@@ -881,7 +890,41 @@ void GlmEngine::yield_exit(YieldSave& sv) {
   hcur_ = sv.hcur; emb_over_ = std::move(sv.emb); emb_base_ = sv.emb_base; sv.on = false;
 }
 
+cudaEvent_t GlmEngine::pf_event() {
+  if (pf_ev_free_.empty()) { cudaEvent_t e; CUDA_CHECK(cudaEventCreate(&e)); return e; }
+  cudaEvent_t e = pf_ev_free_.back();
+  pf_ev_free_.pop_back();
+  return e;
+}
+
 void GlmEngine::prefill(GlmSeq& s, const int32_t* ids, int T, float* logits_last) {
+  if (!pf_prof_) { prefill_body(s, ids, T, logits_last); return; }
+  PfFrame fr;
+  struct Scope {  // also on an exception: the outer record and the events come back
+    GlmEngine& e; PfFrame& fr; PfFrame* prev; GlmExperts::PfMoe* prev_moe;
+    ~Scope() {
+      e.pf_ = prev; e.ex_.set_prefill_moe(prev_moe);
+      for (auto& v : fr.attn) for (auto& [a, b] : v) { e.pf_ev_free_.push_back(a); e.pf_ev_free_.push_back(b); }
+    }
+  } scope{*this, fr, pf_, ex_.prefill_moe()};
+  pf_ = &fr; ex_.set_prefill_moe(&fr.moe);
+  const int64_t pos0 = s.pos;
+  const double t0 = now_ms(), y0 = pf_yield_body_ms;
+  prefill_body(s, ids, T, logits_last);
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  const double wall = now_ms() - t0, yield = pf_yield_body_ms - y0;
+  double attn[2] = {0, 0};
+  for (int k = 0; k < 2; ++k)
+    for (auto& [a, b] : fr.attn[k]) { float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, a, b)); attn[k] += ms; }
+  const GlmExperts::PfMoe& m = fr.moe;
+  const double moe = m.prep + m.gpu + m.join, gb = (double)m.streamed * ex_.record_bytes() / 1e9;
+  fprintf(stderr, "[glm-prefill T=%d pos=%lld] wall %.1f · yield %.1f · moe prep %.1f gpu %.1f cpu-join %.1f · attn kda %.1f dsa %.1f · other %.1f ms · "
+                  "rows hit %ld cpu %ld · streamed %ld (%.2f GB · %.1f GB/s) · moe layers %ld · layer-major %d · est copy %.2f pass %.3f ms\n",
+          T, (long long)pos0, wall, yield, m.prep, m.gpu, m.join, attn[0], attn[1], wall - yield - moe - attn[0] - attn[1], m.hit, m.cpu, m.streamed, gb,
+          m.gpu > 0 ? gb / (m.gpu / 1000.0) : 0.0, m.layers, (int)fr.layer_major, ex_.prefill_copy_ms(), ex_.prefill_pass_ms());
+}
+
+void GlmEngine::prefill_body(GlmSeq& s, const int32_t* ids, int T, float* logits_last) {
   GlmSeq* sp[1] = {&s};
   HIVE_CHECK(s.pos + T <= s.cap, "GLM: sequence capacity exceeded");
   kv_reserve(s, std::min<int64_t>(s.cap, s.pos + T + kKvSlack));  // before any expert-cache slot is lent to the layer-major buffers
@@ -890,7 +933,7 @@ void GlmEngine::prefill(GlmSeq& s, const int32_t* ids, int T, float* logits_last
     for (int off = 0; off < T; off += span) {
       const int n = std::min(span, T - off);
       emb_base_ = off;
-      if (n > max_chunk_) prefill_layer_major(s, ids + off, n, off + n == T ? logits_last : nullptr);
+      if (n > max_chunk_) { if (pf_) pf_->layer_major = true; prefill_layer_major(s, ids + off, n, off + n == T ? logits_last : nullptr); }
       else forward(sp, 1, ids + off, n, true, off + n == T ? logits_last : nullptr, false);
     }
     ex_.warm_quota(2048);

@@ -173,6 +173,8 @@ Changes from that breakdown (A/B, interleaved, restart per configuration, 12 cha
 | Decode/verify logits into a pinned buffer, hived's verify row vector reused (values unchanged) | removes a pageable copy into freshly allocated memory each verify step (rows × 154,880 × 4 B); real-chat c1 69.4 / 67.8 vs 68.2 tok/s — kept for the host work it saves |
 | Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`, the DeepSeek post-and-gate code): routing and the CPU input rows reach the host right after the router, the experts are launched while the shared expert runs | output identical to off (300-token greedy streams; off vs off diverged at token 2); real-chat, interleaved ×2: c1 69.7 → 70.0, c2 86.7 → 85.2, c4 95.3 → 99.4, c8 128.3 → 128.2 tok/s |
 | Promotion victims sorted once per step instead of a scan of every slot for each used expert (same choices) — host timestamps showed `after_step` holding the GPU idle 1.88 ms per verify step | real-chat, interleaved ×2 at 8 seats + batched MTP: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s; promotions per verify unchanged (28 vs 25–29) |
+| Session snapshots copy only the new rows (`HIVE_CKPT_DELTA`), prompt checkpoint after the first token (`HIVE_DEFER_CKPT`) | service log, before / after: prefill end → first token, mean 746 ms (1,097 ms at 64K+) → 0; shared-prefix checks (`HIVE_CKPT_VERIFY`) all ok |
+| Prefill CPU / streaming split from measured costs (`HIVE_GLM_PREFILL_ADAPT`) | service log, before / after: 65–256-row prefill 1,115 → 862 ms, 257–1,024 rows 2.99 → 2.85 ms/row, larger prompts unchanged |
 
 ### Lossy changes measured with quality (on top of each other)
 
@@ -219,6 +221,13 @@ The same as DeepSeek: a conversation continues from its own state, and with `HIV
 | system prompt changed at its start (control) | 0 cached · 5.6 s | 0 cached · 6.0 s |
 
 Responses report the reused tokens as `usage.prompt_tokens_details.cached_tokens` (OpenAI) and `cache_read_input_tokens` (Anthropic).
+
+Snapshots (prompt checkpoints, boundary snapshots, archived sessions) copy the KDA conv / state whole and the DSA latent / indexer and MTP
+rows up to the position. With `HIVE_CKPT_DELTA` (on in `config/glm.env`) a snapshot shares the rows the previous snapshot of the same
+sequence already holds — rows below a committed position are never rewritten; MTP rows only below that snapshot's exact MTP position —
+and copies only the new ones; `HIVE_DEFER_CKPT` (on) takes the prompt checkpoint after the first token is sent. Motivation (service
+traffic, 2026-10-05, before both): the synchronous full copy came before the first token and added 746 ms to the mean TTFT, 1,097 ms
+for prompts of 64K tokens and more. `HIVE_CKPT_VERIFY=N` compares every N-th shared prefix with the device rows (`[glm-ckpt] verify`).
 
 ## Context and KV memory
 
@@ -290,7 +299,8 @@ The reference comparison (next-token top-1 and hidden states) passes on every pa
 | `HIVE_GLM_SHORT_PREFILL` | 64 | prompt chunks up to this many rows (capped at 64) use the decode expert path (VRAM hits + CPU misses) instead of streaming experts |
 | `HIVE_GLM_PREFILL_TILES` | 4 | blocks of `max_chunk` rows one prefill call runs layer-major (1 = block by block) |
 | `HIVE_GLM_PREFILL_ELASTIC` | on | layer-major buffers borrowed from the expert-cache tail while a long prompt runs; `0` = reserved at start |
-| `HIVE_GLM_PREFILL_CPU` | on | prefill experts with ≤ 24 rows computed by the CPU next to the GPU's streamed ones |
+| `HIVE_GLM_PREFILL_CPU` | on | prefill experts computed by the CPU next to the GPU's streamed ones (fewest rows first, while the CPU share finishes before the copies) |
+| `HIVE_GLM_PREFILL_ADAPT` | on | the CPU/streaming split uses the measured cost of a streamed record and of an 8-row CPU pass (moving averages over the previous prefill layers, shown on `[glm-prefill]` as `est copy … pass …`) instead of fixed 0.507 / 0.17 ms; an expert goes to the CPU while its CPU cost is below one copy. Only the split changes; the CPU (fp32) and GPU (bf16) results of an expert can differ by rounding, as they already did when the cache state moved the split. `0` = the fixed estimates and the 24-row limit. Motivation: a record measured 0.65–0.85 ms, the CPU finished its share early and the GPU streamed 1,257 records per 65–256-row prefill (1,072 of 1,135 ms) |
 | `HIVE_GLM_PREFETCH_ROWS2` | 0 | prefetch budget for steps with ≥ 2 rows (0 = same as `HIVE_GLM_PREFETCH`) |
 | `HIVE_CACHE_PRIOR` | 0 (`config/glm.env`: 0.1) | decode routing biased toward VRAM-resident experts by λ × the layer's score range; top-2 always kept (`HIVE_CACHE_PRIOR_TOPJ`) |
 | `HIVE_GLM_DEFER` | 0 (`config/glm.env`: 1) | CPU misses ranked 3rd or lower computed while the GPU goes on, added one MoE layer later |
@@ -299,7 +309,7 @@ The reference comparison (next-token top-1 and hidden states) passes on every pa
 | `HIVE_MTP_BATCH` | off (`config/glm.env`: 1) | verify the drafts of several sequences in one step: c2 66.6 → 79.5 tok/s with `HIVE_MAX_BATCH=8` (earlier, at 4 seats, c4 within noise) |
 | `HIVE_GLM_LAUNCH_PROBE` | 0 | measurement: every N-th decode step, GPU time vs host enqueue time of each layer's front (totals every 50 probed steps) |
 | `HIVE_GLM_NOTHINK` | `low` | API server setting: what a no-thinking request becomes — `low` (official minimum effort) or `empty` (prefilled empty thinking block) |
-| `HIVE_PROFILE` / `HIVE_TRACE_CACHE` / `HIVE_TRACE_MTP` | off | monitoring lines in the DeepSeek formats, read by `tools/hive_monitor.py`: `[cache]` per decode / verify step; every N-th step (`HIVE_PROFILE=N`) `[profile]` section times, `[decode-host]` (where the decode stream sat empty: routing to the host, waiting for CPU experts, between layers; plus the host's deferral wait) and `[early-route]`, from CUDA events — no host synchronization added; `[mtp]` from hived. Ignored while `HIVE_GLM_PROF` is set |
+| `HIVE_PROFILE` / `HIVE_TRACE_CACHE` / `HIVE_TRACE_MTP` | off | monitoring lines in the DeepSeek formats, read by `tools/hive_monitor.py`: `[cache]` per decode / verify step; every N-th step (`HIVE_PROFILE=N`) `[profile]` section times, `[decode-host]` (where the decode stream sat empty: routing to the host, waiting for CPU experts, between layers; plus the host's deferral wait) and `[early-route]`, from CUDA events — no host synchronization added; `[mtp]` from hived; host time: `[step-host]` (hived), `[call-host]`, `[fwd-host]` and one `[glm-prefill]` line per prefill call (see configuration.md). Ignored while `HIVE_GLM_PROF` is set (`[glm-prefill]` and `[step-host]` / `[call-host]` are not) |
 | `HIVE_GLM_PROF` | 0 | 1 = host-synchronized phase timings, 2 = CUDA-event phase timings; hived prints a per-call breakdown (phases, cache hits, CPU expert GB/s) every 400 calls of a kind (measurement only) |
 | `HIVE_GLM_KDA_ROWS` | on | KDA recurrence of a verify step's rows in one launch (bit-identical); `0` = one launch per row plus snapshot copies |
 | `HIVE_GLM_EARLY_ROUTE` | on | fast decode path: routing posted right after the router, experts launched while the shared expert runs; `0` = stream synchronization after the shared expert |
