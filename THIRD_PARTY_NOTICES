@@ -133,6 +133,17 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
+5. Draft vocabulary of the GLM MTP head (config/glm-draft-vocab-64k.bin)
+   The file is a list of GLM tokenizer ids ranked by frequency (no text), built with
+   tools/build_draft_vocab.py from:
+     - OpenAssistant oasst2 (2023-11-05 "ready" messages, English assistant
+       messages) — https://huggingface.co/datasets/OpenAssistant/oasst2,
+       Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0);
+     - NSMC, the Naver sentiment movie corpus (review texts) —
+       https://github.com/e9t/nsmc, CC0 1.0 (public domain dedication).
+   Neither dataset is included in this repository.
+
+================================================================================
 Runtime and build dependencies that are not included in this repository
 (installed separately, each under its own license): NVIDIA CUDA Toolkit, cuBLAS/
 cuBLASLt and driver (NVIDIA CUDA EULA — only relevant when redistributing those

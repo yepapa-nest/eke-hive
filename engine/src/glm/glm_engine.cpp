@@ -181,6 +181,31 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
     al(mtp_moe_ws_, glm_moe_fp8_ws_bytes(1, c_.n_act, c_.moe_inter));
     // the embedding table read by the draft chain on the device (embed_gather_dev): pin + map it (it stays in host RAM)
     CUDA_CHECK(cudaHostRegister(const_cast<bf16*>(m_.embed_host()), (size_t)c_.vocab * c_.hidden * 2, cudaHostRegisterMapped));
+    // HIVE_GLM_DRAFT_VOCAB=FILE (little-endian int32 token ids, tools/build_draft_vocab.py; unset/""/"0" = whole vocabulary): the draft
+    //   head scores only these rows of lm_head, read in place (gemv_rows_bf16 — no copy, no VRAM taken from the expert cache). Drafts
+    //   are proposals only: the verify step scores them against the full lm_head, so the output is unchanged; a token outside the list
+    //   can only be missed as a draft. Motivation (2026-10-06 GLM service log, [step-host spec]): the draft took 4.29 ms of a 41.8 ms
+    //   step, and three drafts read the whole bf16 lm_head (154,880 × 4,096 × 2 B = 1.27 GB) three times.
+    if (const char* dv = getenv("HIVE_GLM_DRAFT_VOCAB"); dv && *dv && strcmp(dv, "0") != 0) {
+      std::vector<int32_t> rows;
+      if (FILE* f = fopen(dv, "rb")) {
+        int32_t v;
+        while (fread(&v, 4, 1, f) == 1)
+          if (v >= 0 && v < c_.vocab) rows.push_back(v);
+        fclose(f);
+      }
+      std::sort(rows.begin(), rows.end());
+      rows.erase(std::unique(rows.begin(), rows.end()), rows.end());  // ascending rows: the head reads lm_head front to back
+      if (!rows.empty() && (int)rows.size() < c_.vocab) {
+        al(draft_rows_, rows.size() * 4);
+        CUDA_CHECK(cudaMemcpy(draft_rows_.p, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice));
+        al(draft_idx_, 16 * 4);
+        draft_n_ = (int)rows.size();
+        fprintf(stderr, "[glm] MTP draft head: %d of %d tokens (%s)\n", draft_n_, c_.vocab, dv);
+      } else {
+        fprintf(stderr, "[glm] ⚠️HIVE_GLM_DRAFT_VOCAB=%s: no usable token ids — the draft head scores the whole vocabulary\n", dv);
+      }
+    }
   }
   fprintf(stderr, "[glm] engine: chunk %d · work buffers ready (attention workspace %.0f MiB)\n", max_chunk, ws_bytes_ / 1048576.0);
 }

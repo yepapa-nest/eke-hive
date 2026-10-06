@@ -126,6 +126,7 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | 21 | Cache-aware routing (`HIVE_CACHE_PRIOR=0.1`) and expert deferral (`HIVE_DECODE_DEFER`) | Decode only. Each router's selection scores get λ × the layer's running score range for experts already in VRAM, with the top 2 by the original scores always kept and the routing weights left as the model's (idea: Skliar et al., TMLR 2025) — fewer misses reach the CPU. CPU misses ranked 3rd or lower in their row are no longer waited for: they run while the next layer starts and are added to the hidden streams one layer later (idea: KTransformers, SOSP 2025); ~1.5 rows per layer took that path. Both first proved on GLM-5.3 ([below](#glm-53-flash), [glm.md](glm.md#lossy-changes-measured-with-quality-on-top-of-each-other)) | Real-chat benchmark: c1 53.8 → 76.9, c4 81.1 → 124.0, c8 100.2 → 173.0 tok/s; decode after 17–54K prompts +66–74 %; prefill unchanged; quality 172 → 175 / 179 (McNemar p = 0.375; long-context items byte-identical). The first build hung on the first decode: the next layer's job list was rebuilt while the deferred batch still read it — fixed by adding the batch before the list is rebuilt |
 | 22 | Decode kernels: expert activations a stage ahead, multi-row head (both bit-identical) | The fused expert kernel (FUSED3) loaded its activation operand only one 4-block step before use, so in launches with few work items (one stream, MTP verify rows) every step waited on an L2 round trip: one expert 53.0 → 37.8 µs, five experts 114.6 → 94.2 µs (`tests/bench_moe_lowm.cu`, L2 flushed); `test_decode_moe` M=1 811 → 912 GB/s. The head kernel read each vocabulary row once per input row (`HIVE_HEAD_ROWS`): 4 rows 1,169 → 911 µs, 8 rows 2,170 → 950 µs (`tests/test_head_rows.cu`) — it serves the verify rows and the MTP draft block | Real-chat benchmark, 7 base runs vs 6, interleaved: c1 83.9 → 86.0 tok/s (+2.5 %), c2 92.4 → 92.9, c4 123.6 → 124.2, c8 171.4 → 173.7; prefill unchanged |
 | 23 | Mid-size prompts admitted at layer yields by remaining work (`HIVE_LAYER_YIELD_MID=16384`) | Service log (10-01..10-05): 114 requests of ≥ 4K rows waited > 2 s behind another prefill of ≥ 4K rows (e.g. three 22K-row requests 5.3 s behind a 20K one) — a layer yield admitted only ≤ 1,023-row requests. Now a request of up to 16,384 rows is admitted when it is at most half of the paused forward's remaining rows (its rows × (1 − progress) + its later chunks), at most that forward's rows per forward; its own forward yields once more for decode steps only (`ly::Hooks::max_depth` 2) | 85K prompt + 12K request 3 s later + a decoder (`tools/layer_yield_check.py`, two runs each): request 14.6 → 4.4 s to the first token, the long prompt 13.9 → 18.2 s, mean of the two 14.3 → 11.3 s; decoder's longest stall 1.83 → 2.05 s (5.13 s without the second level) |
+| 24 | Server: one tokenization with offsets, and only the changed tail of a conversation (`HIVE_TOKEN_CACHE`, shared with GLM step 28) | prepare step, next turn of a 153K-token conversation: 590 → 25 ms; first request ~590 → 326 ms; ids and boundary hints identical |
 
 ### Rejected (measured, not adopted)
 
@@ -186,9 +187,10 @@ full record, with every A/B, is in [glm.md](glm.md#performance); this section is
 ### Result
 
 Real-chat benchmark (`tools/bench_chat.py`, shipped `config/glm.env`; [benchmarks.md](benchmarks.md#real-chat-benchmark-headline)):
-decode 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6 tok/s with 1 / 2 / 4 / 8 / 16 / 32 streams (two runs; before steps 17–21
-65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3), time to first token 7.3 / 11.8 / 13.9 / 26.4 / 53.7 / 66.3 s for 17K / 42K / 54K / 100K /
-200K / 250K-token prompts, quality 158 / 163 (steps 17–21 do not change outputs).
+decode 70.8 / 87.8 / 103.9 / 130.6 / 130.3 / 130.9 tok/s with 1 / 2 / 4 / 8 / 16 / 32 streams (two runs, 2026-10-07; 2026-10-05 before
+steps 25–28: 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6; before steps 17–21
+65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3), time to first token 7.4 / 11.7 / 14.0 s for 17K / 42K / 54K-token prompts (26.4 / 53.7 / 66.3 s for
+100K / 200K / 250K, 2026-10-05), quality 158 / 163 (steps 17–28 do not change outputs).
 
 ### Where the time goes
 
@@ -233,6 +235,10 @@ with the headline benchmark.
 | 22 | Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`) — the DeepSeek post-and-gate (`er_route_post`, `er::Gate`) after the router; the host classifies and launches experts while the shared expert runs | outputs identical; real-chat, interleaved ×2: c4 95.3 → 99.4 tok/s, c1 / c2 / c8 +0.4 / −1.7 / −0.1 % |
 | 23 | Session snapshots copy only the rows added since the previous one (`HIVE_CKPT_DELTA`) and the prompt checkpoint is taken after the first token is sent (`HIVE_DEFER_CKPT`); shared prefixes checked against the device rows (`HIVE_CKPT_VERIFY=16`) | service log, before / after: time between the end of the prefill and the first token, mean 746 ms (1,097 ms at 64K+) → 0; every prefix check ok |
 | 24 | Prefill CPU / streaming split from measured costs (`HIVE_GLM_PREFILL_ADAPT`) — a streamed record took 0.65–0.85 ms instead of the assumed 0.507 ms and the CPU finished its share early | service log, before / after, same size ranges: 65–256-row prefill 1,115 → 862 ms (records streamed 1,241 → 766), 257–1,024 rows 2.99 → 2.85 ms/row, 1K–4K 1.49 → 1.47 ms/row; the CPU (fp32) and GPU (bf16) results of an expert can differ by rounding |
+| 25 | MTP draft head over the 65,536 tokens most frequent in public chat answers (`HIVE_GLM_DRAFT_VOCAB`) — the three drafts of a step read the whole bf16 `lm_head` (154,880 × 4,096) three times; the head now reads only the listed rows, in place | outputs unchanged (the verify step uses the full head); real-chat, interleaved ×2: c1 69.4 → 71.4, c4 98.1 → 104.6 tok/s, c2 / c8 unchanged (A/A spread 0.3–2.1 %). Measured with a list built from ShareGPT answers; the shipped list (OpenAssistant oasst2 + NSMC, [glm.md](glm.md)) covers ~1 point fewer chat tokens and has not been measured on the GPU yet |
+| 26 | Mid-size requests admitted at layer yields (`HIVE_LAYER_YIELD_MID=16384`, as DeepSeek step 23) | 96K-token prefill, 2K request 8 s in: its first token 18.9 / 18.6 → 2.9 / 2.9 s; the long prompt 22.7 → 31.0 s (it served a 2K and a 12K request meanwhile) |
+| 27 | RAM budget for evicted conversations 96 GB (`HIVE_HOST_SESSION_MB=98304`; a 145K-token conversation keeps ~3 GB, 32 GB held about ten) | twelve 145K conversations, then the first one again: 37.0 s → 1.6 s to the first token |
+| 28 | Server: one tokenization with offsets, and only the changed tail of a conversation (`HIVE_TOKEN_CACHE`, both models) — the server tokenized each 159K-token prompt twice (ids, then boundary hints) | prepare step, next turn of a 159K conversation: 554 → 27 ms (GLM), 590 → 25 ms (DeepSeek); first request 562 → 314 ms; ids and boundary hints identical |
 
 Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 
@@ -248,6 +254,9 @@ Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 | W4A8 CPU kernel | 49.4 → 44.8 GB/s on one node, lower accuracy |
 | Layer-major buffers reserved permanently | 3.6 GiB less cache, c1 −6 % |
 | Pinning CPU workers to physical cores | 45.2 / 45.3 vs 46.3 / 45.1 tok/s unpinned |
+| 48 CPU expert threads instead of 32 (SMT, chunking bit-identical) | c1 71.1 vs 71.5, c2 85.6 vs 89.2, c4 101.8 vs 103.3, c8 128.9 vs 128.3 tok/s (×2) — the CPU phase is DRAM-bandwidth bound |
+| Shorter layer-yield period (250 ms) or 8 decode steps per yield instead of 4, for decoders running during a long prefill | 57K-token prefill with a running decoder: decoder chunks/s 4.65 / 4.65 / 4.72 (500 ms) vs 4.56 / 4.88 (250 ms) vs 4.09 / 5.59 (8 steps); the longest gap stays ~1.0 s in every run — set by the time between yield points, not by these switches |
+| Boundary snapshot on the first turn (`HIVE_PREFIX_FIRST_TURN`) | six new conversations sharing a 4.4K-token system block: 3.85 s to the first token from the second one either way — the system-block snapshot is already saved by the first conversation |
 | Equal row ranges per CPU worker (`HIVE_GLM_CPU_BALANCE`) | 18.65 / 19.98 vs 19.44 / 19.73 ms per 3-row verify |
 
 ### Open problem

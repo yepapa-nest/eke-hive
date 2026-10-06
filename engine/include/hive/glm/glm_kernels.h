@@ -36,6 +36,12 @@ void scatter_add_f32_rows(const float* src, const int32_t* idx, int n, int H, fl
 // out[0:H] = table[*id_dev] — the row index is read on the device (table may be pinned host memory, UVA)
 void embed_gather_dev(const __nv_bfloat16* table, const int32_t* id_dev, int H, __nv_bfloat16* out, cudaStream_t st);
 
+// HIVE_GLM_DRAFT_VOCAB: out[r] = W[rows[r], :] · x for n selected rows of a bf16 [*, H] matrix (fp32 out) — the draft head reads only
+//   those rows of lm_head in place (no copy). One warp per row, 16-byte loads; H % 8 == 0.
+void gemv_rows_bf16(const __nv_bfloat16* W, const int32_t* rows, int n, const __nv_bfloat16* x, int H, float* out, cudaStream_t st);
+// *out = table[*idx] (device-side id mapping of the draft argmax back to a vocabulary id)
+void map_id_dev(const int32_t* idx, const int32_t* table, int32_t* out, cudaStream_t st);
+
 // Expert deferral: h[m, c, :] = bf16(h[m, c, :] + post[m, c] · y[m, :]) for M rows of hc streams of width dim; y fp32 [M, dim] (may be pinned
 //   host memory, read through UVA), post fp32 [M, hc] — the contribution hc_post would have added for a MoE output y, added later
 void hc_inject(__nv_bfloat16* h, const float* post, const float* y, int M, int hc, int dim, cudaStream_t st);

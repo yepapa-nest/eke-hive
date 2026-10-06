@@ -366,14 +366,137 @@ def env_on(name: str) -> bool:
 
 
 def _common_prefix_len(a: str, b: str) -> int:
-    lo, hi = 0, min(len(a), len(b))
-    while lo < hi:  # binary search over slice comparisons (C speed) — O(n log n), no per-character Python loop
+    # Equal 64K-character blocks are skipped with one slice compare each (C speed); the first unequal block is narrowed by
+    #   binary search. Copies about the prefix length once instead of ~log2(n) times (the former whole-range binary search).
+    n, step, i = min(len(a), len(b)), 1 << 16, 0
+    while i + step <= n and a[i:i + step] == b[i:i + step]:
+        i += step
+    lo, hi = i, min(i + step, n)
+    while lo < hi:
         mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
+        if a[i:mid] == b[i:mid]:
             lo = mid
         else:
             hi = mid - 1
     return lo
+
+
+class TokenCache:
+    """HIVE_TOKEN_CACHE (default on; "0" = off): tokenize only the changed tail of a conversation's prompt.
+    Each turn of a conversation re-sends the whole prompt, and the server tokenized it whole, with an offset mapping, twice
+    (ids, then boundary hints): 232 + 305 ms for a 159K-token GLM conversation (prep_bench, 2026-10-06; service log p50
+    676 ms per request at 131K+). Per conversation the last prompt, its ids and token end offsets are kept (LRU,
+    HIVE_TOKEN_CACHE_SESSIONS, default 64). A new prompt is cut at the last special token (role marker) that starts inside
+    the common prefix with the kept prompt: the tokens before it are reused, the rest is tokenized without the template's
+    added tokens. A fast tokenizer splits added special tokens out of the text before anything else, so the pieces on
+    either side of one are tokenized independently and the result equals a whole-prompt tokenization. Only special tokens
+    without lstrip/rstrip are used as cut points, and tokenizers whose template appends tokens at the end are not cached.
+    HIVE_TOKEN_CACHE_VERIFY=N (default 32) re-tokenizes every N-th cached result whole on a background thread; a mismatch
+    turns the cache off for the rest of the process and is logged ("[server] token cache MISMATCH")."""
+
+    def __init__(self):
+        import collections, threading
+        self.entries = collections.OrderedDict()
+        self.lock = threading.Lock()
+        self.tok = None
+        self.cut_ids = frozenset()
+        self.lead: list[int] = []
+        self.supported = False
+        self.disabled = False
+        self.hits = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("HIVE_TOKEN_CACHE", "1") != "0"
+
+    def _bind(self, tok) -> None:
+        """Per tokenizer: cut-point ids, the leading added tokens, and whether the template appends anything at the end."""
+        self.tok, self.entries = tok, type(self.entries)()
+        try:
+            full = list(tok("x")["input_ids"])
+            bare = list(tok("x", add_special_tokens=False)["input_ids"])
+            k = len(full) - len(bare)
+            self.lead = full[:k]
+            self.supported = k >= 0 and full[k:] == bare
+            dec = getattr(tok, "added_tokens_decoder", {}) or {}
+            self.cut_ids = frozenset(i for i, t in dec.items()
+                                     if getattr(t, "special", False) and not getattr(t, "lstrip", False) and not getattr(t, "rstrip", False))
+            self.supported = self.supported and bool(self.cut_ids)
+        except Exception:  # noqa: BLE001 — a tokenizer without offsets or added-token metadata: whole tokenization only
+            self.supported = False
+
+    def _whole(self, prompt: str):
+        from array import array
+        enc = TOK(prompt, return_offsets_mapping=True)
+        offs = enc["offset_mapping"]
+        return list(enc["input_ids"]), array("l", [e for _, e in offs]), array("l", [b for b, _ in offs])
+
+    def tokenize(self, key: str, prompt: str):
+        """(ids, token end offsets) for prompt; ends is None when offsets are unavailable."""
+        from array import array
+        import bisect
+        if self.tok is not TOK:
+            self._bind(TOK)
+        if self.disabled or not self.supported or not self.enabled():
+            ids, ends, _ = self._whole(prompt)
+            return ids, ends
+        with self.lock:
+            e = self.entries.get(key)
+            if e is not None:
+                self.entries.move_to_end(key)
+        cut = None
+        if e is not None:
+            p_old, ids_old, ends_old, starts_old, cuts = e
+            c = _common_prefix_len(p_old, prompt)
+            j = bisect.bisect_right(cuts, c) - 1  # last cut point starting at or before the divergence
+            while j >= 0 and cuts[j] == 0:
+                j -= 1
+            if j >= 0:
+                p = cuts[j]
+                t = bisect.bisect_left(starts_old, p)  # index of the special token that starts at p
+                if t < len(ids_old) and starts_old[t] == p and ids_old[t] in self.cut_ids:
+                    cut = (p, t, ids_old, ends_old, starts_old, cuts)
+        if cut is None:
+            ids, ends, starts = self._whole(prompt)
+            cuts = array("l", [starts[i] for i, v in enumerate(ids) if v in self.cut_ids])
+        else:
+            p, t, ids_old, ends_old, starts_old, _ = cut
+            enc = TOK(prompt[p:], add_special_tokens=False, return_offsets_mapping=True)
+            tail = list(enc["input_ids"])
+            ids = ids_old[:t].tolist() + tail
+            offs = enc["offset_mapping"]
+            ends = ends_old[:t] + array("l", [x + p for _, x in offs])
+            starts = starts_old[:t] + array("l", [x + p for x, _ in offs])
+            self.hits += 1
+            n = int(os.environ.get("HIVE_TOKEN_CACHE_VERIFY", "32") or 0)
+            if n > 0 and self.hits % n == 0:
+                self._verify_later(prompt, list(ids))
+            cuts = cut[5][:bisect.bisect_left(cut[5], p)] + array("l", [x + p for (x, _), v in zip(offs, tail) if v in self.cut_ids])
+        with self.lock:
+            self.entries[key] = (prompt, array("l", ids), ends, starts, cuts)
+            self.entries.move_to_end(key)
+            cap = int(os.environ.get("HIVE_TOKEN_CACHE_SESSIONS", "64") or 64)
+            while len(self.entries) > max(1, cap):
+                self.entries.popitem(last=False)
+        return ids, ends
+
+    def _verify_later(self, prompt: str, ids: list[int]) -> None:
+        import threading
+
+        def run():
+            try:
+                ok = list(TOK(prompt)["input_ids"]) == ids
+            except Exception:  # noqa: BLE001
+                return
+            if ok:
+                print(f"[server] token cache verify ok · {len(ids)} tokens", flush=True)
+            else:
+                self.disabled = True
+                print(f"[server] token cache MISMATCH · {len(ids)} tokens — cache off for this process", flush=True)
+        threading.Thread(target=run, daemon=True).start()
+
+
+TOKCACHE = TokenCache()
 
 
 class TailChangeTracker:
@@ -426,7 +549,7 @@ TAILS = TailChangeTracker()
 HINT_TURNS = 4  # only the last few completed assistant-turn ends (the daemon only uses boundaries inside the newly prefilled span — earlier ones were recorded on earlier turns)
 
 
-def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int]) -> list[int]:
+def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None) -> list[int]:
     """H5 (HIVE_PREFIX_SHARE): **exact token offsets** in the encoded prompt — end of the system/tool block and ends of
     completed assistant turns.
     Makes no assumption about the reference template's internals: for each boundary, render "the messages before it + an
@@ -436,16 +559,18 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     the ids actually sent, emit nothing.
     Results are always prefix positions of ids (a wrong boundary only loses a reuse opportunity — the daemon compares the
     token prefix itself). Image requests emit nothing, since text offsets do not match the placeholder expansion.
-    Cost: one extra full-prompt tokenization + one template render per boundary (<= 1 + HINT_TURNS) + string compares —
-    only when enabled."""
-    try:
-        enc = TOK(prompt, return_offsets_mapping=True)
-        if list(enc["input_ids"]) != list(ids):
+    Cost: one template render per boundary (<= 1 + HINT_TURNS) + string compares, plus one extra full-prompt tokenization
+    unless the caller passes the token end offsets of ids (`ends`, from TokenCache) — only when enabled."""
+    if ends is None or len(ends) != len(ids):
+        try:
+            enc = TOK(prompt, return_offsets_mapping=True)
+            if list(enc["input_ids"]) != list(ids):
+                return []
+            ends = [int(e) for _, e in enc["offset_mapping"]]
+        except Exception:
             return []
-        ends = [int(e) for _, e in enc["offset_mapping"]]
-    except Exception:
-        return []
-    if any(ends[i] > ends[i + 1] for i in range(len(ends) - 1)):
+    import itertools, operator
+    if not all(map(operator.le, ends, itertools.islice(ends, 1, None))):
         return []  # non-monotonic mapping (unknown tokenizer) — no boundaries
     import bisect
     probes = []
@@ -1179,16 +1304,27 @@ async def chat(request: Request):
     thinking_mode, effort = effort_from_request(body)
     try:
         prep_ms = {}  # request record "prep_ms": where the server's time before the engine goes (lock wait, chat template, tokenizer, boundary hints)
+        session = (hashlib.sha256(str(body['hive_session_id']).encode()).hexdigest()[:32]
+                   if body.get('hive_session_id') else session_id_for(messages, body.get("user")))
         def prepare():
             t0 = time.perf_counter()
             with ENCODE_LOCK:
                 t1 = time.perf_counter()
                 prompt, media = encode_prompt(messages, tools, thinking_mode, effort)
                 t2 = time.perf_counter()
-                ids, images, blob = tokenize_with_images(prompt, media)
+                ends = None
+                if not media:  # text: ids and token end offsets from one tokenization, only the changed tail (TokenCache)
+                    try:
+                        ids, ends = TOKCACHE.tokenize(session, prompt)
+                        images, blob = [], b""
+                    except Exception:  # noqa: BLE001 — a tokenizer without offsets: the plain path below
+                        ends = None
+                        ids, images, blob = tokenize_with_images(prompt, media)
+                else:
+                    ids, images, blob = tokenize_with_images(prompt, media)
                 t3 = time.perf_counter()
                 # H5: boundary hints are computed only with HIVE_PREFIX_SHARE (same container env as hived — off = zero cost, no field)
-                hints = boundary_hints(messages, tools, thinking_mode, effort, prompt, ids) if env_on("HIVE_PREFIX_SHARE") and not media else []
+                hints = boundary_hints(messages, tools, thinking_mode, effort, prompt, ids, ends) if env_on("HIVE_PREFIX_SHARE") and not media else []
                 t4 = time.perf_counter()
             prep_ms.update(lock=round((t1 - t0) * 1000, 1), template=round((t2 - t1) * 1000, 1), tokenize=round((t3 - t2) * 1000, 1), hints=round((t4 - t3) * 1000, 1))
             return ids, images, blob, hints
@@ -1204,8 +1340,7 @@ async def chat(request: Request):
         log_request({"t_recv": t_recv, "t_done": time.time() * 1000.0, "endpoint": endpoint, "status": 400, "outcome": "context_length_exceeded",
                      "prompt_tokens": len(ids), "max_ctx": mc, "stream": bool(body.get("stream")), "client": client_tags(request, body)})
         return JSONResponse(overflow_body(mc, len(ids)), status_code=400)
-    session = (hashlib.sha256(str(body['hive_session_id']).encode()).hexdigest()[:32]
-               if body.get('hive_session_id') else session_id_for(messages, body.get("user")))
+    # (session: computed before prepare — the token cache is keyed on it)
     # HIVE_PREFIX_ADAPTIVE (needs HIVE_PREFIX_SHARE hints): one extra boundary chunk only for conversations whose tail changes (TailChangeTracker)
     prefix_extra = (await asyncio.to_thread(TAILS.observe, session, ids, hints)) if hints and env_on("HIVE_PREFIX_ADAPTIVE") else False
     # HIVE_PREFIX_FIRST_TURN (needs HIVE_PREFIX_SHARE hints): the first turn of a conversation (no assistant message yet) asks for one extra

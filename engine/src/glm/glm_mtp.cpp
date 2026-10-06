@@ -112,6 +112,13 @@ void GlmEngine::mtp_step(GlmSeq& s, int step, int32_t tok, const bf16* h_in, int
   add_bf16(tmp, h1, H, tmp, stream_);                     // + residual
   rmsnorm(tmp, w.head_norm.as<bf16>(), c_.rms_eps, 1, H, h_out, stream_);
   // head (main lm_head) → greedy draft and its softmax statistics, left on the device
+  if (draft_n_ > 0) {  // HIVE_GLM_DRAFT_VOCAB: only the listed rows (the confidence is the softmax over those rows)
+    gemv_rows_bf16(m_.lm_head().p(), draft_rows_.as<int32_t>(), draft_n_, h_out, H, logits_dev_.as<float>(), stream_);
+    argmax_rows(logits_dev_.as<float>(), 1, draft_n_, draft_idx_.as<int32_t>() + step, stream_);
+    map_id_dev(draft_idx_.as<int32_t>() + step, draft_rows_.as<int32_t>(), mtp_ids_d_.as<int32_t>() + step, stream_);
+    row_max_sumexp(logits_dev_.as<float>(), 1, draft_n_, one_f_.as<float>(), mtp_conf_d_.as<float>() + 2 * step, mtp_conf_d_.as<float>() + 2 * step + 1, stream_);
+    return;
+  }
   blas_.gemm_bf16_f32out(h_out, m_.lm_head().p(), logits_dev_.as<float>(), 1, c_.vocab, H);
   argmax_rows(logits_dev_.as<float>(), 1, c_.vocab, mtp_ids_d_.as<int32_t>() + step, stream_);
   row_max_sumexp(logits_dev_.as<float>(), 1, c_.vocab, one_f_.as<float>(), mtp_conf_d_.as<float>() + 2 * step, mtp_conf_d_.as<float>() + 2 * step + 1, stream_);

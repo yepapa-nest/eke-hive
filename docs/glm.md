@@ -88,28 +88,29 @@ Expert cache: about 4,690 slots (38.8 % of the 12,096 experts) with `config/glm.
 
 ### Through hived (the API), non-thinking requests — current defaults (`config/glm.env`)
 
-Measured in two runs (2026-10-05), every adopted change on (262,144 context with KV memory that follows use, 32 CPU threads, cache-aware
-routing λ 0.1, expert deferral, KDA verify rows, MTP k ≤ 3, prefix sharing, 8 seats with batched MTP verify, layer yields, sorted
-promotion victims), with the real-chat benchmark `tools/bench_chat.py` — the headline harness for both families: twelve different
+Measured in two runs (2026-10-07), every adopted change on (262,144 context with KV memory that follows use, 32 CPU threads, cache-aware
+routing λ 0.1, expert deferral, KDA verify rows, MTP k ≤ 3 with the 64K-token draft head, prefix sharing, 8 seats with batched MTP verify,
+layer yields with mid-size admission, sorted promotion victims), with the real-chat benchmark `tools/bench_chat.py` — the headline harness for both families: twelve different
 chat prompts (5 Korean, 3 English, 2 code, 2 creative), answers up to 600 tokens, `reasoning_effort: none`, decode speed after the first token:
 
 | Streams | Total | Per stream | Time to first token (median / max) |
 |---|---|---|---|
-| 1 | **70.3 tok/s** (Korean 72.2 · English 68.8 · code 78.2 · creative 55.8) | 71.5 | 0.51 / 0.80 s |
-| 2 | 85.2 | 47.0 | 0.54 / 0.99 s |
-| 4 | 97.9 | 27.7 | 0.55 / 1.72 s |
-| 8 | 129.1 | 17.4 | 0.94 / 3.62 s |
-| 16 | 128.3 | 17.3 | 12.8 / 39.8 s (`HIVE_MAX_BATCH` 8 — the rest wait) |
-| 32 | 129.6 | 16.9 | 45.1 / 108.6 s |
+| 1 | **70.8 tok/s** (Korean 75.5 · English 67.9 · code 73.9 · creative 54.4) | 71.2 | 0.51 / 0.96 s |
+| 2 | 87.8 | 47.2 | 0.54 / 0.92 s |
+| 4 | 103.9 | 28.6 | 0.53 / 1.73 s |
+| 8 | 130.6 | 17.5 | 0.63 / 3.40 s |
+| 16 | 130.3 | 17.4 | 12.7 / 39.2 s (`HIVE_MAX_BATCH` 8 — the rest wait) |
+| 32 | 130.9 | 16.9 | 45.1 / 107.8 s |
 
-Before 2026-10-05 (4 seats, no batched verify, one run): 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3 tok/s. With two streams both drafts
+2026-10-05 (before the draft head of 2026-10-07): 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6 tok/s. Before 2026-10-05 (4 seats, no batched
+verify, one run): 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3 tok/s. With two streams both drafts
 are verified in one step; with more each step decodes several sequences without drafts.
 
 | Prompt | First token | Prefill | Decode after it |
 |---|---|---|---|
-| 17K tokens | 7.3 s | 2,328 tok/s | 54.3 tok/s |
-| 42K tokens | 11.8 s | 3,649 tok/s | 48.9 tok/s |
-| 54K tokens | 13.9 s | 3,917 tok/s | 50.5 tok/s |
+| 17K tokens | 7.4 s | 2,307 tok/s | 54.9 tok/s |
+| 42K tokens | 11.7 s | 3,639 tok/s | 49.6 tok/s |
+| 54K tokens | 14.0 s | 3,925 tok/s | 45.1 tok/s |
 | 100K tokens | 26.4 s | 3,833 tok/s | 45.1 tok/s |
 | 200K tokens | 53.7 s | 3,787 tok/s | 43.4 tok/s |
 | 250K tokens | 66.3 s | 3,837 tok/s | 40.0 tok/s |
@@ -175,6 +176,9 @@ Changes from that breakdown (A/B, interleaved, restart per configuration, 12 cha
 | Promotion victims sorted once per step instead of a scan of every slot for each used expert (same choices) — host timestamps showed `after_step` holding the GPU idle 1.88 ms per verify step | real-chat, interleaved ×2 at 8 seats + batched MTP: c1 67.3 → 70.4, c2 78.6 → 86.8, c4 88.1 → 96.6, c8 126.0 → 129.9 tok/s; promotions per verify unchanged (28 vs 25–29) |
 | Session snapshots copy only the new rows (`HIVE_CKPT_DELTA`), prompt checkpoint after the first token (`HIVE_DEFER_CKPT`) | service log, before / after: prefill end → first token, mean 746 ms (1,097 ms at 64K+) → 0; shared-prefix checks (`HIVE_CKPT_VERIFY`) all ok |
 | Prefill CPU / streaming split from measured costs (`HIVE_GLM_PREFILL_ADAPT`) | service log, before / after: 65–256-row prefill 1,115 → 862 ms, 257–1,024 rows 2.99 → 2.85 ms/row, larger prompts unchanged |
+| MTP draft head over 65,536 frequent tokens (`HIVE_GLM_DRAFT_VOCAB`) — three drafts read the whole bf16 `lm_head` (1.27 GB) three times per step | outputs unchanged (full-head verify); real-chat, interleaved ×2: c1 69.4 → 71.4, c4 98.1 → 104.6 tok/s, c2 / c8 unchanged; draft acceptance 0.68 / 0.69 (measured with a ShareGPT-based list; the shipped list covers ~1 point fewer chat tokens) |
+| Mid-size requests admitted at layer yields (`HIVE_LAYER_YIELD_MID=16384`, DeepSeek step 23) | 96K-token prefill with a 2K request arriving 8 s in: its first token 18.9 → 2.9 s (×2); the long prompt waits for it (22.7 → 31.0 s with a 12K request served too) |
+| RAM budget for evicted conversations 96 GB (`HIVE_HOST_SESSION_MB=98304`) | twelve 145K-token conversations, then the first one again: 37.0 s → 1.6 s to the first token |
 
 ### Lossy changes measured with quality (on top of each other)
 
@@ -305,6 +309,7 @@ The reference comparison (next-token top-1 and hidden states) passes on every pa
 | `HIVE_CACHE_PRIOR` | 0 (`config/glm.env`: 0.1) | decode routing biased toward VRAM-resident experts by λ × the layer's score range; top-2 always kept (`HIVE_CACHE_PRIOR_TOPJ`) |
 | `HIVE_GLM_DEFER` | 0 (`config/glm.env`: 1) | CPU misses ranked 3rd or lower computed while the GPU goes on, added one MoE layer later |
 | `HIVE_GLM_SKIP_MISS` | 0 | skip missed experts ranked 3rd or lower whose weight is below this fraction of the row (measured within noise) |
+| `HIVE_GLM_DRAFT_VOCAB` | unset (`config/glm.env`: `/hive/config/glm-draft-vocab-64k.bin`) | file of int32 token ids (`tools/build_draft_vocab.py`): the MTP draft head scores only these rows of `lm_head`, read in place (no copy, no VRAM taken). The verify step scores against the full `lm_head`, so outputs are unchanged; a token outside the list can only be missed as a draft. Shipped list: 65,536 tokens ranked by frequency in OpenAssistant oasst2 English assistant messages and the NSMC Korean corpus, equally weighted (`--balance --lang en`; [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES) §5); it covers 98.5 % / 98.4 % of the tokens of English / Korean chat answers (ShareGPT, 200K answers each). The speed numbers were measured with an earlier list built from ShareGPT answers (99.4 % / 99.8 %) |
 | `HIVE_GLM_PROMOTE` | 8 | misses promoted per token of a step (4 / 16 measured equal / slower) |
 | `HIVE_MTP_BATCH` | off (`config/glm.env`: 1) | verify the drafts of several sequences in one step: c2 66.6 → 79.5 tok/s with `HIVE_MAX_BATCH=8` (earlier, at 4 seats, c4 within noise) |
 | `HIVE_GLM_LAUNCH_PROBE` | 0 | measurement: every N-th decode step, GPU time vs host enqueue time of each layer's front (totals every 50 probed steps) |

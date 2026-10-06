@@ -28,24 +28,25 @@ Decode, tok/s in total (per stream), and time to first token, median (max):
 
 | Streams | DeepSeek-V4.1-Flash | | GLM-5.3-Flash | |
 | --- | --- | --- | --- | --- |
-| 1 | **85.3** (83.8) | 0.23 s (0.50) | **70.3** (71.5) | 0.51 s (0.80) |
-| 2 | **92.9** (47.1) | 0.26 s (0.49) | **85.2** (47.0) | 0.54 s (0.99) |
-| 4 | **124.6** (33.9) | 0.58 s (0.84) | **97.9** (27.7) | 0.55 s (1.72) |
-| 8 | **175.0** (23.8) | 1.42 s (1.72) | **129.1** (17.4) | 0.94 s (3.62) |
-| 16 | **178.1** (23.0) | 9.82 s (29.1) | **128.3** (17.3) | 12.8 s (39.8) |
-| 32 | **181.5** (23.9) | 34.4 s (79.4) | **129.6** (16.9) | 45.1 s (108.6) |
+| 1 | **85.3** (83.8) | 0.23 s (0.50) | **70.8** (71.2) | 0.51 s (0.96) |
+| 2 | **92.9** (47.1) | 0.26 s (0.49) | **87.8** (47.2) | 0.54 s (0.92) |
+| 4 | **124.6** (33.9) | 0.58 s (0.84) | **103.9** (28.6) | 0.53 s (1.73) |
+| 8 | **175.0** (23.8) | 1.42 s (1.72) | **130.6** (17.5) | 0.63 s (3.40) |
+| 16 | **178.1** (23.0) | 9.82 s (29.1) | **130.3** (17.4) | 12.7 s (39.2) |
+| 32 | **181.5** (23.9) | 34.4 s (79.4) | **130.9** (16.9) | 45.1 s (107.8) |
 
-Mean of two runs each (the build of 2026-10-05). One stream by prompt kind (tok/s): DeepSeek Korean 87.2 · English 82.7 · code 106.2 ·
-creative 62.4; GLM 72.2 · 68.8 · 78.2 · 55.8. Both models decode up to 8 requests at a time (`HIVE_MAX_BATCH`); beyond that requests
+Mean of two runs each (DeepSeek: the build of 2026-10-05; GLM: 2026-10-07, with the 64K-token draft head — measured with a ShareGPT-based draft list; the shipped list is built from OpenAssistant
+oasst2 + NSMC and covers ~1 point fewer chat tokens, not yet re-measured). One stream by prompt kind
+(tok/s): DeepSeek Korean 87.2 · English 82.7 · code 106.2 · creative 62.4; GLM 75.5 · 67.9 · 73.9 · 54.4. Both models decode up to 8 requests at a time (`HIVE_MAX_BATCH`); beyond that requests
 wait, which is the time to first token at 16–32 streams.
 
 Long prompts — time to first token · prefill tok/s · decode tok/s after it:
 
 | Prompt | DeepSeek-V4.1-Flash | GLM-5.3-Flash |
 | --- | --- | --- |
-| ~17K | 5.05 s · 3,530 · 63.4 | 7.32 s · 2,328 · 54.3 |
-| ~42K | 7.53 s · 5,918 · 79.1 | 11.75 s · 3,649 · 48.9 |
-| ~54K | 9.69 s · 5,816 · 75.8 | 13.86 s · 3,917 · 50.5 |
+| ~17K | 5.05 s · 3,530 · 63.4 | 7.37 s · 2,307 · 54.9 |
+| ~42K | 7.53 s · 5,918 · 79.1 | 11.71 s · 3,639 · 49.6 |
+| ~54K | 9.69 s · 5,816 · 75.8 | 13.96 s · 3,925 · 45.1 |
 | ~100K | — | 26.43 s · 3,833 · 45.1 |
 | ~200K | — | 53.72 s · 3,787 · 43.4 |
 | ~250K | — | 66.29 s · 3,837 · 40.0 |

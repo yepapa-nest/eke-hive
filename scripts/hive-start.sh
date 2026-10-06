@@ -81,5 +81,5 @@ docker run -d --name "$HIVE_CONTAINER" --gpus "device=$HIVE_GPU" -u "$(id -u):$(
   --entrypoint bash "$HIVE_IMAGE" /hive/scripts/hive-entrypoint.sh \
     --ckpt "$HIVE_CKPT_MOUNT" --engram /out/engram --sock /out/hive.sock --vram-cache-mb "$HIVE_CACHE_MB" \
     --cpu-threads "$HIVE_CPU_THREADS" --max-ctx "$HIVE_MAX_CTX" --max-chunk "$HIVE_MAX_CHUNK" --max-batch "$HIVE_MAX_BATCH" \
-    "${EXTRA[@]}" >/dev/null
+    ${HIVE_HOST_SESSION_MB:+--host-session-mb "$HIVE_HOST_SESSION_MB"} "${EXTRA[@]}" >/dev/null
 echo "$HIVE_DAEMON_BIN ($HIVE_MODEL_FAMILY) starting — log $HIVE_STATE_DIR/logs/hived.log · API :$HIVE_PORT (ready when the log prints '[hived] ready in')"

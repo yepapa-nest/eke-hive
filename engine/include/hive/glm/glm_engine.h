@@ -140,6 +140,8 @@ class GlmEngine {
   void mtp_kv(GlmSeq& s, int64_t pos0, int n, const bf16* h_rows, const int32_t* next_ids);   // exact entries pos0..pos0+n-1
   void mtp_step(GlmSeq& s, int step, int32_t tok, const bf16* h_in, int64_t pos, bf16* h_out);
   DevBuf mtp_ids_d_, mtp_conf_d_, mtp_moe_ws_;
+  DevBuf draft_rows_, draft_idx_;          // HIVE_GLM_DRAFT_VOCAB: lm_head rows the draft head scores, argmax index per draft step
+  int draft_n_ = 0;                        // 0 = the draft head scores the whole vocabulary
   Fp8BMat* mtp_moe_tab_ = nullptr;
   void mtp_after_forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, bool prefill, const int64_t* pos_before);
   int mtp_k_ = 0;

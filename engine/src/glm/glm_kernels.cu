@@ -206,6 +206,48 @@ void embed_gather_dev(const __nv_bfloat16* table, const int32_t* id_dev, int H, 
   CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+constexpr int kRowsPerBlock = 8;  // 8 warps
+__global__ void gemv_rows_kernel(const __nv_bfloat16* __restrict__ W, const int32_t* __restrict__ rows, int n,
+                                 const __nv_bfloat16* __restrict__ x, int H, float* __restrict__ out) {
+  extern __shared__ uint4 xs[];  // x as 16-byte chunks (H / 8)
+  const int nv = H / 8;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) xs[i] = reinterpret_cast<const uint4*>(x)[i];
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int r = blockIdx.x * kRowsPerBlock + warp;
+  if (r >= n) return;
+  const uint4* w = reinterpret_cast<const uint4*>(W + (size_t)rows[r] * H);
+  float acc = 0.f;
+  for (int i = lane; i < nv; i += 32) {
+    const uint4 a = w[i], b = xs[i];
+    const __nv_bfloat162* pa = reinterpret_cast<const __nv_bfloat162*>(&a);
+    const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&b);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 fa = __bfloat1622float2(pa[j]), fb = __bfloat1622float2(pb[j]);
+      acc = fmaf(fa.x, fb.x, acc);
+      acc = fmaf(fa.y, fb.y, acc);
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (lane == 0) out[r] = acc;
+}
+__global__ void map_id_kernel(const int32_t* __restrict__ idx, const int32_t* __restrict__ table, int32_t* __restrict__ out) { *out = table[*idx]; }
+}  // namespace
+
+void gemv_rows_bf16(const __nv_bfloat16* W, const int32_t* rows, int n, const __nv_bfloat16* x, int H, float* out, cudaStream_t st) {
+  HIVE_CHECK(H % 8 == 0 && n > 0, "gemv_rows_bf16");
+  gemv_rows_kernel<<<(n + kRowsPerBlock - 1) / kRowsPerBlock, 32 * kRowsPerBlock, (size_t)H * 2, st>>>(W, rows, n, x, H, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void map_id_dev(const int32_t* idx, const int32_t* table, int32_t* out, cudaStream_t st) {
+  map_id_kernel<<<1, 1, 0, st>>>(idx, table, out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void hc_inject_kernel(bf16* __restrict__ h, const float* __restrict__ post, const float* __restrict__ y, int M, int hc, int dim) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (size_t)M * dim) return;

@@ -887,4 +887,101 @@ class ExposureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msgs[1]["content"], "thanks")
 
 
+def bpe_tokenizer():
+    """A small real fast tokenizer (byte-level BPE trained on the fly) with role markers as added special tokens — the
+    structure TokenCache relies on, without any model files."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors, trainers
+    from transformers import PreTrainedTokenizerFast
+    tk = Tokenizer(models.BPE())
+    tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tk.decoder = decoders.ByteLevel()
+    corpus = ['the engine streams experts over PCIe and computes misses on the CPU',
+              '\uc11c\ubc84 \uc900\ube44 \ub2e8\uacc4\uc758 \uc2dc\uac04\uc744 \uc7ac\uae30 \uc704\ud55c \uae34 \ub300\ud654\uc785\ub2c8\ub2e4', 'def f(x):\n    return [i * i for i in range(x)]'] * 50
+    tk.train_from_iterator(corpus, trainers.BpeTrainer(vocab_size=600, special_tokens=['<bos>', '<|user|>', '<|assistant|>', '<|system|>', '<pad>']))
+    tk.post_processor = processors.TemplateProcessing(single='<bos> $A', special_tokens=[('<bos>', tk.token_to_id('<bos>'))])
+    tok = PreTrainedTokenizerFast(tokenizer_object=tk, bos_token='<bos>', pad_token='<pad>')
+    tok.add_special_tokens({'additional_special_tokens': ['<|user|>', '<|assistant|>', '<|system|>']})
+    return tok
+
+
+class TokenCacheTests(unittest.TestCase):
+    """HIVE_TOKEN_CACHE: cached ids (prefix reused up to a role marker + tail tokenized) == whole-prompt tokenization."""
+    def setUp(self):
+        self.tok_before = s.TOK
+        s.TOK = bpe_tokenizer()
+        self.cache = s.TokenCache()
+        self.env = {k: os.environ.pop(k, None) for k in ('HIVE_TOKEN_CACHE', 'HIVE_TOKEN_CACHE_VERIFY')}
+    def tearDown(self):
+        s.TOK = self.tok_before
+        for k, v in self.env.items():
+            os.environ.pop(k, None)
+            if v is not None: os.environ[k] = v
+
+    @staticmethod
+    def render(turns):
+        return '<|system|>you are helpful. ' + ''.join(f'<|{r}|>{t}' for r, t in turns) + '<|assistant|>'
+
+    def check(self, key, prompt):
+        ids, ends = self.cache.tokenize(key, prompt)
+        enc = s.TOK(prompt, return_offsets_mapping=True)
+        self.assertEqual(ids, list(enc['input_ids']))
+        self.assertEqual(list(ends), [e for _, e in enc['offset_mapping']])
+        return ids
+
+    def test_growing_conversation_reuses_and_matches(self):
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        turns = []
+        for k in range(12):
+            turns += [('user', f'question {k}: the engine streams experts \uc11c\ubc84 {k * 7}'), ('assistant', f'answer {k}: def f(x): return x*{k}')]
+            self.check('c1', self.render(turns + [('user', 'next')]))
+        self.assertGreaterEqual(self.cache.hits, 10)  # every turn after the first reused its prefix
+
+    def test_edited_middle_and_unrelated_sessions_match(self):
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        base = [('user', 'a ' * 30), ('assistant', 'b ' * 30), ('user', 'c ' * 30), ('assistant', 'd ' * 30)]
+        self.check('c2', self.render(base + [('user', 'q')]))
+        edited = [base[0], ('assistant', 'B CHANGED ' * 5)] + base[2:]
+        self.check('c2', self.render(edited + [('user', 'q')]))          # divergence inside an earlier message
+        self.check('c2', self.render(edited[:1] + [('user', 'q2')]))      # shorter prompt (rewritten history)
+        self.check('c3', self.render(base))                                # another session: whole tokenization
+        self.check('c2', 'no role markers at all ' * 20)                   # nothing to cut at: whole tokenization
+
+    def test_off_switch_and_lstrip_markers(self):
+        os.environ['HIVE_TOKEN_CACHE'] = '0'
+        p = self.render([('user', 'x'), ('assistant', 'y')])
+        self.check('c4', p); self.check('c4', p + '<|user|>z')
+        self.assertEqual(self.cache.hits, 0)
+        os.environ.pop('HIVE_TOKEN_CACHE')
+        from tokenizers import AddedToken
+        s.TOK.add_special_tokens({'additional_special_tokens': [AddedToken('<|tool|>', lstrip=True)]})
+        self.cache._bind(s.TOK)
+        self.assertNotIn(s.TOK.convert_tokens_to_ids('<|tool|>'), self.cache.cut_ids)
+        self.assertIn(s.TOK.convert_tokens_to_ids('<|user|>'), self.cache.cut_ids)
+
+    def test_verify_mismatch_turns_the_cache_off(self):
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '1'
+        logged = []
+        import threading
+        real_thread = threading.Thread
+        class Inline:
+            def __init__(self, target, daemon=None): self.target = target
+            def start(self): self.target()
+        threading.Thread = Inline
+        try:
+            p = self.render([('user', 'x'), ('assistant', 'y')])
+            self.check('c5', p)
+            self.check('c5', p + '<|user|>z')                 # verified inline: ok
+            self.assertFalse(self.cache.disabled)
+            real_tok = s.TOK
+            class Wrong:  # whole tokenization disagrees with the cached ids
+                def __call__(self, text, **kw):
+                    out = dict(real_tok(text, **kw)); out['input_ids'] = list(out['input_ids'])[:-1]; return out
+                def __getattr__(self, n): return getattr(real_tok, n)
+            self.cache.tok = s.TOK = Wrong()
+            self.cache._verify_later(p, [1, 2, 3])
+            self.assertTrue(self.cache.disabled)
+        finally:
+            threading.Thread = real_thread
+
+
 if __name__=='__main__': unittest.main()
