@@ -315,7 +315,7 @@
 [store] pinned 275.7 GiB in 9.2s
 [store] engram layer 1 (384006168 rows) → RAM 20.1s (5.0 GB/s)
 [store] engram layer 14 (384016682 rows) → RAM 121.6s (0.8 GB/s)
-[hive] 전문가 추적 → /out/logs/expert-trace-20260930-181347.bin
+[hive] expert trace → /out/logs/expert-trace-20260930-181347.bin
 [runtime] dspark on: stages 3 · block 5 · targets 3 · capture rows 128
 [runtime] prefill tile 3 × 16384 rows (slots 2)
 [runtime] prefill host tiles 3 × 16384 rows (h 640 MiB pinned each · 2 staging) · slots 6 · VRAM free 4797 MiB
@@ -329,7 +329,7 @@
 [hived] prefix share on: boundary snapshots, extra chunks per request 1
 [hived] deferred prompt checkpoint on (after the first token)
 [hived] listening on /out/hive.sock
-[hived] session pool 8 × 251 MiB reserved · VRAM free 2731 MiB (= 운영 여유: 실행 중 할당은 이미지 패치 버퍼뿐)
+[hived] session pool 8 × 251 MiB reserved · VRAM free 2731 MiB (= operating headroom: the only runtime allocation is the image patch buffer)
 [hived] ready in 431.2s · layers 40 · ctx 262144 · chunk 16384 · dspark on(block 5 · conf ≥ -1.00 · max 5)
 [decode-sync M=37] layer waits 40 · host wait 24.44 ms (spin)
 [profile M=37] total 607.06 ms: embed 0.50 hc.flat+gemm 6.57 hc.sinkhorn 1.58 hc.pre+norm 0.82 hc_attn 0.03 attn.q 5.59 attn.kv 3.04 attn.compress 2.45 attn.sparse 1.80 attn.wo 130.51 attention 0.01 hc_ffn 0.02 moe.router 99.41 moe.shared 6.96 moe.d2h 0.56 moe.router+shared 0.01 moe.sync 0.32 moe.gpu_experts 238.99 moe.cpu_experts 106.43 moe 0.05 head 0.97 mtp.sync 0.44
@@ -2499,7 +2499,7 @@ cudaMalloc(162.0 MiB) failed: out of memory (free 38.6 MiB / 97213.9 MiB)
 [store] pinned 275.7 GiB in 11.7s
 [store] engram layer 1 (384006168 rows) → RAM 19.9s (5.1 GB/s)
 [store] engram layer 14 (384016682 rows) → RAM 137.3s (0.7 GB/s)
-[hive] 전문가 추적 → /out/logs/expert-trace-20261001-121118.bin
+[hive] expert trace → /out/logs/expert-trace-20261001-121118.bin
 [runtime] engram alias on: 1190 MiB of engram work buffers live inside q/o
 [runtime] mtp verify decode path on: verify2 1 · batch 0 · rows ≤ 8
 [runtime] dspark on: stages 3 · block 5 · targets 3 · capture rows 128
