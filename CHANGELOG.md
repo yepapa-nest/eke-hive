@@ -19,6 +19,18 @@ DeepSeek ([docs/performance.md](docs/performance.md), steps 22–23):
   promotions one step head later (c4 and decode after a 54K prompt lower in both runs).
 - `[decode-host]` gives the step-head promotion commit wait (`promo wait … ms/step`).
 
+DeepSeek configuration: layer yields every 150 ms with a 0.2 decode share (were 500 ms / 0.05) — a streaming answer during a
+background prefill stalled at most 0.42 s instead of 0.74 s; the overlapped prefill pays 349 → 469 ms per 1K tokens.
+
+Server (both families):
+- Fix: a boundary hint stopped one token too far when the next message began with the same character as the template's next
+  text (for example a context block `<info-msg>` placed before the user's message, against `<｜Assistant｜>`), so the saved
+  snapshot never matched the next turn and every follow-up turn prefilled the whole conversation. Hints now stop where the next
+  content starts. Measured on DeepSeek (26K-token conversation with such a block): the next turn's first request 0 → 23,287
+  tokens reused, prefill 6.9 → 2.2 s.
+- `HIVE_PREFIX_ADAPTIVE` also saves a boundary for a conversation with earlier turns seen for the first time (after a restart),
+  so its second turn there resumes instead of prefilling everything.
+
 GLM ([docs/glm.md](docs/glm.md), steps 17–21):
 - Fix: tool-call arguments typed `string` in the request's schema are kept as written. The parser decoded every argument as
   JSON, so a job id `3e382151` became `inf` (and the arguments `{"job_id": Infinity}`, which is not JSON), `0123` became 123.

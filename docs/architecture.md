@@ -271,9 +271,12 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   of the same conversation get auxiliary sessions. Tokenisation and image preprocessing run off the event loop.
 - **Boundary hints.** With `HIVE_PREFIX_SHARE`, the server finds the exact token offsets where the system/tools
   block and recent assistant turns end (by rendering the prefix with the same template and comparing) and sends
-  them to the daemon as snapshot points. With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
+  them to the daemon as snapshot points. A boundary stops where the next message's content starts (a second render
+  with different content marks that point), so content that begins like the template's next text cannot extend it.
+  With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
   on a conversation whose tail is replaced between turns (the previous request is not a prefix of the new one
-  but shares a boundary), so the next turn resumes from that boundary instead of prefilling everything again.
+  but shares a boundary), or on a conversation with earlier turns that it has not seen yet (after a restart), so
+  the next turn resumes from that boundary instead of prefilling everything again.
   With `HIVE_PREFIX_FIRST_TURN=seen` it asks for that chunk on a first turn whose system/tools block another
   conversation already sent (it keeps a hash per block), so the third and later conversations with a repeated block
   resume from it while a block that never repeats costs nothing.

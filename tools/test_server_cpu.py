@@ -736,6 +736,19 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         p2, ids2, h2=self.hints_for(other)
         self.assertEqual(h2, [sys_end]); self.assertEqual(ids2[:sys_end], ids[:sys_end])
 
+    def test_boundary_stops_where_the_next_content_starts(self):
+        """2026-10-08: a next message starting with "<" (a per-turn "<info-msg>" block) shared "<" with the empty probe's
+        "<|assistant|>" and the boundary took that token — the next turn (user's words there) could not resume it."""
+        msgs=self.conv()[:3]+[{'role':'user','content':'<info>t</info>'}, {'role':'user','content':'second question'}]
+        prompt, ids, hints=self.hints_for(msgs)
+        turn_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>first question<|assistant|>first answer<|eos|><|user|>'))
+        self.assertIn(turn_end, hints)
+        self.assertEqual(ids[turn_end-1], MARKERS['<|user|>'])
+        nxt=self.conv()[:3]+[{'role':'user','content':'second question'}, {'role':'assistant','content':'a2'},
+                             {'role':'user','content':'<info>u</info>'}, {'role':'user','content':'third'}]
+        _, ids2, _=self.hints_for(nxt)
+        self.assertEqual(ids2[:turn_end], ids[:turn_end])   # the saved boundary is a prefix of the next turn
+
     def test_tools_without_system_and_turn_cap(self):
         tools=[{'type':'function','function':{'name':'f'}}]
         msgs=[{'role':'user','content':'q'}]
@@ -757,7 +770,8 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_adaptive_extra_chunk_for_changing_tails(self):
         """HIVE_PREFIX_ADAPTIVE: prefix_extra=1 only when the previous request was not a prefix of this one but shared one of its
-        boundaries (a block near the end is replaced each turn). Append-only conversations and the first request never get it."""
+        boundaries (a block near the end is replaced each turn), or when a conversation that already has turns is seen for the first
+        time (2026-10-08). Append-only conversations and a first turn (no assistant message yet) never get it."""
         os.environ['HIVE_PREFIX_SHARE']='1'
         hist=[{'role':'system','content':self.SYS}, {'role':'user','content':'first question'}, {'role':'assistant','content':'first answer'}]
         def turn(ctx, q='second question'):  # fresh context placed just before the newest user message (the client pattern)
@@ -770,7 +784,7 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             os.environ['HIVE_PREFIX_ADAPTIVE']='1'
             s.TAILS=s.TailChangeTracker()
             await s.chat(Request({'messages':turn('A'), 'reasoning_effort':'none'}))
-            self.assertIsNone(extra(), 'first request of a conversation: nothing to compare')
+            self.assertEqual(extra(), 1, 'first sight of a conversation that already has turns (a restart): snapshot once')
             await s.chat(Request({'messages':turn('B'), 'reasoning_effort':'none'}))
             self.assertEqual(extra(), 1, 'tail replaced after a shared boundary')
             self.assertIn('boundaries', s.DAEMON.kw[-1])
@@ -792,6 +806,7 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             # a different prefix before every boundary is a new conversation shape, not a changing tail
             t2=s.TailChangeTracker()
             self.assertFalse(t2.observe('c', [1]*60, [20, 40]))
+            self.assertTrue(s.TailChangeTracker().observe('h', [1]*60, [20, 40], history=True))   # unknown, with history
             self.assertFalse(t2.observe('c', [2]*60, [20, 40]))
             self.assertTrue(t2.observe('c', [2]*40+[3]*30, [20, 40]))
         finally:

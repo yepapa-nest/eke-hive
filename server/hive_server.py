@@ -522,13 +522,18 @@ class TailChangeTracker:
     def _hash(view: memoryview, n: int) -> bytes:
         return hashlib.blake2b(view[:n], digest_size=16).digest()
 
-    def observe(self, key: str, ids: list[int], hints: list[int]) -> bool:
-        """Record this request (call off the event loop: hashing touches every token). True = ask for an extra chunk."""
+    def observe(self, key: str, ids: list[int], hints: list[int], history: bool = False) -> bool:
+        """Record this request (call off the event loop: hashing touches every token). True = ask for an extra chunk.
+        `history` = the request already has an assistant turn. Such a conversation seen for the first time (a server restart, or
+        evicted from this tracker) is flagged too: without a snapshot now, its next turn re-reads everything when the tail changes
+        (measured 2026-10-08, DeepSeek, one conversation right after a restart: turn 1 not flagged → turn 2 cached 0, 6.9 s prefill →
+        turn 3 resumed 23,287 tokens, 2.2 s). The cost is one extra chunk once per conversation (~0.9 s there: 24,737 tokens in one
+        chunk 6.0 s vs 25,310 in two 6.9 s)."""
         view = memoryview(array("i", ids)).cast("B")
         w = array("i").itemsize
         with self.lock:
             prev = self.entries.get(key)
-        flag = False
+        flag = prev is None and history
         if prev is not None:
             plen, phash, phints = prev
             append = len(ids) >= plen and self._hash(view, plen * w) == phash
@@ -624,11 +629,18 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     for pre in probes:
         try:
             text, media = encode_prompt(list(pre) + [{"role": "user", "content": ""}], tools, thinking_mode, effort)
+            # Where the next message's own content starts: the same probe with a different content diverges exactly there.
+            #   Without this cap the boundary ran into the content whenever it began with a character the template's next text
+            #   also begins with — a per-turn info block "<info-msg>" placed before the user's message against the empty
+            #   probe's "<｜Assistant｜>" shares "<", so the boundary took that "<" token. The next turn has the user's words
+            #   there, never matched the snapshot, and re-read the whole conversation (measured 2026-10-08: "reuse 0 via reset ·
+            #   common with live 24731" with the snapshot at 24732, every follow-up turn cached 0).
+            other, _ = encode_prompt(list(pre) + [{"role": "user", "content": "\x00"}], tools, thinking_mode, effort)
         except Exception:
             continue
         if media:
             continue
-        c = _common_prefix_len(text, prompt)
+        c = min(_common_prefix_len(text, prompt), _common_prefix_len(text, other))
         t = bisect.bisect_right(ends, c)  # number of leading tokens ending at or before c (a prefix, since offsets are monotonic)
         if 0 < t < len(ids):
             out.add(t)
@@ -1380,7 +1392,8 @@ async def chat(request: Request):
         return JSONResponse(overflow_body(mc, len(ids)), status_code=400)
     # (session: computed before prepare — the token cache is keyed on it)
     # HIVE_PREFIX_ADAPTIVE (needs HIVE_PREFIX_SHARE hints): one extra boundary chunk only for conversations whose tail changes (TailChangeTracker)
-    prefix_extra = (await asyncio.to_thread(TAILS.observe, session, ids, hints)) if hints and env_on("HIVE_PREFIX_ADAPTIVE") else False
+    prefix_extra = ((await asyncio.to_thread(TAILS.observe, session, ids, hints, any(m.get("role") == "assistant" for m in messages)))
+                    if hints and env_on("HIVE_PREFIX_ADAPTIVE") else False)
     # HIVE_PREFIX_FIRST_TURN (needs HIVE_PREFIX_SHARE hints): the first turn of a conversation (no assistant message yet) asks for one extra
     #   chunk too, so the daemon saves a shared snapshot at the end of the system/tools block — the next new conversation with the same
     #   system block resumes there instead of prefilling it again. With HIVE_PREFIX_EXTRA_CHUNKS=0 no such snapshot was ever taken
