@@ -546,6 +546,44 @@ class TailChangeTracker:
 TAILS = TailChangeTracker()
 
 
+class SeenPrefixes:
+    """HIVE_PREFIX_FIRST_TURN=seen: cut a first turn at its boundary hints only when another conversation already sent that prefix.
+
+    A boundary cut on a first turn costs a prefill chunk — on GLM every extra chunk streams all non-resident experts again, a 22K-token
+    first turn 7.3-8.1 s without the cut vs 8.8-9.2 s with it (2026-10-07, live GLM, three runs each). The snapshot pays only if a later
+    conversation starts with the same tokens. Service traffic on 2026-10-07 (GLM, 279 requests): 61 such cuts (their shorter pieces:
+    128 s of prefill), while shared snapshots of 2,000+ tokens were resumed 8 times — most first-turn system blocks never repeat (a
+    per-document date at the end of the system prompt, per-conversation memory). This keeps, per boundary, a hash of the prefix and the conversation that
+    first sent it (LRU, `cap` prefixes): the first conversation with a block pays nothing, the second pays the cut and saves the
+    snapshot, the third and later resume from it."""
+
+    def __init__(self, cap: int = 4096):
+        self.cap = cap
+        self.entries: OrderedDict = OrderedDict()
+        self.lock = threading.Lock()
+
+    def observe(self, key: str, ids: list[int], hints: list[int]) -> bool:
+        """Record this request's boundary prefixes (call off the event loop). True = another conversation sent one of them."""
+        view = memoryview(array("i", ids)).cast("B")
+        w = array("i").itemsize
+        hashes = [hashlib.blake2b(view[: h * w], digest_size=16).digest() for h in hints if 0 < h <= len(ids)]
+        seen = False
+        with self.lock:
+            for d in hashes:
+                owner = self.entries.get(d)
+                if owner is None:
+                    self.entries[d] = key
+                elif owner != key:
+                    seen = True
+                self.entries.move_to_end(d)
+            while len(self.entries) > self.cap:
+                self.entries.popitem(last=False)
+        return seen
+
+
+SEEN = SeenPrefixes()
+
+
 HINT_TURNS = 4  # only the last few completed assistant-turn ends (the daemon only uses boundaries inside the newly prefilled span — earlier ones were recorded on earlier turns)
 
 
@@ -1348,8 +1386,11 @@ async def chat(request: Request):
     #   system block resumes there instead of prefilling it again. With HIVE_PREFIX_EXTRA_CHUNKS=0 no such snapshot was ever taken
     #   (a cut at that boundary adds a chunk, so it is never "free"). The daemon skips the cut once that snapshot exists, so the extra
     #   chunk is paid only by the first conversation with a given system block; follow-up turns keep the global budget.
+    #   HIVE_PREFIX_FIRST_TURN=seen: the same, but only when another conversation already sent this exact block (SeenPrefixes) — a block
+    #   that never repeats (per-document dates, per-conversation memory) pays no cut.
+    first_turn = os.environ.get("HIVE_PREFIX_FIRST_TURN", "")
     if hints and not prefix_extra and env_on("HIVE_PREFIX_FIRST_TURN") and not any(m.get("role") == "assistant" for m in messages if isinstance(m, dict)):
-        prefix_extra = True
+        prefix_extra = True if first_turn != "seen" else await asyncio.to_thread(SEEN.observe, session, ids, hints)
     if INFLIGHT.get(session, 0) > 0:  # concurrent request in the same conversation (regenerate, two tabs, parallel bench) — separate session
         # B8: a per-request "~<uuid>" session would fill the daemon session pool and archived budget with single-use
         #   sessions and push real conversations out of the LRU. Use fixed per-conversation auxiliary slots (~1, ~2, ...,

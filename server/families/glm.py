@@ -329,9 +329,14 @@ def _patchify(pair) -> tuple[Any, int, int]:
 
 
 def _image_spans(data: bytes):
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 
-    img = Image.open(io.BytesIO(data)).convert("RGB")
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+    except UnidentifiedImageError as e:
+        # PIL's own message names only the BytesIO object; the size and leading bytes tell an empty or non-image payload
+        #   (an error page, a truncated capture) apart from an unsupported format
+        raise ValueError(f"cannot identify image: {len(data)} bytes, starting {data[:16].hex() or '(empty)'}") from e
     x = _fit([img], _IMG_TOKENS)
     pair = __import__("numpy").concatenate([x, x], axis=0)  # an image is one temporal patch: the same frame twice
     return [(_patchify(pair), None)]

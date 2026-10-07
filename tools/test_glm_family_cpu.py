@@ -64,6 +64,17 @@ want = pair[:, :, 14:28, 0:14].transpose(1, 0, 2, 3).reshape(-1)  # third row of
 ok = p.shape == (16, 1176) and gh == 4 and gw == 4 and np.array_equal(p[2], want)
 fails += not ok
 print(f"{'ok  ' if ok else 'FAIL'} patchify 56x56 -> {p.shape}, merge-block order")
+# undecodable image bytes: a 400 message that names the payload (2026-10-07 service log: ten "cannot identify image file
+#   <_io.BytesIO object at 0x...>" errors gave no hint whether the client sent nothing or an error page)
+for data, want in ((b"", "0 bytes, starting (empty)"), (b"<html>oops</html>", "17 bytes, starting 3c68746d6c3e6f6f70733c2f68746d6c")):
+    try:
+        glm._image_spans(data)
+        got = "no error"
+    except ValueError as e:
+        got = str(e)
+    ok = want in got
+    fails += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} undecodable image {data[:8]!r} -> {got}")
 # ---- tool-call arguments: schema-typed strings stay raw, output is always valid JSON (no model) ----
 import json  # noqa: E402
 

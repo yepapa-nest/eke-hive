@@ -214,7 +214,8 @@ streaming of the DeepSeek path (`HIVE_TOOL_STREAM`) does not apply to GLM.
 ## Prompt-prefix reuse
 
 The same as DeepSeek: a conversation continues from its own state, and with `HIVE_PREFIX_SHARE` + `HIVE_PREFIX_ADAPTIVE` (on in
-`config/glm.env`) conversations share boundary snapshots — the KDA recurrent state is part of each snapshot. Measured with an
+`config/glm.env`, with `HIVE_PREFIX_EXTRA_CHUNKS=0` and `HIVE_PREFIX_FIRST_TURN=seen` since 2026-10-07 — a first turn is cut at its
+system block only once another conversation sent the same block; [performance.md](performance.md) step 29) conversations share boundary snapshots — the KDA recurrent state is part of each snapshot. Measured with an
 8.6K-token system prompt, answers correct in every case (prefill times taken while another CPU job ran — compare within a column, not with the tables above):
 
 | | sharing off | sharing on |

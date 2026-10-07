@@ -798,6 +798,40 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop('HIVE_PREFIX_ADAPTIVE', None)
             s.TAILS=s.TailChangeTracker()
 
+    async def test_first_turn_seen(self):
+        """HIVE_PREFIX_FIRST_TURN=seen: a first turn asks for the boundary cut only when another conversation already sent the same
+        system block; =1 asks on every first turn; later turns never get it from this switch."""
+        os.environ['HIVE_PREFIX_SHARE']='1'
+        def first(q, sys_text=None): return [{'role':'system','content':sys_text or self.SYS}, {'role':'user','content':q}]
+        def extra(): return s.DAEMON.kw[-1].get('prefix_extra')
+        try:
+            os.environ['HIVE_PREFIX_FIRST_TURN']='1'
+            s.SEEN=s.SeenPrefixes()
+            await s.chat(Request({'messages':first('q1'), 'reasoning_effort':'none'}))
+            self.assertEqual(extra(), 1, '=1: every first turn')
+            os.environ['HIVE_PREFIX_FIRST_TURN']='seen'
+            s.SEEN=s.SeenPrefixes()
+            await s.chat(Request({'messages':first('q1'), 'reasoning_effort':'none'}))
+            self.assertIsNone(extra(), 'first conversation with this block: no cut')
+            await s.chat(Request({'messages':first('q1'), 'reasoning_effort':'none'}))
+            self.assertIsNone(extra(), 'the same conversation again is not evidence')
+            await s.chat(Request({'messages':first('q2'), 'reasoning_effort':'none'}))
+            self.assertEqual(extra(), 1, 'second conversation with the same block: cut')
+            self.assertIn('boundaries', s.DAEMON.kw[-1])
+            await s.chat(Request({'messages':first('q3', self.SYS+' (dated 2026-10-07)'), 'reasoning_effort':'none'}))
+            self.assertIsNone(extra(), 'a block that differs at its end is a new block')
+            later=first('q2')+[{'role':'assistant','content':'a'}, {'role':'user','content':'q2b'}]
+            await s.chat(Request({'messages':later, 'reasoning_effort':'none'}))
+            self.assertIsNone(extra(), 'not a first turn')
+            t=s.SeenPrefixes(cap=2)
+            for k in range(4): t.observe('c', [k]*30, [10])
+            self.assertEqual(len(t.entries), 2)
+            self.assertFalse(t.observe('d', [0]*30, [10]), 'evicted prefix counts as new')
+            self.assertTrue(t.observe('e', [3]*30, [10]))
+        finally:
+            os.environ.pop('HIVE_PREFIX_FIRST_TURN', None)
+            s.SEEN=s.SeenPrefixes()
+
     async def test_sent_only_when_enabled(self):
         await s.chat(Request({'messages':self.conv(), 'reasoning_effort':'none'}))
         self.assertNotIn('boundaries', s.DAEMON.kw[-1], 'default: no field, no hint cost')

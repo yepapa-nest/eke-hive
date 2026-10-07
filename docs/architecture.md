@@ -274,6 +274,9 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   them to the daemon as snapshot points. With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
   on a conversation whose tail is replaced between turns (the previous request is not a prefix of the new one
   but shares a boundary), so the next turn resumes from that boundary instead of prefilling everything again.
+  With `HIVE_PREFIX_FIRST_TURN=seen` it asks for that chunk on a first turn whose system/tools block another
+  conversation already sent (it keeps a hash per block), so the third and later conversations with a repeated block
+  resume from it while a block that never repeats costs nothing.
 - **Cache flush.** `POST /flush_cache` drops all reusable prompt state in the daemon (refused while a request is
   decoding); benchmarks call it between runs so every axis starts cold.
 
