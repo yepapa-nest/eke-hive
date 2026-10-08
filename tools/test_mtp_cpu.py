@@ -169,6 +169,25 @@ def batch_checks(exe, td, ck):
     w = [r for _, r in out['batch_wrong'][0]]
     ck.true('batch_wrong: rejections exercised', sum(r['done']['mtp_drafted'] - r['done']['mtp_accepted'] for r in w) > 0)
     ck.true('batch3: three parts in one verify', '[mtp] batch S 3 ' in out['batch3'][1])
+    # run-time switch {"op":"set","mtp_batch":...} (2026-10-09): on over a startup-off daemon whose verify path is allocated (HIVE_MTP_VERIFY2),
+    #   off over HIVE_MTP_BATCH=1, and on without the allocation (absorbed: no batch speculation, oracle tokens) — then back to the startup value (-1)
+    for name, env, val, want in [('set_on', {'HIVE_MTP_VERIFY2': '1'}, 1, True), ('set_off', {'HIVE_MTP_BATCH': '1'}, 0, False),
+                                 ('set_on_unallocated', {}, 1, False), ('set_reset', {'HIVE_MTP_BATCH': '1'}, -1, True)]:
+        h = T.Hived(exe, td, {**TIMING, 'FAKE_MTP': '5', 'HIVE_TRACE_MTP': '1', **env}, name=name)
+        try:
+            if name == 'set_reset':
+                ck.true(f'{name}: set 0 acknowledged', h.op({'op': 'set', 'mtp_batch': 0}).get('mtp_batch') == 0)
+            r = h.op({'op': 'set', 'mtp_batch': val})
+            ck.true(f'{name}: set acknowledged', r.get('ok') is True and r.get('mtp_batch') == val, repr(r))
+            h.generate('warm', T.tokens(30, 7), 4)
+            got = concurrent(h, reqs2)
+            for i, ((ids, n), rr) in enumerate(got):
+                T.done_ok(ck, f'{name}[{i}]', rr, ids, n, None)
+        finally:
+            T.stop_clean(h, ck)
+        log = h.log_path.read_text(errors='replace')
+        print(f'  {name}: batch trace lines {log.count("[mtp] batch S ")}')
+        ck.true(f'{name}: batch speculation {"ran" if want else "absent"}', ('[mtp] batch S ' in log) == want, log[-1500:])
     # (6): first-use verify samples are filtered (speculation continues); a runtime hiding first uses locks out (negative control)
     fu = {}
     for name, silent in [('first_use', False), ('first_use_silent', True)]:

@@ -2,14 +2,32 @@
 
 ## Unreleased
 
-Real-chat benchmark (`tools/bench_chat.py`, two runs each; [docs/benchmarks.md](docs/benchmarks.md)):
+Real-chat benchmark (`tools/bench_chat.py`, 2026-10-09, one run each, GPU at 600 W and capped at 300 W; [docs/benchmarks.md](docs/benchmarks.md)):
 
 | | DeepSeek-V4.1-Flash | GLM-5.3-Flash |
 | --- | --- | --- |
-| Decode, 1 / 2 / 4 / 8 / 16 / 32 streams (total) | 85.3 / 92.9 / 124.6 / 175.0 / 178.1 / 181.5 tok/s | 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6 tok/s |
-| Time to first token, 17K / 42K / 54K prompt | 5.05 / 7.53 / 9.69 s | 7.3 / 11.8 / 13.9 s |
+| Decode, 1 / 2 / 4 / 8 / 16 / 32 streams (total), 600 W | 80.7 / 106.4 / 125.0 / 172.8 / 171.6 / 176.9 tok/s | 68.1 / 86.5 / 103.5 / 129.0 / 127.4 / 128.9 tok/s |
+| The same, 300 W cap | 82.9 / 99.9 / 115.8 / 157.9 / 160.8 / 163.1 tok/s | 69.4 / 85.6 / 102.5 / 129.3 / 129.8 / 130.5 tok/s |
+| Time to first token, 17K / 42K / 54K prompt, 600 W | 4.90 / 7.49 / 9.59 s | 7.21 / 11.31 / 13.74 s |
+| The same, 300 W cap | 6.56 / 11.00 / 13.66 s | 8.17 / 15.25 / 18.90 s |
 
-DeepSeek ([docs/performance.md](docs/performance.md), steps 22–23):
+DeepSeek ([docs/performance.md](docs/performance.md), steps 29–32):
+- Intra-layer yields (`HIVE_LAYER_YIELD_INTRA`, on in `config/hive.env`): decode-only yield points inside a layer of a long
+  prefill (embedding units, unit / tile fronts, before the expert pass, indexer row batches), with the paused prefill's staging
+  records held and its shared buffers parked. Bit-identical prompt logits and state on the GPU check. 85K prompt with a decoder:
+  decoder tokens during the prompt 57 → 106–132, longest gap 1.86 → 1.16–1.49 s; the long prompt's first token +8–10 %.
+- Batched speculation (`HIVE_MTP_BATCH`) re-measured on the current build and turned on: c2 88 → 100 tok/s (+13 %), first token
+  median c2 0.5 → 0.25 s and c4 0.72 → 0.27 s, c4 / c8 throughput unchanged. The daemon op `{"op":"set","mtp_batch":N}` switches it
+  at run time (used for the interleaved A/B).
+- Short-prefill DMA band (`HIVE_DMA_BAND_SHORT=1.05`): the adaptive CPU / DMA share of short prefills now settles within 5 % instead of
+  20 %; `[prefill-prof]` logs the experts sent to the CPU / DMA and the pre-copies used / wasted.
+- Fix: a decode step that failed inside a layer yield could leave a deferred expert batch that the next short-path layer of the
+  paused prefill would have added to its hidden state; deferred work is flushed before the prefill resumes and dropped after a host error.
+
+Server: boundary-hint probe renders are kept per conversation (`HIVE_HINT_CACHE`) — a turn renders the template 4 times instead of
+about 12; 156K-token conversation 29.1 → 12.2 ms per turn (CPU), hints identical.
+
+DeepSeek (steps 22–23):
 - Decode kernels: the fused expert kernel loads its activations a stage ahead, and the head reads each vocabulary row once for all
   rows of a step (`HIVE_HEAD_ROWS`) — both bit-identical; interleaved with the previous build c1 83.9 → 86.0 tok/s, c8 171.4 → 173.7.
 - Layer yields also admit a request of up to 16K rows when it is at most half of what the paused prefill still has to do

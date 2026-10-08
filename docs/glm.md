@@ -106,6 +106,8 @@ chat prompts (5 Korean, 3 English, 2 code, 2 creative), answers up to 600 tokens
 verify, one run): 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3 tok/s. With two streams both drafts
 are verified in one step; with more each step decodes several sequences without drafts.
 
+2026-10-09 (a newer build, the shipped OpenAssistant / NSMC draft list, one run each): 68.1 / 86.5 / 103.5 / 129.0 / 127.4 / 128.9 tok/s at 600 W and 69.4 / 85.6 / 102.5 / 129.3 / 129.8 / 130.5 tok/s with the GPU capped at 300 W; first token for 16.9K / 42K / 55K-token prompts 7.21 / 11.31 / 13.74 s (300 W: 8.17 / 15.25 / 18.90 s).
+
 | Prompt | First token | Prefill | Decode after it |
 |---|---|---|---|
 | 17K tokens | 7.4 s | 2,307 tok/s | 54.9 tok/s |

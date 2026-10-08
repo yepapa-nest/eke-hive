@@ -10,10 +10,12 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from array import array
 
 spec = importlib.util.spec_from_file_location('server_under_test', Path(__file__).resolve().parents[1] / 'server/hive_server.py')
 s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
+ORIG_ENCODE_PROMPT = s.encode_prompt  # the real encode_prompt (some tests below replace the module's)
 
 class Request:
     def __init__(self, body): self.body = body
@@ -916,6 +918,214 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('boundaries', s.DAEMON.kw[-1])
         self.assertFalse(s.INFLIGHT)
 
+
+
+def rich_encode(messages, tools, thinking_mode, effort):
+    """A template whose output depends on everything the real ones read: thinking mode and effort, tools, a reasoning field
+    shown only after the last user message (DeepSeek drops earlier reasoning), tool-call arguments rendered as JSON (types and key
+    order matter), image parts (media returned, a placeholder in the text)."""
+    s.check_image_parts(messages)
+    messages=[dict(m) for m in messages]
+    if tools and messages and messages[0].get('role')!='system': messages.insert(0, {'role':'system', 'content':''})
+    last_user=max([i for i, m in enumerate(messages) if m.get('role')=='user'], default=-1)
+    media, text=[], '<|bos|>'
+    if thinking_mode=='thinking' and effort is not None: text+=f'[effort {effort!r}]'
+    for i, m in enumerate(messages):
+        c=m.get('content')
+        if isinstance(c, list):
+            parts=[]
+            for p in c:
+                if p.get('type')=='image_url': media.append(p); parts.append('[img]')
+                else: parts.append(p.get('text', ''))
+            c=''.join(parts)
+        text+='<|'+m['role']+'|>'+(c or '')
+        if i==0 and tools: text+='<|tools|>'+json.dumps(tools)
+        if m['role']=='assistant':
+            if thinking_mode=='thinking' and i>last_user: text+='(r:'+(m.get('reasoning_content') or '')+')'
+            for tc in m.get('tool_calls') or []: text+='{call '+json.dumps(tc['function'])+'}'
+            text+='<|eos|>'
+    return text+'<|assistant|>'+('(think' if thinking_mode=='thinking' else ''), media
+
+class HintCacheTests(unittest.TestCase):
+    """HIVE_HINT_CACHE: hints with the probe cache == hints rendered from scratch (HIVE_HINT_CACHE=0), request after request."""
+    TOOLS=[{'type':'function','function':{'name':'read','parameters':{'type':'object','properties':{'path':{'type':'string'}}}}}]
+    def setUp(self):
+        self.saved=(s.TOK, s.encode_prompt, s.HINT_CACHE)
+        s.TOK=HintTokenizer(); s.encode_prompt=self.counting(rich_encode); s.HINT_CACHE=s.HintProbeCache()
+        self.env={k: os.environ.pop(k, None) for k in ('HIVE_HINT_CACHE', 'HIVE_HINT_CACHE_MB')}
+    def tearDown(self):
+        s.TOK, s.encode_prompt, s.HINT_CACHE=self.saved
+        for k, v in self.env.items():
+            os.environ.pop(k, None)
+            if v is not None: os.environ[k]=v
+    def counting(self, enc):
+        self.renders=0
+        def f(*a):
+            self.renders+=1
+            return enc(*a)
+        return f
+
+    def both(self, msgs, tools=None, mode='chat', effort=None, gen_cut=True):
+        """Cached hints (offsets from a tokenization, and as TokenCache's int64 array) checked against the uncached path."""
+        prompt, media=s.encode_prompt(msgs, tools, mode, effort)
+        ids=s.TOK.encode(prompt)
+        os.environ['HIVE_HINT_CACHE']='0'
+        want=s.boundary_hints(msgs, tools, mode, effort, prompt, ids, gen_cut=gen_cut)
+        os.environ.pop('HIVE_HINT_CACHE')
+        r0=self.renders
+        got=s.boundary_hints(msgs, tools, mode, effort, prompt, ids, gen_cut=gen_cut)
+        self.last_renders=self.renders-r0
+        ends=array('l', [e for _, e in s.TOK(prompt, True)['offset_mapping']])
+        got2=s.boundary_hints(msgs, tools, mode, effort, prompt, ids, ends, gen_cut=gen_cut)
+        self.assertEqual(got, want); self.assertEqual(got2, want)
+        return want
+
+    @staticmethod
+    def agent(turns, args=None):
+        m=[{'role':'system','content':'system prompt '*20}, {'role':'user','content':'task'}]
+        for k in range(turns):
+            m.append({'role':'assistant','content':'' if k%2 else f'step {k}','reasoning_content':f'why {k}',
+                      'tool_calls':[{'id':f'c{k}','type':'function','function':{'name':'read','arguments':args if args is not None else {'path':f'/f{k}'}}}]})
+            m.append({'role':'tool','tool_call_id':f'c{k}','content':f'result {k} '*5})
+            if k%3==2: m.append({'role':'user','content':f'<info-msg>t{k}</info-msg> go on'})
+        return m
+
+    def test_growing_agent_conversation(self):
+        for mode, effort in (('chat', None), ('thinking', 'high'), ('thinking', 50)):
+            s.HINT_CACHE=s.HintProbeCache()
+            for k in range(1, 12):
+                hints=self.both(self.agent(k), self.TOOLS, mode, effort)
+                self.assertTrue(hints)
+                if k>=2:  # system block and older turn ends come from the cache: the newest turn end + the suffix pair only
+                    self.assertEqual(self.last_renders, 4, (mode, k))
+            self.assertGreater(s.HINT_CACHE.hits, 0)
+
+    def test_edited_history_misses(self):
+        base=self.agent(6)
+        self.both(base, self.TOOLS)
+        def edit(f):
+            e=json.loads(json.dumps(base)); f(e); return e
+        def args(v):
+            def f(e): e[2]['tool_calls'][0]['function']['arguments']=v
+            return f
+        groups=[[edit(lambda e: e[1].update(content='a much longer task description'))],   # first user message
+                [edit(lambda e: e[2].update(content='step 0 rewritten'))],                   # an older assistant turn
+                [edit(lambda e: e[0].update(content='system prompt '*21))],                  # the system block
+                [base[:3]+base[5:]],                                                         # a dropped turn
+                # run back to back, so each one meets the entry the previous one left: 1 / True / 1.0 render differently, so do
+                #   0.0 / -0.0 and two key orders, yet plain == calls each pair equal
+                [edit(args({'path':1})), edit(args({'path':True})), edit(args({'path':1.0})), edit(args({'path':1}))],
+                [edit(args({'path':0.0})), edit(args({'path':-0.0}))],
+                [edit(args({'a':1,'b':2})), edit(args({'b':2,'a':1}))]]
+        for group in groups:
+            for e in group:
+                self.both(e, self.TOOLS)
+            self.both(base, self.TOOLS)   # and back: the result is still exact
+
+    def test_tools_mode_and_effort_changes(self):
+        m=self.agent(5)
+        other=[{'type':'function','function':{'name':'write','parameters':{}}}]
+        for tools, mode, effort in ((self.TOOLS, 'chat', None), (other, 'chat', None), (None, 'chat', None), (self.TOOLS, 'thinking', None),
+                                    (self.TOOLS, 'thinking', 'high'), (self.TOOLS, 'thinking', 'max'), (self.TOOLS, 'thinking', 75),
+                                    (self.TOOLS, 'thinking', 75.0), (self.TOOLS, 'thinking', True), (self.TOOLS, 'chat', None)):
+            self.both(m, tools, mode, effort)
+            self.both(m, tools, mode, effort)
+
+    def test_image_messages_emit_nothing_there(self):
+        img={'type':'image_url','image_url':{'url':'data:image/png;base64,AAAA'}}
+        m=[{'role':'system','content':'sys'}, {'role':'user','content':[{'type':'text','text':'look'}, img]},
+           {'role':'assistant','content':'a cat'}, {'role':'user','content':'and now?'}]
+        for _ in range(2):
+            prompt, media=rich_encode(m, None, 'chat', None)
+            self.assertTrue(media)
+            hints=self.both(m)
+            self.assertEqual(hints, [len(s.TOK.encode('<|bos|><|system|>sys<|user|>'))])   # only the block before the image
+
+    def test_info_msg_boundary_stays_before_the_content(self):
+        """0ab95c3 (2026-10-08): the boundary must stop where the next message's content starts even when it begins with "<"."""
+        s.encode_prompt=self.counting(hint_encode)
+        conv=[{'role':'system','content':'S '*10}, {'role':'user','content':'first question'}, {'role':'assistant','content':'first answer'}]
+        turn_end=len(s.TOK.encode('<|system|>'+'S '*10+'<|user|>first question<|assistant|>first answer<|eos|><|user|>'))
+        for nxt in ([{'role':'user','content':'<info>t</info>'}, {'role':'user','content':'q'}],
+                    [{'role':'user','content':'<info>u</info>'}, {'role':'user','content':'q2'}]):
+            hints=self.both(conv+nxt, gen_cut=False)
+            self.assertIn(turn_end, hints)
+            self.assertEqual(s.TOK.encode(hint_encode(conv+nxt, None, 'chat', None)[0])[turn_end-1], MARKERS['<|user|>'])
+        self.assertGreater(s.HINT_CACHE.hits, 0)
+
+    def test_off_switch_uncacheable_inputs_budget_and_rebinding(self):
+        m=self.agent(4)
+        os.environ['HIVE_HINT_CACHE']='0'
+        prompt,_=s.encode_prompt(m, self.TOOLS, 'chat', None); ids=s.TOK.encode(prompt)
+        s.boundary_hints(m, self.TOOLS, 'chat', None, prompt, ids)
+        self.assertEqual(len(s.HINT_CACHE.entries), 0)
+        os.environ.pop('HIVE_HINT_CACHE')
+        class Odd(str): pass
+        odd=[dict(x) for x in m]; odd[1]['content']=Odd('task')   # not JSON-like: rendered, never cached
+        self.both(odd, self.TOOLS); self.assertEqual(len(s.HINT_CACHE.entries), 0)
+        os.environ['HIVE_HINT_CACHE_MB']='0.0001'                  # ~100 bytes: every entry is evicted at once
+        self.both(m, self.TOOLS); self.both(m, self.TOOLS)
+        self.assertLessEqual(len(s.HINT_CACHE.entries), 1)
+        os.environ.pop('HIVE_HINT_CACHE_MB')
+        self.both(m, self.TOOLS); self.assertTrue(s.HINT_CACHE.entries)
+        s.encode_prompt=self.counting(hint_encode)                  # another encoder: the kept renders are dropped
+        self.both(m[:2]+[{'role':'assistant','content':'x'}, {'role':'user','content':'y'}], self.TOOLS)
+        self.assertTrue(all(e[2] is None or not e[2].startswith('<|bos|>') for e in s.HINT_CACHE.entries.values()))
+
+    def test_clock_reading_template_is_not_cached(self):
+        s.TOK.chat_template="{{ strftime_now('%Y-%m-%d') }}"
+        self.both(self.agent(3), self.TOOLS); self.both(self.agent(3), self.TOOLS)
+        self.assertEqual(len(s.HINT_CACHE.entries), 0)
+
+    def test_non_monotonic_offsets(self):
+        m=self.agent(2); prompt,_=s.encode_prompt(m, None, 'chat', None); ids=s.TOK.encode(prompt)
+        ends=array('l', [e for _, e in s.TOK(prompt, True)['offset_mapping']]); ends[3], ends[4]=ends[4], ends[3]-1
+        self.assertEqual(s.boundary_hints(m, None, 'chat', None, prompt, ids, ends), [])
+        os.environ['HIVE_HINT_CACHE']='0'
+        self.assertEqual(s.boundary_hints(m, None, 'chat', None, prompt, ids, ends), [])
+        self.assertIsNone(s._ends_monotonic([1, 2])); self.assertTrue(s._ends_monotonic(array('l', [0, 0, 3])))
+
+    def test_negative_control_a_lossy_snapshot_is_caught(self):
+        """The comparison above detects a cache that matches on too little: snapshots that keep only the type."""
+        real=s._freeze
+        s._freeze=lambda x: type(x).__name__
+        try:
+            base=self.agent(6); self.both(base, self.TOOLS)
+            e=json.loads(json.dumps(base)); e[1]['content']='a much longer task description'
+            with self.assertRaises(AssertionError):
+                self.both(e, self.TOOLS)
+        finally:
+            s._freeze=real
+
+
+@unittest.skipUnless(os.environ.get('HIVE_TEST_CKPT'), 'HIVE_TEST_CKPT (a checkpoint with encoding/ and the tokenizer) not set')
+class HintCacheReferenceTests(unittest.TestCase):
+    """The same comparison with the reference DeepSeek encoding and tokenizer (optional: HIVE_TEST_CKPT=<checkpoint dir>)."""
+    def test_reference_encoding(self):
+        saved=(s.TOK, s.ENC, s.encode_prompt, s.HINT_CACHE, s.TOKCACHE)
+        glob={k: getattr(s, k) for k in ('IMG', 'FAMILY', 'STOP_IDS', 'EOS_TEXTS', 'DSML_START')}
+        s.encode_prompt=ORIG_ENCODE_PROMPT
+        s.load_modules(os.environ['HIVE_TEST_CKPT']); s.HINT_CACHE=s.HintProbeCache(); s.TOKCACHE=s.TokenCache()
+        try:
+            tools=HintCacheTests.TOOLS
+            for mode, effort in (('chat', None), ('thinking', 'high')):
+                m=[{'role':'system','content':'You are a coding agent. '*50}, {'role':'user','content':'<info-msg>ctx</info-msg> fix the bug'}]
+                for k in range(8):
+                    m=m+[{'role':'assistant','content':'' if k%2 else f'step {k}','reasoning_content':f'think {k}',
+                          'tool_calls':[{'id':f'c{k}','type':'function','function':{'name':'read','arguments':json.dumps({'path':f'/f{k}'})}}]},
+                         {'role':'tool','tool_call_id':f'c{k}','content':f'contents {k} '*40}]
+                    prompt,_=s.encode_prompt(m, tools, mode, effort)
+                    ids, ends=s.TOKCACHE.tokenize(mode, prompt)
+                    os.environ['HIVE_HINT_CACHE']='0'
+                    want=s.boundary_hints(m, tools, mode, effort, prompt, ids, ends, gen_cut=True)
+                    os.environ.pop('HIVE_HINT_CACHE')
+                    self.assertEqual(s.boundary_hints(m, tools, mode, effort, prompt, ids, ends, gen_cut=True), want)
+                    self.assertTrue(want)
+            self.assertGreater(s.HINT_CACHE.hits, 0)
+        finally:
+            os.environ.pop('HIVE_HINT_CACHE', None)
+            s.TOK, s.ENC, s.encode_prompt, s.HINT_CACHE, s.TOKCACHE=saved
+            for k, v in glob.items(): setattr(s, k, v)
 
 
 class ExposureTests(unittest.IsolatedAsyncioTestCase):

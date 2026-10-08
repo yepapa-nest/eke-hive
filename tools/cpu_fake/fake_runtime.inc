@@ -349,6 +349,12 @@ static int32_t fake_next(Seq& seq, int W) {
 //   a fake park/unpark of rows [0, R)), checks again (a clobbered row = the yield body touched more than the parked rows, or park/unpark broken →
 //   "fake state: layer-yield work rows clobbered"), then writes salt l+1. FAKE_LY_NO_PARK=1 = negative control (park/unpark do nothing).
 //   FAKE_PREFILL_SHORT_MS: sleep of a forward with M < prefill_threshold instead of FAKE_PREFILL_MS (a short prompt is cheap in production).
+// HIVE_LAYER_YIELD_INTRA (tools/test_layer_yield_intra_cpu.py): FAKE_INTRA=n splits every layer into n+1 parts with an intra-layer point between them
+//   (kinds cycle unit → index → moe; the last point of a layer has last=true) — called whatever the switch, like production (the runtime returns at
+//   once when it is off). Fake park/unpark of an intra yield: same rows as a boundary yield + FAKE_PF=1 holds the real ExpertStore's staging ring
+//   (outstanding pre-copies). Checks ("fake state: …"): a prefill forward inside an intra yield (decode only — verify rows excepted), a staging hold
+//   left set outside any yield. FAKE_DECODE_STAGE=1: every fake decode step writes one staging record unless held (FAKE_IGNORE_HOLD=1 = a writer
+//   that ignores the hold — the real copy_to_staging must abort). FAKE_FAIL_DECODE_INTRA=N: the N-th decode step inside an intra yield throws.
 static std::vector<uint64_t> fake_work;
 static constexpr uint64_t kFakeSalt = 0x9e3779b97f4a7c15ull;
 static double fake_now_ms() { return hive::mono_ms(); }
@@ -362,36 +368,62 @@ static void fake_work_check(const std::vector<uint64_t>& vals, int salt, size_t 
       throw std::runtime_error("fake state: layer-yield work rows clobbered at row " + std::to_string(m) + " (" + where + ")");
 }
 struct Runtime::LyPark { std::vector<uint64_t> rows; };
+static int fake_intra_depth = 0;  // > 0 while an intra-layer yield runs (decode only)
+static long fake_intra_points = 0;  // intra points reached (whether they yielded or not)
 void Runtime::ly_begin(std::vector<std::pair<Seq*, int>> owners) {
   if (ly_.depth > 1) return;
   if (ly_.depth == 0) ly_.last = fake_now_ms();
   ly_owner_[ly_.depth] = std::move(owners);
 }
-void Runtime::layer_yield_point() {
+void Runtime::layer_yield_point(int kind, int layer, bool last) {
   if (!ly_.on() || ly_.depth >= ly_.h.max_depth) return;
+  const bool intra = kind != ly::kLayer;
+  if (intra) ++fake_intra_points;
+  if (intra && !(ly_live_ && ly_.intra)) return;  // production condition without the GPU-only part (elastic big layout)
   const int lvl = std::min(ly_.depth, 1);
   if (!lypark_[lvl]) lypark_[lvl] = std::make_shared<LyPark>();
   LyPark& P = *lypark_[lvl];
   static const bool no_park = fake_env("FAKE_LY_NO_PARK", 0) > 0;
-  bool pend = false;
-  ly::yield_point(ly_,
-      [&](int R) {
-        CUDA_CHECK(cudaStreamSynchronize(st_));
-        if (!no_park) P.rows.assign(fake_work.begin(), fake_work.begin() + std::min<size_t>((size_t)R, fake_work.size()));
-        pend = prefill_pending_; prefill_pending_ = true;  // production: promotion pause / no elastic lending during the yield
-        return true;
-      },
-      [&](int) {
-        CUDA_CHECK(cudaStreamSynchronize(st_));
-        if (!no_park) std::copy(P.rows.begin(), P.rows.end(), fake_work.begin());
-        prefill_pending_ = pend;
-      },
-      [] { return fake_now_ms(); });
+  static const bool fake_pf = fake_env("FAKE_PF", 0) > 0;
+  bool pend = false, hold = false, live = false;
+  auto park = [&](int R) {
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    if (!no_park) P.rows.assign(fake_work.begin(), fake_work.begin() + std::min<size_t>((size_t)R, fake_work.size()));
+    pend = prefill_pending_; prefill_pending_ = true;  // production: promotion pause / no elastic lending during the yield
+    if (intra) { hold = store_.staging_held(); live = ly_live_; ly_live_ = false; if (fake_pf) store_.set_staging_hold(true); ++fake_intra_depth; }
+    return true;
+  };
+  auto unpark = [&](int) {
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    if (!no_park) std::copy(P.rows.begin(), P.rows.end(), fake_work.begin());
+    prefill_pending_ = pend;
+    if (intra) { --fake_intra_depth; store_.set_staging_hold(hold); ly_live_ = live; }
+  };
+  if (!intra) {
+    if (ly_.intra) ly_.seg.close(ly::seg_key(ly::kLayer, layer, last), fake_now_ms());
+    const bool y = ly::yield_point(ly_, park, unpark, [] { return fake_now_ms(); });
+    if (ly_.intra && y) ly_.seg.t0 = ly_.last;
+    return;
+  }
+  ly::yield_point_intra(ly_, kind, ly::seg_key(kind, layer, last), park, unpark, [] { return fake_now_ms(); });
 }
-static void fake_layers(Runtime* rt, bool ly_ok, int ms, const std::vector<uint64_t>& vals, size_t cap, const std::function<void()>& yield) {
+static void fake_prefill_checks(Runtime* rt, bool verify, bool held) {
+  if (fake_intra_depth > 0 && !verify) throw std::runtime_error("fake state: prefill forward inside an intra-layer yield (decode only)");
+  if (held && !rt->in_layer_yield()) throw std::runtime_error("fake state: staging hold left set outside a yield");
+}
+static void fake_layers(Runtime* rt, bool ly_ok, int ms, const std::vector<uint64_t>& vals, size_t cap, const std::function<void()>& yield,
+                        const std::function<void(int, int, bool)>& intra = {}) {
   const int FL = std::max(1, fake_env("FAKE_LAYERS", 1));
+  static const int NI = std::max(0, fake_env("FAKE_INTRA", 0));
+  static const int kinds[3] = {ly::kUnit, ly::kIndex, ly::kMoe};
   for (int l = 0; l < FL; ++l) {
-    if (ms > 0) std::this_thread::sleep_for(std::chrono::microseconds((long)ms * 1000 / FL));
+    for (int j = 0; j < NI && ly_ok && intra; ++j) {  // intra-layer points: part j of the layer, then a point
+      if (ms > 0) std::this_thread::sleep_for(std::chrono::microseconds((long)ms * 1000 / FL / (NI + 1)));
+      fake_work_check(vals, l, cap, "before intra yield");
+      intra(kinds[j % 3], l, j + 1 == NI);
+      fake_work_check(vals, l, cap, "after intra yield");
+    }
+    if (ms > 0) std::this_thread::sleep_for(std::chrono::microseconds((long)ms * 1000 / FL / (ly_ok && intra ? NI + 1 : 1)));
     if (l + 1 < FL && ly_ok) {
       fake_work_check(vals, l, cap, "before yield");
       yield();
@@ -420,7 +452,10 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   //   HIVE_LAYER_YIELD_SMALL (production: also HIVE_PREFILL_SMALL forwards below the threshold) — here: any forward below the threshold
   static const bool ly_small = [] { const char* v = getenv("HIVE_LAYER_YIELD_SMALL"); return v && *v && strcmp(v, "0") != 0; }();
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && !verify_ && (M >= opt_.prefill_threshold || ly_small);
+  fake_prefill_checks(this, verify_, store_.staging_held());
   if (ly_ok) ly_begin({{&seq, M}});
+  struct LyLive { bool& f; bool was; ~LyLive() { f = was; } } ly_live{ly_live_, ly_live_};  // production forward (T11b)
+  ly_live_ = ly_ok && ly_intra_;
   fake_work_put(*vals, 0, (size_t)opt_.max_chunk);
   fake_cpu_experts(store_, model_.cfg(), M);
   if (fake_env("FAKE_PLACE", 0) && store_.n_slots() > 0)  // create resident experts (resident keys before sleep -> compared after wake; default off)
@@ -437,7 +472,8 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
     for (int m = 0; m < M; ++m) if (ids[m] == atoi(f)) { CUDA_CHECK(cudaStreamSynchronize(st_)); throw std::runtime_error("fake injected forward failure"); }
   {
     const int ms = M < opt_.prefill_threshold && getenv("FAKE_PREFILL_SHORT_MS") ? fake_env("FAKE_PREFILL_SHORT_MS", 0) : fake_env("FAKE_PREFILL_MS", 0);
-    fake_layers(this, ly_ok, ms, *vals, (size_t)opt_.max_chunk, [this] { layer_yield_point(); });  // FAKE_LAYERS 1 = one sleep (no per-layer yield)
+    fake_layers(this, ly_ok, ms, *vals, (size_t)opt_.max_chunk, [this] { layer_yield_point(); },  // FAKE_LAYERS 1 = one sleep (no per-layer yield)
+                [this](int k, int l, bool last) { layer_yield_point(k, l, last); });
   }
   CUDA_CHECK(cudaStreamSynchronize(st_));
   const int32_t next = fake_next(seq, model_.cfg().window);
@@ -469,7 +505,10 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   fake_cpu_experts(store_, model_.cfg(), rows);
   // forward_multi is always a prefill (production ly_ok) — slot 0 = the first part's first max_chunk rows
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth;
+  fake_prefill_checks(this, false, store_.staging_held());
   if (ly_ok) { std::vector<std::pair<Seq*, int>> own; for (auto& p : parts) own.push_back({p.seq, p.M}); ly_begin(std::move(own)); }
+  struct LyLive { bool& f; bool was; ~LyLive() { f = was; } } ly_live{ly_live_, ly_live_};  // production forward_multi (T11b)
+  ly_live_ = ly_ok && ly_intra_;
   std::vector<uint64_t> vals0(parts[0].M);
   for (int m = 0; m < parts[0].M; ++m) vals0[m] = content_at(nullptr, parts[0].ids, m);
   fake_work_put(vals0, 0, (size_t)opt_.max_chunk);
@@ -484,7 +523,8 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     if (const char* f = getenv("FAKE_FAIL_TOKEN")) for (int m = 0; m < p.M; ++m) if (p.ids[m] == atoi(f)) fail = true;
   }
   if (fail) { CUDA_CHECK(cudaStreamSynchronize(st_)); throw std::runtime_error("fake injected forward failure"); }
-  fake_layers(this, ly_ok, fake_env("FAKE_PREFILL_MS", 0), vals0, (size_t)opt_.max_chunk, [this] { layer_yield_point(); });  // one layer-first pass for all parts (FAKE_LAYERS)
+  fake_layers(this, ly_ok, fake_env("FAKE_PREFILL_MS", 0), vals0, (size_t)opt_.max_chunk, [this] { layer_yield_point(); },  // one layer-first pass for all parts (FAKE_LAYERS)
+              [this](int k, int l, bool last) { layer_yield_point(k, l, last); });
   CUDA_CHECK(cudaStreamSynchronize(st_));
   for (auto& p : parts) {
     p.next = fake_next(*p.seq, model_.cfg().window);
@@ -502,18 +542,23 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
   HIVE_CHECK(M >= 1 && M <= opt_.max_batch, "batch size");
   struct BatchGuard { std::vector<Seq*>* ss; int ex; ~BatchGuard() { if (std::uncaught_exceptions() > ex) for (Seq* q : *ss) q->broken = true; } } guard{&seqs, std::uncaught_exceptions()};
   fake_cpu_experts(store_, model_.cfg(), M);
+  if (store_.staging_held() && !in_layer_yield()) throw std::runtime_error("fake state: staging hold left set outside a yield");
+  if (fake_env("FAKE_DECODE_STAGE", 0) && (!store_.staging_held() || fake_env("FAKE_IGNORE_HOLD", 0)))  // a decode DMA share (production: moe_decode_experts gates on the hold)
+    store_.copy_to_staging(0, 0, 0, side_);
   {  // a decode step uses Work rows [0, floor) (production: rows ≤ max(window, max_batch, dspark_block+1))
     std::vector<uint64_t> dv((size_t)std::min(ly_.floor, opt_.max_chunk));
     for (size_t i = 0; i < dv.size(); ++i) dv[i] = 0xdec0de00ull + i + (uint64_t)seqs[0]->pos * 131;
     fake_work_put(dv, 7, (size_t)opt_.max_chunk);
   }
   const int fail_pos = fake_env("FAKE_FAIL_DECODE_POS", -1);
+  static int intra_steps = 0;  // FAKE_FAIL_DECODE_INTRA=N: the N-th decode step inside an intra-layer yield fails (after the state half-advanced)
+  const bool fail_intra = fake_intra_depth > 0 && fake_env("FAKE_FAIL_DECODE_INTRA", 0) > 0 && ++intra_steps == fake_env("FAKE_FAIL_DECODE_INTRA", 0);
   for (int m = 0; m < M; ++m) {
     auto vals = std::make_shared<std::vector<uint64_t>>(1, content_at(nullptr, ids, m));
     fake_write(st_, *seqs[m], model_.cfg().window, vals);
     seqs[m]->engram_history.push_back((*vals)[0]);
     // half-advanced state (history grew, pos did not), like an exception between layers
-    if (seqs[m]->pos == fail_pos) { CUDA_CHECK(cudaStreamSynchronize(st_)); throw std::runtime_error("fake injected decode failure"); }
+    if (seqs[m]->pos == fail_pos || fail_intra) { CUDA_CHECK(cudaStreamSynchronize(st_)); throw std::runtime_error("fake injected decode failure"); }
     seqs[m]->tokens.push_back(ids[m]); seqs[m]->pos += 1;
   }
   if (int ms = fake_env("FAKE_STEP_MS", 0)) std::this_thread::sleep_for(FakeMs(ms));

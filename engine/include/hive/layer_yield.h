@@ -116,13 +116,75 @@ struct Hooks {
   //   want() then reports decode work only.
   int max_depth = 1;
 };
-struct Stats { long yields = 0, skipped_park = 0; double inner_ms = 0, park_ms = 0, max_gap_ms = 0; };
+struct Stats { long yields = 0, skipped_park = 0, intra_yields = 0; double inner_ms = 0, park_ms = 0, max_gap_ms = 0; };
+
+// ---- Intra-layer points (HIVE_LAYER_YIELD_INTRA) --------------------------------------------------------------------------------------------------------------
+// Problem (measured 2026-10-08, service log): with layer-boundary yields only, 78 % of the decode stall tail came from ≥ 49K-row forwards
+//   (forward_multi with host tiles): an ordinary encoder layer ≈ 460 ms, the kv/index source layers (2, 8, 14) at positions 140–239K 1.95–5.5 s
+//   (indexer), the first gap (embedding + layer 0) 1.0 s — a running decoder waits for the whole layer whatever the period is.
+// Fix: yield points inside a layer, decode only (no admission, no short prefill — only the decode floor of rows is parked there):
+//   kEmbed = after a unit's embedding + layer-0 front (forward_multi layer-0 pass) · kUnit = after a unit's / sub-chunk's front (forward_multi
+//   passes, forward's tiled front loop; after the last unit = right before the expert stage) · kMoe = after the router sync, right before the
+//   expert stage (forward's single-sequence streaming layers) · kIndex = between indexer row batches (inside attention).
+//   Runtime side: runtime.cpp "T11b" comment above Runtime::layer_yield_point. Off (default) = none of this runs (the points return at once).
+enum Kind : int { kLayer = 0, kEmbed = 1, kUnit = 2, kMoe = 3, kIndex = 4, kKinds = 5 };
+inline const char* kind_name(int k) {
+  static const char* const n[kKinds] = {"layer", "embed", "unit", "moe", "index"};
+  return k >= 0 && k < kKinds ? n[k] : "?";
+}
+// HIVE_LAYER_YIELD_INTRA: switch convention — unset · "" · "0" = off, anything else = on.
+inline bool parse_intra(const char* v) { return v && *v && !(v[0] == '0' && v[1] == 0); }
+// HIVE_LAYER_YIELD_CAP (ms, look-ahead bound of intra points): unset · "" · non-numeric · below 50 = 200 · "0" = look-ahead off · ≥ 50 = that
+//   value (capped at 60000). 200 ms = the target stall on the reference machine (a decode step is ~30–50 ms; the measured stall after the
+//   150 ms period was 0.36–0.42 s).
+constexpr double kDefaultCapMs = 200.0;
+inline double parse_cap(const char* v) {
+  if (!v || !*v) return kDefaultCapMs;
+  char* end = nullptr;
+  const double x = strtod(v, &end);
+  const bool num = end != v && end && *end == 0 && std::isfinite(x);
+  if (num && x == 0.0) return 0.0;
+  if (num && x >= 50.0) return std::min(x, 60000.0);
+  return kDefaultCapMs;
+}
+// Decision at an intra point: yield when the period has elapsed, or (look-ahead) when the next indivisible segment (EMA of the time from a
+//   point with this key to the next point) would end beyond the cap — a stall of elapsed + next becomes one of next. The look-ahead only
+//   fires when the stall it removes (elapsed) is at least what a yield costs (EMA of earlier intra yields) — right after a resume it would
+//   insert a decode step for nothing.
+inline bool intra_due(double elapsed, double period, double cap, double next_ms, double cost_ms) {
+  if (elapsed >= period) return true;
+  return cap > 0 && next_ms > 0 && elapsed + next_ms > cap && elapsed >= cost_ms;
+}
+inline void ema(double& v, double x, double a = 0.1) { v = v <= 0 ? x : v * (1 - a) + x * a; }  // same form as hived's ema (first sample = value)
+// Segment key: (point kind, layer, whether it is the last point of its run — the last unit of a pass and the last indexer batch are
+//   followed by a different kind of work than the others).
+inline int seg_key(int kind, int layer, bool last) { return (std::max(0, layer) * kKinds + kind) * 2 + (last ? 1 : 0); }
+struct Segs {
+  std::vector<double> ms;  // EMA per key (0 = no sample)
+  double t0 = 0;           // start of the open segment (a point's time, or the resume after a yield)
+  int key = -1;            // key of the point that opened it (-1 = none — the first point of a forward closes nothing)
+  void close(int next_key, double t) {
+    if (key >= 0 && t >= t0) {
+      if ((size_t)key >= ms.size()) ms.resize((size_t)key + 1, 0.0);
+      ema(ms[(size_t)key], t - t0);
+    }
+    key = next_key; t0 = t;
+  }
+  double next(int k) const { return k >= 0 && (size_t)k < ms.size() ? ms[(size_t)k] : 0.0; }
+};
+
 struct State {
   Hooks h;
   int depth = 0;
   int floor = 1, cap = 0;
   double last = 0;  // time of the last resume (or start of the outer forward)
   Stats st;
+  // HIVE_LAYER_YIELD_INTRA (off: intra false and none of the fields below is touched)
+  bool intra = false;
+  double cap_ms = kDefaultCapMs;
+  int kind = kLayer;  // kind of the point currently yielding (hived reads it — intra points run decode only)
+  Segs seg;
+  double cost_ms = 0;  // EMA of the inner time of intra yields
   bool on() const { return h.run && h.want && h.period_ms > 0; }
 };
 // park(R) → bool (parked?) · unpark(R) · now() are supplied by the caller (runtime/fake). Returns whether it yielded.
@@ -143,6 +205,39 @@ template <class Park, class Unpark, class Now> bool yield_point(State& s, Park&&
   } guard{s, R, unpark_fn, now, t_parked};
   ++s.depth;
   ++s.st.yields;
+  s.st.park_ms += t_parked - t;
+  s.st.max_gap_ms = std::max(s.st.max_gap_ms, gap);
+  s.h.run(R, gap);
+  return true;
+}
+
+// Intra-layer point (HIVE_LAYER_YIELD_INTRA): same order as yield_point with three differences — ① the clock rule is intra_due (period or
+//   look-ahead) and every call closes the open segment (segment EMA) ② R = the decode floor (park_rows(1, …)): nothing larger than decode
+//   runs inside (hived's want/run see s.kind ≠ kLayer and neither admit nor prefill) ③ the yield's inner time feeds cost_ms and, after the
+//   resume, a new segment starts. Exceptions: the guard restores (unpark, depth, kind) exactly like yield_point.
+template <class Park, class Unpark, class Now> bool yield_point_intra(State& s, int kind, int key, Park&& park_fn, Unpark&& unpark_fn, Now&& now) {
+  if (!s.on() || !s.intra || s.depth >= std::max(1, s.h.max_depth)) return false;
+  const double t = now();
+  s.seg.close(key, t);
+  const double gap = t - s.last;
+  if (!intra_due(gap, s.h.period_ms, s.cap_ms, s.seg.next(key), s.cost_ms)) return false;
+  struct KindGuard { State& s; int was; ~KindGuard() { s.kind = was; } } kind_guard{s, s.kind};
+  s.kind = kind;
+  if (s.h.want() <= 0) return false;
+  const int R = park_rows(1, s.floor, s.cap);
+  if (R <= 0) return false;
+  if (!park_fn(R)) { ++s.st.skipped_park; s.last = now(); s.seg.t0 = s.last; return false; }
+  const double t_parked = now();
+  struct Guard {
+    State& s; int R; Unpark& un; Now& now; double t0;
+    ~Guard() {
+      --s.depth; un(R); const double t1 = now(); s.st.inner_ms += t1 - t0; s.last = t1;
+      ema(s.cost_ms, t1 - t0); s.seg.t0 = t1;  // the next segment starts at the resume (the yield is not prefill work)
+    }
+  } guard{s, R, unpark_fn, now, t_parked};
+  ++s.depth;
+  ++s.st.yields;
+  ++s.st.intra_yields;
   s.st.park_ms += t_parked - t;
   s.st.max_gap_ms = std::max(s.st.max_gap_ms, gap);
   s.h.run(R, gap);

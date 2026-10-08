@@ -50,7 +50,7 @@ def contracts():
     for needle in ('const bool cpu_first = env_on("HIVE_DECODE_CPU_FIRST"), stage_hit = env_on("HIVE_DECODE_STAGE_HIT");',
                    'const int prefetch = env_on("HIVE_DECODE_PREFETCH") ? bmiss::parse_prefetch(getenv("HIVE_DECODE_PREFETCH")) : 0;',
                    'if (cpu_first || stage_hit || prefetch > 0) {',
-                   'BatchMiss* B = bmiss_ && batch_ && M >= 2 && kind == kDmaDecode && !ub_active_ && !dsplit_ && opt_.cpu_for_misses ? bmiss_.get() : nullptr;',
+                   'BatchMiss* B = !held && bmiss_ && batch_ && M >= 2 && kind == kDmaDecode && !ub_active_ && !dsplit_ && opt_.cpu_for_misses ? bmiss_.get() : nullptr;',
                    'const bool sh = B && B->stage_hit;',
                    'const bool defer_copy = B && B->cpu_first;',
                    '  if (!sh) {\n  for (int i = 0; i < n_miss_e; ++i) {\n    if (gpu_share_left > 0) { --gpu_share_left; str_e[n_str_e++] = miss_e[i]; }\n'

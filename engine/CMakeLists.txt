@@ -189,6 +189,10 @@ target_link_libraries(bench_short_prefill hive_core)
 add_executable(test_cache_elastic tests/test_cache_elastic.cpp)
 target_link_libraries(test_cache_elastic hive_core)
 
+# HIVE_LAYER_YIELD_INTRA: long prefill with decoders stepping at layer/intra-layer yields, off vs on — byte comparison of the paused prompt's logits and image (tools/compare_layer_yield_intra.py)
+add_executable(test_layer_yield_intra tests/test_layer_yield_intra.cpp)
+target_link_libraries(test_layer_yield_intra hive_core)
+
 add_executable(hive src/hive_main.cpp)
 target_link_libraries(hive hive_core)
 

@@ -134,6 +134,7 @@ class HostStager;  // host-tile h staging (runtime.cpp)
 struct ForwardStats {
   int n_routed = 0, n_hit = 0, n_cpu = 0, n_streamed = 0, tail_rows = 0;
   int n_dma_rows = 0, n_promoted = 0;
+  int n_cpu_e = 0, n_dma_e = 0;  // experts (not rows) of missed experts computed on the CPU / moved by demand DMA (prefill profile; pre-copies not included)
   double ms_cpu_span = 0;  // overlaps GPU; ms_cpu_wait now means actual host blocking time
   std::vector<int> row_hit, row_cpu, row_dma;
   double ms_total = 0, ms_cpu_wait = 0, ms_host = 0;  // ms_host = host preparation in decode layers (GPU idle time)
@@ -241,6 +242,11 @@ class Runtime {
   // Share of the paused forward's work done at the current layer boundary (0..1) — hived's HIVE_LAYER_YIELD_MID estimates the forward's remaining rows
   //   from it. Encoder layers (all rows) carry 90 % of a decoder-tail forward, the tail layers (128 rows) the rest; without the tail, layers are equal.
   double layer_yield_progress() const { return ly_progress_; }
+  // HIVE_LAYER_YIELD_INTRA ("T11b" comment in runtime.cpp): yield points inside a layer, decode only. layer_yield_kind() = kind of the point
+  //   currently yielding (ly::kLayer at layer boundaries — hived admits only there). layer_yield_intra_on() = the switch was read on (the runtime
+  //   still skips intra points when HIVE_CACHE_ELASTIC is off or incomplete, or CPU misses are off — see the startup line).
+  int layer_yield_kind() const { return ly_.kind; }
+  bool layer_yield_intra_on() const { return ly_.intra; }
   const RuntimeOptions& opt() const { return opt_; }
   // ---- DSpark speculative decoding (single sequence) ----
   //   Draft: target-layer hidden at seq's last processed position (seq.mtp_pos) + next token tok (position seq.pos) -> a block of B drafts d1..dB (positions pos+1..) and confidences.
@@ -270,6 +276,9 @@ class Runtime {
   void forward_verify_batch(std::vector<VerifyPart>& parts, std::vector<float>& logits_rows, ForwardStats* stats);
   void rollback_batch(const std::vector<int>& n_keep);
   bool mtp_batch_enabled() const { return mtp_on_ && mtp_batch_ && v2_ok_; }
+  // {"op":"set","mtp_batch":0|1} (hived): switch batched speculation at run time for interleaved A/B in one process. Engine thread only.
+  //   Has an effect only when the verify decode path was allocated at startup (HIVE_MTP_VERIFY2 or HIVE_MTP_BATCH — v2_ok_); otherwise mtp_batch_enabled() stays false.
+  void set_mtp_batch(bool on) { mtp_batch_ = on; }
   int mtp_batch_rows() const { return v2_ok_ ? v2_rows_ : 0; }  // row cap for one verify (decode kernel M <= 8, row table max_batch)
   bool mtp_verify2() const { return verify2_ && v2_ok_; }
   void set_mtp_verify2_for_test(bool on) { verify2_ = on; }
@@ -594,7 +603,14 @@ class Runtime {
   struct LyPark;                                 // runtime.cpp (pinned storage — incomplete type: shared_ptr so the fake runtime compiles)
   std::shared_ptr<LyPark> lypark_[2];            // per yield level (ly::Hooks::max_depth ≤ 2)
   void ly_begin(std::vector<std::pair<Seq*, int>> owners);  // outer prefill forward start: clock and owners (forwards inside a yield do not touch it)
-  void layer_yield_point();                      // layer boundary (called only by the outer prefill forward)
+  // Layer boundary (kind ly::kLayer — called only by the outer prefill forward) or an intra-layer point (HIVE_LAYER_YIELD_INTRA: other kinds —
+  //   layer and last select the look-ahead segment key; returns at once unless ly_live_ and the intra conditions hold)
+  void layer_yield_point(int kind = ly::kLayer, int layer = -1, bool last = false);
+  bool ly_live_ = false;        // the forward running now is yield-eligible (forward/forward_multi ly_ok) — intra points deeper in the call tree (moe, indexer) read it
+  bool ly_intra_ = false;       // HIVE_LAYER_YIELD_INTRA read on (constructor option block); usable only with ly_intra_ok()
+  bool ly_intra_ok() const;     // switch on · elastic small/big layouts complete · CPU misses on (runtime.cpp)
+  cudaEvent_t ly_ev_[2] = {nullptr, nullptr};  // kIndex: host pacing behind the GPU (created on first use)
+  int ly_ev_n_ = 0;
 };
 
 }  // namespace hive

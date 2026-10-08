@@ -232,6 +232,11 @@ class ExpertStore {
   // H2D one expert into a GPU record (ExpertLayout format) dst — 12 pieces from the two nodes' half-records (6 matrices × 2 halves)
   void copy_rec_async(uint8_t* dst_dev, int l, int e, cudaStream_t st) const;
   void copy_to_staging(int slot, int l, int e, cudaStream_t st);
+  // HIVE_LAYER_YIELD_INTRA staging hold (runtime.cpp "T11b"): set while decode steps run inside an intra-layer yield and the paused prefill
+  //   still owns pre-copied staging records (pf_). Decode writers check staging_held() and send their misses to the CPU; copy_to_staging
+  //   itself aborts while held (data-corruption guard — comment in expert_store.cpp).
+  void set_staging_hold(bool on) { staging_hold_.store(on, std::memory_order_relaxed); }
+  bool staging_held() const { return staging_hold_.load(std::memory_order_relaxed); }
   // victim_ready: (HIVE_CACHE_REUSE_STAGE only) event marking that work reading the victim slot's old record is done — the dedicated D2D stream waits on it first (nullptr if none)
   void copy_for_promotion(uint8_t* dst_dev, int l, int e, cudaStream_t st, cudaEvent_t victim_ready = nullptr);
   bool reuse_staging() const { return reuse_staging_; }
@@ -418,6 +423,7 @@ class ExpertStore {
   std::vector<int32_t> pending_slot_;  // key -> pending slot; shared by every insertion path
   uint64_t promotions_ = 0, commits_ = 0, evictions_ = 0, duplicate_skips_ = 0, d2d_records_ = 0;
   mutable uint64_t h2d_records_ = 0;
+  std::atomic<bool> staging_hold_{false};  // set_staging_hold (atomic: the G1 dispatcher thread calls copy_to_staging)
   bool reuse_staging_ = false;
   std::vector<int> staging_key_;
   std::vector<cudaEvent_t> staging_ready_, staging_reused_;

@@ -68,6 +68,7 @@ struct ExpertStore {
  std::vector<int> staging_key_{-1,-1},staging_ready_{101,102},staging_reused_{103,104},staging_reuse_pending_{0,0};
  int reuse_st_=9,reuse_done_=105;bool reuse_join_pending_=false;
  uint8_t* staging_rec(int){return nullptr;}
+ bool staging_held() const{return false;}  // T11b staging hold (never set here — tools/test_layer_yield_intra_cpu.py tests it on the real store)
  void copy_for_promotion(uint8_t*,int,int,int,int=0);void copy_to_staging(int,int,int,int);void join_reuse(int);
  int place(int,int,int);int promote(int,float,int,int=0);
  int promote_keys(const std::vector<int>&,int,int,int,bool=false,int=0);

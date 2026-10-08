@@ -610,6 +610,104 @@ HINT_TURNS = 4  # only the last few completed assistant-turn ends (the daemon on
 GEN_TAIL_MAX = 16  # a generation-suffix hint is sent only when at most this many tokens follow it (the daemon cuts such a tail for free)
 
 
+def _freeze(x):
+    """An immutable, type-exact snapshot of a JSON-like value: two snapshots compare equal only when the values are the same
+    structure with the same types, the same dict key order and the same strings — 1, 1.0 and True stay distinct (plain `==`
+    would merge them, yet a template renders them differently), floats compare by repr (-0.0 ≠ 0.0). Strings are kept by
+    reference (immutable). Anything else (bytes, custom classes, str subclasses) raises TypeError: the caller then does not cache."""
+    t = type(x)
+    if t is str:
+        return x
+    if t is dict:
+        return (dict, tuple([(_freeze(k), _freeze(v)) for k, v in x.items()]))
+    if t is list or t is tuple:
+        return (t, tuple([_freeze(v) for v in x]))
+    if t is float:
+        return (float, repr(x))
+    if t is int or t is bool or x is None:
+        return (t, x)
+    raise TypeError(f"not cacheable: {t.__name__}")
+
+
+class HintProbeCache:
+    """HIVE_HINT_CACHE (default on; "0" = off): reuse boundary_hints' probe renders across turns of a conversation.
+    Each probe renders "the messages before a boundary + an empty user message" (and the same with a "\\x00" user message) over the
+    whole conversation, twice per boundary: up to 2 × (1 + HINT_TURNS) template renders per request plus the generation-suffix pair
+    — hints p50 118-212 ms at 64K+ prompt tokens in the service log (2026-10-08 20-23h), against a template of 7-11 ms for the
+    prompt itself. The messages before a boundary rarely change between turns, so the system block and all but the newest turn
+    end were rendered on an earlier request already. A probe's result depends only on its own render, kept as `text[:c]` with c the
+    point where the empty and "\\x00" renders part (the boundary is then the common prefix of that piece and the prompt — the same
+    number the full renders give). Entries are matched by a type-exact snapshot of the probe's messages, tools, thinking mode and
+    effort (`_freeze`), never by a key alone; a different encoder or tokenizer object clears the cache, and a chat template that
+    reads the clock (`strftime_now`) is never cached. LRU within HIVE_HINT_CACHE_MB (default 256; estimated as twice the kept text)."""
+
+    def __init__(self):
+        self.entries: OrderedDict = OrderedDict()
+        self.size = 0
+        self.lock = threading.Lock()
+        self.bind = None
+        self.pure = True
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("HIVE_HINT_CACHE", "1") != "0"
+
+    def usable(self) -> bool:
+        b = (encode_prompt, ENC, TOK)
+        with self.lock:
+            if self.bind is None or any(x is not y for x, y in zip(b, self.bind)):
+                self.entries.clear()
+                self.size = 0
+                self.bind = b
+                self.pure = "strftime_now" not in str(getattr(TOK, "chat_template", None) or "")
+            return self.pure
+
+    def get(self, key, fpre, ftools):
+        """(True, kept text or None for a probe with media) when an entry with exactly these inputs exists, else (False, None)."""
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None or e[0] != fpre or e[1] != ftools:
+                self.misses += 1
+                return False, None
+            self.entries.move_to_end(key)
+            self.hits += 1
+            return True, e[2]
+
+    def put(self, key, fpre, ftools, text) -> None:
+        import sys as _sys
+        try:
+            budget = float(os.environ.get("HIVE_HINT_CACHE_MB") or 256) * 1024 * 1024
+        except ValueError:
+            budget = 256 * 1024 * 1024
+        sz = 2 * _sys.getsizeof(text) if text is not None else 256
+        with self.lock:
+            old = self.entries.pop(key, None)
+            if old is not None:
+                self.size -= old[3]
+            self.entries[key] = (fpre, ftools, text, sz)
+            self.size += sz
+            while self.entries and self.size > budget:
+                self.size -= self.entries.popitem(last=False)[1][3]
+
+
+HINT_CACHE = HintProbeCache()
+
+
+def _ends_monotonic(ends):
+    """Whether token end offsets never decrease, with numpy over an int64 array (TokenCache's `ends`); None = not applicable
+    (a list, another item type, no numpy) and the caller checks element by element."""
+    if not isinstance(ends, array) or ends.typecode not in ("l", "q") or ends.itemsize != 8:
+        return None
+    try:
+        import numpy as np
+        a = np.frombuffer(ends, dtype=np.int64)
+        return bool((a[1:] >= a[:-1]).all())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None,
                    gen_cut: bool = False) -> list[int]:
     """H5 (HIVE_PREFIX_SHARE): **exact token offsets** in the encoded prompt — end of the system/tool block and ends of
@@ -621,8 +719,9 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     the ids actually sent, emit nothing.
     Results are always prefix positions of ids (a wrong boundary only loses a reuse opportunity — the daemon compares the
     token prefix itself). Image requests emit nothing, since text offsets do not match the placeholder expansion.
-    Cost: one template render per boundary (<= 1 + HINT_TURNS) + string compares, plus one extra full-prompt tokenization
-    unless the caller passes the token end offsets of ids (`ends`, from TokenCache) — only when enabled."""
+    Cost: two template renders per boundary (<= 1 + HINT_TURNS) + string compares, plus one extra full-prompt tokenization
+    unless the caller passes the token end offsets of ids (`ends`, from TokenCache) — only when enabled. With HIVE_HINT_CACHE
+    (HintProbeCache) a boundary whose messages were probed on an earlier request costs a compare instead of its renders."""
     if ends is None or len(ends) != len(ids):
         try:
             enc = TOK(prompt, return_offsets_mapping=True)
@@ -632,7 +731,10 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
         except Exception:
             return []
     import itertools, operator
-    if not all(map(operator.le, ends, itertools.islice(ends, 1, None))):
+    mono = _ends_monotonic(ends) if HintProbeCache.enabled() else None  # HIVE_HINT_CACHE: the same check vectorized (~3 ms at 150K tokens)
+    if mono is None:
+        mono = all(map(operator.le, ends, itertools.islice(ends, 1, None)))
+    if not mono:
         return []  # non-monotonic mapping (unknown tokenizer) — no boundaries
     import bisect
     probes = []
@@ -666,7 +768,44 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
             t = bisect.bisect_right(ends, c)
             if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
                 out.add(t)
+    # HIVE_HINT_CACHE: probe renders seen on an earlier request are reused (HintProbeCache). Off (or inputs that cannot be
+    #   snapshotted) = the loop below without a cache, unchanged.
+    cache = HINT_CACHE if probes and HintProbeCache.enabled() and HINT_CACHE.usable() else None
+    if cache is not None:
+        try:
+            fmsgs = [_freeze(m) for m in messages[: max(len(p) for p in probes)]]
+            ftools, fmode, feff = _freeze(tools), _freeze(thinking_mode), _freeze(effort)
+        except Exception:  # noqa: BLE001 — not JSON-like (or too deep): this request renders every probe
+            cache = None
     for pre in probes:
+        if cache is not None:
+            fpre = tuple(fmsgs[: len(pre)])
+            key = (len(pre), fmode, feff, hash(fpre[-1]) if fpre else None)
+            hit, kept = cache.get(key, fpre, ftools)
+            if hit:
+                if kept is None:  # that probe rendered media: no boundary
+                    continue
+                # kept = text[:c_other], so its common prefix with the prompt is min(cpl(text, prompt), cpl(text, other)) — the
+                #   same cap at the next message's content as below (the "<info-msg>" fix, 0ab95c3)
+                t = bisect.bisect_right(ends, _common_prefix_len(kept, prompt))
+                if 0 < t < len(ids):
+                    out.add(t)
+                continue
+            try:
+                text, media = encode_prompt(list(pre) + [{"role": "user", "content": ""}], tools, thinking_mode, effort)
+                other, _ = encode_prompt(list(pre) + [{"role": "user", "content": "\x00"}], tools, thinking_mode, effort)
+            except Exception:
+                continue
+            if media:
+                cache.put(key, fpre, ftools, None)
+                continue
+            c_other = _common_prefix_len(text, other)
+            cache.put(key, fpre, ftools, text[:c_other])
+            c = min(_common_prefix_len(text, prompt), c_other)
+            t = bisect.bisect_right(ends, c)
+            if 0 < t < len(ids):
+                out.add(t)
+            continue
         try:
             text, media = encode_prompt(list(pre) + [{"role": "user", "content": ""}], tools, thinking_mode, effort)
             # Where the next message's own content starts: the same probe with a different content diverges exactly there.

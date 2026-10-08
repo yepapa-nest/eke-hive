@@ -137,6 +137,7 @@ int main(int argc,char** argv){
  // Z1 sleep/wake control ops (hived {"op":"sleep"/"wake"}): queued for the engine thread — none in this fixture
  struct Ctl{int fd;bool sleep;double deadline;int level;};std::deque<Ctl> ctl_q;std::atomic<bool> sleep_asked{false};
  std::vector<int> flush_q;  // {"op":"flush"} connections (hived) — none are drained in this fixture
+ std::atomic<int> g_mtp_batch_override{-1};  // {"op":"set","mtp_batch":...} run-time override (hived global — the engine thread is not part of this fixture)
  const size_t kMaxHeaderBytes=(size_t)64<<20,kMaxBinBytes=(size_t)1<<30;  // request size caps (hived, next to the listening socket)
  auto now_ms=[]{return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();};
 '''+ingress+r'''

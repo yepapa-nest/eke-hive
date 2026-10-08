@@ -16,6 +16,7 @@
 //   {"op":"sleep"[, "timeout_s":N]} -> releases VRAM once in-flight requests finish {"ok":true,"state":"sleeping","sleep":{...}} · {"op":"wake"} -> {"ok":true,"state":"ready",...}
 //     (idempotent; failure/timeout responses and the queueing policy are described in the header comment of the "sleep / wake" block below)
 //   (optional) generate's "boundaries":[offset...] — read only with HIVE_PREFIX_SHARE (boundary snapshots). Otherwise ignored like any unknown field.
+//   {"op":"set","mtp_batch":1|0|-1} -> {"ok":true,"mtp_batch":v} — run-time HIVE_MTP_BATCH override (-1 = startup value; needs the verify decode path allocated at startup)
 //   {"op":"flush"} — drop every reusable prompt state (session tokens/checkpoints/history, archived sessions, shared boundary snapshots)
 //     when no request is decoding; replies {"ok":true,...} or {"error":"not idle",...}. The expert VRAM cache (weights) is kept.
 //   (optional) generate's "prefix_extra":N — per-request extra-chunk budget for boundary cuts (overrides HIVE_PREFIX_EXTRA_CHUNKS; HIVE_PREFIX_SHARE only).
@@ -83,6 +84,10 @@ bool env_on(const char* name) { const char* v = getenv(name); return v && *v && 
 
 // Graceful shutdown (installed only when HIVE_GRACEFUL_STOP_S>0 — by default SIGTERM keeps its default action = immediate exit).
 //   The handler only writes one byte to a self-pipe (async-signal-safe). A second signal restores the default action and dies at once (forced exit while draining).
+// {"op":"set","mtp_batch":0|1|-1}: run-time override of HIVE_MTP_BATCH (-1 = the startup value). Written by the receiver thread, read by the engine
+//   thread at each batched step (relaxed — a step or two of delay is fine). Added 2026-10-09 so the batched-speculation A/B can alternate inside one
+//   running service instead of restarting it (no spare GPU window — the service carries live traffic).
+std::atomic<int> g_mtp_batch_override{-1};
 int g_stop_pipe_w = -1;
 volatile sig_atomic_t g_stop_seen = 0;
 void on_stop_signal(int sig) {
@@ -904,6 +909,17 @@ int main(int argc, char** argv) {
         { std::lock_guard<std::mutex> lk(stats_mu); s = stats_snapshot; }
         { std::lock_guard<std::mutex> lk2(mu); s["pending_requests"] = queue.size(); }
         send_json(fd, s);
+        finish_socket(fd); incoming.erase(fd);
+        continue;
+      }
+      if (op == "set") {  // run-time switches (only the keys below; others are ignored, values absorbed: number → 1 if > 0, 0 if == 0, -1 if < 0 = startup value)
+        json out = {{"ok", true}};
+        if (j.contains("mtp_batch") && j["mtp_batch"].is_number()) {
+          const double v = j["mtp_batch"].get<double>();
+          g_mtp_batch_override.store(!std::isfinite(v) || v < 0 ? -1 : v > 0 ? 1 : 0);
+        }
+        out["mtp_batch"] = g_mtp_batch_override.load();
+        send_json(fd, out);
         finish_socket(fd); incoming.erase(fd);
         continue;
       }
@@ -2306,7 +2322,10 @@ int main(int argc, char** argv) {
         //       stale, re-measure once per window. Without it, every "no draft · skip 32" interval still drafted 4 parts (14-17 ms).
         //   Row limit (rt.mtp_batch_rows() = 8 — decode kernel M <= 8): sum(k_s+1) <= 8, so c2 gets a k sum <= 6, c4 <= 4, c8 none -> then a
         //   regular batch step without speculation (absorbed, no rejection).
-    static const bool mtp_batch = env_on("HIVE_MTP_BATCH");
+    static const bool mtp_batch_env = env_on("HIVE_MTP_BATCH");
+    const int mtp_batch_ov = g_mtp_batch_override.load(std::memory_order_relaxed);
+    const bool mtp_batch = mtp_batch_ov < 0 ? mtp_batch_env : mtp_batch_ov > 0;
+    rt.set_mtp_batch(mtp_batch);  // a plain flag store each step (engine thread) — mtp_batch_enabled() still requires the startup allocation
     static mtpg::Gate gate_b;
     static mtpg::Backoff back_b;
     if (mtp_batch && stepping.size() >= 2) gate_b.tick();
@@ -2560,6 +2579,9 @@ int main(int argc, char** argv) {
     h.max_depth = ly_mid > ly_max ? 2 : 1;
     h.want = [&, ly_rows_of, ly_seat, h_nested_ok]() -> int {
       if (in_yield) return h_nested_ok() && !active.empty() ? 1 : 0;
+      // HIVE_LAYER_YIELD_INTRA: a point inside a layer runs decode steps only — the runtime parks only the decode floor of rows there and the
+      //   paused layer's staging records are held (runtime.cpp "T11b"), so nothing is admitted (requests wait for the next layer boundary)
+      if (rt.layer_yield_kind() != ly::kLayer) return active.empty() ? 0 : 1;
       int need = active.empty() ? 0 : 1;
       if (ly_max > 0 && ly_seat()) {
         std::lock_guard<std::mutex> lk(mu);
@@ -2570,6 +2592,7 @@ int main(int argc, char** argv) {
     };
     h.run = [&, ly_rows_of, ly_seat](int R, double gap_ms) {
       const bool nested = in_yield;  // level 2 (inside a forward admitted by a yield): decode steps only
+      const int kind = rt.layer_yield_kind();  // HIVE_LAYER_YIELD_INTRA: ≠ kLayer = a point inside a layer — decode steps only (no admission)
       struct InYield { bool& f; bool was; ~InYield() { f = was; } } in_yield_guard{in_yield, in_yield};
       in_yield = true;
       ++prefill_epoch;  // prefill layers ran since the last decode step
@@ -2580,9 +2603,9 @@ int main(int argc, char** argv) {
         const auto it = ly_rows.find(sid);
         who += (who.empty() ? "" : ",") + sid + ":" + (it != ly_rows.end() ? std::to_string(it->second) : std::string("?"));
       }
-      fprintf(stderr, "[hived] layer yield: %s · prefill %.0f ms since resume · rows %d · active %zu%s\n", who.empty() ? "-" : who.c_str(), gap_ms, R, active.size(),
-              nested ? " · level 2 (decode only)" : "");
-      const size_t cap = nested ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));
+      fprintf(stderr, "[hived] layer yield: %s · prefill %.0f ms since resume · rows %d · active %zu%s%s%s\n", who.empty() ? "-" : who.c_str(), gap_ms, R, active.size(),
+              nested ? " · level 2 (decode only)" : "", kind != ly::kLayer ? " · intra " : "", kind != ly::kLayer ? ly::kind_name(kind) : "");
+      const size_t cap = nested || kind != ly::kLayer ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));
       int n = 0, n_mid = 0;
       while (cap > 0 && ly_seat()) {
         Request r;

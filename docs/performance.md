@@ -42,17 +42,23 @@ The headline numbers (real chat prompts, both models) are in [benchmarks.md](ben
 ### Result
 
 Headline (the real-chat benchmark, `tools/bench_chat.py` — [benchmarks.md](benchmarks.md#real-chat-benchmark-headline)),
-before and after step 21, and with steps 22–23 (two runs; the step-21 column is one run — one-stream runs of the step-21 build
-measured 82.2–84.9 tok/s on 2026-10-05, so the step-22 gain is the interleaved 83.9 → 86.0 of its row, not the difference of the columns):
+before and after step 21, with steps 22–23 (two runs; the step-21 column is one run — one-stream runs of the step-21 build
+measured 82.2–84.9 tok/s on 2026-10-05, so the step-22 gain is the interleaved 83.9 → 86.0 of its row, not the difference of the columns),
+and with steps 29–32 at the GPU's full 600 W and with the board capped at 300 W (`nvidia-smi -pl 300`; one run each, same build, CPU
+boost off — 3.5 GHz; no other request on the engine). The long-prompt step builds its prompts from `docs/*.md`, which grew: the
+current column's prompts are 17.7K / 44K / 57K tokens:
 
-| Streams | Steps 1–20 | Step 21 | Steps 22–23 (current) |
-| --- | --- | --- | --- |
-| 1 | 53.8 tok/s | 76.9 tok/s | **85.3 tok/s** |
-| 2 / 4 | 68.4 / 81.1 | 92.6 / 124.0 | **92.9 / 124.6** |
-| 8 / 16 / 32 | 100.2 / 98.4 / 105.1 | 173.0 / 172.7 / 174.3 | **175.0 / 178.1 / 181.5** |
-| Decode after a 17K / 42K / 54K prompt | 36.9 / 43.8 / 44.5 | 64.1 / 72.6 / 77.4 | 63.4 / 79.1 / 75.8 |
-| Time to first token, 17K / 42K / 54K | 4.94 / 7.38 / 9.63 s | 4.95 / 7.48 / 9.63 s | 5.05 / 7.53 / 9.69 s |
-| Quality suite | 172 / 179 | 175 / 179 | (steps 22–23 do not change outputs) |
+| Streams | Steps 1–20 | Step 21 | Steps 22–23 | Steps 29–32, 600 W (current) | Steps 29–32, 300 W cap |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 53.8 tok/s | 76.9 tok/s | 85.3 tok/s | **80.7 tok/s** | 82.9 tok/s |
+| 2 / 4 | 68.4 / 81.1 | 92.6 / 124.0 | 92.9 / 124.6 | **106.4 / 125.0** | 99.9 / 115.8 |
+| 8 / 16 / 32 | 100.2 / 98.4 / 105.1 | 173.0 / 172.7 / 174.3 | 175.0 / 178.1 / 181.5 | **172.8 / 171.6 / 176.9** | 157.9 / 160.8 / 163.1 |
+| Decode after a 17K / 42K / 54K prompt | 36.9 / 43.8 / 44.5 | 64.1 / 72.6 / 77.4 | 63.4 / 79.1 / 75.8 | 71.9 / 82.3 / 74.1 | 71.2 / 80.6 / 72.1 |
+| Time to first token, 17K / 42K / 54K | 4.94 / 7.38 / 9.63 s | 4.95 / 7.48 / 9.63 s | 5.05 / 7.53 / 9.69 s | 4.90 / 7.49 / 9.59 s | 6.56 / 11.00 / 13.66 s |
+| Quality suite | 172 / 179 | 175 / 179 | (steps 22–23 do not change outputs) | (not re-run) | |
+
+One-stream decode moves by a few percent between runs of the same build (80.7 and 82.9 above are the same build at 600 / 300 W;
+the board cap costs prefill and many-stream decode, not one stream).
 
 The development history below uses the development benchmark `tools/bench_tune.py` ([How it is measured](#how-it-is-measured);
 it reads lower than the chat benchmark and was not re-run after step 21):
@@ -131,6 +137,10 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | 26 | Generation-suffix checkpoint: the server hints where the next turn continues and the daemon cuts the last few tokens there for free; the tail tracker compares up to that hint | With reasoning on, a DeepSeek prompt ends in `<think>` while the next turn renders the answer as `</think>…`, so the prompt-end checkpoint never matched and follow-up turns re-read most of the conversation. `tools/bench_incr.py --effort low` (35–45K-token conversation, 4 turns per size): 300-token turns 2.98 → 1.43 s (max 7.03 → 1.69 s), 1000-token turns 3.57 → 1.96 s; with reasoning off nothing changes (1.46 / 1.66 s, one chunk). GLM's template keeps the empty reasoning block, so no hint is sent there | |
 | 27 | Request priority (`priority` / `service_tier`): a decode step runs only the best priority; the queue admits by priority | Two overlapping streams ran at about half speed each because a batch of two runs without speculation. A 400-token answer sent 3 s after a 1500-token background answer: 8.64 → 5.11 s with the background at priority 1 (its own total unchanged, 25.5 / 25.7 s) | |
 | 28 | Server: on a conversation-key miss the token cache takes the kept prompt with the longest common prefix | A conversation under a new key was tokenized whole: 154K tokens 285 → 8 ms, same ids | |
+| 29 | Short-prefill DMA band (`HIVE_DMA_BAND_SHORT=1.05`) and per-layer expert-split logging | A service day (715 short chunks) showed the adaptive CPU / DMA share of short prefills sitting at the edge of its ±20 % band: in every size bucket the GPU window (resident compute + DMA) ended 15–25 % after the CPU share, and the GPU side set the layer time (front + MoE = layer time). The two short kinds now use a 5 % band, and on the short streaming kind pre-copied experts count toward the DMA share. `[prefill-prof]` now prints the experts sent to the CPU / DMA per layer group and the pre-copies used / wasted, so the next change can be judged from the log | not measured on its own — rolled out with steps 30–32; expected 3–8 % on short prefills (the CPU side runs at ~100–120 GB/s, near the memory bandwidth) |
+| 30 | Intra-layer yields (`HIVE_LAYER_YIELD_INTRA`, look-ahead cap `HIVE_LAYER_YIELD_CAP` 200 ms) — decode-only yield points inside a layer: between embedding units, between unit / tile fronts, before the expert pass, between indexer row batches. The paused prefill's staging records are held (decode misses go to the CPU), Work buffers outside the elastic layout are parked | GPU check: a 65,536-row prompt with two decoders, off / on / off: the paused prompt's logits and saved state bit-identical. Live, 85K prompt + one decoder + four short requests (`tools/layer_yield_check.py`), off → on, on: decoder tokens during the long prompt 57 → 106, 132; its longest gap 1.86 → 1.49, 1.16 s (the rest is short admissions at layer boundaries); the long prompt's first token 20.28 → 21.82, 22.21 s (+8–10 %); short requests within noise | |
+| 31 | Batched speculation re-measured on the current build (`HIVE_MTP_BATCH=1`, switchable at run time with `{"op":"set","mtp_batch":N}`) | Rejected twice on older builds (c2 +0 %, c4 down). Interleaved off / on twice in one service run at a 300 W cap: total c2 88.2 / 87.9 → 98.7 / 101.0 tok/s, c4 118.1 / 118.2 → 117.7 / 113.9, c8 147.6 / 148.8 → 147.7 / 148.8; first token median c2 0.48–0.52 → 0.25–0.26 s, c4 0.71–0.73 → 0.26–0.27 s | |
+| 32 | Server: boundary-hint probe renders reused across turns (`HIVE_HINT_CACHE`, `HIVE_HINT_CACHE_MB`) — each turn rendered the template about 12 times over the whole conversation to find its boundaries; probes whose messages are unchanged (compared by an exact snapshot, not a key) reuse the kept render | CPU, real encoder and tokenizer, 30-turn agent conversations: hints per turn 80K 12.0 → 4.9 ms, 156K 29.1 → 12.2 ms; hints identical to the uncached path on every turn | |
 
 ### Rejected (measured, not adopted)
 
@@ -139,7 +149,7 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | Prefetching predicted CPU experts during attention (`HIVE_DECODE_PREGATE`) | c4 −24 %, c8 −29 %. Precision 0.20 / recall 0.69 in real decode: wrong prefetches steal the same DRAM bandwidth the CPU experts need. A score threshold reduced the loss (−6 to −13 %) but "off" stayed fastest |
 | Next-layer expert prediction for pre-copies (the measurement switch `HIVE_DECODE_PREDICT_EVAL` stays) | The prediction is good — layer l+1's router on layer l's FFN input names 72.5 % of the real top-6 and its first non-resident candidate is routed 63.1 % of the time (`HIVE_DECODE_PREDICT_EVAL`) — but copying it ahead loses: waiting for it each layer c1 −27 %, c4 −21 %; computing it in the front graph and copying only on an idle link c1 −10 % (the link was busy for nearly every candidate); retrying after the front, 18K copies of which 25 % arrived in time, c1 −15 %. A record takes ~0.67 ms on PCIe 4.0 and a decode layer ~0.45 ms, and demand DMA and promotions already fill the link. The same idea gave GLM-5.3 +2 % (its layers are CPU-bound and longer) |
 | Skipping low-weight CPU misses (`HIVE_DECODE_SKIP_MISS=0.1`, on top of step 21) | Lossy (rank ≥ 3 misses below 10 % of the row's weight are dropped; ~0.08 rows per layer). Real-chat c1 +8 %, c2–c32 within ±1 %, decode after 17–54K prompts 4–12 % lower; quality 176 / 179 (p = 1 against step 21). No gain worth a lossy change — the same verdict as on GLM (`HIVE_GLM_SKIP_MISS`, +0 / +2 %) |
-| Batched speculative decoding across sequences (`HIVE_MTP_BATCH`) | Lossless (byte-identical replicated-state test) but c2 +0 %, c4 up to −8 % on this machine; re-measured on the current verify path: c2 37–38 vs 37–41, c4/c8 unchanged — still no gain |
+| Batched speculative decoding across sequences (`HIVE_MTP_BATCH`) — on older builds | Lossless (byte-identical replicated-state test) but c2 +0 %, c4 up to −8 % on those builds; re-measured on the current build and adopted as step 31 (c2 +13 %) |
 | Higher DMA share during decode (`HIVE_DMA_FRAC` 0.9) | Decode −28 to −41 % |
 | Promoting misses into the cache during prefill | c4 −14 % (kept off) |
 | GEMV v2 / router / PDL variants (decode) | Bit-identical but 0.5–0.97× (register preloads lowered occupancy) |
@@ -195,6 +205,7 @@ decode 70.8 / 87.8 / 103.9 / 130.6 / 130.3 / 130.9 tok/s with 1 / 2 / 4 / 8 / 16
 steps 25–28: 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6; before steps 17–21
 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3), time to first token 7.4 / 11.7 / 14.0 s for 17K / 42K / 54K-token prompts (26.4 / 53.7 / 66.3 s for
 100K / 200K / 250K, 2026-10-05), quality 158 / 163 (steps 17–28 do not change outputs).
+2026-10-09 (a newer build, the shipped OpenAssistant / NSMC draft list, one run each): 68.1 / 86.5 / 103.5 / 129.0 / 127.4 / 128.9 tok/s at 600 W and 69.4 / 85.6 / 102.5 / 129.3 / 129.8 / 130.5 tok/s with the GPU capped at 300 W; first token for 16.9K / 42K / 55K-token prompts 7.21 / 11.31 / 13.74 s (300 W: 8.17 / 15.25 / 18.90 s).
 
 ### Where the time goes
 
@@ -239,7 +250,7 @@ with the headline benchmark.
 | 22 | Early routing on the fast decode path (`HIVE_GLM_EARLY_ROUTE`) — the DeepSeek post-and-gate (`er_route_post`, `er::Gate`) after the router; the host classifies and launches experts while the shared expert runs | outputs identical; real-chat, interleaved ×2: c4 95.3 → 99.4 tok/s, c1 / c2 / c8 +0.4 / −1.7 / −0.1 % |
 | 23 | Session snapshots copy only the rows added since the previous one (`HIVE_CKPT_DELTA`) and the prompt checkpoint is taken after the first token is sent (`HIVE_DEFER_CKPT`); shared prefixes checked against the device rows (`HIVE_CKPT_VERIFY=16`) | service log, before / after: time between the end of the prefill and the first token, mean 746 ms (1,097 ms at 64K+) → 0; every prefix check ok |
 | 24 | Prefill CPU / streaming split from measured costs (`HIVE_GLM_PREFILL_ADAPT`) — a streamed record took 0.65–0.85 ms instead of the assumed 0.507 ms and the CPU finished its share early | service log, before / after, same size ranges: 65–256-row prefill 1,115 → 862 ms (records streamed 1,241 → 766), 257–1,024 rows 2.99 → 2.85 ms/row, 1K–4K 1.49 → 1.47 ms/row; the CPU (fp32) and GPU (bf16) results of an expert can differ by rounding |
-| 25 | MTP draft head over the 65,536 tokens most frequent in public chat answers (`HIVE_GLM_DRAFT_VOCAB`) — the three drafts of a step read the whole bf16 `lm_head` (154,880 × 4,096) three times; the head now reads only the listed rows, in place | outputs unchanged (the verify step uses the full head); real-chat, interleaved ×2: c1 69.4 → 71.4, c4 98.1 → 104.6 tok/s, c2 / c8 unchanged (A/A spread 0.3–2.1 %). Measured with a list built from ShareGPT answers; the shipped list (OpenAssistant oasst2 + NSMC, [glm.md](glm.md)) covers ~1 point fewer chat tokens and has not been measured on the GPU yet |
+| 25 | MTP draft head over the 65,536 tokens most frequent in public chat answers (`HIVE_GLM_DRAFT_VOCAB`) — the three drafts of a step read the whole bf16 `lm_head` (154,880 × 4,096) three times; the head now reads only the listed rows, in place | outputs unchanged (the verify step uses the full head); real-chat, interleaved ×2: c1 69.4 → 71.4, c4 98.1 → 104.6 tok/s, c2 / c8 unchanged (A/A spread 0.3–2.1 %). Measured with a list built from ShareGPT answers; the shipped list (OpenAssistant oasst2 + NSMC, [glm.md](glm.md)) covers ~1 point fewer chat tokens; measured with it on 2026-10-09 (a newer build, one run each at 600 / 300 W): c1 68.1 / 69.4 tok/s against 70.8 with the earlier list (2–4 % lower), c4 103.5 / 102.5 against 103.9, c8 129.0 / 129.3 against 130.6 |
 | 26 | Mid-size requests admitted at layer yields (`HIVE_LAYER_YIELD_MID=16384`, as DeepSeek step 23) | 96K-token prefill, 2K request 8 s in: its first token 18.9 / 18.6 → 2.9 / 2.9 s; the long prompt 22.7 → 31.0 s (it served a 2K and a 12K request meanwhile) |
 | 27 | RAM budget for evicted conversations 96 GB (`HIVE_HOST_SESSION_MB=98304`; a 145K-token conversation keeps ~3 GB, 32 GB held about ten) | twelve 145K conversations, then the first one again: 37.0 s → 1.6 s to the first token |
 | 28 | Server: one tokenization with offsets, and only the changed tail of a conversation (`HIVE_TOKEN_CACHE`, both models) — the server tokenized each 159K-token prompt twice (ids, then boundary hints) | prepare step, next turn of a 159K conversation: 554 → 27 ms (GLM), 590 → 25 ms (DeepSeek); first request 562 → 314 ms; ids and boundary hints identical |

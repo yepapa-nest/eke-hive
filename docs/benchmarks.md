@@ -24,53 +24,45 @@ python3 tools/bench_chat.py --name deepseek                                     
 python3 tools/bench_chat.py --name glm --long 17000,42000,54000,100000,200000,250000   # GLM, up to 250K
 ```
 
-Decode, tok/s in total (per stream), and time to first token, median (max):
+Decode, tok/s in total (per stream), and time to first token, median (max) — GPU at its full 600 W, and with the board capped
+at 300 W (`nvidia-smi -pl 300`):
 
-| Streams | DeepSeek-V4.1-Flash | | GLM-5.3-Flash | |
+| Streams | DeepSeek-V4.1-Flash | | DeepSeek, 300 W cap | GLM-5.3-Flash | | GLM, 300 W cap |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | **80.7** (82.9) | 0.26 s (0.38) | 82.9 · 0.22 s | **68.1** (68.8) | 0.52 s (0.70) | 69.4 · 0.50 s |
+| 2 | **106.4** (56.2) | 0.25 s (0.42) | 99.9 · 0.26 s | **86.5** (46.2) | 0.54 s (0.88) | 85.6 · 0.53 s |
+| 4 | **125.0** (31.9) | 0.25 s (0.82) | 115.8 · 0.27 s | **103.5** (28.9) | 0.54 s (1.85) | 102.5 · 0.54 s |
+| 8 | **172.8** (23.5) | 0.99 s (1.82) | 157.9 · 0.93 s | **129.0** (17.4) | 0.63 s (3.33) | 129.3 · 0.62 s |
+| 16 | **171.6** (22.6) | 9.51 s (29.3) | 160.8 · 11.1 s | **127.4** (17.3) | 12.7 s (39.7) | 129.8 · 12.8 s |
+| 32 | **176.9** (23.3) | 34.4 s (80.4) | 163.1 · 39.3 s | **128.9** (17.0) | 40.4 s (108.3) | 130.5 · 43.9 s |
+
+One run per column, 2026-10-09, same builds for both caps (DeepSeek with steps 29–32 of [performance.md](performance.md); the
+DeepSeek 300 W 2- and 4-stream values are the mean of two batched-speculation runs), CPU boost off (3.5 GHz). One stream by prompt
+kind (tok/s, 600 W): DeepSeek Korean 87.1 · English 82.0 · code 78.2 · creative 62.0; GLM 72.0 · 67.3 · 67.1 · 56.8 (the code prompts
+vary most between runs). Both models decode up to 8 requests at a time (`HIVE_MAX_BATCH`); beyond that requests wait, which is
+the time to first token at 16–32 streams. The board cap costs DeepSeek 6–9 % at 4–32 streams and makes its long prompts take 34–47 % longer; GLM's
+decode does not move and its long prompts take 13–38 % longer.
+
+Long prompts — time to first token · prefill tok/s · decode tok/s after it (the prompts are built from `docs/*.md`, so their size
+follows the docs: now 17.7K / 44K / 57K tokens for DeepSeek and 16.9K / 42K / 55K for GLM; each sent once after a cache flush):
+
+| Prompt | DeepSeek-V4.1-Flash | DeepSeek, 300 W cap | GLM-5.3-Flash | GLM, 300 W cap |
 | --- | --- | --- | --- | --- |
-| 1 | **85.3** (83.8) | 0.23 s (0.50) | **70.8** (71.2) | 0.51 s (0.96) |
-| 2 | **92.9** (47.1) | 0.26 s (0.49) | **87.8** (47.2) | 0.54 s (0.92) |
-| 4 | **124.6** (33.9) | 0.58 s (0.84) | **103.9** (28.6) | 0.53 s (1.73) |
-| 8 | **175.0** (23.8) | 1.42 s (1.72) | **130.6** (17.5) | 0.63 s (3.40) |
-| 16 | **178.1** (23.0) | 9.82 s (29.1) | **130.3** (17.4) | 12.7 s (39.2) |
-| 32 | **181.5** (23.9) | 34.4 s (79.4) | **130.9** (16.9) | 45.1 s (107.8) |
-
-Mean of two runs each (DeepSeek: the build of 2026-10-05; GLM: 2026-10-07, with the 64K-token draft head — measured with a ShareGPT-based draft list; the shipped list is built from OpenAssistant
-oasst2 + NSMC and covers ~1 point fewer chat tokens, not yet re-measured). One stream by prompt kind
-(tok/s): DeepSeek Korean 87.2 · English 82.7 · code 106.2 · creative 62.4; GLM 75.5 · 67.9 · 73.9 · 54.4. Both models decode up to 8 requests at a time (`HIVE_MAX_BATCH`); beyond that requests
-wait, which is the time to first token at 16–32 streams.
-
-Long prompts — time to first token · prefill tok/s · decode tok/s after it:
-
-| Prompt | DeepSeek-V4.1-Flash | GLM-5.3-Flash |
-| --- | --- | --- |
-| ~17K | 5.05 s · 3,530 · 63.4 | 7.37 s · 2,307 · 54.9 |
-| ~42K | 7.53 s · 5,918 · 79.1 | 11.71 s · 3,639 · 49.6 |
-| ~54K | 9.69 s · 5,816 · 75.8 | 13.96 s · 3,925 · 45.1 |
-| ~100K | — | 26.43 s · 3,833 · 45.1 |
-| ~200K | — | 53.72 s · 3,787 · 43.4 |
-| ~250K | — | 66.29 s · 3,837 · 40.0 |
+| ~17K | 4.90 s · 3,608 · 71.9 | 6.56 s · 2,696 · 71.2 | 7.21 s · 2,346 · 55.6 | 8.17 s · 2,071 · 55.4 |
+| ~42K | 7.49 s · 5,875 · 82.3 | 11.00 s · 3,998 · 80.6 | 11.31 s · 3,730 · 47.0 | 15.25 s · 2,765 · 48.8 |
+| ~54K | 9.59 s · 5,946 · 74.1 | 13.66 s · 4,174 · 72.1 | 13.74 s · 4,000 · 42.2 | 18.90 s · 2,907 · 40.6 |
+| ~100K | — | — | 26.43 s · 3,833 · 45.1 | |
+| ~200K | — | — | 53.72 s · 3,787 · 43.4 | |
+| ~250K | — | — | 66.29 s · 3,837 · 40.0 | |
 
 Builds and settings: DeepSeek with `config/hive.env`, GLM with `config/glm.env` (8 seats, batched MTP verify, layer yields, context
-262,144); two runs each, no other traffic. The GLM 100K–250K rows are from the previous build (a single request's prefill — nothing
-in that path changed). Single-stream runs vary most on the code prompts: the previous headline (DeepSeek 76.9 tok/s at one
-stream, one run) was measured on the same benchmark; re-measured interleaved with today's build on the same day, the step-22/23
-changes gave 83.9 → 86.0 tok/s at one stream ([performance.md](performance.md)) — the rest of the difference to 76.9 is run-to-run spread.
-Without the two routing changes of step 21 DeepSeek measured 53.8 / 68.4 / 81.1 / 100.2 / 98.4 / 105.1 tok/s (1–32 streams) on
-the same benchmark. GLM before today's steps 17–21 ([performance.md](performance.md#glm-53-flash)): 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3 tok/s.
-
-Quality on the bundled suite (`tools/quality_eval.py`, [validation.md](validation.md#quality-suite)), same builds:
-
-| Suite | DeepSeek-V4.1-Flash | GLM-5.3-Flash (thinking `low`) |
-| --- | --- | --- |
-| Long context (needle retrieval) | 32 / 35 (5 lengths, 4K–100K) | 21 / 21 (3 lengths: 64K, 128K, 250K) |
-| Korean / English QA | 79 / 80 | 75 / 80 |
-| Code | 20 / 20 | 20 / 20 |
-| Tool calls | 22 / 22 | 22 / 22 |
-| Operations | 22 / 22 | 20 / 20 (the 2 image items skipped: the GLM checkpoint ships no example image) |
-| **Total** | **175 / 179** | **158 / 163** |
-
-DeepSeek scored 172 / 179 without the two routing changes (the long-context items gave identical outputs).
+262,144), no other request on the engine during a run — a request held at a lower priority still holds one of the 8 seats, so a
+benchmark run waits until the engine is idle. The GLM 100K–250K rows are from an earlier build at 600 W (a single request's prefill —
+nothing in that path changed). Earlier headlines on the same benchmark (two runs each): DeepSeek of 2026-10-05 85.3 / 92.9 / 124.6 /
+175.0 / 178.1 / 181.5 tok/s, GLM of 2026-10-07 70.8 / 87.8 / 103.9 / 130.6 / 130.3 / 130.9 tok/s — one-stream runs of the same build
+spread by a few percent, so the one-stream difference is within run-to-run variation, while DeepSeek's 2-stream gain is batched
+speculation (step 31). Without the two routing changes of step 21 DeepSeek measured 53.8 / 68.4 / 81.1 / 100.2 / 98.4 / 105.1 tok/s
+(1–32 streams); GLM before its steps 17–21 ([performance.md](performance.md#glm-53-flash)): 65.2 / 66.6 / 89.3 / 88.8 / 91.6 / 93.3 tok/s.
 
 ## Sleep and wake
 

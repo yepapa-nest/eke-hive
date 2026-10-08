@@ -351,7 +351,7 @@ def source_contract(ck):
     x = x[:x.index('\n}\n')]
     swapped = set(re.findall(r'std::swap\(w\.(\w+), t\.\w+\)', x))
     g_swapped = set(re.findall(r'std::swap\((\w+_), t\.\w+\)', x))
-    p = rt[rt.index('void Runtime::layer_yield_point() {'):]
+    p = rt[rt.index('void Runtime::layer_yield_point(int kind, int layer, bool last) {'):]
     p = p[:p.index('\n}\n')]
     park = p[:p.index('auto unpark')]
     parked = set(re.findall(r'\b(?:dv|hb)\(w\.(\w+)', park)) | set(re.findall(r'P\.dev\.push_back\(\{w\.(\w+)\.p', park))
@@ -429,9 +429,9 @@ def run_mutants(exe, td):
     out.append(('fake park disabled', *mutant_case(exe, td, {**ON, 'FAKE_LY_NO_PARK': '1'}, lambda h, ck: sc_decoder(h, ck, True, 'np'))))
     # 2) hived admits beyond R: want() reports only decoders (R = floor 64) and run() ignores R → 200-row admission overwrites rows 64..199
     want_scan = "          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));"
-    cap_line = "      const size_t cap = nested ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));"
+    cap_line = "      const size_t cap = nested || kind != ly::kLayer ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));"
     assert src.count(want_scan) == 1 and src.count(cap_line) == 1, 'hived T11 lines drifted'
-    m2 = src.replace(want_scan, "          (void)ly_rows_of;").replace(cap_line, "      const size_t cap = nested ? 0 : std::max(ly_max, ly_mid);")
+    m2 = src.replace(want_scan, "          (void)ly_rows_of;").replace(cap_line, "      const size_t cap = nested || kind != ly::kLayer ? 0 : std::max(ly_max, ly_mid);")
     exe2 = t.build_daemon(td, name='hived_mut_rows', hived_source=m2)
 
     def beyond_r(h, ck):

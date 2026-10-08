@@ -314,7 +314,8 @@ class HostStager {
   }
   // One pass: visit(i, staging buffer or nullptr) in items order. A host unit must be staged right before its visit (early or now) and is downloaded after it.
   //   Early uploads follow item order only — so the earliest staged item is always the next visit (never stuck holding every buffer).
-  void run_pass(const std::vector<Item>& items, const std::function<void(size_t, DevBuf*)>& visit) {
+  //   after(i) (optional — T11b intra-layer yield point): called once item i is downloaded and the next uploads are issued (no buffer is in a slot).
+  void run_pass(const std::vector<Item>& items, const std::function<void(size_t, DevBuf*)>& visit, const std::function<void(size_t)>& after = {}) {
     size_t next = 0;
     auto prefetch = [&] {
       for (; next < items.size(); ++next) {
@@ -326,13 +327,14 @@ class HostStager {
     prefetch();
     for (size_t i = 0; i < items.size(); ++i) {
       const Item& it = items[i];
-      if (it.k < 0) { visit(i, nullptr); continue; }
+      if (it.k < 0) { visit(i, nullptr); if (after) after(i); continue; }
       if (!staged(it.k)) HIVE_CHECK(stage_in(it.k, it.load), "host tile stage_in (no free buffer)");
       DevBuf& b = use(it.k);
       visit(i, &b);
       stage_out(it.k, it.store);
       next = std::max(next, i + 1);
       prefetch();
+      if (after) after(i);
     }
   }
 
@@ -420,6 +422,7 @@ struct Runtime::Work {
   struct Elastic {
     bool on = false, big = false, bound = false, lendable = false;
     int S = 0, depth = 0;            // S = small-layout row count (forwards with rows ≤ S use the small layout); depth = nesting of big-layout forwards (forward → forward_multi)
+    bool complete = true;            // T11b: every allocated member of setup's list got two layouts (q/o included) — intra-layer yields rely on it
     size_t bytes = 0;                // bytes placed in the elastic region (big layout + buffers used only by big forwards)
     uint8_t* base = nullptr;         // elastic region (tail of the store's slot area — own when it cannot be obtained)
     DevBuf own;                      // fallback: a separately allocated region when the store could not provide elastic slots (never lent = same VRAM as without the switch)
@@ -525,12 +528,14 @@ struct Runtime::ElasticScope {
     // Alias off: the four engram work buffers also get two layouts (only addresses move — the only reader is still engram_dev). Dead eg_v/eg_s are left alone (R5 contract: allocation lines kept, zero uses)
     if (!w.eg_alias) for (DevBuf* b : {&w.eg_vals, &w.eg_q, &w.eg_sc, &w.eg_kv}) list.push_back({b, 0});
     if (qo) { list.push_back({&w.q, 0}); list.push_back({&w.o, 0}); }
+    else E.complete = false;  // T11b: q (live inside attention) would stay shared with decode
     for (DevBuf* b : {&w.gate, &w.up, &w.y, &w.yq, &w.ys, &w.eout, &w.g_xq, &w.g_xs}) list.push_back({b, 1});
     size_t off = 0, small = 0;
     auto place = [&](size_t n) { off = align_up(off, 256); const size_t o = off; off += n; return o; };
     for (auto& [b, kind] : list) {
       const size_t R = kind ? Mrows : (size_t)M, Rs = kind ? Srows : (size_t)S;
-      if (!b->p || b->n == 0 || b->n % R != 0) continue;  // sizes that are not proportional (configuration-specific formulas) are left alone
+      if (!b->p || b->n == 0) continue;
+      if (b->n % R != 0) { E.complete = false; continue; }  // sizes that are not proportional (configuration-specific formulas) are left alone (T11b: then not complete)
       const size_t n = b->n, ns = n / R * Rs;
       E.work.push_back({b, place(n), n, nullptr, 0});
       b->free();
@@ -820,6 +825,12 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   //   stall dominated); on top of HIVE_WARM_DEFER the decoders' longest gap 1.05–1.07 → 0.59–0.60 s at −1.5 % decode (21.5 → 21.2 tok/s) —
   //   adopted (docs/performance.md step 20).
   ly_small_ = env_on("HIVE_LAYER_YIELD_SMALL");
+  // HIVE_LAYER_YIELD_INTRA (optional, default off): decode-only yield points inside a layer (embedding/front units, before the expert stage,
+  //   between indexer row batches) — "T11b" comment above Runtime::layer_yield_point. HIVE_LAYER_YIELD_CAP = look-ahead bound (hive/layer_yield.h).
+  //   Needs HIVE_CACHE_ELASTIC (checked after the Work allocation — off there = the switch is dropped with a warning).
+  ly_intra_ = env_on("HIVE_LAYER_YIELD_INTRA");
+  ly_.intra = ly_intra_;
+  if (ly_intra_) ly_.cap_ms = ly::parse_cap(getenv("HIVE_LAYER_YIELD_CAP"));
   engram_par_ = env_on("HIVE_ENGRAM_PAR");                        // L2
   engram_digest_ = engram_digest_on();                            // HIVE_ENGRAM_DIGEST (verification log)
   idx_msub_actual_ = env_on("HIVE_IDX_MSUB_ACTUAL");              // L3
@@ -1192,6 +1203,13 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   //   hived enables it (set_layer_yield) — before that ly_.on() is false and the yield points below do not even read the clock (same as without the switch).
   ly_.cap = w_->M;
   ly_.floor = std::max({c.window, std::max(1, std::min(opt_.max_batch, w_->M)), c.dspark_block + 1});
+  if (ly_intra_) {  // T11b: intra-layer points need the elastic layouts (decode then runs in buffers physically apart from the paused prefill's)
+    if (!ly_intra_ok()) {
+      fprintf(stderr, "[runtime] ⚠️layer yield intra off: needs HIVE_CACHE_ELASTIC with every row buffer split (elastic %s · complete %s) and CPU misses on (%s)\n",
+              w_->el.on ? "on" : "off", w_->el.complete ? "yes" : "no", opt_.cpu_for_misses ? "on" : "off");
+      ly_intra_ = false; ly_.intra = false;
+    } else fprintf(stderr, "[runtime] layer yield intra on: decode-only points inside layers · look-ahead cap %.0f ms\n", ly_.cap_ms);
+  }
   if (model_.ckpt().has("vision.patch_embed.proj.weight") && opt_.vision) {
     vision_can_ = true;
     vision_max_patches_ = opt_.vision_max_patches > 0 ? opt_.vision_max_patches : c.vision_max_tokens * c.vision_downsample * c.vision_downsample;
@@ -1332,6 +1350,7 @@ Runtime::~Runtime() {
   for (auto& pr : split_d_) for (cudaEvent_t e : pr) if (e) cudaEventDestroy(e);
   for (auto e : stage_copied_) cudaEventDestroy(e);
   for (auto e : stage_freed_) cudaEventDestroy(e);
+  for (cudaEvent_t e : ly_ev_) if (e) cudaEventDestroy(e);  // T11b kIndex pacing (created only when used)
   if (st_) cudaStreamDestroy(st_);
   if (side_) cudaStreamDestroy(side_);
   if (promo_) cudaStreamDestroy(promo_);
@@ -1411,6 +1430,9 @@ void h2d(void* dst, const HostImageBuffer& src, size_t cap) {
 
 void Runtime::quiesce_after_host_error() {
   store_.wait_jobs();
+  // HIVE_DECODE_DEFER: a failed decode step can leave its deferred batch pending (def_pending_) — the next decode step's first layer would add those
+  //   rows into a different batch's h (and inside a layer yield, the paused prefill's). The failed step's sequences are marked broken: discard it.
+  def_pending_ = false; djobs_.clear();
   store_.flush_promotions();  // E4: issue the remaining slices of decided promotions (batch events before issue are not recorded yet) so the sync and commit below cover them
   CUDA_CHECK(cudaStreamSynchronize(st_));
   CUDA_CHECK(cudaStreamSynchronize(side_));
@@ -1586,10 +1608,11 @@ struct Runtime::PrefillProf {
     int l = 0, M = 0; bool short_moe = false;
     double h0 = 0, h_router = 0, h_synced = 0, h_moe = 0, h_end = 0;
     cudaEvent_t e0 = nullptr, e_router = nullptr, e_end = nullptr;
-    int routed = 0, hit = 0, cpu = 0, streamed = 0, dma_rows = 0; double cpu_wait = 0, cpu_span = 0; uint64_t pf = 0;
+    int routed = 0, hit = 0, cpu = 0, streamed = 0, dma_rows = 0, cpu_e = 0, dma_e = 0; double cpu_wait = 0, cpu_span = 0; uint64_t pf = 0;
   };
   std::vector<Layer> layers;
   int M = 0; int64_t pos = 0; double t0 = 0, t_embed = 0, t_layers = 0;
+  uint64_t pf_used0 = 0, pf_wasted0 = 0;  // pre-copy outcome counters at begin (printed as per-forward deltas)
   cudaEvent_t e_start = nullptr, e_embed = nullptr, e_layers = nullptr;
   ForwardStats base{};  // totals at layer start (stay 0 without stats)
   ~PrefillProf() { for (cudaEvent_t e : pool) cudaEventDestroy(e); }
@@ -1599,7 +1622,9 @@ struct Runtime::PrefillProf {
     CUDA_CHECK(cudaEventRecord(e, st));
     return e;
   }
-  void begin(int m, int64_t p, cudaStream_t st) { on = true; used = 0; layers.clear(); M = m; pos = p; t0 = now_ms(); e_start = ev(st); }
+  void begin(int m, int64_t p, cudaStream_t st, uint64_t pf_used, uint64_t pf_wasted) {
+    on = true; used = 0; layers.clear(); M = m; pos = p; t0 = now_ms(); e_start = ev(st); pf_used0 = pf_used; pf_wasted0 = pf_wasted; y_ms = 0;
+  }
   void embed(cudaStream_t st) { if (on) { t_embed = now_ms(); e_embed = ev(st); } }
   void layer_begin(int l, int m, bool short_moe, const ForwardStats* s, uint64_t pf, cudaStream_t st) {
     if (!on) return;
@@ -1620,17 +1645,28 @@ struct Runtime::PrefillProf {
     if (s) {
       x.routed = s->n_routed - base.n_routed; x.hit = s->n_hit - base.n_hit; x.cpu = s->n_cpu - base.n_cpu; x.streamed = s->n_streamed - base.n_streamed;
       x.dma_rows = s->n_dma_rows - base.n_dma_rows; x.cpu_wait = s->ms_cpu_wait - base.ms_cpu_wait; x.cpu_span = s->ms_cpu_span - base.ms_cpu_span;
+      x.cpu_e = s->n_cpu_e - base.n_cpu_e; x.dma_e = s->n_dma_e - base.n_dma_e;
     }
     x.pf = pf - x.pf;
   }
   void layers_done(cudaStream_t st) { if (on) { t_layers = now_ms(); e_layers = ev(st); } }
+  // T11b: an intra-layer yield of ms inside the current layer — shift that layer's host stamps so its host intervals exclude it (GPU events still include
+  //   the decode steps' work on st_); the total goes to the header line
+  double y_ms = 0;
+  void yielded(double ms) {
+    if (!on) return;
+    y_ms += ms;
+    if (layers.empty()) return;
+    Layer& x = layers.back();
+    for (double* h : {&x.h0, &x.h_router, &x.h_synced, &x.h_moe}) *h += ms;
+  }
   // End of forward (after the sync): sum into two groups (enc = M rows, tail = fewer rows) and print. dfrac = DMA share at the end (short prefill, short streaming kinds)
-  void report(int tail_rows, double t_end, float dfrac_short, float dfrac_sstream) {
+  void report(int tail_rows, double t_end, float dfrac_short, float dfrac_sstream, uint64_t pf_used, uint64_t pf_wasted) {
     if (!on) return;
     on = false;
     auto el = [](cudaEvent_t a, cudaEvent_t b) { float ms = 0.f; if (a && b) CUDA_CHECK(cudaEventElapsedTime(&ms, a, b)); return (double)ms; };
     struct G { int n = 0, n_short = 0, rows = 0; double hf = 0, hs = 0, hm = 0, ht = 0, gf = 0, gm = 0, gap = 0, cw = 0, cs = 0;
-               long routed = 0, hit = 0, cpu = 0, str = 0, dmar = 0; uint64_t pf = 0; } g[2];
+               long routed = 0, hit = 0, cpu = 0, str = 0, dmar = 0, cpue = 0, dmae = 0; uint64_t pf = 0; } g[2];
     cudaEvent_t prev = e_embed ? e_embed : e_start;
     for (const Layer& x : layers) {
       G& a = g[x.M < M ? 1 : 0];
@@ -1638,18 +1674,23 @@ struct Runtime::PrefillProf {
       a.hf += x.h_router - x.h0; a.hs += x.h_synced - x.h_router; a.hm += x.h_moe - x.h_synced; a.ht += x.h_end - x.h_moe;
       a.gf += el(x.e0, x.e_router); a.gm += el(x.e_router, x.e_end); a.gap += el(prev, x.e0);
       a.cw += x.cpu_wait; a.cs += x.cpu_span; a.routed += x.routed; a.hit += x.hit; a.cpu += x.cpu; a.str += x.streamed; a.dmar += x.dma_rows; a.pf += x.pf;
+      a.cpue += x.cpu_e; a.dmae += x.dma_e;
       prev = x.e_end;
     }
     const double gpu_all = el(e_start, e_layers);
-    fprintf(stderr, "[prefill-prof M=%d pos=%lld tail=%d] wall %.1f ms · embed %.1f · layers %.1f · head+sync %.1f · gpu(start→layers end) %.1f · dma frac short %.2f sstream %.2f\n",
-            M, (long long)pos, tail_rows, t_end - t0, t_embed - t0, t_layers - t_embed, t_end - t_layers, gpu_all, dfrac_short, dfrac_sstream);
+    fprintf(stderr, "[prefill-prof M=%d pos=%lld tail=%d] wall %.1f ms · embed %.1f · layers %.1f · head+sync %.1f · gpu(start→layers end) %.1f · dma frac short %.2f sstream %.2f"
+            " · pre-copies used %llu wasted %llu%s\n",
+            M, (long long)pos, tail_rows, t_end - t0, t_embed - t0, t_layers - t_embed, t_end - t_layers, gpu_all, dfrac_short, dfrac_sstream,
+            (unsigned long long)(pf_used - pf_used0), (unsigned long long)(pf_wasted - pf_wasted0),
+            y_ms > 0 ? (" · intra yields " + std::to_string((long)(y_ms + 0.5)) + " ms").c_str() : "");  // T11b (absent when no intra yield)
     for (int i = 0; i < 2; ++i) {
       const G& a = g[i];
       if (!a.n) continue;
       fprintf(stderr, "[prefill-prof M=%d] %s layers %d (rows %d, short-moe %d): host front %.1f · sync wait %.1f · moe host %.1f (cpu wait %.1f · cpu span %.1f) · tail %.1f"
-              " | gpu front %.1f · gpu moe %.1f · gpu gap %.1f | rows routed %ld hit %ld cpu %ld dma %ld · streamed %ld · prefetch %llu · per layer %.2f ms\n",
+              " | gpu front %.1f · gpu moe %.1f · gpu gap %.1f | rows routed %ld hit %ld cpu %ld dma %ld · streamed %ld · prefetch %llu · per layer %.2f ms"
+              " · experts cpu %ld dma %ld\n",
               M, i ? "tail" : "enc", a.n, a.rows, a.n_short, a.hf, a.hs, a.hm, a.cw, a.cs, a.ht, a.gf, a.gm, a.gap, a.routed, a.hit, a.cpu, a.dmar, a.str,
-              (unsigned long long)a.pf, (a.hf + a.hs + a.hm + a.ht) / a.n);
+              (unsigned long long)a.pf, (a.hf + a.hs + a.hm + a.ht) / a.n, a.cpue, a.dmae);
     }
   }
 };
@@ -1712,7 +1753,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   pmark("start");
   // R2 HIVE_PREFILL_PROF: start the breakdown for this forward (multi-row chunk, not verify) (off = no pprof_ — every hook below is just a pointer check)
   if (spo_.prof && !pprof_) pprof_ = std::make_shared<PrefillProf>();
-  if (pprof_) { pprof_->on = false; if (spo_.prof && !verify_) pprof_->begin(M, start_pos, st_); }
+  if (pprof_) { pprof_->on = false; if (spo_.prof && !verify_) pprof_->begin(M, start_pos, st_, prefetch_used_, prefetch_wasted_); }
   mh_n_ = 0;
   if (verify_) {  // rollback snapshot: ring slots [pos, pos+M) of every layer + ratio>1 compressor state. History length was recorded by forward_verify.
     for (int l = 0; l < c.n_layers; ++l) w.lringp_h[l] = seq.ring[l].as<bf16>();
@@ -1783,6 +1824,8 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && in_prefill_ && (!small_fwd || ly_small_) && !batch_ && (M_orig >= opt_.prefill_threshold || small_fwd) &&
                      opt_.dump_dir.empty() && opt_.inject_dir.empty();
   if (ly_ok) ly_begin({{&seq, M_orig}});
+  struct LyLive { bool& f; bool was; ~LyLive() { f = was; } } ly_live{ly_live_, ly_live_};  // T11b: intra points (moe, indexer) of this forward (a forward inside a yield sets its own)
+  ly_live_ = ly_ok && ly_intra_;
   const int tail_layer = c.kv_source_layers.empty() ? -1 : *std::max_element(c.kv_source_layers.begin(), c.kv_source_layers.end());
   const int tail_len = opt_.decoder_tail > 0 ? opt_.decoder_tail : 0;
   const bool tail_mode = tail_mode_for(M);
@@ -1803,6 +1846,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
         tile_select(s);
         layer_front(seq, l, tM[s], tStart[s]);
         subs.push_back(SubChunk{tM[s], w.route_ids_h, w.rw_h, w.xq.as<uint8_t>(), w.xs.as<uint8_t>(), w.acc.as<float>()});
+        if (ly_live_) layer_yield_point(ly::kUnit, l, s + 1 == T);  // T11b (after a sub-chunk front; the last one = right before the expert stage)
       }
       tile_select(0);
       if (pprof_) { pprof_->router(st_); pprof_->synced(); }  // each sub-chunk front synchronized by itself (layer_front) — end of router = end of the last front
@@ -1870,7 +1914,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   if (mtp_on_ && !verify_ && mh_n_ > 0) { mtp_sync_seq(seq, mh_pos0_, mh_n_); pmark("mtp.sync"); }
   CUDA_CHECK(cudaStreamSynchronize(st_));
   preport(M);
-  if (pprof_) pprof_->report(tail_mode && !upper_skipped ? tail_len : 0, now_ms(), dma_frac_[kDmaShort], dma_frac_[kDmaStreamShort]);  // R2 (after the sync — all events have completed)
+  if (pprof_) pprof_->report(tail_mode && !upper_skipped ? tail_len : 0, now_ms(), dma_frac_[kDmaShort], dma_frac_[kDmaStreamShort], prefetch_used_, prefetch_wasted_);  // R2 (after the sync — all events have completed)
   // Adaptive promotion (decode): after score decay, move hot non-resident experts in on the side stream
   if (M_orig < opt_.prefill_threshold && (opt_.promote_per_token > 0 || opt_.promote_misses > 0)) {
     int n = promote_after_step();
@@ -2019,9 +2063,12 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     for (auto& p : parts) own.push_back({p.seq, p.M});
     ly_begin(std::move(own));
   }
+  struct LyLive { bool& f; bool was; ~LyLive() { f = was; } } ly_live{ly_live_, ly_live_};  // T11b: intra points of this forward (pass ends, indexer)
+  ly_live_ = ly_ok && ly_intra_;
   auto host_k = [&](int u) { return units_[(size_t)u].slot >= resident ? units_[(size_t)u].slot - resident : -1; };
   // One pass: visit the units in us in order. load/store = rows to upload before / download after the visit (meaningful only for host units, 0 = none). body(u) runs with the unit selected.
   std::vector<SubChunk> subs;
+  int ly_l = -1, ly_kind = ly::kUnit;  // T11b: layer and point kind of the current pass (-1 = no intra points — the head pass)
   auto pass = [&](const std::vector<int>& us, const std::function<size_t(int)>& load_rows, const std::function<size_t(int)>& store_rows,
                   const std::function<void(int)>& body) {
     std::vector<HostStager::Item> items(us.size());
@@ -2039,8 +2086,11 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
       if (stage) std::swap(tiles_.at((size_t)units_[(size_t)u].slot - 1).h, *stage);
       if (items[i].k >= 0) items[i].store = store_rows(u) * rowb;  // row count after the visit (shrinks at the tail layer)
     };
-    if (stager_) stager_->run_pass(items, visit);
-    else for (size_t i = 0; i < items.size(); ++i) visit(i, nullptr);
+    // T11b: after each unit's visit (Work back in its original state — unit_select(-1)); after the last one = right before the expert stage
+    std::function<void(size_t)> after;
+    if (ly_live_ && ly_l >= 0) after = [&](size_t i) { layer_yield_point(ly_kind, ly_l, i + 1 == us.size()); };
+    if (stager_) stager_->run_pass(items, visit, after);
+    else for (size_t i = 0; i < items.size(); ++i) { visit(i, nullptr); if (after) after(i); }
   };
   std::vector<int> sub_u;  // Q3: unit index of subs[i] (push_sub appends both; cleared together with subs)
   auto push_sub = [&](int u) { subs.push_back(SubChunk{units_[(size_t)u].M, w.route_ids_h, w.rw_h, w.xq.as<uint8_t>(), w.xs.as<uint8_t>(), w.acc.as<float>()}); sub_u.push_back(u); };
@@ -2105,6 +2155,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   for (int l = 0; l < L; ++l) {
     prefetch_layer_experts(l);  // pre-copy during the fronts (same point as C2 — tail l−1 follows experts l−1 in st_ order, unrelated to the pre-copy)
     subs.clear(); sub_u.clear();
+    ly_l = l; ly_kind = l == 0 ? ly::kEmbed : ly::kUnit;  // T11b
     pass(all, l == 0 ? std::function<size_t(int)>(none) : std::function<size_t(int)>(rows_of), rows_of, [&](int u) {
       UnitCtx& x = units_[(size_t)u];
       PrefillPart& p = parts[(size_t)x.part];
@@ -2125,6 +2176,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     for (const UnitCtx& x : units_) if (x.last && (!x.tail || parts[(size_t)x.part].upper_needed)) { any_up = true; if (!mshort(x.tail ? tail_len : x.M)) up_long = true; }
     if (any_up && up_long) prefetch_layer_experts(L);
     subs.clear(); sub_u.clear();
+    ly_l = L; ly_kind = L == 0 ? ly::kEmbed : ly::kUnit;  // T11b
     pass(all, L == 0 ? std::function<size_t(int)>(none) : std::function<size_t(int)>(rows_of),
          [&](int u) -> size_t { return units_[(size_t)u].up ? (size_t)units_[(size_t)u].M : 0; }, [&](int u) {
       UnitCtx& x = units_[(size_t)u];
@@ -2161,6 +2213,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
       for (int u : up) if (!mshort(units_[(size_t)u].M)) long_l = true;
       if (long_l) prefetch_layer_experts(l);
       subs.clear(); sub_u.clear();
+      ly_l = l; ly_kind = ly::kUnit;  // T11b
       pass(up, rows_of, rows_of, [&](int u) {
         UnitCtx& x = units_[(size_t)u];
         tail_prev(l - 1, x.M);
@@ -2176,6 +2229,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   }
 // ---- Last layer tail → head (logits) → MTP ring/hidden (each sequence from its own capture)
   const bool head = model_.has_head() && nl == c.n_layers;
+  ly_l = -1;  // T11b: no intra points in the head pass
   pass(up, rows_of, none, [&](int u) {
     UnitCtx& x = units_[(size_t)u];
     PrefillPart& p = parts[(size_t)x.part];
@@ -2241,6 +2295,10 @@ struct Runtime::LyPark {
   std::vector<std::vector<int>> last_rows;
   Prof prof;
   std::shared_ptr<PrefillProf> pprof;
+  // T11b intra points only
+  int unit = -1, pf_l = -1;
+  std::vector<std::pair<int, int>> pf;
+  bool hold = false, live = false;
   ~LyPark() { if (stash) cudaFreeHost(stash); }
   bool reserve(size_t n) {
     if (n <= cap) return true;
@@ -2253,14 +2311,179 @@ struct Runtime::LyPark {
   }
 };
 
+// ---- T11b HIVE_LAYER_YIELD_INTRA — decode-only yield points inside a layer ------------------------------------------------------------------------------------
+// Why (measured 2026-10-08, service log, layer-boundary yields at 150 ms): 78 % of the decode stall tail came from ≥ 49K-row forwards (forward_multi with
+//   host tiles) — an ordinary encoder layer ≈ 460 ms, kv/index source layers 2/8/14 at positions 140–239K 1.95–5.5 s (indexer), the first gap (embedding +
+//   layer 0) 1.0 s; ≤ 16K forwards: gap p50 170 / p95 244 ms. A boundary yield cannot cut a layer.
+// Points (kinds in hive/layer_yield.h): kEmbed/kUnit = after a unit's visit in forward_multi passes (HostStager::run_pass after(i) — the unit is back in
+//   tiles_/host memory, Work = slot 0) and after each sub-chunk front of forward's tiled loop; the last unit's point = right before the expert stage ·
+//   kMoe = moe() after the router sync of a streaming layer (forward's single-sequence path) · kIndex = between indexer row batches (inside attention;
+//   the host is paced one batch behind the GPU with two events, so the clock measures GPU progress).
+// What runs inside: decode steps only (hived want/run see layer_yield_kind() ≠ kLayer — no admission, no short prefill, no warm), so R = the decode
+//   floor. Requires HIVE_CACHE_ELASTIC with every listed row buffer split (Elastic::complete): decode then uses the small layout — buffers physically
+//   apart from the paused prefill's big layout — so attention/indexer temporaries that are live mid-layer (q, kv, iq, iw, idx, cand, xq/xs, acc, h …)
+//   survive without parking. Off, incomplete or CPU misses off (the hold below needs a CPU fallback) = the intra points return at once.
+// Parked at intra points = the layer-boundary set (below) + the shared (single-layout) buffers live mid-layer: pre_a/post_a/comb_a (hc_attn_pre →
+//   hc_ffn_pre) and iqp (HIVE_IDX_TC packed queries, written before the indexer row loop). Every Work member is classified in the table below
+//   (tools/test_layer_yield_intra_cpu.py checks that each member is in exactly one of: the elastic list (ElasticScope::setup), the layer-boundary park
+//   list, the intra park list, this table).
+// Extra rules at intra points:
+//   (1) staging hold — pre-copies of the paused layer (pf_, prefetch_layer_experts) occupy staging slots whose stage_freed_ is recorded only when the
+//       expert stage consumes them; a decode step advancing stage_next_ could overwrite them and the prefill would multiply with the wrong expert.
+//       While pf_ is non-empty, ExpertStore::set_staging_hold(true): moe_decode_experts sends every miss to the CPU (no DMA share, no B2 ring use),
+//       bm_prefetch does nothing, forward_batch_step falls back to the per-layer path; copy_to_staging aborts if a writer slips through.
+//   (2) pf_/pf_l_ are restored, not cleared (the pre-copies stay valid — a decode failure's quiesce_after_host_error would otherwise drop them).
+//   (3) a unit visit interrupted at kIndex is closed with unit_select(-1) and reopened after (its globals, slot and member buffers round-trip).
+//   (4) promotion stays paused and lending blocked (prefill_pending_, ly_.depth — same as boundary yields); ly_live_ is false inside.
+//   (5) HIVE_DECODE_DEFER: unpark flushes a deferred batch a failed decode step may have left pending (both kinds — fixed here for boundary yields
+//       too: after a decode exception def_pending_ stayed set and the paused prefill's next short-path layer (moe_decode_experts) would add those
+//       rows into the prefill's h). The flush lands in the decode layout (or, elastic off, in rows the restore overwrites next).
+// Math: unchanged for the paused prefill (same kernels, inputs and order; only cache residency between points can differ — the same property as the
+//   boundary yield). GPU check: tools/validate_gpu.sh "layer_yield_intra".
+// LY-INTRA-WORK BEGIN — Work members that are neither in the elastic list nor parked, and why they are dead at every intra point
+//   hflat: row-move temporary of prepare_decoder_tail / HIVE_HC_CUBLAS mix input — written and read inside one call, no point inside
+//   mixes: hc mix coefficients — written and read inside hc_attn_pre/hc_ffn_pre (and as a row-move temporary of prepare_decoder_tail)
+//   rsq: same as mixes
+//   qrs: q_lora scales — read by the q and indexer-q GEMMs, both before the indexer row loop; the next layer rewrites them
+//   pos: never read (positions live in the mapped pos_h)
+//   gpos: never read (the mapped gpos_h is used)
+//   visible: never read (the mapped visible_h is used)
+//   ids: router output — moved to route_ids_h by route_to_host before the front's sync; read again only by the next router
+//   rw: same as ids
+//   g_rows: expert-stage scratch (moe_decode_experts default table pointer) — written after the points
+//   g_rw: same as g_rows
+//   cpu_out: not allocated (the mapped cpu_out_h is used)
+//   cpu_rows: expert-stage scratch (CPU row numbers) — written after the points
+//   eg_v: never read (R5: kernels read the mapped eg_v_d)
+//   eg_s: never read (R5)
+//   iscore: indexer per-batch scratch — consumed by that batch's top-k before the next kIndex point (the yield drains the stream first)
+//   iscore_f: same as iscore
+//   bmax: same as iscore
+//   topk_pos: same as iscore
+//   woa: wo_a bf16 scratch — rewritten from the weights right before use (after the indexer)
+//   xlast: head input — after the last layer only
+//   logits: head output — after the last layer only
+//   next: head argmax — after the last layer only
+//   attn_S: attention scratch of small-row kernels (prefill M ≥ 16 uses the flash kernel); written after the indexer
+//   attn_pacc: decode split-K partials — decode only
+//   attn_pm: decode only
+//   attn_ps: decode only
+//   dec_tab: decode only (D2 row table)
+//   dec_cnt: decode only (D2 counters)
+//   valid: decode only
+//   logits_b: decode/verify head only
+//   next_b: decode/verify head only
+//   is_image: not allocated (the mapped is_image_h is used)
+//   img_types: image merge at the forward head (before layer 0; forward_multi takes no images)
+//   img_row_of: same as img_types
+//   img_rows: same as img_types
+//   emb_rows: not allocated
+//   iota: constant row table (written once by the constructor)
+//   gdesc_dev: expert-stage table — written after the points
+//   tbl_dev: expert-stage table — written after the points
+//   mhq: MTP sync scratch — after the head only
+//   mhs: same as mhq
+//   mx: same as mhq
+//   dids: draft only
+//   dconf: draft only
+//   membed: draft only
+//   dx: draft only
+//   ring_snap: verify only
+//   counters: last-block counters of the fused decode kernels (M ≤ 8 — never the prefill's rows); the kernels return them to 0
+//   kvrows_h: decode row table
+//   kvrows_d: = kvrows_h
+//   kptrs_h: decode row table
+//   kptrs_d: = kptrs_h
+//   trows_h: decode row table
+//   trows_d: = trows_h
+//   dsti_h: decode row table
+//   dsti_d: = dsti_h
+//   ringp_h: decode row table
+//   ringp_d: = ringp_h
+//   dstp_h: decode row table
+//   dstp_d: = dstp_h
+//   dstk_h: decode row table
+//   dstk_d: = dstk_h
+//   skv_h: decode row table
+//   skv_d: = skv_h
+//   ssc_h: decode row table
+//   ssc_d: = ssc_h
+//   next_b_h: decode/verify head only
+//   emb_h: embedding rows of prologue_rows — consumed before its sync (before layer 0's front)
+//   emb_d: = emb_h
+//   is_image_d: = is_image_h
+//   pos_d: = pos_h
+//   g_rows_d: = g_rows_h
+//   cpu_rows_d: = cpu_rows_h
+//   gpos_d: = gpos_h
+//   visible_d: = visible_h
+//   g_rw_d: = g_rw_h
+//   cpu_out_d: = cpu_out_h
+//   eg_v_d: = eg_v_h
+//   eg_s_d: = eg_s_h
+//   route_ids_d: = route_ids_h
+//   rw_d: = rw_h
+//   xq_hd: = xq_h
+//   xs_hd: = xs_h
+//   g_rows_cap: scalar (capacity)
+//   g_rows_h: expert-stage table — written after the points
+//   cpu_rows_h: expert-stage table — written after the points
+//   next_h: head only
+//   g_rw_h: expert-stage table — written after the points
+//   cpu_out_h: CPU expert outputs — expert stage only
+//   a_f_h: CPU expert inputs — unpacked in the expert stage
+//   a_s_h: same as a_f_h
+//   scratch_h: CPU job scratch — expert stage only
+//   xq_h: host activations for CPU experts — written in the expert stage (kMoe is skipped on the short-tail path, whose router writes them first)
+//   xs_h: same as xq_h
+//   eg_v_h: engram lookup rows — written and read at the layer head (engram_host → engram_dev), before any point of that layer
+//   eg_s_h: same as eg_v_h
+//   gdesc_h: expert-stage table
+//   gdesc_d: = gdesc_h
+//   tbl_h: expert-stage table
+//   rows_by_e: expert-stage sort buffer
+//   cpu_jobs: expert-stage job list
+//   gmoe: grouped prefill executor (moe_experts_multi only — decode never touches it)
+//   Msub: scalar (indexer rows per batch)
+//   Tcap: scalar
+//   nblocks_cap: scalar
+//   mh_rows: scalar
+//   mpos_h: MTP sync positions — written by mtp_sync itself
+//   mpos_d: = mpos_h
+//   mringp_h: decode MTP row table
+//   mringp_d: = mringp_h
+//   mhid_h: decode MTP row table
+//   mhid_d: = mhid_h
+//   dids_h: draft only
+//   dconf_h: draft only
+//   lringp_h: verify only
+//   lringp_d: = lringp_h
+//   vxn: verify only
+//   cstate_snap: verify only
+//   ringp1_h: single-sequence decode/draft ring table
+//   ringp1_d: = ringp1_h
+//   vgrp_h: verify only
+//   vgrp_d: = vgrp_h
+//   vlringp_h: verify only
+//   vlringp_d: = vlringp_h
+//   vcsnap: verify only
+//   vckv: verify only
+//   M: scalar (row capacity)
+//   eg_alias: scalar (flag)
+//   el: elastic layout state — depth and big saved and restored by park/unpark
+// LY-INTRA-WORK END
+bool Runtime::ly_intra_ok() const { const Work::Elastic& E = w_->el; return ly_intra_ && E.on && E.complete && opt_.cpu_for_misses; }
+
 void Runtime::ly_begin(std::vector<std::pair<Seq*, int>> owners) {
   if (ly_.depth > 1) return;
   if (ly_.depth == 0) ly_.last = now_ms();  // a forward inside a yield keeps the clock of that yield's resume
   ly_owner_[ly_.depth] = std::move(owners);
 }
 
-void Runtime::layer_yield_point() {
+void Runtime::layer_yield_point(int kind, int layer, bool last) {
   if (!ly_.on() || ly_.depth >= ly_.h.max_depth || capturing_) return;
+  const bool intra = kind != ly::kLayer;
+  if (intra && !(ly_live_ && ly_.intra && w_->el.big)) return;  // T11b (off: ly_.intra false — returns here; the big layout = the paused prefill is apart from decode)
   const int lvl = std::min(ly_.depth, 1);
   if (!lypark_[lvl]) lypark_[lvl] = std::make_shared<LyPark>();
   LyPark& P = *lypark_[lvl];
@@ -2274,23 +2497,34 @@ void Runtime::layer_yield_point() {
   };
   auto park = [&](int R) -> bool {
     drain();
+    P.unit = intra ? unit_cur_ : -1;
+    if (P.unit >= 0) unit_select(-1);  // T11b kIndex inside a forward_multi unit visit: close it (globals → its UnitCtx, member buffers back) — reopened by unpark
     P.tile_cur = tile_cur_;
     tile_select(0);
     // slot 0's inter-layer state (same set as tile_xchg's swap list + cand and mh — tools/test_layer_yield_cpu.py compares the two lists textually)
     P.dev.clear(); P.hst.clear();
     const size_t hc = (size_t)c.hc, dim = (size_t)c.dim, kk = (size_t)c.n_act;
-    auto dv = [&](DevBuf& b, size_t rb) { if (b.p && b.n >= rb && rb) P.dev.push_back({b.p, rb, b.n / rb}); };
+    auto elastic_member = [&](const DevBuf& b) { for (const auto& e : w.el.work) if (e.b == &b) return true; return false; };
+    auto dv = [&](DevBuf& b, size_t rb) {
+      if (intra && elastic_member(b)) return;  // T11b: decode runs in the small layout — the paused prefill's big-layout rows are apart (no copy needed)
+      if (b.p && b.n >= rb && rb) P.dev.push_back({b.p, rb, b.n / rb});
+    };
     dv(w.h, hc * dim * 2); dv(w.pre_mix, hc * 4); dv(w.idx, (size_t)(c.window + c.index_topk) * 4); dv(w.xq, dim); dv(w.xs, dim / 32); dv(w.acc, dim * 4);
     dv(w.pre_f, hc * 4); dv(w.post_f, hc * 4); dv(w.comb_f, hc * hc * 4);
     if (c.cand_source_layer >= 0) dv(w.cand, (size_t)c.cand_topk_blocks * 4);
     if (w.mh.p && w.mh.n) P.dev.push_back({w.mh.p, w.mh.n, 1});  // row 1 = whole (mh_rows rows — all of them when R ≥ 1)
     auto hb = [&](void* p, size_t rb) { if (p) P.hst.push_back({p, rb, (size_t)w.M}); };
     hb(w.route_ids_h, kk * 4); hb(w.rw_h, kk * 4); hb(w.pos_h, 4); hb(w.ids_h, 4); hb(w.is_image_h, 1); hb(w.visible_h, 4); hb(w.gpos_h, 4);
+    if (intra) {  // T11b intra park list: shared (single-layout) buffers live mid-layer — LY-INTRA-WORK table above
+      auto iv = [&](DevBuf& b, size_t rb) { if (b.p && b.n >= rb && rb) P.dev.push_back({b.p, rb, b.n / rb}); };
+      iv(w.pre_a, hc * 4); iv(w.post_a, hc * 4); iv(w.comb_a, hc * hc * 4); iv(w.iqp, (size_t)c.index_n_heads * kvp::IDX_ROW);
+    }
     if (!P.reserve(ly::park_bytes(P.dev, R))) {
       if (!P.warned) fprintf(stderr, "[runtime] ⚠️layer yield: pinned park buffer (%.0f MiB) unavailable — yield skipped (prefill continues)\n",
                              ly::park_bytes(P.dev, R) / 1048576.0);
       P.warned = true;
       tile_select(P.tile_cur);
+      if (P.unit >= 0) unit_select(P.unit);
       return false;
     }
     ly::park(P.dev, R, P.stash, [&](void* d, const void* src, size_t n) { CUDA_CHECK(cudaMemcpyAsync(d, src, n, cudaMemcpyDeviceToHost, st_)); });
@@ -2305,11 +2539,17 @@ void Runtime::layer_yield_point() {
     if (w.el.on) { w.el.depth = 0; ElasticScope::view(*this, false); }  // the inner forward picks its own layout (decode = small layout = the addresses graphs captured)
     in_prefill_ = false; score_prefill_ = false; small_fwd_ = false;
     prefill_pending_ = true;  // pauses promotion (with HIVE_PREFILL_PAUSE_PROMOTE), blocks elastic lending
+    if (intra) {  // T11b: keep the paused layer's pre-copies (restored by unpark) and hold the staging ring while they are outstanding
+      P.pf = pf_; P.pf_l = pf_l_; P.hold = store_.staging_held(); P.live = ly_live_;
+      if (!pf_.empty()) store_.set_staging_hold(true);
+      ly_live_ = false;
+    }
     CUDA_CHECK(cudaStreamSynchronize(st_));  // D2H done — before inner work (including other streams) overwrites those rows
     return true;
   };
   auto unpark = [&](int R) {
     drain();
+    deferred_flush();  // T11b (5): a decode step that failed mid-layer may leave a deferred batch pending — add it here (decode layout), never into the prefill's h
     if (w.el.on) { ElasticScope::view(*this, P.el_big); w.el.depth = P.el_depth; }  // back to the layout at park time (restore address = parked address)
     ly::unpark(P.dev, R, P.stash, [&](void* d, const void* src, size_t n) { CUDA_CHECK(cudaMemcpyAsync(d, src, n, cudaMemcpyHostToDevice, st_)); });
     ly::unpark(P.hst, R, P.host.data(), [](void* d, const void* src, size_t n) { memcpy(d, src, n); });
@@ -2319,12 +2559,22 @@ void Runtime::layer_yield_point() {
     for (auto e : prof_.ev) cudaEventDestroy(e);  // table left by the inner forward (cut off before its report)
     prof_ = std::move(P.prof); P.prof = Prof{};
     pprof_ = std::move(P.pprof);
-    pf_.clear(); pf_l_ = -1;  // the outer pre-copies were consumed (this point is after the expert stage) — drop the inner work's pre-copy markers too (the next layer head issues them again)
+    if (!intra) { pf_.clear(); pf_l_ = -1; }  // the outer pre-copies were consumed (this point is after the expert stage) — drop the inner work's pre-copy markers too (the next layer head issues them again)
+    else { pf_ = std::move(P.pf); pf_l_ = P.pf_l; P.pf.clear(); store_.set_staging_hold(P.hold); ly_live_ = P.live; }  // T11b (1)(2): the paused layer still consumes its pre-copies
     tile_select(P.tile_cur);
+    if (P.unit >= 0) unit_select(P.unit);  // T11b (3)
     for (auto& [sq, m] : ly_owner_[lvl]) { Seq* sp = sq; xtrace_step(1, m, &sp, 1); }
     CUDA_CHECK(cudaStreamSynchronize(st_));
   };
-  ly::yield_point(ly_, park, unpark, [] { return now_ms(); });
+  if (!intra) {
+    if (ly_.intra) ly_.seg.close(ly::seg_key(ly::kLayer, layer, last), now_ms());  // T11b: a boundary ends the open segment (off: never runs)
+    const bool y = ly::yield_point(ly_, park, unpark, [] { return now_ms(); });
+    if (ly_.intra && y) ly_.seg.t0 = ly_.last;
+    return;
+  }
+  const double t0 = now_ms();
+  if (ly::yield_point_intra(ly_, kind, ly::seg_key(kind, layer, last), park, unpark, [] { return now_ms(); }) && pprof_)
+    pprof_->yielded(now_ms() - t0);  // R2 HIVE_PREFILL_PROF: per-layer host intervals exclude the yield
 }
 
 // E4 HIVE_DECODE_COPY_PRIO — decode PCIe ordering: demand DMA first, promotions in the gaps after it.
@@ -3697,7 +3947,16 @@ void Runtime::indexer(Seq& seq, const LayerWeights& L, int l, int M, int64_t sta
   const int Msub = idx_msub_actual_ && opt_.dump_dir.empty()
                        ? idx_msub_for(w.Msub, w.Tcap, w.nblocks_cap, std::max(c.index_topk, c.cand_topk_blocks), M, T, bs, CB, c.index_topk)
                        : w.Msub;
+  const bool ly_ix = ly_live_ && M > Msub;  // T11b kIndex (off: ly_live_ is false)
+  if (ly_ix) ly_ev_n_ = 0;
   for (int m0 = 0; m0 < M; m0 += Msub) {
+    if (ly_ix && m0 > 0) {  // T11b: between row batches — pace the host one batch behind the GPU (else it issues every batch at once and the clock never advances here)
+      for (cudaEvent_t& e : ly_ev_) if (!e) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+      CUDA_CHECK(cudaEventRecord(ly_ev_[ly_ev_n_ & 1], st_));
+      if (ly_ev_n_ > 0) CUDA_CHECK(cudaEventSynchronize(ly_ev_[(ly_ev_n_ - 1) & 1]));
+      ++ly_ev_n_;
+      layer_yield_point(ly::kIndex, l, m0 + Msub >= M);  // iscore/iscore_f/bmax/topk_pos are per-batch scratch (dead here); iq/iw/idx/cand are elastic, iqp and visible_h are parked
+    }
     const int Ms = std::min(Msub, M - m0);
     if (uses_cand) {
       // P1: Reindex layers score only inside layer 20's candidate blocks (min(cand_topk_blocks, ⌈T/8⌉) per row) — full-T scores, keep masks and full-T top-k all disappear
@@ -3907,6 +4166,7 @@ void Runtime::moe(Seq& seq, const LayerWeights& L, int l, int M, ForwardStats* s
     dump_host("route_w_L" + std::to_string(l) + ".f32", w_->rw_h, (size_t)M * model_.cfg().n_act * 4);
   }
   if (pprof_) pprof_->synced();
+  if (prefill && ly_live_) layer_yield_point(ly::kMoe, l, true);  // T11b: front done, expert stage next (not on the short-tail path — it reads xq_h, which decode rewrites)
   if (prefill) moe_experts(seq, L, l, M, stats);
   else moe_decode_experts(L, l, M, stats);
   if (pprof_) pprof_->moe_done();
@@ -4133,7 +4393,8 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
   //   would overwrite an earlier copy of the same layer (same as dma_cap 8 and decode_handshake.h kMaxDma).
   bool ds_model = false, ds_sample = false;
   DecodeSplit* S = nullptr;
-  if (dsplit_ && opt_.cpu_for_misses && kind == kDmaDecode && !ub_active_ && n_miss_e > 0 && !vrowind) {  // R1 ROWIND layers stay outside the model
+  const bool held = store_.staging_held();  // T11b staging hold (intra-layer yield with the paused prefill's pre-copies in staging): no staging slot — every miss to the CPU
+  if (dsplit_ && opt_.cpu_for_misses && kind == kDmaDecode && !ub_active_ && n_miss_e > 0 && !vrowind && !held) {  // R1 ROWIND layers stay outside the model
     S = dsplit_.get();
     ds_consume();
     dsplit::Input& in = S->in;
@@ -4162,8 +4423,9 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
   // B2 (see the comment at the top of hive/batch_miss.h): B only on batched decode layers (forward_batch, M ≥ 2, decode kind, not a UBATCH half, C1 model off, CPU misses on) —
   //   otherwise nullptr and everything below is unchanged (str_si is not read, copies happen at the usual place, the plain classification loop).
   if (vrowind) { gpu_share_left = 0; std::sort(miss_e, miss_e + n_miss_e); }  // R1 ROWIND: every miss on the CPU, in expert-id order (not row-count order)
+  if (held) gpu_share_left = 0;  // T11b
   p.rowind = vrowind;
-  BatchMiss* B = bmiss_ && batch_ && M >= 2 && kind == kDmaDecode && !ub_active_ && !dsplit_ && opt_.cpu_for_misses ? bmiss_.get() : nullptr;
+  BatchMiss* B = !held && bmiss_ && batch_ && M >= 2 && kind == kDmaDecode && !ub_active_ && !dsplit_ && opt_.cpu_for_misses ? bmiss_.get() : nullptr;
   const bool sh = B && B->stage_hit;          // HIVE_DECODE_STAGE_HIT (or PREFETCH)
   int str_si[512];                             // sh: existing staging slot of str_e[i] (-1 = new copy); not read when off
   int stg_e[512], stg_si[512], n_stg = 0;      // sh: misses intact in the ring with finished copies — to the GPU after the resident groups, without copy or CPU
@@ -4213,7 +4475,8 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
   // B5: after splitting by frac, if one side is empty (all DMA or all CPU) no comparison sample arises and frac would freeze at a limit — take one step toward the default (dma_frac_relax)
   //   C1: layers chosen by the model did not use frac (no relaxation either, like G2 — layers chosen by the base rule behave as usual)
   //   B2 STAGE_HIT: n_miss = misses minus those served straight from the ring; DMA share = n_str_dma (off = same as n_str_e)
-  if (opt_.cpu_for_misses && n_miss >= 3 && (n_str_dma == 0 || n_cpu_e == 0) && !ds_model && !vrowind) dma_frac_relax(kind);  // R1 ROWIND layers stay outside adaptation
+  if (opt_.cpu_for_misses && n_miss >= 3 && (n_str_dma == 0 || n_cpu_e == 0) && !ds_model && !vrowind && !held) dma_frac_relax(kind);  // R1 ROWIND layers stay outside adaptation (T11b held layers too)
+  if (stats) { stats->n_cpu_e += n_cpu_e; stats->n_dma_e += n_str_dma; }
   int goff = 0, ng = 0;
   auto add_group = [&](int e, const uint8_t* rec) {  // group = expert × rows ≤ 8 (kernel limit) — more rows chain further groups
     for (int i0 = cnt[e]; i0 < cnt[e + 1]; i0 += 8) {
@@ -4545,6 +4808,7 @@ void Runtime::moe_decode_finish(MoePend& p, ForwardStats* stats) {
 //   Cache slots are untouched (no eviction). Slot safety: the ring position comes from stage_next_ (same rule as other writers) and stage_freed_ is recorded
 //   after the copy so the next writer waits for it; consumption happens through the STAGE_HIT lookup (StageTrack::find).
 void Runtime::bm_prefetch(int l2) {
+  if (store_.staging_held()) return;  // T11b staging hold (moe_decode_experts already drops B while held — this keeps the writer itself gated)
   BatchMiss& B = *bmiss_;
   const int S = store_.staging_slots(), margin = bmiss::kLayerAlloc + B.prefetch;
   if (S <= margin) return;  // with a ring smaller than one layer's allocation, pre-copied records could never pass the consumption check
@@ -4612,8 +4876,18 @@ void Runtime::dma_frac_consume() {
   cudaEventElapsedTime(&gpu_ms, dma_e0_, dma_e1_);
   const int kd = dma_evt_kind_;
   float& f = dma_frac_[kd];
-  if (dma_evt_cpu_ms_ > gpu_ms * 1.2) f = std::min(kDmaFracHi[kd], f + kDmaFracStep);
-  else if (gpu_ms > dma_evt_cpu_ms_ * 1.2) f = std::max(kDmaFracLo[kd], f - kDmaFracStep);
+  // HIVE_DMA_BAND_SHORT=B (1 < B < 1.2; unset / empty / "0" / out of range = 1.2 for every kind = the base rule): the dead band of the two short-prefill kinds
+  //   (kDmaShort, kDmaStreamShort) only. Measured 2026-10-08 (service log, 715 short chunks): the share sits at the upper edge of the ±20 % band — the GPU
+  //   window (DMA + resident compute) ends 15–25 % after the CPU share in every short bucket, and the GPU side sets the layer time (gpu front + gpu moe = layer
+  //   time) — so 1.8–12 ms per layer only DMA runs. A narrower band lets the share settle closer to the balance point. Decode and long streaming keep 1.2.
+  static const float band_short = [] {
+    const char* v = getenv("HIVE_DMA_BAND_SHORT");
+    const double b = v && *v ? atof(v) : 0.0;
+    return std::isfinite(b) && b > 1.0 && b < 1.2 ? (float)b : 1.2f;
+  }();
+  const float band = kd == kDmaShort || kd == kDmaStreamShort ? band_short : 1.2f;
+  if (dma_evt_cpu_ms_ > gpu_ms * band) f = std::min(kDmaFracHi[kd], f + kDmaFracStep);
+  else if (gpu_ms > dma_evt_cpu_ms_ * band) f = std::max(kDmaFracLo[kd], f - kDmaFracStep);
   dma_evt_pending_ = false;
 }
 void Runtime::dma_frac_relax(int kind) {
@@ -4723,6 +4997,15 @@ void Runtime::moe_experts_multi(const LayerWeights& L, int l, const std::vector<
     for (int e = 0; e < E; ++e) if (!by_e[e].empty() && store_.slot_of(l, e) < 0 && pf_slot[e] < 0) miss.push_back({(int)by_e[e].size(), e});  // pre-copied experts go to the GPU
     std::sort(miss.begin(), miss.end());
     int n_dma = (int)(frac * (float)miss.size() + 0.5f);
+    // HIVE_DMA_BAND_SHORT (same switch as the band above; off = the line above): on the short streaming kind, pre-copied experts are DMA too — the share is
+    //   taken over (misses + pre-copies) and the pre-copies are subtracted from the demand count. Measured 2026-10-08: 1K–4K encoder layers pre-copy 26–58
+    //   records outside the share, the GPU/CPU ratio stays at 1.25–1.42 — above the band, with the share pinned near its floor.
+    static const bool band_short_on = [] { const char* v = getenv("HIVE_DMA_BAND_SHORT"); const double b = v && *v ? atof(v) : 0.0; return std::isfinite(b) && b > 1.0 && b < 1.2; }();
+    if (band_short_on && kind == kDmaStreamShort && !fixed_prefill && dma_frac_fixed_ < 0.f) {
+      int n_pf = 0;
+      for (int e = 0; e < E; ++e) if (!by_e[e].empty() && store_.slot_of(l, e) < 0 && pf_slot[e] >= 0) ++n_pf;
+      n_dma = std::max(0, (int)(frac * (float)(miss.size() + n_pf) + 0.5f) - n_pf);
+    }
     if (split_balance) {
       // G2 HIVE_PREFILL_SPLIT=balance: choose the share with the cost model (hive/prefill_split.h — predicted CPU completion ≈ predicted GPU (streaming + compute) completion). Takes precedence over the fixed values and the adaptive rule above.
       //   The CPU share rule (fewest rows first, cumulative rows ≤ w.M) is unchanged — only how many go to the CPU changes.
@@ -4744,11 +5027,14 @@ void Runtime::moe_experts_multi(const LayerWeights& L, int l, const std::vector<
       if (stats) { ++stats->split_layers; stats->split_share_sum += split_dec.share; if (split_dec.cold) ++stats->split_cold; }
     }
     const int n_cpu = std::max(0, (int)miss.size() - n_dma);
+    int n_cpu_taken = 0;
     for (int i = 0; i < n_cpu; ++i) {
       if (cpu_rows_total + miss[i].first > w.M) break;
       to_cpu_e[miss[i].second] = 1;
       cpu_rows_total += miss[i].first;
+      ++n_cpu_taken;
     }
+    if (stats) { stats->n_cpu_e += n_cpu_taken; stats->n_dma_e += (int)miss.size() - n_cpu_taken; }
     // B5: with zero CPU jobs no sample (time_dma) arises — e.g. at frac 0.95 with ≤ 10 misses rounding sends everything to DMA and frac would freeze at 0.95
     if (!miss.empty() && cpu_rows_total == 0 && !fixed_prefill && !split_balance) dma_frac_relax(kind);  // H1: a fixed share does not use frac (like a fixed HIVE_DMA_FRAC); G2 does not use frac either
   }
@@ -5171,7 +5457,7 @@ bool Runtime::forward_batch_step(std::vector<Seq*>& seqs, int M, const std::func
   // Outside the conditions take the per-layer path (layer loop): graphs off, not the fused/block-scale variant (the base chain differs), CPU misses off (DMA share = E,
   //   exceeds the staging ring), dump/inject, no staging, or layer shapes beyond the plan kernel limits
   if (!graphs_ || !fuse_ || !use_mx || !opt_.cpu_for_misses || !opt_.dump_dir.empty() || !opt_.inject_dir.empty() || verify_ || M > Mb ||
-      store_.staging_slots() < 1 || M * k > hs::kMaxR)
+      store_.staging_slots() < 1 || M * k > hs::kMaxR || store_.staging_held())  // T11b staging hold: the dispatcher's DMA share would take staging slots
     return false;
   for (int l = 0; l < nL; ++l) {
     const LayerWeights& L = model_.layer(l);

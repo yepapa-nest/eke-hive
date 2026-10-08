@@ -255,6 +255,7 @@ class Runtime {
   //   the inner forwards use rows the outer prefill does not hold (GlmEngine::yield_enter).
   void set_layer_yield(ly::Hooks h) { ly_.h = std::move(h); }
   bool layer_yield_on() const { return ly_.on(); }
+  int layer_yield_kind() const { return ly::kLayer; }  // HIVE_LAYER_YIELD_INTRA is DeepSeek-only: GLM pauses at layer boundaries only (hived admits there as before)
   bool in_layer_yield() const { return ly_.depth > 0; }
   const ly::Stats& layer_yield_stats() const { return ly_.st; }
   double layer_yield_resume_ms() const { return ly_.last; }
@@ -276,6 +277,12 @@ class Runtime {
   void forward_verify_batch(std::vector<VerifyPart>& parts, std::vector<float>& logits_rows, ForwardStats* stats);
   void rollback_batch(const std::vector<int>& n_keep);
   bool mtp_batch_enabled() const { return mtp_batch_; }
+  // {"op":"set","mtp_batch":...} (hived): run-time switch. Batched verify buffers exist only when HIVE_MTP_BATCH was on at startup, so turning it on
+  //   is absorbed (stays off) unless the startup value was on; turning it off and back on is allowed.
+  void set_mtp_batch(bool on) {
+    if (!mtp_batch_seen_) { mtp_batch_seen_ = true; mtp_batch_start_ = mtp_batch_; }
+    mtp_batch_ = on && mtp_batch_start_;
+  }
   int mtp_batch_rows() const { return mtp_batch_ ? std::min(8, rows_cap_) : 0; }
   // No CUDA graphs here. hived's MTP gate (HIVE_MTP_GATE3) drops step-cost samples taken while this counter moved — the GLM runtime
   //   moves it for verify steps within kWarmSteps decode steps after a prefill, when the expert cache is still filling: the first verify of
@@ -311,6 +318,7 @@ class Runtime {
   void layer_yield_point();
   int rows_cap_ = 0;
   bool mtp_batch_ = false;                 // HIVE_MTP_BATCH (constructor)
+  bool mtp_batch_seen_ = false, mtp_batch_start_ = false;  // set_mtp_batch: the startup value (captured on the first call, after the constructor)
   std::vector<GlmSeq*> vb_seqs_;           // parts of the last forward_verify_batch (for rollback_batch)
   float* cand_it_h_ = nullptr; float* cand_it_d_ = nullptr;
   int32_t* cand_idx_h_ = nullptr; float* cand_val_h_ = nullptr; float* cand_max_h_ = nullptr; float* cand_sum_h_ = nullptr;

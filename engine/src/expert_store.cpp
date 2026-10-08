@@ -935,6 +935,18 @@ void ExpertStore::defer_rec(uint8_t* dst, int l, int e) {
 }
 
 void ExpertStore::copy_to_staging(int slot, int l, int e, cudaStream_t st) {
+  // HIVE_LAYER_YIELD_INTRA staging hold — data-corruption guard (fail-closed on purpose; the only abort on this path). While an intra-layer
+  //   yield runs decode steps, the paused prefill's pre-copies (runtime pf_) sit in staging slots whose stage_freed_ event is recorded only
+  //   when the prefill consumes them, so a writer advancing stage_next_ would wait on an older event and overwrite a record the prefill then
+  //   multiplies with — silently wrong weights, no error anywhere. Every decode writer checks staging_held() first (runtime.cpp: moe_decode_experts,
+  //   bm_prefetch, forward_batch_step); reaching this line while held means a writer was missed, and continuing would corrupt the paused
+  //   prompt. Evidence: derived from the code (the hold exists only on the new intra path; not measured on a GPU) — reproduced on CPU
+  //   2026-10-09 by tools/test_layer_yield_intra_cpu.py (real ExpertStore, fake CUDA: copy_to_staging while held → this abort; mutant without
+  //   the check → the slot is overwritten). Not an input-validation guard: no request, model or runtime value can set the hold.
+  if (staging_held()) {
+    fprintf(stderr, "[store] FATAL: staging slot %d written while held by an intra-layer yield (layer %d expert %d) — a decode staging writer ignored the hold\n", slot, l, e);
+    abort();
+  }
   if (reuse_staging_ && staging_reuse_pending_[slot]) {
     CUDA_CHECK(cudaStreamWaitEvent(st, staging_reused_[slot], 0));
     staging_reuse_pending_[slot] = 0;

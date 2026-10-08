@@ -30,11 +30,12 @@ the first token; [docs/benchmarks.md](docs/benchmarks.md#real-chat-benchmark-hea
 | Inputs | text and images | text, images and video |
 | Thinking off | yes (`reasoning_effort: none`) | no — the model always thinks; "off" maps to its lowest effort |
 | Context | 262,144 | 262,144 |
-| Decode, 1 stream | **85.3 tok/s** (Korean 87.2 · English 82.7 · code 106.2 · creative 62.4) | 70.8 tok/s (75.5 · 67.9 · 73.9 · 54.4) |
-| Decode, 2 / 4 streams (total) | **92.9 / 124.6 tok/s** | 87.8 / 103.9 tok/s |
-| Decode, 8 / 16 / 32 streams (total) | **175.0 / 178.1 / 181.5 tok/s** (8 at a time) | 130.6 / 130.3 / 130.9 tok/s (8 at a time) |
-| Time to first token, 1 stream | **0.23 s** | 0.51 s |
-| Time to first token, 17K / 42K / 54K prompt | **5.05 / 7.53 / 9.69 s** | 7.4 / 11.7 / 14.0 s |
+| Decode, 1 stream | **80.7 tok/s** (Korean 87.1 · English 82.0 · code 78.2 · creative 62.0) | 68.1 tok/s (72.0 · 67.3 · 67.1 · 56.8) |
+| Decode, 2 / 4 streams (total) | **106.4 / 125.0 tok/s** | 86.5 / 103.5 tok/s |
+| Decode, 8 / 16 / 32 streams (total) | **172.8 / 171.6 / 176.9 tok/s** (8 at a time) | 129.0 / 127.4 / 128.9 tok/s (8 at a time) |
+| Time to first token, 1 stream | **0.26 s** | 0.52 s |
+| Time to first token, 17K / 42K / 54K prompt | **4.90 / 7.49 / 9.59 s** (17.7K / 44K / 57K tokens) | 7.2 / 11.3 / 13.7 s (16.9K / 42K / 55K tokens) |
+| The same with the GPU capped at 300 W (`nvidia-smi -pl 300`): decode 1 / 4 / 8 streams · first token, 17K / 42K / 54K | 82.9 / 115.8 / 157.9 tok/s · 6.6 / 11.0 / 13.7 s | 69.4 / 102.5 / 129.3 tok/s · 8.2 / 15.3 / 18.9 s |
 | Time to first token, 100K / 200K / 250K prompt | — | 26.4 / 53.7 / 66.3 s |
 | Quality suite (bundled) | 175 / 179 | 158 / 163 (thinking at its lowest level) |
 | Sleep / wake (level 3, a 120K conversation open, GPU memory back to ~1 GB) | 0.7 s / 3.2 s | 3.8 s / 3.0 s |

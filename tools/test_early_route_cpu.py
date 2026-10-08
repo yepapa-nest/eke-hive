@@ -106,8 +106,10 @@ def copy_engine_model():
     flo = float(re.search(r'kDmaFracLo\[4\] = \{([0-9.]+)f', rt).group(1))
     fhi = float(re.search(r'kDmaFracHi\[4\] = \{([0-9.]+)f', rt).group(1))
     fstep = float(re.search(r'kDmaFracStep = ([0-9.]+)f;', rt).group(1))
-    assert 'if (dma_evt_cpu_ms_ > gpu_ms * 1.2) f = std::min(kDmaFracHi[kd], f + kDmaFracStep);' in rt
-    assert 'else if (gpu_ms > dma_evt_cpu_ms_ * 1.2) f = std::max(kDmaFracLo[kd], f - kDmaFracStep);' in rt
+    # the model below is the decode kind: its band stays 1.2 (HIVE_DMA_BAND_SHORT narrows only the two short-prefill kinds)
+    assert 'const float band = kd == kDmaShort || kd == kDmaStreamShort ? band_short : 1.2f;' in rt
+    assert 'if (dma_evt_cpu_ms_ > gpu_ms * band) f = std::min(kDmaFracHi[kd], f + kDmaFracStep);' in rt
+    assert 'else if (gpu_ms > dma_evt_cpu_ms_ * band) f = std::max(kDmaFracLo[kd], f - kDmaFracStep);' in rt
     assert 'else if (n_miss >= 3) gpu_share_left = std::min(std::min(dma_cap, store_.staging_slots()), std::max(opt_.decode_gpu_share, (int)(frac * n_miss + 0.5f)));' in rt
     mx = body_of(rt, 'void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardStats* stats, MoePend& p,')
     # production launch order facts the model encodes
