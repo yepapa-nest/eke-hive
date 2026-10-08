@@ -22,7 +22,18 @@ DeepSeek ([docs/performance.md](docs/performance.md), steps 22–23):
 DeepSeek configuration: layer yields every 150 ms with a 0.2 decode share (were 500 ms / 0.05) — a streaming answer during a
 background prefill stalled at most 0.42 s instead of 0.74 s; the overlapped prefill pays 349 → 469 ms per 1K tokens.
 
-Server (both families):
+Server and daemon (both families):
+- Fix: with reasoning on, every follow-up DeepSeek turn re-read most of the conversation — the prompt ends in `<think>`
+  while the next turn renders the answer as `</think>…`, so the prompt-end checkpoint never matched. The server now sends
+  a generation-suffix hint (found by rendering, no template knowledge) and the daemon cuts that tail of a few tokens for
+  free. 35–45K-token conversation, effort low: 300-token turns 2.98 → 1.43 s, 1000-token turns 3.57 → 1.96 s.
+- Conversation keys: `prompt_cache_key`, `session_id`, `X-Session-ID` or `user` are mixed into the session key, so
+  conversations with an identical head (fixed instructions as the first user message) no longer share one session.
+- Request priority: vLLM `priority` / OpenAI `service_tier`. Only the best priority among the running requests steps;
+  the queue admits by priority. A conversation overlapping a background answer: 8.64 → 5.11 s.
+- The token cache reuses the kept prompt with the longest common prefix when a conversation's key is new (154K tokens:
+  285 → 8 ms).
+
 - Fix: a boundary hint stopped one token too far when the next message began with the same character as the template's next
   text (for example a context block `<info-msg>` placed before the user's message, against `<｜Assistant｜>`), so the saved
   snapshot never matched the next turn and every follow-up turn prefilled the whole conversation. Hints now stop where the next

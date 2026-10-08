@@ -267,12 +267,16 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
 - **Images.** `prepare_vl_inputs` produces the token sequence with image placeholders and the patch tensors; the
   patches are sent to the daemon as bf16 bytes after the JSON request, and the ViT runs in the daemon (loaded at
   the first image, unloaded when idle).
-- **Sessions.** The session key is a hash of the conversation head (or `hive_session_id`); concurrent requests
+- **Sessions.** The session key is a hash of the conversation head mixed with the client's conversation key
+  (`prompt_cache_key`, `session_id`, `X-Session-ID` or `user`), or `hive_session_id`; concurrent requests
   of the same conversation get auxiliary sessions. Tokenisation and image preprocessing run off the event loop.
 - **Boundary hints.** With `HIVE_PREFIX_SHARE`, the server finds the exact token offsets where the system/tools
   block and recent assistant turns end (by rendering the prefix with the same template and comparing) and sends
   them to the daemon as snapshot points. A boundary stops where the next message's content starts (a second render
   with different content marks that point), so content that begins like the template's next text cannot extend it.
+  A generation-suffix hint marks where the next turn's prompt leaves this one (a reasoning template ends the prompt
+  in a reasoning-start token the next turn does not have); the daemon cuts that tail of a few tokens on the short path,
+  so every turn leaves a shared snapshot the next one resumes from exactly.
   With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
   on a conversation whose tail is replaced between turns (the previous request is not a prefix of the new one
   but shares a boundary), or on a conversation with earlier turns that it has not seen yet (after a restart), so

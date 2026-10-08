@@ -32,6 +32,8 @@ P.add_argument('--ctx', default='80000,150000', help='target token counts of the
 P.add_argument('--sizes', default='300,1000,3000', help='new tokens appended per turn (comma-separated) — cycled turn by turn')
 P.add_argument('--reps', type=int, default=10, help='turns per size')
 P.add_argument('--max-tokens', type=int, default=16)
+P.add_argument('--effort', default='none', help='reasoning_effort sent with every turn (none = thinking off). With reasoning on the prompt ends in a\n'
+                                             'reasoning-start token the next turn does not contain, which the none default never exercises')
 A = P.parse_args()
 
 CH_PER_TOK = 2.5  # characters per token of this corpus (bench_tune: 200,000 chars ≈ 80K tokens) — actual token counts are recorded from the response usage
@@ -49,7 +51,7 @@ def assistant_text(k):
 
 
 def stream(messages, sid_key):
-    body = {'model': 'hive', 'messages': messages, 'max_tokens': A.max_tokens, 'temperature': 0.0, 'reasoning_effort': 'none',
+    body = {'model': 'hive', 'messages': messages, 'max_tokens': A.max_tokens, 'temperature': 0.0, 'reasoning_effort': A.effort,
             'stream': True, 'stream_options': {'include_usage': True}, 'hive_session_id': sid_key}
     t0 = time.time(); first = None; usage = {}
     r = requests.post(A.base + '/v1/chat/completions', json=body, stream=True, timeout=1800)
@@ -99,7 +101,7 @@ def engine_turns(text, sid):
 
 os.makedirs(os.path.dirname(A.out) or '.', exist_ok=True)
 log_off = os.path.getsize(A.log)
-res = {'name': A.name, 'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'env': {k: v for k, v in os.environ.items() if k.startswith('HIVE_')}}
+res = {'name': A.name, 'effort': A.effort, 'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'env': {k: v for k, v in os.environ.items() if k.startswith('HIVE_')}}
 sizes = [int(x) for x in A.sizes.split(',')]
 turns, sids = [], []
 off = 0

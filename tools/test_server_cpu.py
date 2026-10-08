@@ -749,6 +749,52 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         _, ids2, _=self.hints_for(nxt)
         self.assertEqual(ids2[:turn_end], ids[:turn_end])   # the saved boundary is a prefix of the next turn
 
+    def test_generation_suffix_hint_is_where_the_next_turn_continues(self):
+        """2026-10-08: with reasoning on, the prompt ends in a reasoning-start token while the next turn renders this answer without
+        it ("</think>answer") — the prompt-end checkpoint never matched. The hint sits where the two renderings part."""
+        def think_encode(messages, tools, thinking_mode, effort):
+            text=''
+            for m in messages:
+                text+='<|'+m['role']+'|>'+('</think>' if m['role']=='assistant' else '')+(m.get('content') or '')
+                if m['role']=='assistant': text+='<|eos|>'
+            return text+'<|assistant|><think>', []
+        added={'<think>':7, '</think>':8}
+        MARKERS.update(added); s.encode_prompt=think_encode
+        try:
+            msgs=self.conv()
+            prompt,_=think_encode(msgs, None, 'chat', None); ids=s.TOK.encode(prompt)
+            self.assertNotIn(len(ids)-1, s.boundary_hints(msgs, None, 'chat', None, prompt, ids))            # off unless asked
+            hints=s.boundary_hints(msgs, None, 'chat', None, prompt, ids, gen_cut=True)
+            self.assertIn(len(ids)-1, hints)                                                                # before <think>
+            nxt=msgs+[{'role':'assistant','content':'second answer'}, {'role':'user','content':'third'}]
+            p2,_=think_encode(nxt, None, 'chat', None)
+            self.assertEqual(s.TOK.encode(p2)[:len(ids)-1], ids[:len(ids)-1])                                # a prefix of the next turn
+        finally:
+            for k in added: MARKERS.pop(k)
+            s.encode_prompt=hint_encode
+
+    def test_request_priority(self):
+        self.assertEqual(s.request_priority({}), 0)
+        self.assertEqual(s.request_priority({'priority': 3}), 3)
+        self.assertEqual(s.request_priority({'priority': -5000}), -1000)
+        self.assertEqual(s.request_priority({'priority': True}), 0)                    # bool is not a number here
+        self.assertEqual(s.request_priority({'priority': 'high'}), 0)
+        self.assertEqual(s.request_priority({'service_tier': 'flex'}), 1)
+        self.assertEqual(s.request_priority({'service_tier': 'priority'}), -1)
+        self.assertEqual(s.request_priority({'service_tier': 'flex', 'priority': 0}), 0)  # an explicit priority wins
+
+    def test_conversation_key_fields(self):
+        class R:
+            def __init__(self, h): self.headers=h
+        self.assertEqual(s.conversation_key({'prompt_cache_key':'a', 'session_id':'b', 'user':'u'}, R({'x-session-id':'c'})), 'a')
+        self.assertEqual(s.conversation_key({'session_id':'b', 'user':'u'}, R({'x-session-id':'c'})), 'b')
+        self.assertEqual(s.conversation_key({'user':'u'}, R({'x-session-id':'c'})), 'c')
+        self.assertEqual(s.conversation_key({'user':'u'}, R({})), 'u')
+        self.assertEqual(s.conversation_key({'prompt_cache_key':'  '}, None), '')
+        head=[{'role':'system','content':'S'}, {'role':'user','content':'fixed instructions'}]
+        self.assertNotEqual(s.session_id_for(head, 'room-1'), s.session_id_for(head, 'room-2'))           # same head, different rooms
+        self.assertNotEqual(s.session_id_for(head, 'room-1'), s.session_id_for(head+[], 'room-1x'))
+
     def test_tools_without_system_and_turn_cap(self):
         tools=[{'type':'function','function':{'name':'f'}}]
         msgs=[{'role':'user','content':'q'}]
@@ -807,6 +853,13 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             t2=s.TailChangeTracker()
             self.assertFalse(t2.observe('c', [1]*60, [20, 40]))
             self.assertTrue(s.TailChangeTracker().observe('h', [1]*60, [20, 40], history=True))   # unknown, with history
+            # 2026-10-08: the next turn continues at the previous request's generation-suffix hint (59), not at its end — append-only
+            t3=s.TailChangeTracker()
+            self.assertFalse(t3.observe('g', [1]*60, [20, 59]))
+            self.assertFalse(t3.observe('g', [1]*59+[5]*20, [20, 59, 78]))
+            t4=s.TailChangeTracker()   # the same pair without the suffix hint reads as a changed tail
+            self.assertFalse(t4.observe('g', [1]*60, [20]))
+            self.assertTrue(t4.observe('g', [1]*59+[5]*20, [20]))
             self.assertFalse(t2.observe('c', [2]*60, [20, 40]))
             self.assertTrue(t2.observe('c', [2]*40+[3]*30, [20, 40]))
         finally:
@@ -994,6 +1047,19 @@ class TokenCacheTests(unittest.TestCase):
         self.check('c2', self.render(edited[:1] + [('user', 'q2')]))      # shorter prompt (rewritten history)
         self.check('c3', self.render(base))                                # another session: whole tokenization
         self.check('c2', 'no role markers at all ' * 20)                   # nothing to cut at: whole tokenization
+
+    def test_new_key_reuses_a_kept_prompt_by_content(self):
+        """2026-10-08: a conversation under a new key (a client began sending a key, a window moved) shares its prompt with a kept
+        one — the longest common prefix is taken, and the ids still equal a whole tokenization."""
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        long_sys = [('user', 'the engine streams experts over PCIe ' * 200), ('assistant', 'ok')]
+        self.check('old-key', self.render(long_sys + [('user', 'first')]))
+        h0 = self.cache.hits
+        self.check('new-key', self.render(long_sys + [('user', 'first'), ('assistant', 'answer'), ('user', 'second')]))
+        self.assertEqual(self.cache.hits, h0 + 1)
+        h1 = self.cache.hits
+        self.check('short-key', self.render([('user', 'unrelated and short')]))   # below the 4,096-character floor: whole
+        self.assertEqual(self.cache.hits, h1)
 
     def test_off_switch_and_lstrip_markers(self):
         os.environ['HIVE_TOKEN_CACHE'] = '0'

@@ -444,10 +444,21 @@ class TokenCache:
             e = self.entries.get(key)
             if e is not None:
                 self.entries.move_to_end(key)
+            others = list(self.entries.values()) if e is None else []
+        c = None
+        if e is None and others:
+            # Content first, like the engine's prefix reuse: a conversation whose key is new (a client began sending a conversation
+            #   key, a recent-message window moved its first message, a new conversation with the same long system prompt) still
+            #   shares its prompt with a kept one — take the kept prompt with the longest common prefix instead of tokenizing whole
+            #   (measured 2026-10-08: tokenize p50 80 ms / max 588 ms at 64K+ tokens, the misses being whole tokenizations).
+            best = max(((_common_prefix_len(x[0], prompt), x) for x in others), key=lambda t: t[0])
+            if best[0] >= 4096:
+                c, e = best
         cut = None
         if e is not None:
             p_old, ids_old, ends_old, starts_old, cuts = e
-            c = _common_prefix_len(p_old, prompt)
+            if c is None:
+                c = _common_prefix_len(p_old, prompt)
             j = bisect.bisect_right(cuts, c) - 1  # last cut point starting at or before the divergence
             while j >= 0 and cuts[j] == 0:
                 j -= 1
@@ -539,7 +550,11 @@ class TailChangeTracker:
             append = len(ids) >= plen and self._hash(view, plen * w) == phash
             if not append:
                 flag = any(h <= len(ids) and self._hash(view, h * w) == hh for h, hh in phints)
-        entry = (len(ids), self._hash(view, len(ids) * w), tuple((h, self._hash(view, h * w)) for h in hints if 0 < h <= len(ids)))
+        # A generation-suffix hint (≤ GEN_TAIL_MAX before the end) marks where the next turn continues — the next request extends the
+        #   prompt up to there, not the reasoning-start token after it. Compared over the whole prompt, every turn with reasoning on
+        #   looked "not append-only" and paid an extra boundary chunk it no longer needs (2026-10-08: 3 chunks instead of 2).
+        plen = max((h for h in hints if 0 < len(ids) - h <= GEN_TAIL_MAX), default=len(ids))
+        entry = (plen, self._hash(view, plen * w), tuple((h, self._hash(view, h * w)) for h in hints if 0 < h <= len(ids)))
         with self.lock:
             self.entries[key] = entry
             self.entries.move_to_end(key)
@@ -592,7 +607,11 @@ SEEN = SeenPrefixes()
 HINT_TURNS = 4  # only the last few completed assistant-turn ends (the daemon only uses boundaries inside the newly prefilled span — earlier ones were recorded on earlier turns)
 
 
-def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None) -> list[int]:
+GEN_TAIL_MAX = 16  # a generation-suffix hint is sent only when at most this many tokens follow it (the daemon cuts such a tail for free)
+
+
+def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None,
+                   gen_cut: bool = False) -> list[int]:
     """H5 (HIVE_PREFIX_SHARE): **exact token offsets** in the encoded prompt — end of the system/tool block and ends of
     completed assistant turns.
     Makes no assumption about the reference template's internals: for each boundary, render "the messages before it + an
@@ -626,6 +645,27 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     for k in turn_ends[-HINT_TURNS:]:
         probes.append(messages[: k + 1])
     out = set()
+    if gen_cut and messages:
+        # Where the next turn's prompt leaves this one: the generation prompt ends in a reasoning-start token (DeepSeek
+        #   "<｜Assistant｜><think>", GLM "<|assistant|><think>"), while the next turn renders this answer without its reasoning
+        #   ("...</think>answer"). A checkpoint at the prompt end therefore never matches the next turn — measured 2026-10-08: the
+        #   previous prompt ended "<｜Assistant｜><think>" and the next one had "<｜Assistant｜></think>a1" there, so every follow-up turn
+        #   with reasoning on re-read the whole conversation. Rendering this conversation plus a finished assistant turn finds the
+        #   point without knowing the template (llama.cpp checkpoints a few tokens before the prompt end for the same reason).
+        try:
+            # the next turn = this answer followed by a user message (the DeepSeek template keeps the reasoning markers of a final
+            #   assistant message and drops them only once a user message follows — a probe ending in the answer misses the cut)
+            done, media = encode_prompt(list(messages) + [{"role": "assistant", "content": "\x00"}, {"role": "user", "content": "\x02"}],
+                                        tools, thinking_mode, effort)
+            other, _ = encode_prompt(list(messages) + [{"role": "assistant", "content": "\x01"}, {"role": "user", "content": "\x02"}],
+                                     tools, thinking_mode, effort)
+        except Exception:
+            done, media = None, None
+        if done is not None and not media:
+            c = min(_common_prefix_len(done, prompt), _common_prefix_len(done, other))
+            t = bisect.bisect_right(ends, c)
+            if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
+                out.add(t)
     for pre in probes:
         try:
             text, media = encode_prompt(list(pre) + [{"role": "user", "content": ""}], tools, thinking_mode, effort)
@@ -826,6 +866,40 @@ def client_tags(request, body: dict) -> dict:
         tags["metadata"] = {str(k)[:64]: str(v)[:200] for k, v in list(md.items())[:16]}
     return tags
 INFLIGHT: dict[str, int] = {}  # session id -> in-flight request count (the daemon rejects concurrent requests on one session with "session busy", so the server splits them)
+
+
+def request_priority(body: dict) -> int:
+    """Scheduling priority by the fields other servers use: vLLM `priority` (an integer, lower runs first, default 0) and OpenAI
+    `service_tier` ("flex" = may be slower → 1, "priority" → -1, others → 0). The daemon steps only the best priority among the
+    running requests and holds the rest until it finishes — a background request no longer halves a conversation's decode speed
+    (measured 2026-10-08 on DeepSeek: one stream 103 tok/s, two overlapping 45.6 tok/s each, because a batch of two runs without
+    speculation). Unparsable values are absorbed as 0; the range is clamped to ±1000."""
+    v = body.get("priority")
+    if isinstance(v, bool):
+        v = None
+    if isinstance(v, (int, float)) and math.isfinite(v):
+        return max(-1000, min(1000, int(v)))
+    tier = body.get("service_tier")
+    return {"flex": 1, "priority": -1}.get(tier, 0) if isinstance(tier, str) else 0
+
+
+def conversation_key(body: dict, request=None) -> str:
+    """The client's conversation key, by the fields the hosted APIs and other engines use (2026-10-08 survey): OpenAI/Kimi
+    `prompt_cache_key`, OpenRouter/vLLM/SGLang `session_id` (body) or `X-Session-ID` (header), and the older OpenAI `user`. Engines
+    key reuse on token content and use such a key only to keep a conversation together; here it separates conversations whose
+    head (system + first user message) is identical — a client that sends its fixed instructions as the first user message made
+    all of its conversations one session. "" = none."""
+    for field in ("prompt_cache_key", "session_id"):
+        v = body.get(field)
+        if isinstance(v, (str, int)) and str(v).strip():
+            return str(v).strip()[:256]
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        v = headers.get("x-session-id")
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:256]
+    v = body.get("user")
+    return str(v).strip()[:256] if isinstance(v, (str, int)) and str(v).strip() else ""
 
 
 def session_id_for(messages: list[dict], explicit: str | None) -> str:
@@ -1354,8 +1428,10 @@ async def chat(request: Request):
     thinking_mode, effort = effort_from_request(body)
     try:
         prep_ms = {}  # request record "prep_ms": where the server's time before the engine goes (lock wait, chat template, tokenizer, boundary hints)
+        conv_key = conversation_key(body, request)
         session = (hashlib.sha256(str(body['hive_session_id']).encode()).hexdigest()[:32]
-                   if body.get('hive_session_id') else session_id_for(messages, body.get("user")))
+                   if body.get('hive_session_id') else session_id_for(messages, conv_key))
+        has_turns = any(m.get("role") == "assistant" for m in messages)
         def prepare():
             t0 = time.perf_counter()
             with ENCODE_LOCK:
@@ -1374,7 +1450,8 @@ async def chat(request: Request):
                     ids, images, blob = tokenize_with_images(prompt, media)
                 t3 = time.perf_counter()
                 # H5: boundary hints are computed only with HIVE_PREFIX_SHARE (same container env as hived — off = zero cost, no field)
-                hints = boundary_hints(messages, tools, thinking_mode, effort, prompt, ids, ends) if env_on("HIVE_PREFIX_SHARE") and not media else []
+                hints = (boundary_hints(messages, tools, thinking_mode, effort, prompt, ids, ends, gen_cut=bool(has_turns or conv_key or body.get("hive_session_id")))
+                         if env_on("HIVE_PREFIX_SHARE") and not media else [])
                 t4 = time.perf_counter()
             prep_ms.update(lock=round((t1 - t0) * 1000, 1), template=round((t2 - t1) * 1000, 1), tokenize=round((t3 - t2) * 1000, 1), hints=round((t4 - t3) * 1000, 1))
             return ids, images, blob, hints
@@ -1392,7 +1469,7 @@ async def chat(request: Request):
         return JSONResponse(overflow_body(mc, len(ids)), status_code=400)
     # (session: computed before prepare — the token cache is keyed on it)
     # HIVE_PREFIX_ADAPTIVE (needs HIVE_PREFIX_SHARE hints): one extra boundary chunk only for conversations whose tail changes (TailChangeTracker)
-    prefix_extra = ((await asyncio.to_thread(TAILS.observe, session, ids, hints, any(m.get("role") == "assistant" for m in messages)))
+    prefix_extra = ((await asyncio.to_thread(TAILS.observe, session, ids, hints, has_turns))
                     if hints and env_on("HIVE_PREFIX_ADAPTIVE") else False)
     # HIVE_PREFIX_FIRST_TURN (needs HIVE_PREFIX_SHARE hints): the first turn of a conversation (no assistant message yet) asks for one extra
     #   chunk too, so the daemon saves a shared snapshot at the end of the system/tools block — the next new conversation with the same
@@ -1426,6 +1503,7 @@ async def chat(request: Request):
         # ignore_eos (benchmark harnesses measure throughput at a fixed output length): no stop token, run to max_tokens
         "stop_ids": [] if body.get("ignore_eos") else stop_ids(),
         **({"prefix_extra": 1} if prefix_extra else {}),
+        **({"priority": prio} if (prio := request_priority(body)) else {}),
     }
     think_cap = think_cap_from_request(body) if thinking_mode == "thinking" else None
     if think_cap is not None:
@@ -1479,7 +1557,7 @@ async def chat(request: Request):
 
     req_rec = {"t_recv": t_recv, "t_first": None, "endpoint": endpoint, "stream": stream, "max_tokens": sampling["max_tokens"], "session": session,
                "rid": rid, "daemon_rid": daemon_rid, "prompt_tokens": len(ids), "client": client_tags(request, body), "outcome": "closed", "done": None,
-               "prep_ms": prep_ms,
+               "prep_ms": prep_ms, **({"priority": sampling["priority"]} if "priority" in sampling else {}),
                # record thinking mode and effort so it can be checked whether the requested effort actually arrived
                "thinking_mode": thinking_mode, "effort": effort,
                # thinking cap as received (null if none) — whether it was forced is done.think_forced (daemon), also lifted to the top level below

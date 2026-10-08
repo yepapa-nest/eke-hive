@@ -170,8 +170,11 @@ class Hived:
     def cancel(self, session, rid=None):
         return self.op({'op': 'cancel', 'session': session, **({} if rid is None else {'rid': rid})})
 
-    def generate(self, session, ids, max_tokens, images=(), on_token=None, close_after=None, rid=None, boundaries=None, prefix_extra=None):
+    def generate(self, session, ids, max_tokens, images=(), on_token=None, close_after=None, rid=None, boundaries=None, prefix_extra=None,
+                 priority=None):
         req = {'op': 'generate', 'session': session, 'ids': ids, 'temperature': 0}
+        if priority is not None:
+            req['priority'] = priority
         if prefix_extra is not None:
             req['prefix_extra'] = prefix_extra
         if max_tokens is not None:
@@ -369,6 +372,24 @@ def sc_cancel(h, ck, cfg):
         ck.eq('busy: running request tokens', res3['tokens'], oracle(S, len(res3['tokens'])))
 
 
+def sc_priority(h, ck):
+    """2026-10-08: a better-priority request steps alone (the background one keeps its state and resumes after it); both follow the oracle."""
+    B, F = tokens(270, 160), tokens(260, 161)
+    got, rb = threading.Event(), {}
+    th = threading.Thread(target=lambda: rb.update(h.generate('pb', B, 300, priority=1, on_token=lambda n: n >= 3 and got.set())))
+    th.start()
+    ck.true('priority: background streaming', got.wait(20 * SLOW))
+    rf = done_ok(ck, 'priority: foreground request', h.generate('pf', F, 20), F, 20, 0)
+    ck.true('priority: background still running when the foreground finished', th.is_alive())
+    ck.eq('priority: foreground never held', (rf.get('done') or {}).get('held_steps'), 0)
+    th.join(60 * SLOW)
+    done_ok(ck, 'priority: background finishes, tokens follow the oracle', rb, B, 300, 0)
+    ck.true('priority: background was held', (rb.get('done') or {}).get('held_steps', 0) > 0, repr(rb.get('done')))
+    for k, bad in enumerate(('1', None, [1], 1e9)):
+        Z = tokens(260, 165 + k)
+        done_ok(ck, f'priority {bad!r}: absorbed', h.generate(f'pz{k}', Z, 3, priority=bad) if bad is not None else h.generate(f'pz{k}', Z, 3), Z, 3, 0)
+
+
 def sc_rid_cancel(h, ck):
     # D5: a cancel carrying a rid applies only to that request — a late cancel of finished request A must not hit the next request B of the same session
     P = tokens(270, 40)
@@ -472,7 +493,7 @@ def run_config(exe, td, name, cfg):
     ham = threading.Thread(target=stats_hammer, args=(h, stop, errs, counter))
     ham.start()
     try:
-        for sc in (sc_session, sc_images, sc_cancel, sc_concurrent, sc_disconnect, lambda h, ck, cfg: sc_flush(h, ck)):
+        for sc in (sc_session, sc_images, sc_cancel, sc_concurrent, sc_disconnect, lambda h, ck, cfg: sc_flush(h, ck), lambda h, ck, cfg: sc_priority(h, ck)):
             sc(h, ck, cfg)
             h.alive()
     finally:
@@ -835,6 +856,19 @@ def sc_share_free(h, ck):
     ck.true('per-request extra 1: snapshot at the hint', any('xa: prefix snapshot at 300' in l for l in log_lines(h, 'prefix snapshot')))
     Y = X[:300] + tokens(40, 134)
     done_ok(ck, 'per-request extra 1: the next request resumes from that snapshot', h.generate('xb', Y, 3), Y, 3, 300)
+    # generation-suffix hint (2026-10-08): ≤ 16 tokens before the end, cut for free even with extra budget 0 — the snapshot there is
+    #   where the next turn continues (it renders the previous answer without the reasoning-start token the prompt ended with)
+    G = tokens(350, 150)
+    done_ok(ck, 'gen-suffix hint: cut for free', h.generate('ga', G, 3, boundaries=[349]), G, 3, 0)
+    ck.eq('gen-suffix hint: tiny last chunk', chunks(h, 'ga'), [(256, 'on'), (93, 'on'), (1, 'on')])
+    ck.true('gen-suffix hint: snapshot there', any('ga: prefix snapshot at 349' in l for l in log_lines(h, 'prefix snapshot')))
+    G2 = G[:349] + tokens(60, 151)
+    done_ok(ck, 'gen-suffix hint: next turn (any session) resumes there', h.generate('gb', G2, 3), G2, 3, 349)
+    # with a conversation boundary that needs the per-request extra chunk: that one is cut first, the suffix hint in the next chunk
+    W = tokens(350, 152)
+    done_ok(ck, 'gen-suffix + extra boundary', h.generate('gc', W, 3, boundaries=[300, 340], prefix_extra=1), W, 3, 0)
+    ck.eq('gen-suffix + extra boundary: both cut', chunks(h, 'gc'), [(256, 'on'), (44, 'on'), (40, 'on'), (10, 'on')])
+    ck.true('gen-suffix + extra boundary: both snapshots', all(any(f'gc: prefix snapshot at {k}' in l for l in log_lines(h, 'prefix snapshot')) for k in (300, 340)))
     for k, bad in enumerate(('1', -1, 1.5, None)):
         Z = tokens(350, 140 + k)
         sid = f'xz{k}'

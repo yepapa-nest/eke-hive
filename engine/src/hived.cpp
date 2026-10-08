@@ -21,6 +21,7 @@
 //   (optional) generate's "prefix_extra":N — per-request extra-chunk budget for boundary cuts (overrides HIVE_PREFIX_EXTRA_CHUNKS; HIVE_PREFIX_SHARE only).
 // Sessions: if a session's previous token sequence is a prefix of the new request, only the remainder is prefilled (conversation cache).
 // If the prefix breaks, resume from whichever of the prompt-end checkpoint and the RAM-held states reaches furthest.
+#include <climits>
 #include <fcntl.h>
 #include <csignal>
 #include <sys/socket.h>
@@ -983,6 +984,8 @@ int main(int argc, char** argv) {
         //   think_cap, the next token is forced to think_end (</think>). think_n = tokens emitted in the thinking span (excluding </think>) ·
         //   think_forced = number of times it was forced.
     int think_cap = 0, think_n = 0, think_forced = 0;
+    int prio = 0;            // the request's "priority" (lower runs first, default 0) — decode_step steps only the best priority present
+    long held_steps = 0;     // decode steps this request sat out for a better-priority request
     int32_t think_end = -1, think_start = -1;
     // Exit phrase (think_exit_ids, supplied by the server): when the cap is reached, force this token sequence one token at a time before </think>.
         //   Measured with vLLM: forcing only </think> without an exit phrase let 3.7% (6/162) continue reasoning in the answer (leaked); with a
@@ -1062,7 +1065,7 @@ int main(int argc, char** argv) {
     const double t2 = now_ms();
     json done = {{"done", true}, {"n", A.n}, {"finish", A.finish}, {"prefill_ms", A.t1 - A.t0}, {"decode_ms", t2 - A.t1},
                  {"cached_prefix", (int)A.common}, {"prefill_tokens", (int)(A.prompt_len - A.common)},
-                 {"decode_hit", A.ds.n_hit}, {"decode_cpu", A.ds.n_cpu}, {"cpu_wait_ms", A.ds.ms_cpu_wait}, {"batch_rows", (int)active.size()},
+                 {"decode_hit", A.ds.n_hit}, {"decode_cpu", A.ds.n_cpu}, {"cpu_wait_ms", A.ds.ms_cpu_wait}, {"batch_rows", (int)active.size()}, {"held_steps", A.held_steps},
                  {"decode_dma_rows", A.ds.n_dma_rows}, {"cpu_span_ms", A.ds.ms_cpu_span}, {"timing_scope", "shared_batch_spans_not_additive"},
                  {"mtp_steps", A.mtp_steps}, {"mtp_drafted", A.mtp_drafted}, {"mtp_accepted", A.mtp_accepted}};
     if (A.think_cap > 0) {  // only for requests that received a thinking cap (off = done message shape unchanged)
@@ -1248,25 +1251,32 @@ int main(int argc, char** argv) {
     return r;
   };
   auto hint_cut_j = [&](PJob& J, size_t i, int M, size_t cap) -> int {
-    auto& hints = J.hints; const bool last_upper_skipped = J.last_upper_skipped; int& extra_left = J.extra_left;
+    auto& hints = J.hints; const bool last_upper_skipped = J.last_upper_skipped; int& extra_left = J.extra_left; auto& ids = J.ids;
     auto hint_ok = [&](size_t h) { return hint_ok_j(J, h); };
     auto plan_cost = [&](size_t a, size_t b, size_t c) { return plan_cost_j(J, a, b, c); };
     if (hints.empty()) return M;
     size_t deepest = 0;
-    for (size_t h : hints) if (h > i && hint_ok(h)) deepest = h;
-    size_t free_cut = 0, extra_cut = 0;
+    for (size_t h : hints) if (h > i && hint_ok(h) && ids.size() - h > 16) deepest = h;  // the deepest conversation boundary (not the generation-suffix hint below)
+    size_t free_cut = 0, extra_cut = 0, gen_cut = 0;
     std::array<size_t, 3> nat{};
     bool have_nat = false;
     for (size_t h : hints) {
       if (h <= i || h >= i + (size_t)M || !hint_ok(h)) continue;
       if (last_upper_skipped && !rt.tail_mode_for((int)(h - i))) continue;
+      // A generation-suffix hint (the server sends it at most GEN_TAIL_MAX = 16 tokens before the end — hive_server.boundary_hints):
+      //   the piece after it is a few tokens on the short path (decode policy, about one decode step), and the chunk before it keeps
+      //   its tail mode with the upper layers on (the next chunk is not a tail-mode chunk), so the snapshot there is complete. It is
+      //   where the next turn of the conversation continues (that turn renders this answer without its reasoning) — cut it for free.
+      //   Taken only when no other boundary is cut in this chunk; a conversation boundary cut first leaves this one to the next chunk.
+      if (ids.size() - h <= 16) { gen_cut = h; continue; }
       if (!have_nat) { nat = plan_cost((size_t)M, i + (size_t)M, cap); have_nat = true; }
       const auto cut = plan_cost(h - i, h, cap);
       if (cut[0] <= nat[0] && cut[1] <= nat[1] && cut[2] >= nat[2]) free_cut = h;
       else if (extra_left > 0 && h == deepest) extra_cut = h;
     }
     if (extra_cut > free_cut) { --extra_left; return (int)(extra_cut - i); }
-    return free_cut ? (int)(free_cut - i) : M;
+    if (free_cut) return (int)(free_cut - i);
+    return gen_cut ? (int)(gen_cut - i) : M;
   };
   // boundary snapshot of the same request's previous boundary (PJob::last_boundary — HIVE_CKPT_DELTA base; save_image validates lineage and prefix)
   auto snapshot_boundary_j = [&](PJob& J, size_t at, bool skipped) {
@@ -1304,6 +1314,10 @@ int main(int argc, char** argv) {
     A->temperature = q.value("temperature", 1.0f); A->top_p = q.value("top_p", 1.0f); A->min_p = q.value("min_p", 0.f);
     A->top_k = q.value("top_k", 0);
     A->stop_ids = q.value("stop_ids", std::vector<int32_t>{1});
+    {  // Priority (the server's request_priority: vLLM "priority" / OpenAI "service_tier") — a number, clamped to ±1000; anything else = 0 (absorbed)
+      const auto ip = q.find("priority");
+      if (ip != q.end() && ip->is_number()) { const double v = ip->get<double>(); if (std::isfinite(v)) A->prio = (int)std::max(-1000.0, std::min(1000.0, v)); }
+    }
     {  // Thinking cap (think_cap, think_end_id, think_start_id, think_open — the server sends them only for thinking-mode requests carrying a
        //   max_thinking_tokens-style field). Absorption rules (not guards): if think_cap is not a positive integer or think_end_id is outside
        //   the vocabulary, the feature is off · think_open absent = true (a thinking-mode prompt ends with <think> — DS encoding.py) ·
@@ -2111,8 +2125,14 @@ int main(int argc, char** argv) {
     if (now_ms() - last_state_save > 60000.0) { save_cache_state(); last_state_save = now_ms(); }
     step_seqs.clear(); step_ids.clear();
     std::vector<Active*> stepping;
+    // Priority: only the best priority among the requests that can step runs this step; the others keep their pending token and logits
+    //   and resume when it finishes. Measured 2026-10-08 (DeepSeek): one stream 103 tok/s, two overlapping 45.6 tok/s each (a batch of two
+    //   runs without speculation) — a background request halved a conversation. Requests without the field are all 0: unchanged.
+    int best_prio = INT_MAX;
+    for (auto& A : active) if (A->client_ok && !A->cancel->load() && A->n < A->max_tokens) best_prio = std::min(best_prio, A->prio);
     for (auto& A : active) {
       if (!A->client_ok || A->cancel->load() || A->n >= A->max_tokens) { if (A->cancel->load()) A->finish = "cancel"; continue; }
+      if (A->prio > best_prio) { ++A->held_steps; continue; }
       int32_t tok = A->pending_tok >= 0 ? A->pending_tok : (fake_head ? sample(A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng)
                                                                     : sample_cands(A->cands, A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng));
       A->pending_tok = -1;
@@ -2946,7 +2966,22 @@ int main(int argc, char** argv) {
       bool got = false;
       std::unique_lock<std::mutex> lk(mu);
       if (active.empty()) cv.wait_for(lk, std::chrono::seconds(30), [&] { return !queue.empty() || stop_state.load() != 0 || !ctl_q.empty() || !flush_q.empty(); });  // wake every 30 s for idle cleanup (vision encoder release)
-      if (!queue.empty() && (int)active.size() < max_batch && !sleep_asked.load()) { r = std::move(queue.front()); queue.pop_front(); got = true; }
+      if (!queue.empty() && (int)active.size() < max_batch && !sleep_asked.load()) {
+        // Priority: the best-priority queued request first (FIFO among equals), and none below a running request's priority — its
+        //   prefill would interrupt that request's decode (the decode_step rule holds it anyway). Without the field everything is 0: FIFO as before.
+        auto prio_of = [](const Request& x) {
+          const auto it = x.req.find("priority");
+          if (it == x.req.end() || !it->is_number()) return 0;
+          const double v = it->get<double>();
+          return std::isfinite(v) ? (int)std::max(-1000.0, std::min(1000.0, v)) : 0;
+        };
+        int best_active = INT_MAX;
+        for (auto& A : active) best_active = std::min(best_active, A->prio);
+        auto pick = queue.begin();
+        int pick_prio = prio_of(*pick);
+        for (auto it = std::next(queue.begin()); it != queue.end(); ++it) { const int p = prio_of(*it); if (p < pick_prio) { pick = it; pick_prio = p; } }
+        if (pick_prio <= best_active) { r = std::move(*pick); queue.erase(pick); got = true; }
+      }
       lk.unlock();
       if (got) {
         last_prefill_tc = 0;
