@@ -1756,10 +1756,13 @@ int main(int argc, char** argv) {
       else { rt.load_image(*S->seq, pick == 2 ? *S->ckpt : *S->live); S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig; }
       S->tokens.assign(ids.begin(), ids.begin() + common);
     }
+    const size_t archived_lcp = S->live ? lcp(S->live->tokens) : 0;  // where a revived conversation left its archived state (log only)
     S->live.reset();  // an archived last state is used once (or dropped on mismatch) — the session is live again
-    if (!S->tokens.empty() || live_lcp)
-      fprintf(stderr, "[hived] %s: reuse %zu/%zu via %s (session tokens %zu · common with live %zu)\n", A->sid.c_str(), common, ids.size(),
-              pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : "reset", session_tokens, live_lcp);
+    // session_tokens too: a session revived from the archive (no sequence, so live_lcp = 0) that resets left no line at all, which read
+    //   as a lost session (2026-10-14 service log: a 188K conversation re-read after 7 h with no reuse line)
+    if (!S->tokens.empty() || live_lcp || session_tokens)
+      fprintf(stderr, "[hived] %s: reuse %zu/%zu via %s (session tokens %zu · common with live %zu · with archived %zu)\n", A->sid.c_str(), common,
+              ids.size(), pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : "reset", session_tokens, live_lcp, archived_lcp);
     S->last_used = now_ms();
     A->cancel = A->r.cancel.get();
     // Images: metadata + bin (concatenated bf16 patches). A span must fit entirely in one prefill chunk (chunk boundaries are cut before the span).
@@ -1840,6 +1843,20 @@ int main(int argc, char** argv) {
         if (!images_match(e.sig, k)) continue;
         if (e.upper_skipped && !(all_images.empty() && rt.tail_mode_for((int)plan_chunk(k, restore_cap)))) continue;  // C1 validity
         best = &e; best_len = k;
+      }
+      if (!best && common == 0) {  // log why the deepest snapshot sharing this prompt's head was not taken (2026-10-14: a new conversation
+        //   prefilled 8,915 tokens from 0 with a 6,922-token snapshot of the same system block present, and the log could not say why)
+        size_t near_k = 0, near_m = 0; const char* why = "";
+        for (auto& [key, e] : shared_snaps) {
+          if (!e.image) continue;
+          const size_t k = (size_t)e.image->pos, n = std::min(e.image->tokens.size(), ids.size());
+          size_t m = 0; while (m < n && e.image->tokens[m] == ids[m]) ++m;
+          if (m < 256 || m <= near_m) continue;
+          near_k = k; near_m = m;
+          why = e.image->tokens.size() != k ? "image tokens != pos" : m < k ? "prompt differs" : k >= ids.size() ? "covers the whole prompt"
+              : !images_match(e.sig, k) ? "images" : "C1 tail mode";
+        }
+        if (near_m) fprintf(stderr, "[hived] %s: shared-prefix not used — snapshot at %zu shares %zu tokens (%s)\n", A->sid.c_str(), near_k, near_m, why);
       }
       if (best) {
         rt.load_image(*S->seq, *best->image);

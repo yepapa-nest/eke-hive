@@ -723,8 +723,8 @@ def _ends_monotonic(ends):
 
 def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None,
                    gen_cut: bool = False) -> list[int]:
-    """H5 (HIVE_PREFIX_SHARE): **exact token offsets** in the encoded prompt — end of the system/tool block and ends of
-    completed assistant turns.
+    """H5 (HIVE_PREFIX_SHARE): **exact token offsets** in the encoded prompt — end of the system/tool block, end of a leading
+    user message followed by another user message, and ends of completed assistant turns.
     Makes no assumption about the reference template's internals: for each boundary, render "the messages before it + an
     empty user message" with the same encode_prompt, measure the common-prefix length c against the full prompt string
     (past that point the next message's content / generation prompt diverges), tokenize the full prompt once more with an
@@ -756,6 +756,12 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
         n += 1
     if n or tools:
         probes.append(messages[:n])
+    # A client's fixed context sent as the first user message, ahead of the conversation (measured 2026-10-14: a chat client put
+    #   ~2,000 tokens of per-account instructions there, so its new conversations shared 8,879 leading tokens, but the only
+    #   boundary sat at the end of the system/tools block (6,922) and every new conversation prefilled the rest again). Only when the
+    #   next message is another user message — that is the shape of a fixed block; an ordinary first question is followed by its answer.
+    if n < len(messages) - 1 and messages[n].get("role") == "user" and messages[n + 1].get("role") == "user":
+        probes.append(messages[: n + 1])
     turn_ends = [k for k in range(len(messages) - 1) if messages[k].get("role") == "assistant"]
     for k in turn_ends[-HINT_TURNS:]:
         probes.append(messages[: k + 1])

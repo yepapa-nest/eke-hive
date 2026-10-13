@@ -38,6 +38,10 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
   conversation that holds KV to a host image before any cache slot is lent, LRU evictions and `/flush_cache` trim GLM sequences, and an
   evicted conversation continues from its image ([docs/glm.md](docs/glm.md#context-and-kv-memory)). hived skips idle sessions whose
   trim would free nothing (`kv_reclaimable`); `tools/test_kv_reclaim_cpu.py` covers the hook on the real hived.cpp.
+- **Shared prefix for a leading user block**: clients that send fixed instructions as the first user message, followed by the user's
+  turn, now get a boundary at the end of that block too (`boundary_hints`), so new conversations resume the whole shared head instead
+  of only the system/tools block. hived logs a reset of a conversation revived from the host archive (it printed nothing) with its
+  common prefix, and says why the deepest shared snapshot matching a reset prompt's head was not used.
 - **Fix (DeepSeek CPU daemon):** an empty `HIVE_DS_CPU_TAIL` skipped the daemon's decoder-tail default while the engine ignored the
   empty value; empty now means unset in both places. The CPU suite's option audit is clean again (the GLM / Flash-Next CPU daemons'
   `HIVE_*_MTP_K` test and the 27B `HIVE_Q27_TIMING` interval parse were flagged only by the audit's line matching).

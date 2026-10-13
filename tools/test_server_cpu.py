@@ -738,6 +738,21 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         p2, ids2, h2=self.hints_for(other)
         self.assertEqual(h2, [sys_end]); self.assertEqual(ids2[:sys_end], ids[:sys_end])
 
+    def test_leading_user_block_boundary(self):
+        """2026-10-14: a client sent its fixed per-account instructions as the first user message, then the user's turn — new
+        conversations shared that whole block, but the only boundary was the system block's end."""
+        msgs=[{'role':'system','content':self.SYS}, {'role':'user','content':'fixed block'}, {'role':'user','content':'question one'}]
+        prompt, ids, hints=self.hints_for(msgs)
+        sys_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>'))
+        block_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>fixed block<|user|>'))
+        self.assertEqual(hints, [sys_end, block_end])
+        other=msgs[:2]+[{'role':'user','content':'a different question'}]
+        _, ids2, h2=self.hints_for(other)
+        self.assertIn(block_end, h2); self.assertEqual(ids2[:block_end], ids[:block_end])   # another conversation resumes there
+        # an ordinary conversation (first question, then its answer) gets no extra boundary
+        _, _, h3=self.hints_for(self.conv())
+        self.assertNotIn(len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>first question')), h3)
+
     def test_boundary_stops_where_the_next_content_starts(self):
         """2026-10-08: a next message starting with "<" (a per-turn "<info-msg>" block) shared "<" with the empty probe's
         "<|assistant|>" and the boundary took that token — the next turn (user's words there) could not resume it."""
