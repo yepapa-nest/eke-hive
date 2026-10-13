@@ -22,6 +22,9 @@ T=$(mktemp -d)/short_prefill; g++ -std=c++20 -O1 -Iengine/include engine/tests/t
 python3 tools/test_validation_cpu.py
 python3 tools/test_server_cpu.py
 python3 tools/test_glm_family_cpu.py  # GLM family: effort mapping, unset = high, HIVE_GLM_NOTHINK
+python3 tools/test_qwen_family_cpu.py  # Qwen3.8-Flash-Next family: effort mapping, tool-call parsing, stop ids, image/video preprocessing and spans
+T=$(mktemp -d)/qwen_ple; g++ -std=c++20 -O1 -Itools/cpu_fake/include -Iengine/include -Iengine/third_party engine/tests/test_qwen_ple_cpu.cpp -DHIVE_SOURCE_DIR_HINT="\"$ROOT/engine\"" -o "$T" && "$T"  # PLE n-gram hash == oracle vectors, split == whole
+T=$(mktemp -d)/qwen_simd; g++ -std=gnu++20 -O3 -mavx2 -mfma -mf16c engine/tests/test_qwen_cpu_simd.cpp -o "$T" && "$T"  # Qwen CPU engine AVX2 element-wise kernels == scalar twins (bit for bit)
 python3 tools/test_hive_monitor_cpu.py  # hived.log monitor, daily report, lossless concurrent writes with an external log-rotate script (if present)
 # Real CPU expert pool, snapshot/pinned pool/fences, option plumbing, real hived.cpp
 # on fake CUDA/runtime, server<->daemon sessions. TSAN variants + negative controls: tools/test_tsan_cpu.sh
@@ -36,6 +39,7 @@ python3 tools/test_early_route_cpu.py  # HIVE_DECODE_EARLY_ROUTE: post-number wa
 python3 tools/test_snapshot_cpu.py
 python3 tools/test_options_cpu.py
 python3 tools/test_daemon_cpu.py
+python3 tools/test_kv_reclaim_cpu.py  # hived KV reclaim hook on the real hived.cpp: LRU idle victims holding KV, short / admitting sessions kept, restore from the host image; HIVE_KV_RECLAIM_NEGATIVE=1 = 2 mutants
 python3 tools/test_mtp_cpu.py  # real hived.cpp DSpark schedule: oracle tokens (MTP on/off, gate 1/2, wrong drafts, batch), gate 2 active, old gate trap reproduction, switch parsing, first-use samples (negative control = runtime hiding first uses); mutants with HIVE_MTP_NEGATIVE=1
 python3 tools/test_server_session_cpu.py
 python3 tools/bench_mtp_batch.py --self-test  # GPU-window measurement tool (comparison and log aggregation functions)

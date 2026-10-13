@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
+smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
+
+- **GLM-5.3-Flash at 72 / 48 / 32 GB** ([docs/glm.md](docs/glm.md#smaller-vram-budgets)): the layer-major prefill span is lowered to what
+  the expert-cache tail can lend (`GlmEngine::layer_major_span`) instead of failing; `HIVE_GLM_PREFILL_ROWBLOCK` bounds the per-expert
+  prefill scratch, so the 64K prompt runs in one pass (64K first token 20.2 / 20.9 / 22.0 / 28.2 → 16.2 / 16.3 / 16.4 / 22.4 s at
+  96 / 72 / 48 / 32 GB); `HIVE_GLM_MTP_LEND` lends the NextN layer's 6.75 GiB of experts to the expert cache while several streams decode;
+  `HIVE_GLM_CPU_CHUNKS` balances the CPU expert workers. Profiles: `--max-chunk 8192`, `HIVE_GLM_KV_BASE=4096`, reserve 1500 MiB,
+  single-stream MTP. c1 / c8 at 48 GB 48.1 / 57.2 → 53.3 / 77.8 tok/s, at 32 GB 34.5 / 36.2 → 34.9 / 50.9.
+- **Qwen3.8-Flash-Next with a partial expert cache** ([docs/qwen.md](docs/qwen.md)): decode / verify stay on the device — non-resident
+  experts read over PCIe from pinned memory while at least 60 % are resident (`HIVE_QWEN_MAPPED_ROUTE`), below that computed by the CPU
+  in CUDA-graph host nodes (`HIVE_QWEN_HYBRID_ROUTE`, `HIVE_QWEN_HYB_PCIE`); captured graphs capped under a budget
+  (`HIVE_QWEN_GRAPH_CAP`, `HIVE_QWEN_GRAPH_ROWS`). c1 at 72 / 48 / 32 GB 153.6 / 80.5 / 79.0 → 163.6 / 132.7 / 87.8 tok/s.
+- **Qwen3.8-27B under a budget** ([docs/q27.md](docs/q27.md#vram-budget-and-the-kv-tier)): placement counts every device allocation,
+  the drafter is placed first, and the KV tier keeps KV in VRAM while the budget lasts and in pinned host memory beyond it (same kernels,
+  same values), so 262K context works at 32 GB at the all-GPU decode speed: growable host ranges, pinned ahead of use, and a prefetched
+  staging copy for prefill attention (32 GB: 32K / 64K first token 7.2 / 21.0 → 4.6 / 11.8 s). New switches `HIVE_Q27_KV_TIER`,
+  `HIVE_Q27_KV_PLAN`, `HIVE_Q27_KV_HOST_*`, `HIVE_Q27_STAGE_PREFETCH`, `HIVE_Q27_DRAFTER_FIRST`, `HIVE_Q27_HEAD_FIRST`,
+  `HIVE_Q27_EMB_MAPPED`, `HIVE_Q27_W4_PARTIAL` (off), `HIVE_Q27_KV_TIER_MIN_MB`, `HIVE_Q27_LOAD_SLACK_MB` and diagnostics.
+- **CPU expert kernels** (bit-identical): NVFP4 v2 (`HIVE_CPU_NVFP4_V2`, GLM / Flash-Next misses and CPU daemons) and register
+  accumulators for the MXFP4 multi-row kernel (`HIVE_CPU_E2M1_REG`, DeepSeek); pool microbenchmarks in `engine/tests/bench_*_pool_cpu.cpp`.
+- **Session images** of every family are freed off the engine thread (`hive/image_reaper.h`); `HIVE_HOST_SESSION_MB` is set for
+  DeepSeek and the 27B as well and scaled down on hosts with less RAM.
+- **1M-token context measured** for DeepSeek-V4.1-Flash and GLM-5.3-Flash at 96 and 48 GB (`HIVE_MAX_CTX=1048576`, no other change):
+  short chat unchanged, ~1M-token prompt 335–470 s to the first token, the next turn of a 1M conversation about 4 s with the session
+  kept ([README](README.md#reference-1m-token-context-glm-53-flash-deepseek-v41-flash)).
+- **Two models on one card**: `HIVE_VRAM_BALLAST_RELEASE=1` frees the VRAM-limit ballast just before ready (startup sizing unchanged), and
+  `HIVE_START_WAIT_OTHERS=0` lets `hive-start.sh` start beside another running daemon ([README](README.md#reference-two-models-on-one-card)).
+- **Fix (27B):** a repeated long prompt on a reduced-VRAM 27B could crash during session restore — the KV reclaim could pick the session
+  being restored. A session is now protected from the reclaim from the moment its sequence is taken until its admission job ends.
+- **Fix (GLM):** long conversations could drain the expert cache to 0 slots and then fail a new request with `no VRAM for the KV
+  cache` (48 GB, 1M context: 256K, 512K and 128K prompts in distinct conversations). Idle conversations kept the KV their sequence had
+  grown (the GLM runtime had neither `trim_seq` nor hived's KV reclaim hook). KV growth now moves the least recently used idle
+  conversation that holds KV to a host image before any cache slot is lent, LRU evictions and `/flush_cache` trim GLM sequences, and an
+  evicted conversation continues from its image ([docs/glm.md](docs/glm.md#context-and-kv-memory)). hived skips idle sessions whose
+  trim would free nothing (`kv_reclaimable`); `tools/test_kv_reclaim_cpu.py` covers the hook on the real hived.cpp.
+- **Fix (DeepSeek CPU daemon):** an empty `HIVE_DS_CPU_TAIL` skipped the daemon's decoder-tail default while the engine ignored the
+  empty value; empty now means unset in both places. The CPU suite's option audit is clean again (the GLM / Flash-Next CPU daemons'
+  `HIVE_*_MTP_K` test and the 27B `HIVE_Q27_TIMING` interval parse were flagged only by the audit's line matching).
+- `tools/bench_chat.py --long-timeout` (cap a long prompt's first token; the VRAM-size table uses 600 s).
+
+New families ([docs/qwen.md](docs/qwen.md), [docs/q27.md](docs/q27.md)): **Qwen3.8-Flash-Next** (`model_type` `qwen4_exp`, NVIDIA NVFP4
+checkpoint) as `hived_qwen` — Gated DeltaNet and QSA sparse-attention kernels, gated-residual hyper-connections, the PLE n-gram table in
+pinned RAM or read from the SSD (`HIVE_QWEN_PLE`), MTP drafting, the vision encoder, a startup VRAM budget (`HIVE_QWEN_VRAM_MB`), and
+device-side expert routing; **Qwen3.8-27B** as `hived_q27` with the DFlash2 drafter; CPU-only daemons for all four families. The GLM
+expert store is now built from a model-independent `ExpertSpec` (GLM behaviour unchanged). Server: `server/families/qwen.py`, `server/families/q27.py`; oracles:
+`oracle/qwen4_oracle.py`, `oracle/q27_oracle.py`.
+
 Real-chat benchmark (`tools/bench_chat.py`, 2026-10-09, one run each, GPU at 600 W and capped at 300 W; [docs/benchmarks.md](docs/benchmarks.md)):
 
 | | DeepSeek-V4.1-Flash | GLM-5.3-Flash |

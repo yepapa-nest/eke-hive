@@ -88,6 +88,10 @@ def functions(src):
             if cur:
                 out.append((cur, ''.join(buf)))
             cur, buf = m[1], []
+            if line.rstrip().endswith('}') and line.count('{') == line.count('}') > 0:  # one-line definition (e.g. gpu_layers): complete
+                out.append((cur, line))
+                cur, buf = None, []
+                continue
         if cur:
             buf.append(line)
     if cur:

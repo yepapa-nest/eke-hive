@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "hive/vram_limit.h"
 #include "nlohmann/json.hpp"
 
 namespace hive::glm {
@@ -155,36 +156,162 @@ void GlmModel::load_moe(const std::string& p, MoeW& w) {
   w.sh_down = mat_fp8ok(p + "mlp.shared_experts.down_proj.weight");
 }
 
-GlmModel::GlmModel(const std::string& dir, bool load_mtp) : cfg_(GlmConfig::load(dir)), ckpt_(dir) {
+// VRAM a GPU-placed layer takes, from the checkpoint headers (the tensors GlmModel loads for it: FP8 where the Z.ai copy has one)
+size_t GlmModel::layer_bytes(int l) {
+  const std::string p = P + "layers." + std::to_string(l) + ".";
+  size_t b = 0;
+  for (const std::string& n : ckpt_.names_with_prefix(p)) {
+    if (n.find(".mlp.experts.") != std::string::npos || n.find("input_scale") != std::string::npos) continue;
+    if (fp8_ && fp8_->has(n) && fp8_->has(n + "_scale_inv")) { b += fp8_->get(n).nbytes + fp8_->get(n + "_scale_inv").nbytes; continue; }
+    const TensorInfo& t = ckpt_.get(n);
+    b += (t.dtype == "BF16" && (n.find("hc_") != std::string::npos || n.find("A_log") != std::string::npos || n.find("dt_bias") != std::string::npos))
+             ? t.nbytes * 2 : t.nbytes;  // vec_f32 widens these to fp32
+  }
+  return b;
+}
+
+// HIVE_GLM_GPU_LAYERS=N (0 ≤ N ≤ n_layers): layers N.. run on the CPU. Unset, with HIVE_VRAM_LIMIT_MB: as many leading layers as fit beside
+//   the parts that stay on the GPU (lm_head, the NextN layer when loaded) and an estimate of the rest of the startup (hive/vram_limit.h
+//   fixed_bytes at the lean knobs, the cache reserve, a minimum expert cache of HIVE_GLM_MIN_SLOTS slots, default 64) — an estimate: hived's
+//   own plan after the load works from the measured weights. Otherwise everything on the GPU (unchanged behaviour).
+int GlmModel::gpu_layers_for_limit(bool load_mtp) {
+  const GlmConfig& c = cfg_;
+  if (const char* v = getenv("HIVE_GLM_GPU_LAYERS"); v && *v) return std::max(0, std::min(c.n_layers, atoi(v)));
+  const size_t L = vram_limit::limit_bytes();
+  if (L == 0) return c.n_layers;
+  const bool mtp = load_mtp && !(getenv("HIVE_GLM_MTP_K") && strcmp(getenv("HIVE_GLM_MTP_K"), "0") == 0);
+  vram_limit::Knobs k;
+  k.mtp = mtp; k.max_batch = 1; k.max_sessions = 2; k.max_chunk = 4096; k.max_ctx = 32768;
+  const double reserve = (getenv("HIVE_CACHE_RESERVE_MB") ? atof(getenv("HIVE_CACHE_RESERVE_MB")) : 2400.0) * vram_limit::kMiB;
+  const int min_slots = getenv("HIVE_GLM_MIN_SLOTS") ? std::max(0, atoi(getenv("HIVE_GLM_MIN_SLOTS"))) : 64;
+  double room = (double)L - (double)vram_limit::kCtxFallback - vram_limit::fixed_bytes(vram_limit::Family::Glm, k) - reserve - min_slots * 13.5 * vram_limit::kMiB;
+  room -= (double)ckpt_.get("lm_head.weight").nbytes + 64.0 * vram_limit::kMiB;
+  if (mtp) room -= 7.2 * 1024 * vram_limit::kMiB;  // NextN layer with its FP8 experts (6.95 GiB measured, docs/vram-footprint.md §3.2)
+  // prefill streaming (default on): one staging copy per layer kind in VRAM — counted as the two largest layers
+  if (!(getenv("HIVE_GLM_STREAM_PREFILL") && strcmp(getenv("HIVE_GLM_STREAM_PREFILL"), "0") == 0)) {
+    size_t big[2] = {0, 0};
+    for (int l = 0; l < c.n_layers; ++l) { const size_t b = layer_bytes(l); if (b > big[0]) { big[1] = big[0]; big[0] = b; } else if (b > big[1]) big[1] = b; }
+    room -= (double)(big[0] + big[1]);
+  }
+  int n = 0;
+  for (; n < c.n_layers; ++n) {
+    const double b = (double)layer_bytes(n);
+    if (b > room) break;
+    room -= b;
+  }
+  fprintf(stderr, "[glm] VRAM limit %.0f MiB: %d of %d layers on the GPU (estimate from the checkpoint headers; HIVE_GLM_GPU_LAYERS overrides)\n",
+          L / 1048576.0, n, c.n_layers);
+  return n;
+}
+
+void GlmModel::load_layer(int l, LayerW& L) {
+  const GlmConfig& c = cfg_;
+  const std::string p = P + "layers." + std::to_string(l) + ".";
+  L.kda = c.is_kda[l]; L.moe = c.is_moe[l];
+  L.in_norm = vec_bf16(p + "input_layernorm.weight"); L.post_norm = vec_bf16(p + "post_attention_layernorm.weight");
+  load_hc(p, "attn", L.hc_attn); load_hc(p, "ffn", L.hc_ffn);
+  if (L.kda) load_kda(p, L.kda_w); else load_dsa(p, L.dsa_w);
+  if (L.moe) load_moe(p, L.moe_w);
+  else {
+    const char* names[3] = {"gate_proj", "up_proj", "down_proj"};
+    for (int j = 0; j < 3; ++j) {
+      const std::string b = p + "mlp." + names[j] + ".";
+      const TensorInfo& tw = ckpt_.get(b + "weight");
+      const TensorInfo& ts = ckpt_.get(b + "weight_scale");
+      const TensorInfo& tg = ckpt_.get(b + "weight_scale_2");
+      HIVE_CHECK(tw.dtype == "U8" && ts.dtype == "F8_E4M3" && tg.dtype == "F32", "GLM: dense MLP must be NVFP4: " + b);
+      L.dense.w[j].alloc(tw.nbytes); CUDA_CHECK(cudaMemcpy(L.dense.w[j].p, tw.data, tw.nbytes, cudaMemcpyHostToDevice));
+      L.dense.s[j].alloc(ts.nbytes); CUDA_CHECK(cudaMemcpy(L.dense.s[j].p, ts.data, ts.nbytes, cudaMemcpyHostToDevice));
+      std::memcpy(&L.dense.g[j], tg.data, 4);
+      vram_bytes_ += tw.nbytes + ts.nbytes;
+    }
+  }
+}
+
+// Every device buffer of a layer, in a fixed order (the staging copy of a kind has the same buffers with the same sizes)
+void GlmModel::bufs_of(LayerW& L, std::vector<DevBuf*>& o) {
+  auto mat = [&](Mat& m) { o.push_back(&m.buf); o.push_back(&m.f8w); o.push_back(&m.f8s); };
+  for (DevBuf* b : {&L.in_norm, &L.post_norm, &L.hc_attn.fn, &L.hc_attn.base, &L.hc_attn.scale, &L.hc_ffn.fn, &L.hc_ffn.base, &L.hc_ffn.scale}) o.push_back(b);
+  KdaW& k = L.kda_w;
+  for (Mat* m : {&k.q, &k.k, &k.v, &k.f_a, &k.f_b, &k.g_a, &k.g_b, &k.b, &k.o}) mat(*m);
+  for (DevBuf* b : {&k.conv_w, &k.A_log, &k.dt_bias, &k.o_norm}) o.push_back(b);
+  DsaW& d = L.dsa_w;
+  for (Mat* m : {&d.q_a, &d.q_b, &d.kv_a, &d.kv_b, &d.o, &d.idx_wq_b, &d.idx_wk, &d.idx_weights, &d.idx_gate}) mat(*m);
+  for (DevBuf* b : {&d.q_a_norm, &d.kv_a_norm, &d.idx_k_norm_w, &d.idx_k_norm_b, &d.idx_ape}) o.push_back(b);
+  for (int j = 0; j < 3; ++j) { o.push_back(&L.dense.w[j]); o.push_back(&L.dense.s[j]); }
+  MoeW& m = L.moe_w;
+  for (Mat* x : {&m.gate, &m.sh_gate, &m.sh_up, &m.sh_down}) mat(*x);
+  o.push_back(&m.bias);
+}
+
+// Load layer l the usual way (temporary VRAM), keep its buffers in pinned RAM; the first layer of each kind stays as that kind's staging copy.
+void GlmModel::keep_streamed(int l) {
+  const size_t v0 = vram_bytes_;
+  auto tmp = std::make_unique<LayerW>();
+  load_layer(l, *tmp);
+  std::vector<DevBuf*> bufs;
+  bufs_of(*tmp, bufs);
+  Streamed& S = streamed_[l];
+  for (DevBuf* b : bufs) {
+    uint8_t* h = nullptr;
+    if (b->n) { CUDA_CHECK(cudaMallocHost(&h, b->n)); CUDA_CHECK(cudaMemcpy(h, b->p, b->n, cudaMemcpyDeviceToHost)); }
+    S.blobs.push_back({h, b->n});
+  }
+  for (int j = 0; j < 3; ++j) S.g[j] = tmp->dense.g[j];
+  auto& st = staging_[tmp->kda][tmp->moe];
+  if (!st) st = std::move(tmp);              // stays in VRAM as the staging copy of this kind
+  else vram_bytes_ = v0;                     // freed again (tmp goes out of scope)
+}
+
+GlmModel::~GlmModel() {
+  for (auto& S : streamed_) for (auto& b : S.blobs) if (b.first) cudaFreeHost(b.first);
+}
+
+size_t GlmModel::stream_bytes(int l) const {
+  size_t b = 0;
+  for (const auto& x : streamed_[l].blobs) b += x.second;
+  return b;
+}
+
+void GlmModel::stream_in(int l, cudaStream_t st) {
+  HIVE_CHECK(l >= n_gpu_ && stream_on_, "GLM stream_in: layer is not streamed");
+  const GlmConfig& c = cfg_;
+  LayerW& S = *staging_[c.is_kda[l]][c.is_moe[l]];
+  std::vector<DevBuf*> bufs;
+  bufs_of(S, bufs);
+  const Streamed& src = streamed_[l];
+  HIVE_CHECK(bufs.size() == src.blobs.size(), "GLM stream_in: layout");
+  for (size_t i = 0; i < bufs.size(); ++i) {
+    HIVE_CHECK(bufs[i]->n == src.blobs[i].second, "GLM stream_in: buffer size differs from the staging copy");
+    if (src.blobs[i].second) CUDA_CHECK(cudaMemcpyAsync(bufs[i]->p, src.blobs[i].first, src.blobs[i].second, cudaMemcpyHostToDevice, st));
+  }
+  for (int j = 0; j < 3; ++j) S.dense.g[j] = src.g[j];
+  for (int x = n_gpu_; x < c.n_layers; ++x) if (active_[x] == &S) active_[x] = nullptr;
+  active_[l] = &S;
+}
+
+GlmModel::GlmModel(const std::string& dir, bool load_mtp) : cfg_(GlmConfig::load(dir)), dir_(dir), ckpt_(dir) {
   const GlmConfig& c = cfg_;
   // Z.ai FP8 tensors (DSA MLA projections, shared experts): HIVE_GLM_FP8_DIR = a directory with model.safetensors.index.json; "0" = off
   if (const char* fd = getenv("HIVE_GLM_FP8_DIR"); fd && *fd && std::string(fd) != "0") {
     fp8_ = std::make_unique<Checkpoint>(fd);
     fprintf(stderr, "[glm] fp8 tensors from %s\n", fd);
   }
+  n_gpu_ = gpu_layers_for_limit(load_mtp);
+  stream_on_ = !(getenv("HIVE_GLM_STREAM_PREFILL") && strcmp(getenv("HIVE_GLM_STREAM_PREFILL"), "0") == 0);
+  active_.assign(c.n_layers, nullptr);
+  streamed_.resize(c.n_layers);
+  if (n_gpu_ < c.n_layers) fprintf(stderr, "[glm] layers %d..%d placed on the CPU (hybrid path)\n", n_gpu_, c.n_layers - 1);
   layers_.resize(c.n_layers);
   for (int l = 0; l < c.n_layers; ++l) {
     LayerW& L = layers_[l];
     const std::string p = P + "layers." + std::to_string(l) + ".";
     L.kda = c.is_kda[l]; L.moe = c.is_moe[l];
-    L.in_norm = vec_bf16(p + "input_layernorm.weight"); L.post_norm = vec_bf16(p + "post_attention_layernorm.weight");
-    load_hc(p, "attn", L.hc_attn); load_hc(p, "ffn", L.hc_ffn);
-    if (L.kda) load_kda(p, L.kda_w); else load_dsa(p, L.dsa_w);
-    if (L.moe) load_moe(p, L.moe_w);
-    else {
-      const char* names[3] = {"gate_proj", "up_proj", "down_proj"};
-      for (int j = 0; j < 3; ++j) {
-        const std::string b = p + "mlp." + names[j] + ".";
-        const TensorInfo& tw = ckpt_.get(b + "weight");
-        const TensorInfo& ts = ckpt_.get(b + "weight_scale");
-        const TensorInfo& tg = ckpt_.get(b + "weight_scale_2");
-        HIVE_CHECK(tw.dtype == "U8" && ts.dtype == "F8_E4M3" && tg.dtype == "F32", "GLM: dense MLP must be NVFP4: " + b);
-        L.dense.w[j].alloc(tw.nbytes); CUDA_CHECK(cudaMemcpy(L.dense.w[j].p, tw.data, tw.nbytes, cudaMemcpyHostToDevice));
-        L.dense.s[j].alloc(ts.nbytes); CUDA_CHECK(cudaMemcpy(L.dense.s[j].p, ts.data, ts.nbytes, cudaMemcpyHostToDevice));
-        std::memcpy(&L.dense.g[j], tg.data, 4);
-        vram_bytes_ += tw.nbytes + ts.nbytes;
-      }
+    if (l >= n_gpu_) {  // CPU-placed: the hybrid CPU engine loads it; with prefill streaming its GPU form is kept in pinned RAM
+      if (stream_on_) keep_streamed(l);
+      continue;
     }
+    load_layer(l, L);
     if ((l + 1) % 9 == 0 || l == c.n_layers - 1)
       fprintf(stderr, "[glm] layers 0..%d loaded · VRAM %.1f GiB\n", l, vram_bytes_ / 1073741824.0);
   }
@@ -250,7 +377,7 @@ GlmModel::GlmModel(const std::string& dir, bool load_mtp) : cfg_(GlmConfig::load
 }
 
 Nvfp4Mat GlmModel::dense_mat(int l, int which) const {
-  const DenseMlpW& d = layers_[l].dense;
+  const DenseMlpW& d = layer(l).dense;
   const int N = which == 2 ? cfg_.hidden : cfg_.dense_inter, K = which == 2 ? cfg_.dense_inter : cfg_.hidden;
   return Nvfp4Mat{d.w[which].as<uint8_t>(), d.s[which].as<uint8_t>(), d.g[which], N, K};
 }

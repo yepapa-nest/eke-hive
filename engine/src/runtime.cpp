@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
 #include "hive/runtime.h"
+#include "hive/image_reaper.h"
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +47,22 @@ bool env_on(const char* name) { const char* v = getenv(name); return v && *v && 
 // E3 HIVE_HC_DECODE_FUSED (env_on — read once by k::hc_decode_fused_on): the decode (M ≤ 8) hc mix kernel also runs sinkhorn. hc ≠ 4 falls back to the base path.
 bool hc_dfused_on(int hc) { return hc == 4 && k::hc_decode_fused_on(); }
 }  // namespace
+
+// ---- layer-level placement (runtime.h "layer-level placement") -------------------------------------------------------------------------------
+//   Layers [first, n_layers) run on the CPU engine (hive/ds/ds_cpu.h run_block — the same math as hived_ds_cpu, validated against the oracle):
+//   dense weights in host RAM (copied from the checkpoint), routed experts aliased from the ExpertStore's pinned half-records (no second copy),
+//   engram rows gathered by the runtime from the store's tables (RAM or HIVE_ENGRAM_SSD — same bytes as the GPU path reads).
+struct Runtime::CpuLayers {
+  std::unique_ptr<ds::cpu::DsCpuEngine> eng;
+  int first = 0;
+  int mirror_src = -1;     // GPU kv source whose compressed KV / indexer keys the first CPU layers read (−1 = none)
+  bool need_topk = false;  // the first CPU layers reuse the index selection of a GPU index-source layer
+  bool need_cand = false;  // CPU index layers read the candidate blocks of a GPU candidate-source layer
+  bool engram = false;     // an engram layer is on the CPU
+  double ms = 0, ms_xfer = 0;
+  long calls = 0;
+};
+int Runtime::gpu_layers() const { return model_.n_gpu_layers(); }
 
 // F2 HIVE_DECODE_PREDICT_EVAL (runtime.h comment): next-layer routing prediction, measurement only. Writes go to its own buffers on its own stream;
 //   the main stream only gets an event recorded on it, so outputs are unchanged apart from the extra GPU work.
@@ -850,9 +867,16 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   verify2_ = env_on("HIVE_MTP_VERIFY2");        // R1: run forward_verify on the decode path (verify_decode — usability is v2_ok_ at the end of the constructor)
   mtp_batch_ = env_on("HIVE_MTP_BATCH");        // R1: multi-sequence verify (forward_verify_batch — hived speculates with ≥ 2 active)
   verify_rowind_ = env_on("HIVE_MTP_VERIFY_ROWIND");  // R1: make verify rows' expert sums row-independent (see the comment at the top of moe_decode_experts)
+  if (model_.n_gpu_layers() < model_.n_loaded_layers()) {  // layer-level placement: paths that assume every layer on the GPU are off (logged at the end)
+    batch_prefill_ = step_graph_ = ubatch_ = verify2_ = mtp_batch_ = false;
+    opt_.mtp = false;
+    opt_.prefill_tile = 1;
+    ly_intra_ = false; ly_.intra = false;
+  }
   // H2: host tile count (requested) — actual allocation (pinned, VRAM) happens after the tile slots and is reduced when short. Tile condition = a max_chunk chunk is in tail mode.
   host_slots_ = host_tile_count(env_on("HIVE_PREFILL_HOST_TILES"), getenv("HIVE_PREFILL_HOST_MB"), (size_t)opt_.max_chunk * model_.cfg().hc * model_.cfg().dim * 2,
                                 tail_mode_for(opt_.max_chunk), std::max(1, opt_.prefill_tile), opt_.max_chunk, opt_.max_ctx);
+  if (model_.n_gpu_layers() < model_.n_loaded_layers()) host_slots_ = 0;
   if (const char* xp = getenv("HIVE_EXPERT_TRACE"); xp && *xp && strcmp(xp, "0") != 0) {  // unset/""/"0" = off (switch rule — so that "0" never becomes a file name)
     xtrace_ = fopen(xp, "ab");
     if (xtrace_) { setvbuf(xtrace_, nullptr, _IOFBF, 1 << 20); fprintf(stderr, "[hive] expert trace → %s\n", xp); }
@@ -1219,6 +1243,147 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
     else fprintf(stderr, "[runtime] vision encoder: lazy (max %d patches · loads on first image, released after %.0fs idle)\n", vision_max_patches_, opt_.vision_idle_ms / 1000.0);
   }
   { size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot); fprintf(stderr, "[runtime] max_chunk %d · max_ctx %lld · index Msub %d · VRAM free %.0f MiB\n", M, (long long)opt_.max_ctx, w_->Msub, fr / 1048576.0); }
+  if (gpu_layers() < model_.n_loaded_layers()) {
+    HIVE_CHECK(model_.n_loaded_layers() == c.n_layers && gpu_layers() >= 1, "layer placement needs the full backbone and one GPU layer");
+    auto C = std::make_shared<CpuLayers>();
+    C->first = gpu_layers();
+    int src = -1, next_src = c.n_layers, last_idx = -1, next_idx = c.n_layers;
+    for (int x : c.kv_source_layers) { if (x < C->first) src = std::max(src, x); else next_src = std::min(next_src, x); }
+    for (int x : c.index_source_layers) { if (x < C->first) last_idx = std::max(last_idx, x); else next_idx = std::min(next_idx, x); }
+    for (int l = C->first; l < std::min(next_src, c.n_layers); ++l) if (c.ratio(l) > 0 && src >= 0) C->mirror_src = src;
+    for (int l = C->first; l < std::min(next_idx, c.n_layers); ++l) if (c.ratio(l) > 0 && last_idx >= 0) C->need_topk = true;
+    if (c.cand_source_layer >= 0 && c.cand_source_layer < C->first)
+      for (int x : c.index_source_layers) if (x >= C->first && x > c.cand_source_layer) C->need_cand = true;
+    for (int x : c.engram_layer_ids) if (x >= C->first) C->engram = true;
+    HIVE_CHECK(!C->engram || eh_ != nullptr, "CPU-placed engram layer needs the engram hash (--engram DIR)");
+    ds::cpu::EngineOptions o;
+    o.first_layer = C->first;
+    o.vision = false;
+    o.ext_engram = true;
+    o.decoder_tail = opt_.decoder_tail;
+    o.tail_min_rows = opt_.prefill_threshold;   // the same chunks as tail_mode_for
+    auto X = std::make_shared<ds::cpu::ExpertHalves>();
+    const HalfLayout& hl = store_.half_layout();
+    X->w1 = hl.w1; X->s1 = hl.s1; X->w3 = hl.w3; X->s3 = hl.s3; X->w2 = hl.w2; X->s2 = hl.s2;
+    ExpertStore* st = &store_;
+    X->get = [st](int l, int e, int n) { return st->host_half(l, e, n); };
+    o.ext_experts = X;
+    const double t0 = now_ms();
+    C->eng = std::make_unique<ds::cpu::DsCpuEngine>(model_.ckpt().dir(), o);
+    fprintf(stderr, "[runtime] layer placement: layers 0..%d on the GPU, %d..%d on the CPU (%.1fs to load their dense weights; experts aliased from the store) · "
+            "mirror of kv source %d · index selection %s · candidates %s · engram %s · off with it: DSpark, step graph, ubatch, batch prefill, host tiles, "
+            "prefill tiles, layer yields\n", C->first - 1, C->first, c.n_layers - 1, (now_ms() - t0) / 1000.0, C->mirror_src, C->need_topk ? "from the GPU" : "own",
+            C->need_cand ? "from the GPU" : "own", C->engram ? "on the CPU" : "on the GPU");
+    cpul_ = std::move(C);
+  }
+}
+
+// Layer-level placement: the CPU block of one forward (runtime.h). Work rows [0, M) hold this forward's rows after the last GPU layer's tail.
+int Runtime::cpu_block(Seq* const* row_seq, int M, const int64_t* pos_end, bool prefill, int64_t win_min) {
+  CpuLayers& C = *cpul_;
+  const Config& c = model_.cfg();
+  Work& w = *w_;
+  const int hc = c.hc, dim = c.dim, HD = hc * dim, win = c.window, KT = c.index_topk;
+  CUDA_CHECK(cudaStreamSynchronize(st_));
+  const double t0 = now_ms();
+  std::vector<uint16_t> hb((size_t)M * HD);
+  std::vector<float> h((size_t)M * HD), pm((size_t)M * hc);
+  CUDA_CHECK(cudaMemcpy(hb.data(), w.h.p, hb.size() * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(pm.data(), w.pre_mix.p, pm.size() * 4, cudaMemcpyDeviceToHost));
+  for (size_t i = 0; i < hb.size(); ++i) { const uint32_t u = (uint32_t)hb[i] << 16; memcpy(&h[i], &u, 4); }
+  std::vector<int64_t> pos(M);
+  std::vector<int8_t> img(M);
+  for (int m = 0; m < M; ++m) { pos[m] = w.pos_h[m]; img[m] = w.is_image_h[m]; }
+  ds::cpu::Block b;
+  for (int m = 0; m < M;) {
+    int n = 1;
+    while (m + n < M && row_seq[m + n] == row_seq[m]) ++n;
+    HIVE_CHECK(row_seq[m]->cpu != nullptr, "sequence without CPU-layer state");
+    b.parts.push_back(ds::cpu::BlockPart{row_seq[m]->cpu.get(), pos[m], m, n});
+    m += n;
+  }
+  // new rows of the GPU kv source the CPU layers read (packed rows as stored — the unpacked values are exact)
+  if (C.mirror_src >= 0) {
+    const int src = C.mirror_src, r = c.ratio(src);
+    for (int m = 0; m < M; ++m) {
+      Seq& q = *row_seq[m];
+      if (m > 0 && row_seq[m - 1] == row_seq[m]) continue;
+      const int64_t g1 = pos_end[m] / r, g0 = std::min(q.cpu_mirror_g, g1);
+      if (g1 <= g0) continue;
+      std::vector<uint8_t> kvr((size_t)(g1 - g0) * kvp::COMP_ROW), ikr;
+      CUDA_CHECK(cudaMemcpy(kvr.data(), q.comp_cache.at(src).as<uint8_t>() + (size_t)g0 * kvp::COMP_ROW, kvr.size(), cudaMemcpyDeviceToHost));
+      if (q.idx_k_cache.count(src)) {
+        ikr.resize((size_t)(g1 - g0) * kvp::IDX_ROW);
+        CUDA_CHECK(cudaMemcpy(ikr.data(), q.idx_k_cache.at(src).as<uint8_t>() + (size_t)g0 * kvp::IDX_ROW, ikr.size(), cudaMemcpyDeviceToHost));
+      }
+      C.eng->mirror_source(*q.cpu, src, kvr.data(), ikr.empty() ? nullptr : ikr.data(), g0, g1);
+      q.cpu_mirror_g = g1;
+    }
+  }
+  // index selection of the last GPU index source: compressed columns [win, win + topk) of the attention table (global index − (win + M), −1 = none)
+  std::vector<int32_t> sel, cand;
+  std::vector<int> sel_n, cand_n;
+  if (C.need_topk) {
+    std::vector<int32_t> idx((size_t)M * (win + KT));
+    CUDA_CHECK(cudaMemcpy(idx.data(), w.idx.p, idx.size() * 4, cudaMemcpyDeviceToHost));
+    sel.assign((size_t)M * KT, -1); sel_n.assign(M, 0);
+    int src = -1;
+    for (int x : c.kv_source_layers) if (x < C.first) src = std::max(src, x);
+    const int rs = std::max(1, c.ratio(src));
+    for (int m = 0; m < M; ++m) {
+      // columns written this forward: prefill = shared_topk_cols_ for every row (−1 past the row's visible groups), decode = the row's own count
+      const int ncol = std::min(KT, prefill ? shared_topk_cols_ : shared_topk_rows_[m]);
+      const int64_t vis = (pos[m] + 1) / rs;
+      for (int j = 0; j < ncol; ++j) {
+        const int32_t v = idx[(size_t)m * (win + KT) + win + j];
+        if (v >= win + M && v - (win + M) < vis) sel[(size_t)m * KT + sel_n[m]++] = v - (win + M);
+      }
+    }
+    b.topk = sel.data(); b.topk_n = sel_n.data(); b.topk_stride = KT;
+  }
+  if (C.need_cand) {
+    const int CB = c.cand_topk_blocks;
+    cand.resize((size_t)M * CB);
+    CUDA_CHECK(cudaMemcpy(cand.data(), w.cand.p, cand.size() * 4, cudaMemcpyDeviceToHost));
+    cand_n.assign(M, 0);
+    const int rc = std::max(1, c.ratio(c.cand_source_layer)), bs = c.cand_block;
+    for (int m = 0; m < M; ++m) {
+      // the indexer writes kb = min(CB, ⌈T/bs⌉) columns per row (ascending, −1 when short); columns past kb are left over from earlier forwards
+      const int64_t T = (pos[m] + 1) / rc, nb = (T + bs - 1) / bs;
+      const int kb = (int)std::min<int64_t>(CB, nb);
+      int n = 0;
+      for (int j = 0; j < kb; ++j) { const int32_t v = cand[(size_t)m * CB + j]; if (v >= 0 && v < nb) cand[(size_t)m * CB + n++] = v; }
+      cand_n[m] = n;
+    }
+    b.cand = cand.data(); b.cand_n = cand_n.data(); b.cand_stride = CB;
+  }
+  if (C.engram) {
+    HIVE_CHECK(seq_hashes_.size() >= (size_t)M * eh_->n_layers() * eh_->n_cols(), "engram hashes of the CPU block rows");
+    b.hashes = seq_hashes_.data();
+    const int nL = eh_->n_layers(), cols = c.n_hash_cols(), hd = c.engram_head_dim;
+    const int64_t* hs = seq_hashes_.data();
+    b.engram_rows = [this, hs, nL, cols, hd](int hidx, int Mr, uint8_t* v, uint8_t* sc) {
+      const EngramTable* T = store_.engram(hidx);
+      HIVE_CHECK(T != nullptr, "engram table missing");
+      if (EngramSsd* ssd = store_.engram_ssd()) ssd->gather(hs, Mr, nL, hidx, cols, hd, T->rows, v, sc, host_par_threads_);
+      else engram_gather(hs, Mr, nL, hidx, cols, hd, T->rows, T->vals.base, T->scales.base, v, sc, host_par_threads_);
+    };
+  }
+  b.M = M; b.pos = pos.data(); b.img = img.data(); b.h = h.data(); b.premix = pm.data();
+  b.win_min = win_min; b.prefill = prefill;
+  const double t1 = now_ms();
+  C.eng->run_block(b);
+  const double t2 = now_ms();
+  const int Mo = b.out_M;
+  for (size_t i = 0; i < (size_t)Mo * HD; ++i) {  // the CPU layers' hidden stream holds bf16 values: the top half is exact
+    uint32_t u; memcpy(&u, &h[(size_t)b.out_r0 * HD + i], 4); hb[i] = (uint16_t)(u >> 16);
+  }
+  CUDA_CHECK(cudaMemcpy(w.h.p, hb.data(), (size_t)Mo * HD * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(w.pre_mix.p, pm.data() + (size_t)b.out_r0 * hc, (size_t)Mo * hc * 4, cudaMemcpyHostToDevice));
+  C.ms += t2 - t1;
+  C.ms_xfer += (t1 - t0) + (now_ms() - t2);
+  ++C.calls;
+  return Mo;
 }
 
 void Runtime::ensure_vision() {
@@ -1362,8 +1527,8 @@ std::unique_ptr<Seq> Runtime::new_seq() const {
   const Config& c = model_.cfg();
   auto s = std::make_unique<Seq>();
   s->cap = opt_.max_ctx;
-  s->ring.resize(model_.n_loaded_layers());
-  for (int l = 0; l < model_.n_loaded_layers(); ++l) {
+  s->ring.resize(gpu_layers());   // CPU-placed layers keep their state in s->cpu
+  for (int l = 0; l < gpu_layers(); ++l) {
     s->ring[l].alloc((size_t)c.window * c.head_dim * 2);
     CUDA_CHECK(cudaMemset(s->ring[l].p, 0, s->ring[l].n));
     if (c.is_kv_source(l)) {
@@ -1382,6 +1547,7 @@ std::unique_ptr<Seq> Runtime::new_seq() const {
       }
     }
   }
+  if (cpul_) { s->cpu = std::make_unique<ds::cpu::CpuSeq>(); cpul_->eng->init_seq(*s->cpu, s->cap); }
   if (mtp_on_) {
     s->mtp_ring.resize(model_.n_mtp());
     for (auto& r : s->mtp_ring) { r.alloc((size_t)c.window * c.head_dim * 2); CUDA_CHECK(cudaMemset(r.p, 0, r.n)); }
@@ -1408,6 +1574,7 @@ void Runtime::reset_seq(Seq& s) const {
   for (auto& r : s.mtp_ring) CUDA_CHECK(cudaMemsetAsync(r.p, 0, r.n, st_));
   s.mtp_hidden_valid = false;
   s.mtp_pos = -1;
+  if (s.cpu) { cpul_->eng->reset_seq(*s.cpu); s.cpu_mirror_g = 0; }
   (void)c;
   CUDA_CHECK(cudaStreamSynchronize(st_));
 }
@@ -1488,7 +1655,7 @@ void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) cons
       static std::atomic<bool> logged{false};
       if (!logged.exchange(true)) fprintf(stderr, "[hive] ⚠️snapshot pinned allocation failed (%zu B) — absorbed with pageable synchronous copies from this snapshot on (further warnings suppressed)\n", bytes);
     }
-    return std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
+    return hive::reaped_bytes(bytes);   // large pieces freed off the engine thread (hive/image_reaper.h)
   };
   auto d2h = [&](HostImageBuffer& dst, const void* src, size_t n, const HostImageBuffer* prev = nullptr) {
     const size_t prefix = dst.extend(prev, n, host_alloc);
@@ -1523,6 +1690,17 @@ void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) cons
   if (s.mtp_hidden.p) d2h(img.mtp_hidden, s.mtp_hidden.p, s.mtp_hidden.n);
   img.mtp_hidden_valid = s.mtp_hidden_valid;
   img.mtp_pos = s.mtp_pos;
+  if (s.cpu) {  // CPU-placed layers (host state: copied as is)
+    s.cpu->pos = s.pos;
+    for (auto& v : s.cpu->save_bytes()) {
+      HostImageBuffer hbuf;
+      std::shared_ptr<uint8_t> p = hive::reaped_bytes(v.size());
+      if (!v.empty()) memcpy(p.get(), v.data(), v.size());
+      hbuf.segments.push_back({std::move(p), v.size()});
+      img.cpu.push_back(std::move(hbuf));
+    }
+    img.cpu_mirror_g = s.cpu_mirror_g;
+  }
   if (env_on("HIVE_TRACE_CACHE")) fprintf(stderr, "[snapshot] pos %lld d2h_bytes %zu host_bytes %zu async %d delta %d\n",
       (long long)s.pos, transferred, img.bytes(), async, base != nullptr);
 }
@@ -1550,6 +1728,18 @@ void Runtime::load_image(Seq& s, const SeqImage& img) const {
   s.engram_history = img.engram_history;
   s.mtp_hidden_valid = img.mtp_hidden_valid && !img.mtp_hidden.empty();
   s.mtp_pos = img.mtp_pos;
+  if (s.cpu) {
+    HIVE_CHECK(!img.cpu.empty(), "seq image without the CPU-layer state");
+    std::vector<std::vector<uint8_t>> b;
+    for (const auto& hbuf : img.cpu) {
+      std::vector<uint8_t> v(hbuf.size());
+      size_t off = 0;
+      for (const auto& sg : hbuf.segments) { memcpy(v.data() + off, sg.data.get(), sg.n); off += sg.n; }
+      b.push_back(std::move(v));
+    }
+    s.cpu->load_bytes(b);
+    s.cpu_mirror_g = img.cpu_mirror_g;
+  }
 }
 
 void Runtime::dump(const std::string& name, const void* dev, size_t bytes) {
@@ -1699,7 +1889,7 @@ bool Runtime::tail_mode_for(int M) const {
   const Config& c = model_.cfg();
   const int tail_layer = c.kv_source_layers.empty() ? -1 : *std::max_element(c.kv_source_layers.begin(), c.kv_source_layers.end());
   const int tail_len = opt_.decoder_tail > 0 ? opt_.decoder_tail : 0;
-  return tail_len > 0 && M >= opt_.prefill_threshold && M > tail_len && tail_layer >= 0 && tail_layer < model_.n_loaded_layers();
+  return tail_len > 0 && M >= opt_.prefill_threshold && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();
 }
 // H2/H3: number of sub-chunks for a chunk of M rows = T of tile_plan (1 when M ≤ max_chunk)
 int Runtime::slots_for(int M) const { return M <= opt_.max_chunk ? 1 : (M + opt_.max_chunk - 1) / opt_.max_chunk; }
@@ -1855,7 +2045,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       if (pprof_) pprof_->moe_done();
       for (int s = 0; s < T; ++s) { tile_select(s); layer_tail(l, tM[s]); }
       if (pprof_) pprof_->layer_end(stats, prefetch_issued_, st_);
-      if (ly_ok) { ly_progress_ = ly_prog(l, tail_layer, model_.n_loaded_layers(), true); layer_yield_point(); }  // T11 (after the layer tails are issued — the yield point switches the slot to 0 and back)
+      if (ly_ok) { ly_progress_ = ly_prog(l, tail_layer, gpu_layers(), true); layer_yield_point(); }  // T11 (after the layer tails are issued — the yield point switches the slot to 0 and back)
     }
     // Layer 20 (last kv source): compressed KV and indexer keys of all sub-chunks (all rows) → keep the last sub-chunk in Work and continue with the tail loop below (TileGuard resets to 0 at the end)
     for (int s = 0; s < T - 1; ++s) { tile_select(s); prepare_decoder_tail(seq, tail_layer, tM[s], tStart[s], 0); }
@@ -1864,7 +2054,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
     start_pos = tStart[T - 1];
     l_begin = tail_layer;
   }
-  for (int l = l_begin; l < model_.n_loaded_layers(); ++l) {
+  for (int l = l_begin; l < gpu_layers(); ++l) {
     bool skip = false;
     if (tail_mode && l == tail_layer) {
       HIVE_CHECK(c.ratio(l) == 1, "decoder tail expects ratio-1 source");
@@ -1880,9 +2070,14 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       if (opt_.decoder_replay) win_min_pos_ = start_pos;
     }
     layer_forward(seq, l, M, start_pos, stats, skip);
-    if (ly_ok && l + 1 < model_.n_loaded_layers()) { ly_progress_ = ly_prog(l, tail_layer, model_.n_loaded_layers(), tail_mode); layer_yield_point(); }  // T11 (after the layer tail; no yield after the last layer, only the head remains)
+    if (ly_ok && l + 1 < gpu_layers()) { ly_progress_ = ly_prog(l, tail_layer, gpu_layers(), tail_mode); layer_yield_point(); }  // T11 (after the layer tail; no yield after the last layer, only the head remains)
   }
   win_min_pos_ = 0;
+  if (cpul_ && !upper_skipped) {  // layer-level placement: the CPU-placed layers for this chunk's rows (tail rows when the GPU switched to them)
+    std::vector<Seq*> rs((size_t)M, &seq);
+    std::vector<int64_t> pe((size_t)M, start_orig + M_orig);
+    M = cpu_block(rs.data(), M, pe.data(), true, tail_mode ? start_pos : 0);
+  }
   if (pprof_) pprof_->layers_done(st_);
   seq.tokens.insert(seq.tokens.end(), ids, ids + M_orig);
   seq.pos += M_orig;
@@ -1995,6 +2190,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   Work& w = *w_;
   const int P = (int)parts.size();
   HIVE_CHECK(P >= 1 && !verify_ && opt_.inject_dir.empty() && !batch_, "forward_multi: prefill only");
+  HIVE_CHECK(!cpul_, "forward_multi: not with CPU-placed layers (batch prefill and host tiles are off then)");
   for (auto& p : parts) {
     HIVE_CHECK(p.seq && p.ids && p.M >= 1 && p.seq->pos + p.M <= p.seq->cap, "forward_multi part");
     for (auto& q : parts) HIVE_CHECK(&q == &p || q.seq != p.seq, "forward_multi: one part per sequence");
@@ -2007,7 +2203,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   HIVE_CHECK(P == 1 || (int)mbufs_.size() >= P - 1, "forward_multi: batch prefill buffers (HIVE_BATCH_PREFILL)");
   struct BrokenGuard { std::vector<PrefillPart>* ps; int ex; ~BrokenGuard() { if (std::uncaught_exceptions() > ex) for (auto& p : *ps) p.seq->broken = true; } }
       broken_guard{&parts, std::uncaught_exceptions()};
-  const int nl = model_.n_loaded_layers();
+  const int nl = gpu_layers();
   const int tail_layer = c.kv_source_layers.empty() ? -1 : *std::max_element(c.kv_source_layers.begin(), c.kv_source_layers.end());
   const int tail_len = opt_.decoder_tail > 0 ? opt_.decoder_tail : 0;
   const int L = tail_layer >= 0 && tail_layer < nl ? tail_layer : nl;  // encoder layers [0, L) — all units
@@ -2788,7 +2984,10 @@ void Runtime::sampler_cands_dev(int M) {
 }
 int32_t Runtime::row_argmax(int m) const { return w_->next_b_h[m]; }
 
-int Runtime::warm_from_keys(const std::vector<int32_t>& keys) {
+int Runtime::warm_from_keys(const std::vector<int32_t>& keys_in) {
+  std::vector<int32_t> keys;
+  for (int32_t k : keys_in)  // layer-level placement: experts of CPU-placed layers (key = layer · E + expert) never route on the GPU — not warmed
+    if (!cpul_ || k / std::max(1, model_.cfg().n_routed) < gpu_layers()) keys.push_back(k);
   if (keys.empty()) return 0;
   store_.seed_scores(keys, 2.f + (float)keys.size() * 1e-3f, 1e-3f);  // list order becomes the score (earlier = higher), all ≥ min_score 1
   int total = 0;
@@ -3452,7 +3651,7 @@ void Runtime::decode_layer(std::vector<Seq*>& seqs, int l, int M, ForwardStats* 
         r.moe_decode_start_cpu(q);
       }
       void prep_next(int l) {  // O1 B HOST_FAST: after front (l) has ended (wait_front) — same precondition as the base path
-        if (r.host_fast_ && l + 1 < r.model_.n_loaded_layers()) { D.pre_Tmax = r.decode_host_prep(seqs, l + 1, M, s); D.pre_l = l + 1; }
+        if (r.host_fast_ && l + 1 < r.gpu_layers()) { D.pre_Tmax = r.decode_host_prep(seqs, l + 1, M, s); D.pre_l = l + 1; }
       }
       void finish(int l) {
         r.moe_decode_finish(q, s);
@@ -3466,8 +3665,8 @@ void Runtime::decode_layer(std::vector<Seq*>& seqs, int l, int M, ForwardStats* 
                     (double)r.def_rows_total_ / r.def_layers_, r.skip_rows_total_);
         }
         r.pmark("moe");
-        if (prof && l == r.model_.n_loaded_layers() - 1) decode_sync_report(M);  // after counting the two waits per layer (publish, end of front)
-        if (prof && r.pregate_k_ > 0 && l == r.model_.n_loaded_layers() - 1) {  // P1 totals (every sample step — same cadence as [early-route])
+        if (prof && l == r.gpu_layers() - 1) decode_sync_report(M);  // after counting the two waits per layer (publish, end of front)
+        if (prof && r.pregate_k_ > 0 && l == r.gpu_layers() - 1) {  // P1 totals (every sample step — same cadence as [early-route])
           const pg::Acc& a = D.pg_acc;
           const auto ps = r.store_.pf_stats();
           fprintf(stderr, "[pregate M=%d] layers %ld · posted %ld late %ld untrusted %ld · prefetch experts %ld · cpu experts %ld · covered %ld (recall %.2f · precision %.2f) · "
@@ -3493,7 +3692,7 @@ void Runtime::decode_layer(std::vector<Seq*>& seqs, int l, int M, ForwardStats* 
   const bool prof_step = profile_ && !(profile_every_ > 1 && step_ % profile_every_ != 0);  // same sample-step decision as pmark
   decode_stream_wait(st_, prof_step);  // D1: default = plain cudaStreamSynchronize(st_); HIVE_DECODE_BLOCKING_SYNC=1 = blocking wait
   D.mark(slot, DecodeOverlap::kWake, st_);
-  if (prof_step && l == model_.n_loaded_layers() - 1) decode_sync_report(M);
+  if (prof_step && l == gpu_layers() - 1) decode_sync_report(M);
   pmark(L.engram ? "segA.engram" : c.is_index_source(l) ? "segA.index" : c.is_kv_source(l) ? "segA.kvsrc" : c.ratio(l) ? "segA.comp" : "segA.win");
   if (!opt_.dump_dir.empty()) {
     dump_host("route_ids_L" + std::to_string(l) + ".i32", w.route_ids_h, (size_t)M * (L.n_act ? L.n_act : c.n_act) * 4);
@@ -3505,7 +3704,7 @@ void Runtime::decode_layer(std::vector<Seq*>& seqs, int l, int M, ForwardStats* 
   p.slot = slot;
   moe_decode_experts(L, l, M, stats, p, true, true, true);
   // O1 B HOST_FAST: the next layer's host tables while GPU/CPU experts run (before the wait) — front graph (l) has finished per the sync above and the next front is not issued yet
-  if (host_fast_ && l + 1 < model_.n_loaded_layers()) { D.pre_Tmax = decode_host_prep(seqs, l + 1, M, stats); D.pre_l = l + 1; }
+  if (host_fast_ && l + 1 < gpu_layers()) { D.pre_Tmax = decode_host_prep(seqs, l + 1, M, stats); D.pre_l = l + 1; }
   moe_decode_finish(p, stats);
   pmark("moe");
 }
@@ -3562,7 +3761,7 @@ void Runtime::ub_view(int h, int M, bool on) {
 void Runtime::decode_layers_ubatch(std::vector<Seq*>& seqs, int M, ForwardStats* stats) {
   const Config& c = model_.cfg();
   DecodeOverlap& D = *dov_;
-  const int nL = model_.n_loaded_layers();
+  const int nL = gpu_layers();
   const bool prof_step = profile_ && !(profile_every_ > 1 && step_ % profile_every_ != 0);  // same sample-step decision as pmark
   std::vector<Seq*> hs[2];
   int Mh[2];
@@ -4158,7 +4357,7 @@ void Runtime::moe(Seq& seq, const LayerWeights& L, int l, int M, ForwardStats* s
   else {  // D1: the decode-policy path (single sequence, MTP verify) uses the same wait as decode_layer (default = plain cudaStreamSynchronize)
     const bool prof_step = profile_ && !(profile_every_ > 1 && step_ % profile_every_ != 0);
     decode_stream_wait(st_, prof_step);
-    if (prof_step && l == model_.n_loaded_layers() - 1) decode_sync_report(M);
+    if (prof_step && l == gpu_layers() - 1) decode_sync_report(M);
   }
   pmark("moe.sync");
   if (!opt_.dump_dir.empty()) {
@@ -4287,7 +4486,7 @@ void Runtime::predict_eval(const LayerWeights& L, int l, int M) {
   }
   P.pend_l = -1;
   // 2) predict layer l+1 from this layer's FFN input (w.xn — in stream order, the input the router just used)
-  if (l + 1 >= c.n_layers) return;
+  if (l + 1 >= gpu_layers()) return;
   const LayerWeights& N = model_.layer(l + 1);
   const MoeWeights& F = N.ffn;
   const int E = N.n_routed ? N.n_routed : c.n_routed, K2 = std::min(kMaxK2, 2 * (N.n_act ? N.n_act : c.n_act));
@@ -4568,7 +4767,7 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
     const size_t scratch_n = ExpertStore::job_scratch_floats(I);
     // HIVE_DECODE_DEFER / HIVE_DECODE_SKIP_MISS (runtime.h): rows ranked 3rd or lower (mj % k ≥ 2) are deferred / skipped — early-route decode of
     //   backbone layers only, never the last layer (nothing would add it), never verify row-independent accumulation
-    const bool split_ok = p.defer_unpack && l < c.n_layers - 1 && !vrowind && !ub_active_;
+    const bool split_ok = p.defer_unpack && l < gpu_layers() - 1 && !vrowind && !ub_active_;
     const bool defer_now = dec_defer_ && split_ok;
     const float skip_f = split_ok ? dec_skip_ : 0.f;
     // The previous layer's deferred batch may still be running on the pool: it reads djobs_ and def_rows_h_, which the lines below
@@ -4620,7 +4819,7 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
   if (ds_sample) { S->obs.jobs = p.ds_jobs; S->has_cpu = !jobs.empty(); }
   // E4 HIVE_DECODE_COPY_PRIO: promotion slices after this layer's demand copies (issued on side_ above) — after waking the CPU pool, so the issue calls do not delay CPU experts
   //   (off = returns immediately). Nothing else is issued on side_ in between, so the gate sits right after this layer's demand copies. O1 B HOST_FAST moves it after the GPU launch (5).
-  if (!fast && pump && !defer_copy) promo_pump(l, model_.n_loaded_layers());  // B2 CPU_FIRST: must follow the demand copies, so it runs after the deferred copies (below)
+  if (!fast && pump && !defer_copy) promo_pump(l, gpu_layers());  // B2 CPU_FIRST: must follow the demand copies, so it runs after the deferred copies (below)
   if (stats) stats->ms_host += now_ms() - th0;
   const double tl0 = now_ms();
   if (p.slot >= 0) D.h_prep[p.slot] += tl0 - th0;
@@ -4703,7 +4902,7 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
     if (cw) CUDA_CHECK(cudaEventRecord(cw_ev_[3 * l], side_));
     for (int j = 0; j < n_pc; ++j) issue_copy(pc_e[j], pc_si[j], pc_pos[j]);
     if (cw) { CUDA_CHECK(cudaEventRecord(cw_ev_[3 * l + 1], side_)); cw_used_[l] |= 1; }
-    if (!fast && pump) promo_pump(l, model_.n_loaded_layers());
+    if (!fast && pump) promo_pump(l, gpu_layers());
   }
   for (int j = 0; j < n_stage; ++j) CUDA_CHECK(cudaStreamWaitEvent(st_, stage_copied_[str_stage[j]], 0));
   run_groups(ng_hit, ng_str, R_hit, R_str);
@@ -4717,7 +4916,7 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
   // 4) deferred work (O1 B HOST_FAST — host bookkeeping that does not affect results moved after the GPU launch): promotion slices, usage observation (scores, policy), expert tracing
   if (fast) {
     const double tp0 = now_ms();
-    if (pump) promo_pump(l, model_.n_loaded_layers());
+    if (pump) promo_pump(l, gpu_layers());
     observe_rows();
     if (!D.obs_off) xtrace_layer(l, M, k, w.route_ids_h);  // F1 (off = unchanged)
     const double dt = now_ms() - tp0;
@@ -4726,7 +4925,7 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
   }
   if (B) {  // B2: [decode-miss] CPU job count; HIVE_DECODE_PREFETCH predicted pre-copy for the next layer (after launch — off the critical path, after promotion slices)
     B->acc.cpu_jobs += (long)jobs.size();
-    if (B->prefetch > 0 && l + 1 < model_.n_loaded_layers()) bm_prefetch(l + 1);
+    if (B->prefetch > 0 && l + 1 < gpu_layers()) bm_prefetch(l + 1);
   }
   p.job_rows = job_rows; p.kind = kind; p.time_dma = time_dma;
   p.cpu_rows_h = w.cpu_rows_h; p.cpu_out_d = w.cpu_out_d; p.acc = w.acc.as<float>();
@@ -5452,7 +5651,7 @@ bool Runtime::forward_batch_step(std::vector<Seq*>& seqs, int M, const std::func
   const Config& c = model_.cfg();
   Work& w = *w_;
   static const bool use_mx = getenv("HIVE_MX") ? atoi(getenv("HIVE_MX")) != 0 : true;  // same formula as moe_decode_experts
-  const int nL = model_.n_loaded_layers(), k = c.n_act;
+  const int nL = gpu_layers(), k = c.n_act;
   const int Mb = std::max(1, std::min(opt_.max_batch, w.M));
   // Outside the conditions take the per-layer path (layer loop): graphs off, not the fused/block-scale variant (the base chain differs), CPU misses off (DMA share = E,
   //   exceeds the staging ring), dump/inject, no staging, or layer shapes beyond the plan kernel limits
@@ -5789,15 +5988,14 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
     r->batch_ = nullptr;
     if (std::uncaught_exceptions() > ex) for (Seq* q : *ss) q->broken = true;  // an exception mid-layer leaves compressor state and engram history half advanced
   } } bguard{this, &seqs, std::uncaught_exceptions()};
-  const int nL = model_.n_loaded_layers();
-  const bool head = model_.has_head() && nL == c.n_layers;
+  const int nL = gpu_layers();
+  const bool head = model_.has_head() && model_.n_loaded_layers() == c.n_layers;   // (with CPU-placed layers the head follows the CPU block)
   // O1: [decode-host] instrumentation (sample steps), HOST_FAST state, UBATCH conditions (M ≥ 2, no dump/inject/expert tracing — otherwise the base layer loop)
   const bool ub = ubatch_ && M >= 2 && opt_.dump_dir.empty() && opt_.inject_dir.empty() && !xtrace_;
   dov_->pre_l = -1; dov_->dma_armed = false;
   dov_->begin(profile_ && !(profile_every_ > 1 && step_ % profile_every_ != 0), nL, ub);
   if (host_fast_) pin_engine_thread_once();
-  auto head_body = [&] {  // last layer tail + head
-    layer_tail(nL - 1, M);
+  auto head_kernels = [&] {
     if (!head) return;
     k::hc_pre(w.h.as<bf16>(), w.pre_mix.as<float>(), M, c.hc, c.dim, w.x.as<bf16>(), st_);
     k::rmsnorm(w.x.as<bf16>(), model_.norm(), c.norm_eps, M, c.dim, w.xn.as<bf16>(), st_);
@@ -5807,6 +6005,7 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
     CUDA_CHECK(cudaMemcpyAsync(w.next_b_h, w.next_b.p, (size_t)M * 4, cudaMemcpyDeviceToHost, st_));
     sampler_cands_dev(M);
   };
+  auto head_body = [&] { layer_tail(nL - 1, M); head_kernels(); };  // last layer tail + head
   // G1 HIVE_DECODE_STEP_GRAPH: when on and the conditions hold, all layers + head run as one step graph (forward_batch_step). Otherwise the layer loop + head graph.
   const bool stepped = step_graph_ && forward_batch_step(seqs, M, head_body, stats);
   if (!stepped && ub) decode_layers_ubatch(seqs, M, stats);  // O1 C
@@ -5814,7 +6013,16 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
   batch_ = nullptr;
   for (int m = 0; m < M; ++m) { seqs[m]->tokens.push_back(ids[m]); seqs[m]->pos += 1; }
   next.assign(M, -1);
-  if (!stepped) { dov_->mark(dov_->slot(nL, 0), DecodeOverlap::kPre, st_); run_graph(nL, M, 0, head_body); }  // O1 A: before the head launch (the last layer's next)
+  if (!stepped) {
+    dov_->mark(dov_->slot(nL, 0), DecodeOverlap::kPre, st_);  // O1 A: before the head launch (the last layer's next)
+    if (cpul_) {  // layer-level placement: last GPU layer tail → CPU block → head (two graphs around the host work)
+      run_graph(nL, M, 0, [&] { layer_tail(nL - 1, M); });
+      std::vector<int64_t> pe(M);
+      for (int m = 0; m < M; ++m) pe[m] = seqs[m]->pos;   // already advanced: the end of this step
+      cpu_block(seqs.data(), M, pe.data(), false, 0);
+      run_graph(nL + 1, M, 0, head_kernels);
+    } else run_graph(nL, M, 0, head_body);
+  }
   if (!head && logits_out) logits_out->assign(M, std::vector<float>());
   if (head) {
     if (logits_out) {
@@ -6614,7 +6822,7 @@ void Runtime::verify_decode(std::vector<VerifyPart>& parts, std::vector<float>& 
   pmark("embed");
   shared_comp_kv_ = nullptr; shared_index_k_ = nullptr; shared_topk_cols_ = 0; have_candidates_ = false;
   shared_topk_rows_.assign(M, 0);
-  const int nL = model_.n_loaded_layers();
+  const int nL = gpu_layers();
   dov_->pre_l = -1; dov_->dma_armed = false;
   dov_->begin(prof, nL, false);
   if (host_fast_) pin_engine_thread_once();

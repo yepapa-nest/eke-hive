@@ -189,6 +189,12 @@ class Runtime {
   ~Runtime();
   std::unique_ptr<Seq> new_seq() const;
   void reset_seq(Seq& s) const;
+  // hived trims a sequence whose contents moved to a host image (LRU eviction, KV reclaim, flush): its KV goes back to HIVE_GLM_KV_BASE
+  //   positions and the freed memory back to the expert cache (GlmEngine::reset_seq)
+  void trim_seq(Seq& s) const { reset_seq(s); }
+  // KV growth under VRAM pressure: hived's reclaim hook (GlmEngine::kv_reserve calls it before lending expert-cache slots)
+  void set_kv_reclaim(std::function<bool()> f) { eng_->kv_reclaim_ = std::move(f); }
+  bool kv_reclaimable(const Seq& s) const { return eng_->kv_above_base(s); }   // hived skips idle sessions whose trim frees nothing
   void save_image(const Seq& s, SeqImage& img, const SeqImage* base = nullptr) const;
   void load_image(Seq& s, const SeqImage& img) const;
   void quiesce_after_host_error();

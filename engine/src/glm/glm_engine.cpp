@@ -93,9 +93,20 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
   CUDA_CHECK(cudaHostAlloc(&rw_h_, 8 * c_.n_act * 4, cudaHostAllocMapped));
   CUDA_CHECK(cudaHostAlloc(&pf_ids_map_, 8 * c_.n_act * 4, cudaHostAllocMapped));
   CUDA_CHECK(cudaHostAlloc(&pf_w_map_, 8 * c_.n_act * 4, cudaHostAllocMapped));
+  n_gpu_ = m_.n_gpu_layers();
+  // next MoE layer on the GPU (prefetch prediction, expert deferral: the last GPU MoE layer is never deferred)
   next_moe_.assign(c_.n_layers, -1);
-  for (int l = 0; l < c_.n_layers; ++l)
-    for (int t = l + 1; t < c_.n_layers; ++t) if (c_.is_moe[t]) { next_moe_[l] = t; break; }
+  for (int l = 0; l < n_gpu_; ++l)
+    for (int t = l + 1; t < n_gpu_; ++t) if (c_.is_moe[t]) { next_moe_[l] = t; break; }
+  if (n_gpu_ < c_.n_layers) {
+    cpu::GlmCpuEngine::Hybrid hy;
+    hy.first = n_gpu_; hy.last = c_.n_layers - 1;
+    hy.experts = [this](int layer, int M, const int32_t* ids, const float* w, const float* x, float* y) { ex_.cpu_rows(c_.moe_index[layer], M, ids, w, x, y); };
+    const double t0 = now_ms();
+    cpu_ = std::make_unique<cpu::GlmCpuEngine>(m_.dir(), hy);
+    fprintf(stderr, "[glm] hybrid: layers 0..%d on the GPU, %d..%d on the CPU (loaded in %.1f s; routed experts of CPU layers from the expert store's RAM)\n",
+            n_gpu_ - 1, n_gpu_, c_.n_layers - 1, (now_ms() - t0) / 1000);
+  }
   if (pf_n_ > 0 && !fused_) {  // stacked router gates [gate(l) ; gate(next MoE layer)] per MoE layer — only the unfused path uses them
     pair_gate_.resize(c_.n_moe);
     const size_t gb = (size_t)c_.n_routed * c_.hidden * 2;
@@ -126,7 +137,9 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
   if (const char* v = getenv("HIVE_GLM_KV_STEP")) { const long long x = atoll(v); if (x > 0) kv_step_ = x; }
   kv_headroom_ = cache_reserve_bytes();
   kda_index_.assign(c_.n_layers, -1); dsa_index_.assign(c_.n_layers, -1);
-  for (int l = 0; l < c_.n_layers; ++l) { if (c_.is_kda[l]) kda_index_[l] = n_kda_++; else dsa_index_[l] = n_dsa_++; }
+  for (int l = 0; l < c_.n_layers; ++l) {
+    if (c_.is_kda[l]) { kda_index_[l] = n_kda_++; kda_layer_.push_back(l); } else { dsa_index_[l] = n_dsa_++; dsa_layer_.push_back(l); }
+  }
   CUDA_CHECK(cudaMallocHost(&kda_ptr_h_, (size_t)2 * n_kda_ * 8 * sizeof(float*) + 64));
   CUDA_CHECK(cudaMallocHost(&dsa_rows_h_, (size_t)n_dsa_ * 8 * sizeof(DsaDecodeRow)));
   CUDA_CHECK(cudaMallocHost(&emb_pin_, (size_t)8 * c_.hidden * 2));
@@ -154,6 +167,12 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
   al(logits_dev_, (size_t)64 * c_.vocab * 4); al(final_x_, 64 * H * 2); al(final_xn_, 64 * H * 2);
   // layer-major prefill buffers for up to tiles × max_chunk rows (HIVE_GLM_PREFILL_TILES, default 4; 1 = off)
   tiles_ = std::max(1, getenv("HIVE_GLM_PREFILL_TILES") ? atoi(getenv("HIVE_GLM_PREFILL_TILES")) : 4);
+  if (cpu_ && m_.streaming()) {
+    if (const char* v = getenv("HIVE_GLM_STREAM_ROWS")) stream_rows_ = std::max(1, atoi(v));
+    s_conv_.alloc((size_t)3 * 3 * c_.kda_heads * c_.kda_dim * 4); s_state_.alloc((size_t)c_.kda_heads * c_.kda_dim * c_.kda_dim * 4);
+    fprintf(stderr, "[glm] hybrid: prompts of %d rows or more run the CPU-placed layers on the GPU, their weights streamed from pinned RAM\n", stream_rows_);
+  }
+  if (cpu_) tiles_ = 1;  // hybrid: chunked prefill only (the layer-major path does not hand rows to the CPU layers)
   elastic_ = !(getenv("HIVE_GLM_PREFILL_ELASTIC") && strcmp(getenv("HIVE_GLM_PREFILL_ELASTIC"), "0") == 0);
   if (tiles_ > 1 && elastic_) {
     fprintf(stderr, "[glm] layer-major prefill: up to %zu rows per call (%d blocks of %d) · buffers borrowed from the expert cache tail while it runs\n",
@@ -178,6 +197,39 @@ GlmEngine::GlmEngine(GlmModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(x),
     al(mtp_ids_d_, 16 * 4); al(mtp_conf_d_, 32 * 4);
     if (!one_f_.p) { one_f_.alloc(16); const float one = 1.f; CUDA_CHECK(cudaMemcpy(one_f_.p, &one, 4, cudaMemcpyHostToDevice)); }
     mtp_moe_tab_ = glm_moe_fp8_table_create(m_.mtp()->experts.data()->data(), (int)m_.mtp()->experts.size(), c_.hidden, c_.moe_inter);
+    if (const char* v = getenv("HIVE_GLM_MTP_LEND"); v && *v && strcmp(v, "0") != 0 && mtp_k_ > 0) {
+      const char* mb = getenv("HIVE_MTP_BATCH");
+      const MtpW& w = *m_.mtp();
+      if (mb && *mb && strcmp(mb, "0") != 0) fprintf(stderr, "[glm] MTP lend off: needs HIVE_MTP_BATCH=0 (batched drafts use the experts with several streams)\n");
+      else if (!grow_backend()) fprintf(stderr, "[glm] MTP lend off: needs CUDA VMM (the expert cache grows in place)\n");
+      else {
+        lend_.on = true;
+        lend_.dev = w.expert_arena.p; lend_.bytes = w.expert_arena.n;
+        if (const char* a = getenv("HIVE_GLM_MTP_LEND_AFTER"); a && atoi(a) > 0) lend_.lend_after = atoi(a);
+        if (const char* a = getenv("HIVE_GLM_MTP_RECLAIM_AFTER"); a && atoi(a) > 0) lend_.reclaim_after = atoi(a);
+        if (const char* a = getenv("HIVE_GLM_MTP_LEND_GAP_MS"); a && atof(a) >= 0) lend_.gap_ms = atof(a);
+        CUDA_CHECK(cudaHostAlloc((void**)&lend_.host, lend_.bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaMemcpy(lend_.host, lend_.dev, lend_.bytes, cudaMemcpyDeviceToHost));
+        const uint8_t* b = static_cast<const uint8_t*>(lend_.dev);
+        for (const auto& t : w.experts) {
+          std::array<Fp8BMat, 3> r = t;
+          for (auto& m : r) { m.w = (const uint8_t*)(uintptr_t)(m.w - b); m.s = (const float*)(uintptr_t)((const uint8_t*)m.s - b); }
+          lend_.rel.push_back(r);
+        }
+        // Move the experts into an arena of our own now, at load: freeing the model's original arena (one region allocated during the
+        //   checkpoint load) took 2,128 ms at the first lend (measured, GLM 48 GB); our own arena frees in ~6 ms. Freed first, then
+        //   reloaded from the pinned copy, so the two never coexist in VRAM.
+        m_.mtp_mut()->expert_arena.free();
+        void* p = mtp_arena_alloc();
+        HIVE_CHECK(p != nullptr, "GLM MTP lend: re-allocating the NextN expert arena failed");
+        mtp_arena_load(p);
+        lend_.dev = p; lend_.own = true;
+        const size_t rec = ex_.record_bytes();
+        ex_.set_va_extra((int)((lend_.bytes + rec - 1) / rec) + 8);
+        fprintf(stderr, "[glm] MTP lend on: the NextN experts' %.2f GiB go to the expert cache after %d multi-stream steps, back after %d single-stream "
+                        "drafts (≥ %.0f ms between switches; pinned copy kept)\n", lend_.bytes / 1073741824.0, lend_.lend_after, lend_.reclaim_after, lend_.gap_ms);
+      }
+    }
     al(mtp_moe_ws_, glm_moe_fp8_ws_bytes(1, c_.n_act, c_.moe_inter));
     // the embedding table read by the draft chain on the device (embed_gather_dev): pin + map it (it stays in host RAM)
     CUDA_CHECK(cudaHostRegister(const_cast<bf16*>(m_.embed_host()), (size_t)c_.vocab * c_.hidden * 2, cudaHostRegisterMapped));
@@ -221,13 +273,17 @@ void GlmEngine::init_seq(GlmSeq& seq, int64_t cap) {
   s->cap = cap; s->device_bytes = 0; s->kv_tokens = 0;
   const size_t W = (size_t)c_.kda_heads * c_.kda_dim;
   s->conv.resize(n_kda_); s->state.resize(n_kda_);
-  for (int i = 0; i < n_kda_; ++i) {
+  for (int l = 0; l < n_gpu_; ++l) {  // GPU layers only (CPU-placed layers keep theirs in s->cpu)
+    const int i = kda_index_[l];
+    if (i < 0) continue;
     s->conv[i].alloc(3 * 3 * W * 4); s->state[i].alloc((size_t)c_.kda_heads * c_.kda_dim * c_.kda_dim * 4);
     s->device_bytes += s->conv[i].n + s->state[i].n;
   }
+  if (cpu_) { s->cpu = std::make_unique<cpu::CpuSeq>(); cpu_->init_seq(*s->cpu, cap); }
   // DSA / MTP caches: addresses for cap positions, memory for the first kv_base_ positions (kv_reserve grows it)
   s->c.resize(n_dsa_); s->kI.resize(n_dsa_); s->gs.resize(n_dsa_); s->pooled.resize(n_dsa_); s->dsa.resize(n_dsa_);
   for (int i = 0; i < n_dsa_; ++i) {
+    if (dsa_layer_of(i) >= n_gpu_) { s->dsa[i] = DsaSeqCache{nullptr, nullptr, nullptr, nullptr, (int)cap}; continue; }
     s->c[i].reserve((size_t)cap * c_.kv_lora * 2); s->kI[i].reserve((size_t)cap * c_.index_dim * 2); s->gs[i].reserve((size_t)cap * c_.index_dim * 2);
     s->pooled[i].reserve((size_t)(cap / c_.index_kpool + 1) * c_.index_dim * 2);
     s->dsa[i] = DsaSeqCache{s->c[i].as<bf16>(), s->kI[i].as<bf16>(), s->gs[i].as<bf16>(), s->pooled[i].as<bf16>(), (int)cap};
@@ -239,7 +295,7 @@ void GlmEngine::init_seq(GlmSeq& seq, int64_t cap) {
     s->h_last.alloc((size_t)c_.hidden * 2);
     s->device_bytes += s->h_last.n;
   }
-  kv_reserve(*s, std::min<int64_t>(kv_base_, cap));
+  kv_reserve(*s, std::min<int64_t>(kv_base_, cap), false);
   reset_seq(*s);
 }
 
@@ -248,7 +304,7 @@ size_t GlmEngine::kv_bytes(const GlmSeq& s, int64_t t) const {
   size_t n = 0;
   const size_t T = (size_t)t;
   for (size_t i = 0; i < s.c.size(); ++i)
-    n += cost(s.c[i], T * c_.kv_lora * 2) + cost(s.kI[i], T * c_.index_dim * 2) + cost(s.gs[i], T * c_.index_dim * 2) +
+    if (s.c[i].n) n += cost(s.c[i], T * c_.kv_lora * 2) + cost(s.kI[i], T * c_.index_dim * 2) + cost(s.gs[i], T * c_.index_dim * 2) +
          cost(s.pooled[i], (T / c_.index_kpool + 1) * c_.index_dim * 2);
   if (s.h_last.p)
     n += cost(s.mtp_c, T * c_.kv_lora * 2) + cost(s.mtp_kI, T * c_.index_dim * 2) + cost(s.mtp_gs, T * c_.index_dim * 2) +
@@ -256,7 +312,7 @@ size_t GlmEngine::kv_bytes(const GlmSeq& s, int64_t t) const {
   return n;
 }
 
-void GlmEngine::kv_reserve(GlmSeq& s, int64_t tokens) {
+void GlmEngine::kv_reserve(GlmSeq& s, int64_t tokens, bool reclaim) {
   if (tokens <= s.kv_tokens) return;
   HIVE_CHECK(tokens <= s.cap, "GLM: sequence capacity exceeded");
   const int64_t t = std::min<int64_t>(s.cap, (tokens + kv_step_ - 1) / kv_step_ * kv_step_);
@@ -264,6 +320,27 @@ void GlmEngine::kv_reserve(GlmSeq& s, int64_t tokens) {
   if (need > 0) {
     size_t fr = 0, tot = 0;
     CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+    // Idle sessions first, then the expert cache. Before, only the cache tail was taken and an idle session kept its lent KV until its
+    //   sequence was reused: 48 GB, ctx 1M, distinct sessions 256K → 512K → 128K → 128K → 128K (2026-10-13) drained the cache 1428 → 0
+    //   slots; the 128K prompts took 43 s and 117 s instead of 32 s and the third failed with no VRAM for its KV.
+    //   No floor below which reclaim starts: the cache size sets short-chat speed all the way down (c1 at 96 / 72 / 48 / 32 GB, 2026-10-13:
+    //   4323 slots 71.8 tok/s · 3248 64.5 · 1428 53.3 · 323 34.9), and KV takes ~20 KB per position (a 256K prompt took 375 slots), so an
+    //   idle 512K conversation would hold ~750 slots for as long as it stays idle — a step down of most of one VRAM size. Evicting it costs
+    //   a host image now and a restore when it returns (96 GB: a 128K conversation evicted by a 256K prompt answered its
+    //   next turn after 1.97 s from the image, 131,071 of 131,110 tokens reused; the 256K prompt took 66.5 s, 69.7 s before the change).
+    //   kv_reclaim_ (hived) evicts the least recently used idle session that holds KV above the base to a host image and trims it — never
+    //   one that is active, prefilling or being admitted; no_regrow_ keeps the freed memory for this sequence.
+    if (fr < need + kv_headroom_ && kv_reclaim_ && reclaim) {
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      no_regrow_ = true;
+      int n = 0;
+      while (fr < need + kv_headroom_ && kv_reclaim_()) { ++n; CUDA_CHECK(cudaMemGetInfo(&fr, &tot)); }
+      no_regrow_ = false;
+      // what an evicted sequence freed beyond this step stays free for the next steps (a prompt grows per prefill call): handing it back to
+      //   the cache here would make each later step evict one more idle conversation
+      if (n) fprintf(stderr, "[glm] KV growth to %lld positions: %d idle session(s) reclaimed (free %.0f MiB, need %.0f + headroom %.0f MiB)\n",
+                     (long long)t, n, fr / 1048576.0, need / 1048576.0, kv_headroom_ / 1048576.0);
+    }
     if (fr < need + kv_headroom_) {  // keep the configured headroom: take the difference from the expert cache tail
       CUDA_CHECK(cudaStreamSynchronize(stream_));  // kernels of the last step may still read tail slots
       ex_.shrink_cache(need + kv_headroom_ - fr);
@@ -273,6 +350,7 @@ void GlmEngine::kv_reserve(GlmSeq& s, int64_t tokens) {
   bool ok = true;
   auto grow = [&](GrowBuf& b, size_t bytes) { ok = ok && b.ensure(bytes); };
   for (size_t i = 0; i < s.c.size(); ++i) {
+    if (!s.c[i].n) continue;  // CPU-placed DSA layer
     grow(s.c[i], T * c_.kv_lora * 2); grow(s.kI[i], T * c_.index_dim * 2); grow(s.gs[i], T * c_.index_dim * 2);
     grow(s.pooled[i], (T / c_.index_kpool + 1) * c_.index_dim * 2);
   }
@@ -285,7 +363,8 @@ void GlmEngine::kv_reserve(GlmSeq& s, int64_t tokens) {
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
     throw std::runtime_error("GLM: no VRAM for the KV cache of " + std::to_string((long long)tokens) + " positions (free " + std::to_string((long long)(fr >> 20)) +
-                             " MiB, expert cache " + std::to_string(ex_.n_slots()) + " slots)");
+                             " MiB, expert cache " + std::to_string(ex_.n_slots()) + " slots, idle sessions " +
+                             (kv_reclaim_ ? (reclaim ? "reclaimed" : "not reclaimable here") : "not reclaimable") + ")");
   }
   s.kv_tokens = t;
 }
@@ -318,12 +397,13 @@ void GlmEngine::kv_trim(GlmSeq& s, int64_t tokens) {
     freed += s.mtp_c.trim(T * c_.kv_lora * 2) + s.mtp_kI.trim(T * c_.index_dim * 2) + s.mtp_gs.trim(T * c_.index_dim * 2) +
              s.mtp_pooled.trim((T / c_.index_kpool + 1) * c_.index_dim * 2);
   s.kv_tokens = tokens;
-  if (freed) ex_.regrow_cache(kv_headroom_);
+  if (freed && !no_regrow_) ex_.regrow_cache(kv_headroom_);
 }
 
 void GlmEngine::reset_seq(GlmSeq& s) {
-  for (auto& b : s.conv) CUDA_CHECK(cudaMemsetAsync(b.p, 0, b.n, stream_));
-  for (auto& b : s.state) CUDA_CHECK(cudaMemsetAsync(b.p, 0, b.n, stream_));
+  for (auto& b : s.conv) if (b.p) CUDA_CHECK(cudaMemsetAsync(b.p, 0, b.n, stream_));
+  for (auto& b : s.state) if (b.p) CUDA_CHECK(cudaMemsetAsync(b.p, 0, b.n, stream_));
+  if (s.cpu) cpu_->reset_seq(*s.cpu);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   kv_trim(s, std::min<int64_t>(kv_base_, s.cap));  // a long conversation's KV goes back to the expert cache
   s.pos = 0; s.tokens.clear(); s.broken = false;
@@ -369,6 +449,7 @@ void GlmEngine::alloc_snapshots(int parts) {
   if (want > old) {
     snap_state_.resize(want); snap_conv_.resize(want);
     for (size_t i = old; i < want; ++i) {
+      if (kda_layer_of((int)(i % n_kda_)) >= n_gpu_) continue;  // CPU-placed KDA layer: its snapshots are the CPU engine's
       snap_state_[i].alloc((size_t)c_.kda_heads * c_.kda_dim * c_.kda_dim * 4);
       snap_conv_[i].alloc((size_t)3 * 3 * c_.kda_heads * c_.kda_dim * 4);
     }
@@ -536,7 +617,7 @@ void GlmEngine::predict_eval(int l, int rows, const bf16* xn) {
   }
   // 2) predict the next two MoE layers from this layer's FFN input
   int found = 0;
-  for (int t = l + 1; t < c_.n_layers && found < 2; ++t) {
+  for (int t = l + 1; t < n_gpu_ && found < 2; ++t) {  // GPU layers only (a CPU-placed layer has no router in VRAM)
     if (!c_.is_moe[t]) continue;
     ++found;
     const MoeW& w = m_.layer(t).moe_w;
@@ -742,7 +823,8 @@ void GlmEngine::sample_report(int rows, const GlmForwardStats& s0, const GlmCach
   auto el = [](cudaEvent_t a, cudaEvent_t b) { float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, a, b)); return (double)std::max(0.f, ms); };
   double sync = 0, gpu = 0, tail = 0, next = 0;
   int layers = 0, cpu_layers = 0, cpu_bound = 0;
-  const int nL = (int)dh_.size();
+  const int nL = std::min((int)dh_.size(), n_gpu_);  // hybrid: the CPU-placed layers record no events
+  if (nL == 0) return;
   for (int l = 0; l < nL; ++l) {
     const DhLayer& L = dh_[l];
     if (L.moe) {
@@ -820,7 +902,10 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   // HIVE_GLM_LAUNCH_PROBE (see glm_engine.h): probe mode for this step — 0 normal launch, 1 held stream, -1 off
   const int probe = !prefill && probe_every_ > 0 && st_.steps % probe_every_ == 0 ? 0 : -1;
   double probe_host = 0;
-  for (int l = 0; l < c_.n_layers; ++l) {
+  const bool stream = cpu_ && prefill && m_.streaming() && T >= stream_rows_;
+  const int n_run = stream ? c_.n_layers : n_gpu_;
+  for (int l = 0; l < n_run; ++l) {
+    if (stream && l >= n_gpu_) stream_begin(l, *seqs[0], T);
     const LayerW& L = m_.layer(l);
     if (sample_) { CUDA_CHECK(cudaEventRecord(dh_[l].start, stream_)); dh_[l].moe = false; dh_[l].x.cpu = false; }
     cudaEvent_t pf_a0 = nullptr;
@@ -850,13 +935,15 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
     }
     mlp_layer(l, rows, prefill);
     if (!L.moe) prof_mark(&st_.ms_dense);
-    if (fast) { if (l + 1 == c_.n_layers) glm_hc_post_decode(attn_.as<bf16>(), post_.as<float>(), comb_.as<float>(), rows, H, hb(), stream_); }
+    if (fast) { if (l + 1 == n_gpu_) glm_hc_post_decode(attn_.as<bf16>(), post_.as<float>(), comb_.as<float>(), rows, H, hb(), stream_); }
     else hc_post_apply(rows);
     prof_mark(&st_.ms_hc);
     if (sample_) CUDA_CHECK(cudaEventRecord(dh_[l].end, stream_));
+    if (stream && l >= n_gpu_) stream_end(l, *seqs[0], T);
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, hb(), rows); }
-    if (prefill && layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);
+    if (prefill && layer_boundary && l + 1 < n_run) layer_boundary(l);
   }
+  if (cpu_ && !stream) cpu_tail(seqs, M, T, prefill);
   if (sample_) CUDA_CHECK(cudaEventRecord(dh_head_, stream_));
   // head: mean over streams → norm → lm_head (only the rows whose logits are needed)
   const int r0 = all_logits ? 0 : rows - 1, nr = all_logits ? rows : 1;
@@ -891,6 +978,103 @@ void GlmEngine::forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, b
   if (prefill) { seqs[0]->pos += T; seqs[0]->tokens.insert(seqs[0]->tokens.end(), ids, ids + T); }
   else for (int m = 0; m < M; ++m) { seqs[m]->pos += 1; seqs[m]->tokens.push_back(ids[m]); }
   st_.ms_total += now_ms() - t0;
+}
+
+// Hybrid: the CPU-placed layers on this forward's rows. The hc streams (bf16 [rows, hc, H]) go to the host once, the CPU engine runs layers
+//   n_gpu_..n_layers−1 (KDA / DSA state in each sequence's CpuSeq, routed experts on the expert store's CPU pool) and the streams come back for
+//   the head. Rows: prefill = T consecutive positions of seqs[0]; decode = one per sequence; verify = the parts' rows (KDA snapshots per part,
+//   restored in rollback_batch).
+void GlmEngine::cpu_tail(GlmSeq* const* seqs, int M, int T, bool prefill) {
+  const double t0 = now_ms();
+  const int rows = prefill ? T : M;
+  const size_t HC = (size_t)c_.hc * c_.hidden, n = (size_t)rows * HC;
+  if ((size_t)rows > tail_rows_) {
+    if (tail_pin_) CUDA_CHECK(cudaFreeHost(tail_pin_));
+    CUDA_CHECK(cudaMallocHost(&tail_pin_, n * 2));
+    tail_rows_ = rows;
+  }
+  CUDA_CHECK(cudaMemcpyAsync(tail_pin_, hb(), n * 2, cudaMemcpyDeviceToHost, stream_));
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  tail_h_.resize(n);
+  for (size_t i = 0; i < n; ++i) tail_h_[i] = bf2f(tail_pin_[i]);
+  std::vector<cpu::CpuSeq*> cs(rows);
+  std::vector<int64_t> pos(rows);
+  std::vector<int> parts;
+  if (prefill) {
+    for (int i = 0; i < rows; ++i) { cs[i] = seqs[0]->cpu.get(); pos[i] = seqs[0]->pos + i; }
+  } else {
+    for (int m = 0; m < M; ++m) { cs[m] = seqs[m]->cpu.get(); pos[m] = seqs[m]->pos + (verify_ ? vrow_off_[m] : 0); }
+    if (verify_) for (const VPart& vp : vparts_) parts.push_back(vp.M);
+  }
+  cpu_->run_layers(cs.data(), pos.data(), rows, tail_h_.data(), prefill, parts.empty() ? nullptr : parts.data(), (int)parts.size());
+  for (size_t i = 0; i < n; ++i) tail_pin_[i] = f2bf(tail_h_[i]);   // values are bf16 already: exact
+  CUDA_CHECK(cudaMemcpyAsync(hb(), tail_pin_, n * 2, cudaMemcpyHostToDevice, stream_));
+  CUDA_CHECK(cudaStreamSynchronize(stream_));  // tail_pin_ is reused by the next call
+  st_.ms_cpu_layers += now_ms() - t0;
+}
+
+void GlmEngine::stream_begin(int l, GlmSeq& s, int T) {
+  const double t0 = now_ms();
+  m_.stream_in(l, stream_);
+  cpu::CpuSeq& cs = *s.cpu;
+  if (c_.is_kda[l]) {
+    const int ki = kda_index_[l];
+    CUDA_CHECK(cudaMemcpyAsync(s_conv_.p, cs.conv[ki].data(), s_conv_.n, cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(s_state_.p, cs.state[ki].data(), s_state_.n, cudaMemcpyHostToDevice, stream_));
+    std::swap(s.conv[ki], s_conv_); std::swap(s.state[ki], s_state_);
+  } else {
+    const int di = dsa_index_[l];
+    const int64_t P0 = s.pos, P = s.pos + T;
+    if (s_cap_ < s.cap) {  // address space for the longest sequence (memory is mapped on use)
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      s_c_.reserve((size_t)s.cap * c_.kv_lora * 2); s_kI_.reserve((size_t)s.cap * c_.index_dim * 2); s_gs_.reserve((size_t)s.cap * c_.index_dim * 2);
+      s_pool_.reserve((size_t)(s.cap / c_.index_kpool + 1) * c_.index_dim * 2);
+      s_cap_ = s.cap;
+    }
+    const size_t need = s_c_.grow_cost((size_t)P * c_.kv_lora * 2) + s_kI_.grow_cost((size_t)P * c_.index_dim * 2) * 2 +
+                        s_pool_.grow_cost((size_t)(P / c_.index_kpool + 1) * c_.index_dim * 2);
+    if (need) make_room(need);
+    HIVE_CHECK(s_c_.ensure((size_t)P * c_.kv_lora * 2) && s_kI_.ensure((size_t)P * c_.index_dim * 2) && s_gs_.ensure((size_t)P * c_.index_dim * 2) &&
+                   s_pool_.ensure((size_t)(P / c_.index_kpool + 1) * c_.index_dim * 2), "GLM stream: no VRAM for the streamed layer's DSA rows");
+    const cpu::CpuSeq::Dsa& d = cs.dsa[di];
+    auto up = [&](GrowBuf& g, const std::vector<uint16_t>& v, size_t n) {
+      n = std::min(n, v.size());
+      if (n) CUDA_CHECK(cudaMemcpyAsync(g.p, v.data(), n * 2, cudaMemcpyHostToDevice, stream_));
+    };
+    up(s_c_, d.c, (size_t)P0 * c_.kv_lora); up(s_kI_, d.kI, (size_t)P0 * c_.index_dim); up(s_gs_, d.gs, (size_t)P0 * c_.index_dim);
+    up(s_pool_, d.pooled, (size_t)(P0 / c_.index_kpool) * c_.index_dim);
+    s.dsa[di] = DsaSeqCache{s_c_.as<bf16>(), s_kI_.as<bf16>(), s_gs_.as<bf16>(), s_pool_.as<bf16>(), (int)s.cap};
+  }
+  st_.ms_stream += now_ms() - t0;
+}
+
+void GlmEngine::stream_end(int l, GlmSeq& s, int T) {
+  const double t0 = now_ms();
+  cpu::CpuSeq& cs = *s.cpu;
+  if (c_.is_kda[l]) {
+    const int ki = kda_index_[l];
+    std::swap(s.conv[ki], s_conv_); std::swap(s.state[ki], s_state_);
+    CUDA_CHECK(cudaMemcpyAsync(cs.conv[ki].data(), s_conv_.p, s_conv_.n, cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(cs.state[ki].data(), s_state_.p, s_state_.n, cudaMemcpyDeviceToHost, stream_));
+  } else {
+    const int di = dsa_index_[l];
+    const int64_t P0 = s.pos, P = s.pos + T, pool = c_.index_kpool;
+    cpu::CpuSeq::Dsa& d = cs.dsa[di];
+    if ((int64_t)d.c.size() < P * c_.kv_lora) {  // the CPU engine's row layout (its own growth follows from these sizes)
+      d.c.resize((size_t)P * c_.kv_lora); d.kI.resize((size_t)P * c_.index_dim); d.gs.resize((size_t)P * c_.index_dim);
+      d.pooled.resize((size_t)(P / pool + 1) * c_.index_dim);
+    }
+    auto down = [&](std::vector<uint16_t>& v, const GrowBuf& g, size_t a, size_t b) {
+      if (b > a) CUDA_CHECK(cudaMemcpyAsync(v.data() + a, g.as<uint16_t>() + a, (b - a) * 2, cudaMemcpyDeviceToHost, stream_));
+    };
+    down(d.c, s_c_, (size_t)P0 * c_.kv_lora, (size_t)P * c_.kv_lora);
+    down(d.kI, s_kI_, (size_t)P0 * c_.index_dim, (size_t)P * c_.index_dim);
+    down(d.gs, s_gs_, (size_t)P0 * c_.index_dim, (size_t)P * c_.index_dim);
+    down(d.pooled, s_pool_, (size_t)(P0 / pool) * c_.index_dim, (size_t)(P / pool) * c_.index_dim);
+    s.dsa[di] = DsaSeqCache{nullptr, nullptr, nullptr, nullptr, (int)s.cap};
+  }
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  st_.ms_stream += now_ms() - t0;
 }
 
 void GlmEngine::alloc_yield_rows(int rows) {
@@ -953,8 +1137,11 @@ void GlmEngine::prefill_body(GlmSeq& s, const int32_t* ids, int T, float* logits
   GlmSeq* sp[1] = {&s};
   HIVE_CHECK(s.pos + T <= s.cap, "GLM: sequence capacity exceeded");
   kv_reserve(s, std::min<int64_t>(s.cap, s.pos + T + kKvSlack));  // before any expert-cache slot is lent to the layer-major buffers
-  if (tiles_ > 1 && T > max_chunk_) {  // layer-major over up to tiles × max_chunk rows per call
-    const int span = tiles_ * max_chunk_;
+  const int span = tiles_ > 1 && T > max_chunk_ ? layer_major_span() : 0;
+  if (tiles_ > 1 && T > max_chunk_ && span < tiles_ * max_chunk_)
+    fprintf(stderr, "[glm] layer-major span %d of %d rows (expert cache %d slots, the lent buffers must stay below that)%s\n", span,
+            tiles_ * max_chunk_, ex_.n_slots(), span ? "" : " — chunked prefill for this prompt");
+  if (span > max_chunk_) {  // layer-major over up to `span` rows per call
     for (int off = 0; off < T; off += span) {
       const int n = std::min(span, T - off);
       emb_base_ = off;
@@ -974,6 +1161,7 @@ void GlmEngine::prefill_body(GlmSeq& s, const int32_t* ids, int T, float* logits
 }
 
 void GlmEngine::decode(GlmSeq* const* seqs, const int32_t* ids, int M, float* logits) {
+  if (lend_.on) mtp_note_steps(M);
   for (int m = 0; m < M; ++m) HIVE_CHECK(seqs[m]->pos + 1 <= seqs[m]->cap, "GLM: sequence capacity exceeded");
   for (int m = 0; m < M; ++m) kv_reserve(*seqs[m], std::min<int64_t>(seqs[m]->cap, seqs[m]->pos + 1 + kKvSlack));
   forward(seqs, M, ids, 1, false, logits, true);

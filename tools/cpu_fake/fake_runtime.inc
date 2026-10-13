@@ -37,6 +37,7 @@ Model::Model(const std::string& dir, int max_layer, int64_t rope_len) : ckpt_(di
   if (fake_env("FAKE_KV_SOURCE", 0)) cfg_.kv_source_layers = {0};  // tail_mode_for needs a kv source layer (C1/tail-split observable in test_daemon_cpu)
   const int nl = max_layer >= 0 ? std::min(max_layer + 1, cfg_.n_layers) : cfg_.n_layers;
   for (int l = 0; l < nl; ++l) layers_.push_back(std::make_unique<LayerWeights>());
+  n_gpu_ = nl;  // layer-level placement (model.cpp plan_gpu_layers): no VRAM cap in the fake, every layer on the GPU
   head_.alloc(16);
   rope_len_ = rope_len;
   static std::vector<std::vector<uint8_t>> blobs;  // expert tensors for ExpertStore::load_layer_experts
@@ -58,6 +59,16 @@ Blas::~Blas() {}
 void EngramHash::load(const std::string&, const std::string&) { throw std::runtime_error("fake: no engram"); }
 
 struct Runtime::Work {};
+// layer-level placement (runtime.cpp Runtime::CpuLayers): the fake never places layers on the CPU (cpul_ stays null); the type only has to be
+//   complete for the production reset_seq text (`if (s.cpu) cpul_->eng->reset_seq(...)`) and the shared_ptr destructor
+struct Runtime::CpuLayers {
+  struct NoEngine { template <class S> void reset_seq(S&) {} };
+  std::unique_ptr<NoEngine> eng;
+};
+int Runtime::gpu_layers() const { return model_.n_gpu_layers(); }   // as runtime.cpp
+// the production image text serializes CPU-placed layers' state through these; the fake has none (Seq::cpu stays null)
+std::vector<std::vector<uint8_t>> ds::cpu::CpuSeq::save_bytes() const { std::abort(); }
+void ds::cpu::CpuSeq::load_bytes(const std::vector<std::vector<uint8_t>>&) { std::abort(); }
 
 // Pinned-allocation failure injection (snapshot pinned path; a CKPT_ASYNC pinned-allocation failure must not abort):
 // FAKE_HOST_ALLOC_FAIL=N makes every N-th cudaHostAlloc issued by the production text below fail

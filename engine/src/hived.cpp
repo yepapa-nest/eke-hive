@@ -35,6 +35,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <concepts>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -54,11 +55,27 @@
 #include "hive/mtp_gate.h"
 #include "hive/sampler.h"
 #include "hive/socket_writer.h"
+#include "hive/vram_limit.h"
 #include "nlohmann/json.hpp"
-// Model family: the DeepSeek build (default) and the GLM build (-DHIVE_FAMILY_GLM, target hived_glm) share this file; the family header
+// Model family: the DeepSeek build (default), the GLM build (-DHIVE_FAMILY_GLM, target hived_glm) and the Qwen3.8-Flash-Next build
+//   (-DHIVE_FAMILY_QWEN, target hived_qwen; -DHIVE_FAMILY_QWEN_CPU, target hived_qwen_cpu: CPU only, built against engine/cpu_shim), the CPU-only
+//   GLM / DeepSeek builds (-DHIVE_FAMILY_GLM_CPU / -DHIVE_FAMILY_DS_CPU) and the Qwen3.8-27B builds (-DHIVE_FAMILY_Q27 / -DHIVE_FAMILY_Q27_CPU) share
+//   this file; the family header
 //   provides Config, Model, ExpertStore, RuntimeOptions, ForwardStats, ImageInput, PrefillPart, Seq, SeqImage, Runtime and the load helpers.
-#ifdef HIVE_FAMILY_GLM
+#if defined(HIVE_FAMILY_GLM)
 #include "hive/glm/hived_family.h"
+#elif defined(HIVE_FAMILY_QWEN)
+#include "hive/qwen/hived_family.h"
+#elif defined(HIVE_FAMILY_QWEN_CPU)
+#include "hive/qwen/hived_family_cpu.h"
+#elif defined(HIVE_FAMILY_GLM_CPU)
+#include "hive/glm/hived_family_cpu.h"
+#elif defined(HIVE_FAMILY_DS_CPU)
+#include "hive/ds/hived_family_cpu.h"
+#elif defined(HIVE_FAMILY_Q27)
+#include "hive/q27/hived_family.h"
+#elif defined(HIVE_FAMILY_Q27_CPU)
+#include "hive/q27/hived_family_cpu.h"
 #else
 #include "hive/bulk_load.h"
 #include "hive/expert_store.h"
@@ -69,8 +86,35 @@
 using json = nlohmann::json;
 using namespace hive;
 using namespace hive::sampling;
-#ifdef HIVE_FAMILY_GLM
+#if defined(HIVE_FAMILY_GLM)
 using namespace hive::glm::fam;
+#elif defined(HIVE_FAMILY_QWEN)
+using namespace hive::qwen::fam;
+#elif defined(HIVE_FAMILY_QWEN_CPU)
+using namespace hive::qwen::cpufam;
+#elif defined(HIVE_FAMILY_GLM_CPU)
+using namespace hive::glm::cpufam;
+#elif defined(HIVE_FAMILY_DS_CPU)
+using namespace hive::ds::cpufam;
+#elif defined(HIVE_FAMILY_Q27)
+using namespace hive::q27::fam;
+#elif defined(HIVE_FAMILY_Q27_CPU)
+using namespace hive::q27::cpufam;
+#endif
+// HIVE_VRAM_LIMIT_MB (hive/vram_limit.h): only the GPU families take part; the CPU-only families have no device memory to limit.
+#if defined(HIVE_FAMILY_QWEN_CPU) || defined(HIVE_FAMILY_GLM_CPU) || defined(HIVE_FAMILY_DS_CPU) || defined(HIVE_FAMILY_Q27_CPU) || defined(HIVE_CPU_ONLY)
+#define HIVE_VRAM_LIMIT_ON 0
+#else
+#define HIVE_VRAM_LIMIT_ON 1
+#if defined(HIVE_FAMILY_GLM)
+constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::Glm;
+#elif defined(HIVE_FAMILY_QWEN)
+constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::Qwen;
+#elif defined(HIVE_FAMILY_Q27)
+constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::None;  // no cost table yet: ballast only, no startup plan
+#else
+constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::DeepSeek;
+#endif
 #endif
 #ifndef HIVE_BUILD_ID
 #define HIVE_BUILD_ID "unknown"
@@ -78,9 +122,36 @@ using namespace hive::glm::fam;
 
 namespace {
 
+// Optional Runtime members, probed per family. A requires-expression on a concrete object outside a template is a hard error when the
+//   member is missing (no SFINAE) — these concepts keep the probe dependent so families without the member simply skip the branch.
+template <class R, class S> concept RtHasTrimSeq = requires(R& r, S& q) { r.trim_seq(q); };
+template <class R> concept RtHasKvReclaim = requires(R& r, std::function<bool()> f) { r.set_kv_reclaim(f); };
+template <class R, class S> concept RtHasKvReclaimable = requires(const R& r, const S& q) { { r.kv_reclaimable(q) } -> std::convertible_to<bool>; };
+template <class R, class S, class F> concept RtHasDraftBatch =
+    requires(R& r, std::vector<S*>& v, std::vector<int32_t>& t, std::vector<std::vector<int32_t>>& d, std::vector<std::vector<float>>& c, F* f) {
+      r.mtp_draft_batch(v, t, d, c, f);
+    };
+template <class R> concept RtHasVerifyLogits = requires(R& r) { r.set_verify_logits(true); };
+template <class R> void rt_set_verify_logits(R& r, bool on) { if constexpr (RtHasVerifyLogits<R>) r.set_verify_logits(on); }
+// The calls themselves go through these templates as well: a discarded if-constexpr branch in a non-template function is still checked.
+template <class R, class S> void rt_trim_seq(R& r, S& q) { if constexpr (RtHasTrimSeq<R, S>) r.trim_seq(q); }
+template <class R> void rt_set_kv_reclaim(R& r, std::function<bool()> f) { if constexpr (RtHasKvReclaim<R>) r.set_kv_reclaim(std::move(f)); }
+// false = trimming this sequence frees no device KV (it holds only what every pooled sequence keeps): evicting its session would cost a
+//   restore later for nothing. Families without the member: every idle sequence is a candidate.
+template <class R, class S> bool rt_kv_reclaimable(const R& r, const S& q) { if constexpr (RtHasKvReclaimable<R, S>) return r.kv_reclaimable(q); else return true; }
+template <class R, class S, class F>
+void rt_draft_batch(R& r, std::vector<S*>& v, std::vector<int32_t>& t, std::vector<std::vector<int32_t>>& d, std::vector<std::vector<float>>& c, F* f) {
+  if constexpr (RtHasDraftBatch<R, S, F>) r.mtp_draft_batch(v, t, d, c, f);
+}
+
 double now_ms() { return hive::mono_ms(); }
 // Project convention (same as env_on in runtime.cpp): unset / "" / "0" = off
 bool env_on(const char* name) { const char* v = getenv(name); return v && *v && strcmp(v, "0") != 0; }
+// HIVE_VRAM_LIMIT_MB ballast held for the life of the process (0 = no limit). Subtracted from the "used" values hived publishes, so they read
+//   like the smaller card.
+size_t g_vram_ballast = 0;
+void* g_vram_ballast_ptr = nullptr;  // kept so HIVE_VRAM_BALLAST_RELEASE can free it before ready
+double vram_used_mib(size_t tot, size_t fr) { const size_t u = tot > fr ? tot - fr : 0; return (double)(u > g_vram_ballast ? u - g_vram_ballast : 0) / 1048576.0; }
 
 // Graceful shutdown (installed only when HIVE_GRACEFUL_STOP_S>0 — by default SIGTERM keeps its default action = immediate exit).
 //   The handler only writes one byte to a self-pipe (async-signal-safe). A second signal restores the default action and dies at once (forced exit while draining).
@@ -280,6 +351,11 @@ int main(int argc, char** argv) {
   // Faster first sleep (hive/devmem.h prepare_shadows): the VMM regions claimed here (dense weights, MTP stage, and below the Runtime
     //   constructor's Work, cuBLAS, sampler) are the "long-lived" regions that survive down to sleep level 3 — their pinned copies are claimed
     //   during startup. With VMM off, keep_* does nothing.
+  // HIVE_VRAM_LIMIT_MB state (GPU families; 0 = off): limit, CUDA context, free VRAM right after the context was created
+  const size_t vram_limit_bytes = HIVE_VRAM_LIMIT_ON ? vram_limit::limit_bytes() : 0;
+  size_t vram_ctx_bytes = 0, vram_free_ctx = 0;
+  bool vram_ctx_measured = false;
+  (void)vram_ctx_measured; (void)vram_ctx_bytes; (void)vram_free_ctx;
   devmem::keep_begin();
   {  // Fitness check before the long load: the kernels are built for sm_120a (Blackwell, compute capability 12.x) and the CPU expert pool for
      //   AVX2/FMA/F16C — on other hardware the first kernel would fail with a bare CUDA error and the first CPU expert with SIGILL.
@@ -294,6 +370,24 @@ int main(int argc, char** argv) {
       fprintf(stderr, "[hived] this build needs a CPU with AVX2, FMA and F16C — see docs/requirements.md\n");
       return 2;
     }
+#if HIVE_VRAM_LIMIT_ON
+    // HIVE_VRAM_LIMIT_MB (hive/vram_limit.h): measure the CUDA context now — NVML's free memory before the context exists, cudaMemGetInfo's
+    //   right after cudaFree(0) creates it. Unset = nothing here runs (no context is created early, startup unchanged).
+    if (vram_limit_bytes > 0) {
+      char pci[32];
+      snprintf(pci, sizeof pci, "%08x:%02x:%02x.0", (unsigned)prop.pciDomainID, (unsigned)prop.pciBusID, (unsigned)prop.pciDeviceID);
+      size_t f0 = 0, tot = 0;
+      const bool nvml = vram_limit::nvml_free(pci, &f0);
+      CUDA_CHECK(cudaFree(0));
+      CUDA_CHECK(cudaMemGetInfo(&vram_free_ctx, &tot));
+      // NVML free below the CUDA free (another process freed memory in between) or a context under 64 MiB (it already existed): not a
+      //   measurement — fall back to the estimate and say so
+      vram_ctx_measured = nvml && f0 > vram_free_ctx && f0 - vram_free_ctx >= (64ull << 20);
+      vram_ctx_bytes = vram_ctx_measured ? f0 - vram_free_ctx : vram_limit::kCtxFallback;
+      fprintf(stderr, "[hived] VRAM limit %.0f MiB on a %.0f MiB card: CUDA context %.0f MiB (%s)\n", vram_limit_bytes / 1048576.0, tot / 1048576.0,
+              vram_ctx_bytes / 1048576.0, vram_ctx_measured ? "measured: NVML free before − CUDA free after" : nvml ? "estimate — NVML reading not usable" : "estimate — NVML not available");
+    }
+#endif
   }
   Model model(ckpt, max_layer, max_ctx);
   size_t vram_model_used = 0;  // sleep VRAM table: weights (dense + MTP) + CUDA context = usage right after model load (measured)
@@ -305,6 +399,107 @@ int main(int argc, char** argv) {
   devmem::keep_end();
   dense_pf.join();
   const double t_model = now_ms();  // cold-load phase timestamps (the [hived] load phases line below)
+#if HIVE_VRAM_LIMIT_ON
+  // HIVE_VRAM_LIMIT_MB, after the weights (measured, not estimated): startup plan, then the ballast (hive/vram_limit.h, docs/vram-footprint.md §4.2)
+  if (vram_limit_bytes > 0) {
+    size_t fr = 0, tot = 0;
+    CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+    const size_t weights = vram_free_ctx > fr ? vram_free_ctx - fr : 0;  // dense weights, MTP, model-side buffers
+    const double MiB = 1048576.0;
+    const double after_weights = (double)vram_limit_bytes - (double)vram_ctx_bytes - (double)weights;  // what the limit leaves for the rest
+    const double per_layer = (double)weights / std::max(1, nl);
+    // the MTP weights are the one block that leaves the GPU without moving a layer
+#if defined(HIVE_FAMILY_GLM)
+    const bool mtp_on = !(getenv("HIVE_GLM_MTP_K") && strcmp(getenv("HIVE_GLM_MTP_K"), "0") == 0);
+    const char* mtp_knob = "HIVE_GLM_MTP_K=0";
+#elif defined(HIVE_FAMILY_QWEN)
+    const bool mtp_on = !(getenv("HIVE_QWEN_MTP_K") && strcmp(getenv("HIVE_QWEN_MTP_K"), "0") == 0);
+    const char* mtp_knob = "HIVE_QWEN_MTP_K=0";
+#else
+    const bool mtp_on = n_mtp > 0;
+    const char* mtp_knob = "--no-mtp";
+#endif
+    auto give_up = [&](double short_by, const char* what) {
+#if defined(HIVE_FAMILY_QWEN)
+      // FN places layers on the CPU itself (fam::Model, HIVE_QWEN_GPU_LAYERS / the limit): reaching this point means even its choice did not fit
+      const char* placement = " — set a lower HIVE_QWEN_GPU_LAYERS (or unset it to let the family choose; docs/qwen.md)";
+#elif defined(HIVE_FAMILY_GLM)
+      // GLM places layers on the CPU itself (GlmModel, HIVE_GLM_GPU_LAYERS / the limit)
+      const char* placement = " — set a lower HIVE_GLM_GPU_LAYERS (or unset it to let the family choose from the limit)";
+#elif !defined(HIVE_FAMILY_Q27)
+      // DeepSeek places layers on the CPU itself (Model::plan_gpu_layers: HIVE_DS_GPU_LAYERS / the limit)
+      const char* placement = " — set a lower HIVE_DS_GPU_LAYERS (or unset it to let the model choose from the limit; docs/vram-footprint.md §3.2)";
+#else
+      const char* placement = ". Layer placement on the CPU does not exist yet for this family — see docs/vram-footprint.md §3.2";
+#endif
+      fprintf(stderr, "[hived] VRAM limit %.0f MiB: %s — short by %.0f MiB (context %.0f + weights %.0f MiB, %d layers ≈ %.0f MiB each): about %d layer(s) "
+              "would have to leave the GPU%s%s\n",
+              vram_limit_bytes / MiB, what, short_by / MiB, vram_ctx_bytes / MiB, weights / MiB, nl, per_layer / MiB,
+              (int)std::ceil(short_by / std::max(1.0, per_layer)), mtp_on ? (std::string(" (first: ") + mtp_knob + " drops the MTP weights)").c_str() : "",
+              placement);
+      fflush(stderr);
+      _exit(2);
+    };
+    if (after_weights <= 0) give_up(-after_weights, "the weights alone do not fit");
+    if (kVramFamily != vram_limit::Family::None) {
+      vram_limit::Knobs k;
+      k.max_chunk = max_chunk; k.prefill_tile = prefill_tile; k.max_ctx = max_ctx; k.max_sessions = max_sessions;
+      k.max_batch = max_batch_arg > 0 ? max_batch_arg : 8;
+      // runtime batch caps: GLM 8 · Qwen FN 16 sequences (64 verify rows, 2026-10-10 batched decode) · DeepSeek uncapped here
+      if (kVramFamily == vram_limit::Family::Glm) k.max_batch = std::min(k.max_batch, 8);
+      else if (kVramFamily == vram_limit::Family::Qwen) k.max_batch = std::min(k.max_batch, 16);
+      k.mtp = mtp_on; k.mtp_batch = env_on("HIVE_MTP_BATCH");
+      if (const char* v = getenv("HIVE_STAGING")) k.staging = std::max(8, std::min(256, atoi(v)));
+      if (kVramFamily == vram_limit::Family::DeepSeek && env_on("HIVE_PREFILL_HOST_TILES")) {  // the runtime's host_tile_count rule (runtime.cpp)
+        int n = 2;
+        if (const char* mb = getenv("HIVE_PREFILL_HOST_MB"); mb && *mb) {
+          const double v = atof(mb), hb = (double)max_chunk * 4 * 5120 * 2;
+          n = std::isfinite(v) && v > 0 ? (int)std::min(1e6, v * MiB / hb) : 0;
+        }
+        k.host_tiles = (int)std::max<int64_t>(0, std::min<int64_t>(n, (max_ctx + max_chunk - 1) / std::max(1, max_chunk) - prefill_tile));
+      }
+      const char* kvb = getenv(kVramFamily == vram_limit::Family::Glm ? "HIVE_GLM_KV_BASE" : "HIVE_QWEN_KV_BASE");
+      if (kvb && *kvb && atoll(kvb) >= 0) k.kv_base = atoll(kvb);
+      const double room = after_weights - (double)cache_reserve_bytes();
+      const double before = vram_limit::fixed_bytes(kVramFamily, k);
+      bool fits = false;
+      const vram_limit::Knobs k0 = k;
+      const auto steps = vram_limit::plan(kVramFamily, k, room, &fits);
+      fprintf(stderr, "[hived] VRAM plan (%s, estimate): limit %.0f − context %.0f − weights %.0f − reserve %.0f = %.0f MiB for work buffers, sessions and "
+              "staging; they need %.0f MiB at the configured settings%s\n", vram_limit::family_name(kVramFamily), vram_limit_bytes / MiB, vram_ctx_bytes / MiB,
+              weights / MiB, cache_reserve_bytes() / MiB, room / MiB, before / MiB, steps.empty() && fits ? " — fits, nothing changed" : "");
+      for (const auto& s2 : steps) fprintf(stderr, "[hived] VRAM plan: %s (%.0f → %.0f MiB)\n", s2.what.c_str(), s2.before / MiB, s2.after / MiB);
+      if (!fits) give_up(vram_limit::fixed_bytes(kVramFamily, k) - room, "work buffers and sessions do not fit even at the lowest settings");
+      // apply: the store, runtime and session pool below read these
+      max_chunk = k.max_chunk; prefill_tile = k.prefill_tile; max_sessions = k.max_sessions;
+      if (k.max_batch != k0.max_batch) max_batch_arg = k.max_batch;
+      if (k.host_tiles != k0.host_tiles) setenv("HIVE_PREFILL_HOST_TILES", "0", 1);
+      if (k.staging != k0.staging) setenv("HIVE_STAGING", std::to_string(k.staging).c_str(), 1);
+      if (k.mtp_batch != k0.mtp_batch) setenv("HIVE_MTP_BATCH", "0", 1);
+      if (!steps.empty())
+        fprintf(stderr, "[hived] VRAM plan: now --max-chunk %d · --prefill-tile %d · --max-batch %d · --max-sessions %d · fixed part %.0f MiB, %.0f MiB left for the expert cache\n",
+                max_chunk, prefill_tile, k.max_batch, max_sessions, vram_limit::fixed_bytes(kVramFamily, k) / MiB, (room - vram_limit::fixed_bytes(kVramFamily, k)) / MiB);
+    } else {
+      fprintf(stderr, "[hived] VRAM plan: no cost table for this family — ballast only\n");
+    }
+    // ballast: the process keeps exactly (limit − context − weights) free from here on
+    const size_t target = (size_t)after_weights;
+    if (fr > target) {
+      size_t b = fr - target;
+      void* p = nullptr;
+      while (b >= (64ull << 20) && cudaMalloc(&p, b) != cudaSuccess) { (void)cudaGetLastError(); p = nullptr; b -= std::max<size_t>(64ull << 20, b / 64); }
+      if (p) { g_vram_ballast = b; g_vram_ballast_ptr = p; }
+      size_t fr2 = 0;
+      cudaMemGetInfo(&fr2, &tot);
+      fprintf(stderr, "[hived] VRAM limit %.0f MiB: ballast %.0f MiB%s — VRAM free %.0f MiB (the process now sees a %.0f MiB card)\n", vram_limit_bytes / MiB,
+              g_vram_ballast / MiB, g_vram_ballast + (64ull << 20) < fr - target ? " (⚠️less than wanted: allocation refused)" : "", fr2 / MiB,
+              (double)(vram_ctx_bytes + weights + fr2) / MiB);
+    } else {
+      fprintf(stderr, "[hived] VRAM limit %.0f MiB: no ballast — free VRAM %.0f MiB is already below what the limit leaves (%.0f MiB)\n", vram_limit_bytes / MiB,
+              fr / MiB, after_weights / MiB);
+    }
+  }
+#endif
   // HIVE_CACHE_FIT (optional; unset/""/"0" = off: size the slots from --vram-cache-mb here). When on, the slot region is sized **after** the
     //   session pool, as "free VRAM at that point - HIVE_CACHE_RESERVE_MB (unset, empty, non-numeric or negative = 2400 MiB)". Headroom a
     //   hand-tuned --vram-cache-mb used to leave beyond the operating rule (>= 2,300 MiB: lazily loaded vision encoder ~1.7 GB + image
@@ -691,6 +886,19 @@ int main(int argc, char** argv) {
             (t_model - t_load) / 1000.0, (t_store - t_model) / 1000.0, (t_weights - t_store) / 1000.0, (t_runtime - t_weights) / 1000.0,
             (t_ready - t_runtime) / 1000.0, load_par, load_prefault);
   }
+#if HIVE_VRAM_LIMIT_ON
+  // HIVE_VRAM_BALLAST_RELEASE=1 (opt-in, for two daemons on one card; unset = unchanged behaviour): every startup sizing
+  //   decision above (layer placement, VRAM plan, session pool, cache fit) ran with the HIVE_VRAM_LIMIT_MB ballast held, exactly as in a
+  //   solo start; the ballast is freed here, just before ready, so a second daemon can start beside this one. Runtime growth (KV, MTP lend,
+  //   image buffers) then reads the device-wide free memory instead of the emulated card.
+  if (g_vram_ballast_ptr && env_on("HIVE_VRAM_BALLAST_RELEASE")) {
+    const size_t b = g_vram_ballast;
+    CUDA_CHECK(cudaFree(g_vram_ballast_ptr));
+    g_vram_ballast_ptr = nullptr; g_vram_ballast = 0;
+    size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+    fprintf(stderr, "[hived] VRAM limit: ballast %.0f MiB released before ready (HIVE_VRAM_BALLAST_RELEASE) — device VRAM free %.0f MiB\n", b / 1048576.0, fr / 1048576.0);
+  }
+#endif
   // ready only after the session pool is reserved — launchers treat this line as startup complete (a pool OOM must not happen after ready)
   fprintf(stderr, "[hived] ready in %.1fs · layers %d · ctx %lld · chunk %d · dspark %s(block %d · conf ≥ %.2f · max %d)\n", (now_ms() - t_load) / 1000.0, nl,
           (long long)max_ctx, max_chunk, rt.mtp_enabled() ? "on" : "off", mtp_B, mtp_conf, mtp_max);
@@ -751,7 +959,8 @@ int main(int argc, char** argv) {
     if (power.load() != kPowerReady || last_stats - vram_ms >= 1000.0) {  // even on forced publishes (request end, every chunk) query the device at most once per second (every time during transitions)
       size_t fr = 0, tot = 0;
       cudaMemGetInfo(&fr, &tot);
-      vram_json = {{"free_mib", fr / 1048576.0}, {"used_mib", (double)(tot - fr) / 1048576.0}, {"total_mib", tot / 1048576.0}};
+      vram_json = {{"free_mib", fr / 1048576.0}, {"used_mib", vram_used_mib(tot, fr)}, {"total_mib", (double)(tot - g_vram_ballast) / 1048576.0}};
+      if (g_vram_ballast) vram_json["limit_ballast_mib"] = g_vram_ballast / 1048576.0;  // HIVE_VRAM_LIMIT_MB: used / total exclude it
       host_mem_json = proc_memory_mib();
       host_mem_json["experts_pinned_mib"] = store.experts_host_bytes() / 1048576.0;
       host_mem_json["engram_mib"] = store.engram_host_bytes() / 1048576.0;
@@ -793,11 +1002,11 @@ int main(int argc, char** argv) {
     pm["engram_mib"] = store.engram_host_bytes() / 1048576.0;
     pm["dense_host_copy_mib"] = devmem::shadow_bytes() / 1048576.0;
     sleep_info = {{"level", sleep_level}, {"started_asleep", true}, {"ms", r.ms}, {"resident_keys", sleep_keys.size()}, {"slots_released", 0},
-                  {"sessions_offloaded", 0}, {"freed_mib", fr1 > fr0 ? (fr1 - fr0) / 1048576.0 : 0.0}, {"vram_used_mib", (double)(tot - fr1) / 1048576.0},
+                  {"sessions_offloaded", 0}, {"freed_mib", fr1 > fr0 ? (fr1 - fr0) / 1048576.0 : 0.0}, {"vram_used_mib", vram_used_mib(tot, fr1)},
                   {"vram_scope", "device-wide cudaMemGetInfo — exact for hived only while no other process holds VRAM (per-process: nvidia-smi --query-compute-apps)"},
                   {"vmm", vmm_info}, {"host_memory", pm}};
     fprintf(stderr, "[hived] started asleep (level %d): dense/work %.0f MiB to RAM in %.0f ms · VRAM used %.0f MiB · host RSS %.0f MiB (experts pinned %.0f · engram %.0f · "
-            "dense copy %.0f MiB) · first wake allocates the cache and warms %zu experts%s\n", sleep_level, r.bytes / 1048576.0, r.ms, (double)(tot - fr1) / 1048576.0,
+            "dense copy %.0f MiB) · first wake allocates the cache and warms %zu experts%s\n", sleep_level, r.bytes / 1048576.0, r.ms, vram_used_mib(tot, fr1),
             pm.value("VmRSS_mib", 0.0), pm.value("experts_pinned_mib", 0.0), pm.value("engram_mib", 0.0), pm.value("dense_host_copy_mib", 0.0), sleep_keys.size(),
             r.ok ? "" : (" · ⚠️release failed: " + r.error).c_str());
   }
@@ -1168,6 +1377,35 @@ int main(int argc, char** argv) {
     return rows ? rows - std::min(rows, reuse_lower_bound(sid, q)) : 0;
   };
   std::set<std::string> prefilling_sids;  // sessions in a batched prefill (not active yet) — excluded from LRU eviction
+  std::set<std::string> admitting_sids;   // sessions whose prefill runs now (excluded from the KV reclaim below)
+  // KV growth under VRAM pressure (the Qwen family): before the expert cache lends slots to sequence KV, evict the least recently used IDLE
+  //   session to a host image and trim its sequence — one per call; false when no idle session holds a sequence. Lending to idle sessions'
+  //   KV evicted experts for good (a 600 W FN run, 2026-10-10: 24576 → 13415 resident slots, device routing off from then on).
+  if constexpr (RtHasKvReclaim<std::remove_reference_t<decltype(rt)>>) {
+    rt_set_kv_reclaim(rt, [&]() -> bool {
+      std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+      if (!lk.owns_lock()) return false;
+      auto victim = sessions.end();
+      for (auto jt = sessions.begin(); jt != sessions.end(); ++jt)
+        if (jt->second.seq && !active_sids.count(jt->first) && !prefilling_sids.count(jt->first) && !admitting_sids.count(jt->first) &&
+            rt_kv_reclaimable(rt, *jt->second.seq) && (victim == sessions.end() || jt->second.last_used < victim->second.last_used)) victim = jt;
+      if (victim == sessions.end()) return false;
+      Session& V = victim->second;
+      if (!V.tokens.empty() && !V.seq->broken && V.seq->pos == (int64_t)V.tokens.size()) {
+        V.live = std::make_shared<SeqImage>();
+        rt.save_image(*V.seq, *V.live, V.ckpt.get());
+        V.live_sig = V.img_sig;
+      }
+      rt_trim_seq(rt, *V.seq);
+      seq_pool.push_back(std::move(V.seq));
+      const std::string id = victim->first;
+      archived[id] = std::move(V);
+      sessions.erase(victim);
+      archive_trim("");
+      fprintf(stderr, "[hived] KV reclaim: idle session %.16s moved to a host image (sequence trimmed)\n", id.c_str());
+      return true;
+    });
+  }
   // HIVE_LAYER_YIELD: prompt id count of sessions being prefilled (the "sid:rows" layer-yield header line — lets a monitor tell >= 16K prefill
     // gaps apart). Only when enabled; entries no longer prefilling are swept on insert.
   std::map<std::string, size_t> ly_rows;
@@ -1206,6 +1444,12 @@ int main(int argc, char** argv) {
     std::vector<ImageInput> chunk_images;
     int hit0 = 0, str0 = 0, cpu0 = 0, dma0 = 0; double wait0 = 0, span0 = 0;
     long ly_n = 0; double ly_last = 0;  // HIVE_LAYER_YIELD: layer yields inside this forward · last resume -> forward end (ms) — tail of the chunk log line (monitor gaps)
+    // the session's entry in admitting_sids (excluded from the KV reclaim) for the job's whole life: set in admit_setup, erased when the job ends
+    struct SidHold {
+      std::set<std::string>* s = nullptr; std::string sid;
+      SidHold() = default; SidHold(const SidHold&) = delete; SidHold& operator=(const SidHold&) = delete;
+      ~SidHold() { if (s) s->erase(sid); }
+    } admit_hold;
   };
   auto plan_chunk_j = [&](PJob& J, size_t at, size_t cap) -> size_t {
     auto& ids = J.ids; auto& all_images = J.all_images;
@@ -1412,6 +1656,8 @@ int main(int argc, char** argv) {
                 rt.save_image(*V.seq, *V.live, V.ckpt.get());
                 V.live_sig = V.img_sig;
               }
+              // the contents now live in the image: trim the sequence (its KV back to the base) — a pooled sequence kept the KV it grew
+              if constexpr (RtHasTrimSeq<std::remove_reference_t<decltype(rt)>, Seq>) rt_trim_seq(rt, *V.seq);
               seq_pool.push_back(std::move(V.seq));
             }
             archived[victim->first] = std::move(V);
@@ -1429,6 +1675,15 @@ int main(int argc, char** argv) {
       S = &it->second;
     }
     A->S = S;
+    // excluded from the KV reclaim from here on: before its sequence is taken from the pool and its image (checkpoint / archived state) is
+    //   loaded. The load allocates KV, under VRAM pressure that allocation runs the reclaim, and the reclaim took the least recently used idle
+    //   session holding a sequence: this one (last_used still from its previous request). Measured 2026-10-13, hived_q27 at a 32 GB cap (KV tier),
+    //   the same 34.8K-token prompt sent twice: "KV reclaim: idle session … moved to a host image" for the session being
+    //   restored, then "q27 image position mismatch" (trimmed to pos 0 under the load) or CUDA "invalid argument" in staged_h2d (KV freed under it).
+    //   Held by the job (PJob::admit_hold) until it ends: also through the prefill chunks of the single path, which before ran unprotected when
+    //   no prefill / layer yield put the session in prefilling_sids.
+    admitting_sids.insert(A->sid);
+    J.admit_hold.s = &admitting_sids; J.admit_hold.sid = A->sid;
     auto& request_sig = J.request_sig;
     if (q.contains("images") && q["images"].is_array()) {
       size_t off=0;
@@ -2250,7 +2505,11 @@ int main(int argc, char** argv) {
         for (int i = 0; i <= k; ++i) rt.row_inv_temp()[i] = A.temperature > 0.f ? 1.f / A.temperature : 1.f;
         const long cap_v = rt.graph_captures();  // HIVE_MTP_GATE3
         sh_f0 = now_ms();
+        // greedy request: the device candidates carry the argmax — the runtime skips the rows × vocab logit copy (Qwen: ~0.5 ms per step with
+        //   the per-row copies below); the full rows are only a fallback of the sampled path
+        rt_set_verify_logits(rt, A.temperature > 0.f);
         rt.forward_verify(seq, ids.data(), (int)ids.size(), rows, &ds);
+        rt_set_verify_logits(rt, true);
         sh_f1 = now_ms(); sh_kind = 0;
         ema(ema_verify_ms[std::min(8, k + 1)], now_ms() - tv);
         const int V = c.vocab;
@@ -2259,8 +2518,9 @@ int main(int argc, char** argv) {
         bool cont = true;
         Cands rc;
         auto sample_row = [&](int i) {
-          std::vector<float> row(rows.begin() + (size_t)i * V, rows.begin() + (size_t)(i + 1) * V);
           snapshot_cands(rt, i, rc);
+          if (rows.empty() && rc.valid && A.temperature <= 0.f) return rc.argmax;   // greedy without the full rows (see above)
+          std::vector<float> row(rows.begin() + (size_t)i * V, rows.begin() + (size_t)(i + 1) * V);
           return sample_cands(rc, row, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
         };
         for (int i = 0; i < k; ++i) {
@@ -2342,6 +2602,26 @@ int main(int argc, char** argv) {
       const double td = now_ms();
       int n_drafts_made = 0;
       const bool any_sampled = b_any_sampled;
+      if constexpr (RtHasDraftBatch<std::remove_reference_t<decltype(rt)>, Seq, ForwardStats>) {
+        // one MTP chain of S rows (the Qwen family): the per-sequence chains were S × the draft cost at c4 / c8
+        std::vector<Seq*> qv;
+        std::vector<int32_t> tv2;
+        std::vector<int> at;
+        for (int s = 0; s < S; ++s) {
+          Seq& q = *stepping[s]->S->seq;
+          if (!q.mtp_hidden_valid) continue;  // no hidden state -> one row without drafts
+          qv.push_back(&q); tv2.push_back(step_ids[s]); at.push_back(s);
+        }
+        if (!qv.empty()) {
+          std::vector<std::vector<int32_t>> dv;
+          std::vector<std::vector<float>> cv;
+          ForwardStats dst{};
+          rt_draft_batch(rt, qv, tv2, dv, cv, &dst);
+          for (size_t j = 0; j < at.size(); ++j) { bdr[at[j]] = std::move(dv[j]); bcf[at[j]] = std::move(cv[j]); }
+          draft_routed += dst.n_routed; draft_hit += dst.n_hit; draft_cpu += dst.n_cpu; draft_dma_rows += dst.n_dma_rows;
+          n_drafts_made += (int)qv.size();
+        }
+      } else {
       for (int s = 0; s < S; ++s) {
         Seq& q = *stepping[s]->S->seq;
         if (!q.mtp_hidden_valid) continue;  // no hidden state -> one row without drafts
@@ -2349,6 +2629,7 @@ int main(int argc, char** argv) {
         rt.mtp_draft(q, step_ids[s], bdr[s], bcf[s], &dst);
         draft_routed += dst.n_routed; draft_hit += dst.n_hit; draft_cpu += dst.n_cpu; draft_dma_rows += dst.n_dma_rows;
         ++n_drafts_made;
+      }
       }
       const double tv = now_ms();
       sh_draft += tv - td;
@@ -2385,7 +2666,13 @@ int main(int argc, char** argv) {
         ForwardStats ds{};
         const long cap_v = rt.graph_captures(), eag_v = rt.graph_eager_runs();  // filter captures and first uses
         sh_f0 = now_ms();
+        {
+          bool any_sampled_v = false;
+          for (Active* X : stepping) any_sampled_v |= X->temperature > 0.f;
+          rt_set_verify_logits(rt, any_sampled_v);
+        }
         rt.forward_verify_batch(parts, brows, &ds);
+        rt_set_verify_logits(rt, true);
         sh_f1 = now_ms(); sh_kind = 1;
         const int V = c.vocab;
         std::vector<int32_t> bnxt(S, -1);
@@ -2395,8 +2682,9 @@ int main(int argc, char** argv) {
           Active& A = *stepping[s];
           Cands rc;
           auto sample_at = [&](int r) {
-            std::vector<float> rowv(brows.begin() + (size_t)r * V, brows.begin() + (size_t)(r + 1) * V);
             snapshot_cands(rt, r, rc);
+            if (brows.empty() && rc.valid && A.temperature <= 0.f) return rc.argmax;
+            std::vector<float> rowv(brows.begin() + (size_t)r * V, brows.begin() + (size_t)(r + 1) * V);
             return sample_cands(rc, rowv, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
           };
           for (int i = 0; i < ch.k[s]; ++i) {  // same acceptance rule as the single path
@@ -2454,7 +2742,13 @@ int main(int argc, char** argv) {
       const double tb = now_ms();
       const long cap_b = rt.graph_captures(), eag_b = rt.graph_eager_runs();  // HIVE_MTP_GATE3 · HIVE_MTP_BATCH (first uses as well)
       sh_f0 = tb;
-      rt.forward_batch(step_seqs, step_ids.data(), step_next, &step_logits, &ds);
+      bool any_sampled_d = false;
+      for (Active* X : stepping) any_sampled_d |= X->temperature > 0.f;
+      // greedy batch: no rows × vocab copy (16 rows = 16 MB per step) — the device candidates carry the argmax. Only where the runtime has
+      //   candidates (n_cands > 0): otherwise sample_cands falls back to the full rows, which must then exist.
+      const bool skip_logits = !any_sampled_d && !fake_head && rt.n_cands() > 0;
+      if (skip_logits) step_logits.clear();
+      rt.forward_batch(step_seqs, step_ids.data(), step_next, skip_logits ? nullptr : &step_logits, &ds);
       sh_f1 = now_ms(); sh_kind = 2;
       const bool cap_clean = rt.graph_captures() == cap_b;
       const bool eag_clean = rt.graph_eager_runs() == eag_b;
@@ -2673,7 +2967,7 @@ int main(int argc, char** argv) {
   auto sleep_report = [&](double t0, size_t fr0, size_t freed, bool deepen) {
     size_t fr1 = 0, tot = 0;
     cudaMemGetInfo(&fr1, &tot);
-    const double MiB = 1048576.0, used = (double)(tot - fr1);
+    const double MiB = 1048576.0, used = vram_used_mib(tot, fr1) * MiB;
     const double pool = sleep_level >= 2 ? 0.0 : (double)session_pool_bytes;
     const double model = sleep_level >= 3 ? 0.0 : (double)vram_model_used;  // level 3: dense weights go to host copies too (what remains is the CUDA context and residue)
     const double other = std::max(0.0, used - model - pool);
@@ -2823,10 +3117,10 @@ int main(int argc, char** argv) {
     cudaMemGetInfo(&fr, &tot);
     wake_info = {{"phase", "done"}, {"level", level_was}, {"ms", t2 - t0}, {"alloc_ms", t1 - t0}, {"warm_ms", t2 - t1}, {"slots", n},
                  {"slots_before_sleep", store.sleep_phys_slots()}, {"warmed", warmed}, {"resident_keys", sleep_keys.size()},
-                 {"vram_used_mib", (double)(tot - fr) / 1048576.0}};
+                 {"vram_used_mib", vram_used_mib(tot, fr)}};
     if (vmm_restored) wake_info["vmm"] = {{"restored_mib", vmm_mib}, {"ms", vmm_ms}};
     fprintf(stderr, "[hived] wake: %.0f ms (alloc %.0f · warm %.0f) · slots %d (before sleep %d) · warmed %d/%zu experts · VRAM used %.0f MiB · level %d%s\n", t2 - t0,
-            t1 - t0, t2 - t1, n, store.sleep_phys_slots(), warmed, sleep_keys.size(), (double)(tot - fr) / 1048576.0, level_was,
+            t1 - t0, t2 - t1, n, store.sleep_phys_slots(), warmed, sleep_keys.size(), vram_used_mib(tot, fr), level_was,
             vmm_restored ? (" · dense/work " + std::to_string((long long)vmm_mib) + " MiB back in " + std::to_string((long long)vmm_ms) + " ms").c_str() : "");
     publish_stats(true);
     return true;
@@ -2852,6 +3146,7 @@ int main(int argc, char** argv) {
         V.tokens.clear(); V.history.clear(); V.ckpt.reset(); V.live.reset();
         std::vector<float>().swap(V.ckpt_logits);
         V.img_sig.clear(); V.ckpt_sig.clear(); V.live_sig.clear();
+        if constexpr (RtHasTrimSeq<std::remove_reference_t<decltype(rt)>, Seq>) { if (V.seq) rt_trim_seq(rt, *V.seq); }   // KV back to the base (cache untouched)
         ++n_sess;
       }
       archived.clear();

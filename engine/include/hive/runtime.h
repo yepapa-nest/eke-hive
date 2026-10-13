@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "hive/cublas_ops.h"
+#include "hive/ds/ds_cpu.h"   // CPU-placed layers (layer-level placement under a VRAM cap — Runtime::CpuLayers)
 #include "hive/engram_hash.h"
 #include "hive/expert_store.h"
 #include "hive/model.h"
@@ -49,6 +50,10 @@ struct Seq {
   bool mtp_hidden_valid = false;
   int64_t mtp_pos = -1;           // position of mtp_hidden (= last position written to the ring)
   mutable std::shared_ptr<SnapshotFence> snapshot_fence; // destroyed before source device buffers
+  // Layers placed on the CPU (Model::n_gpu_layers() < n_layers): their window rings, compressed caches and the host mirror of the GPU kv source
+  //   they read (rows [0, cpu_mirror_g) present) — null when every layer is on the GPU
+  std::unique_ptr<ds::cpu::CpuSeq> cpu;
+  int64_t cpu_mirror_g = 0;
   ~Seq() { if(snapshot_fence) snapshot_fence->wait(); } // fence may also be owned by an image
 };
 
@@ -65,6 +70,8 @@ struct SeqImage {
   HostImageBuffer mtp_hidden;
   bool mtp_hidden_valid = false;
   int64_t mtp_pos = -1;
+  std::vector<HostImageBuffer> cpu;     // CPU-placed layers' state (ds::cpu::CpuSeq::save_bytes, one buffer each); empty without CPU layers
+  int64_t cpu_mirror_g = 0;
   std::shared_ptr<SnapshotFence> fence; // waits before buffers are freed
   ~SeqImage() { if(fence) fence->wait(); } // shared_ptr destruction alone does not wait if Seq still owns it
   size_t allocated_bytes(std::set<const void*>& seen) const {
@@ -73,6 +80,7 @@ struct SeqImage {
     b += (ring.capacity()+mtp_ring.capacity())*sizeof(HostImageBuffer);
     for (auto& v : ring) b += v.allocated_bytes(seen);
     for (auto& v : mtp_ring) b += v.allocated_bytes(seen);
+    for (auto& v : cpu) b += v.allocated_bytes(seen) + sizeof(v);
     for (auto* m : {&comp, &idx, &st_kv, &st_score}) for (auto& [l, v] : *m) b += v.allocated_bytes(seen) + sizeof(v) + 64;
     return b;
   }
@@ -234,7 +242,7 @@ class Runtime {
   //   forward (rows <= R — R is run's first argument: only the first R rows of the outer prefill's Work are lent, so larger forwards, forward_multi and images must not be called),
   //   forward_batch, mtp_draft, forward_verify(_batch), rollback(_batch), save_image/load_image/reset_seq (on sequences other than the outer prefill's) are allowed;
   //   warm_cache is not (long synchronous upload — hived skips it inside a yield). Inside a yield, promotion is paused (same flag as set_prefill_pending) and elastic slots are not lent.
-  void set_layer_yield(ly::Hooks h) { ly_.h = std::move(h); }
+  void set_layer_yield(ly::Hooks h) { if (!cpul_) ly_.h = std::move(h); }  // off with CPU-placed layers (the CPU block runs at the end of a forward, not between layers)
   bool layer_yield_on() const { return ly_.on(); }
   bool in_layer_yield() const { return ly_.depth > 0; }
   const ly::Stats& layer_yield_stats() const { return ly_.st; }
@@ -346,6 +354,16 @@ class Runtime {
   std::vector<char> stage_used_;
   uint32_t stage_next_ = 0;  // engram hashes of this forward (built by layer 1, reused by layer 14)
 
+  // ---- layer-level placement (Model::n_gpu_layers() < n_layers): layers [n_gpu, n_layers) run on the CPU engine (hive/ds/ds_cpu.h run_block) ----
+  //   The GPU runs layers [0, n_gpu) as for a partial model; at the end of a forward the hidden stream, the shared index selection / candidate
+  //   blocks and the new rows of the GPU kv source the CPU layers read cross to the host once, the CPU block runs, and the hidden stream returns
+  //   for the head. Off (nullptr) when every layer is on the GPU = the code paths below are unchanged.
+  struct CpuLayers;
+  std::shared_ptr<CpuLayers> cpul_;
+  int gpu_layers() const;
+  // rows [0, M) of Work = this forward's rows (seq of row m = row_seq[m]); pos_end[m] = end position of row m's sequence in this forward (for
+  //   the source mirror); win_min = first position the rows may see in the window (decoder tail). Returns the rows left in Work rows [0, M').
+  int cpu_block(Seq* const* row_seq, int M, const int64_t* pos_end, bool prefill, int64_t win_min);
   void layer_forward(Seq& seq, int l, int M, int64_t start_pos, ForwardStats* stats, bool skip_compress = false);
   void attention(Seq& seq, const LayerWeights& L, int l, int M, int64_t start_pos, bool skip_compress);
   void compress_source(Seq& seq, const LayerWeights& L, int l, int M, int64_t start_pos);

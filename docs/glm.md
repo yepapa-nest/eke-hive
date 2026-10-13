@@ -242,14 +242,42 @@ for prompts of 64K tokens and more. `HIVE_CKPT_VERIFY=N` compares every N-th sha
 plus the NextN layer, a 512-wide compressed KV and the indexer keys) are growable buffers (`engine/include/hive/grow_buf.h`, CUDA VMM): the
 first `HIVE_GLM_KV_BASE` positions (default: one 16K prefill block) are mapped when the sequence is created, and more is mapped in
 steps of `HIVE_GLM_KV_STEP` positions (4,096) as a conversation grows. The memory comes from the free VRAM above
-`HIVE_CACHE_RESERVE_MB`; when that is not enough, the expert cache gives up tail slots (its slot area is mapped in 56 MiB steps
-for this), and when the sequence is reused for a new conversation its KV is trimmed back and the slots are taken back.
+`HIVE_CACHE_RESERVE_MB`; when that is not enough, idle conversations that hold KV are moved out first (below), then the expert cache
+gives up tail slots (its slot area is mapped in 56 MiB steps for this). When a sequence is trimmed — reused for a new conversation,
+evicted, or cleared by `/flush_cache` — its KV goes back to `HIVE_GLM_KV_BASE` positions and the cache takes the slots back.
 
 Measured against the old fixed allocation of 65,536 positions: session pool 4 × 1,370 → 4 × 458 MiB, expert cache
 4,420 → 4,693 slots, the same chat speed (above), and prompts up to 250K tokens. A long conversation takes the expert-cache slots its KV needs for
-as long as it keeps it; after the 250K needle runs, with several long conversations still held, the cache stood at ~3,600 slots until their sequences
-were reused.
-A failed growth gives back what it mapped before the error is returned.
+as long as it keeps it, while it runs and while it stays idle.
+
+**Idle conversations give their KV back before the cache does.** When KV growth finds too little free VRAM, hived's reclaim hook moves
+the least recently used idle session that holds KV above the base to a host image (the same image an LRU eviction saves) and trims its
+sequence, one session at a time until the growth fits; only then are cache slots lent. The session being admitted, prefilling or
+decoding is never chosen, and one holding only the base KV is skipped (evicting it frees nothing). When the evicted conversation
+returns, it continues from its image instead of prefilling again. Before this, an idle conversation kept its KV (and so the slots it
+had taken) until its pooled sequence was reused, and `/flush_cache` did not trim GLM sequences: at 48 GB with `HIVE_MAX_CTX=1048576`,
+distinct conversations of 256K, 512K and 128K tokens drained the cache from 1,428 to 0 slots, two 128K prompts then took 43 s and
+117 s instead of 32 s, and the third failed with `no VRAM for the KV cache`. There is no floor above zero at which the cache stops lending first: the
+cache size sets chat speed all the way down (c1 71.8 / 64.5 / 53.3 / 34.9 tok/s at 4,323 / 3,248 / 1,428 / 323 slots), KV takes about
+20 KB per position (a 256K prompt took 375 slots), and an evicted conversation costs one restore when it returns (2 s for 128K, below).
+
+| 1M context, distinct conversations in order (2026-10-13) | 48 GB before | 48 GB now | 96 GB before | 96 GB now |
+|---|---|---|---|---|
+| 128K (first token, s) | 32.0 | 34.0 | 31.4 | 33.7 |
+| 256K | 69.9 | 69.2 | 69.7 | 66.3 |
+| 512K | 152.9 | 152.7 | 144.8 | 146.5 |
+| 128K needles at 10 / 50 / 90 % | 43.2 / 117.5 / **failed** | 31.1 / 32.9 / 32.9 | 30.9 / 31.1 / 32.6 | 31.0 / 32.6 / 30.7 |
+| expert cache after the needles (slots) | 0 | 696 of 1,428 | 2,766 of 4,323 | 3,591 of 4,323 |
+| 1M (after a 128K needle and the 512K, s) | 386.8 (fresh daemon) | 386.2 | 335.0 (fresh daemon) | 330.2 |
+
+"Before" are the same prompts with `/flush_cache` between them, which did not trim GLM sequences; "now" sends them without a flush, so
+every earlier conversation is still held when the next one arrives. The first 128K row of "now" ran on a cold daemon (before: after a
+chat warm-up). Every needle answer was correct. A 128K conversation evicted by the following 256K prompt continued its next turn from
+the host image: first token after 1.97 s with 131,071 of 131,110 prompt tokens reused, correct answer (96 GB); the eviction itself did
+not slow the 256K prompt (66.5 s).
+
+A growth that still does not fit with every idle session moved out and the cache at 0 slots fails as before, and gives back what it
+mapped before the error is returned.
 
 ## Sleep and wake
 
@@ -293,6 +321,29 @@ Numerics note: which experts are resident changes with timing (asynchronous prom
 by the CPU (fp32) instead of the GPU (tensor cores), so runs are not bit-identical; near-ties can resolve differently after many tokens.
 The reference comparison (next-token top-1 and hidden states) passes on every path (BF16, FP8, short/streamed/layer-major prefill).
 
+## Smaller VRAM budgets
+
+At 72 / 48 / 32 GB (`HIVE_MODEL=glm HIVE_VRAM_GB=…`, `config/profiles/glm-<size>.env`) the expert cache is what is left, so the profiles
+spend as little VRAM as possible on anything else (each file records its measurement):
+
+- **Layer-major prefill sized to the cache tail.** The whole-prompt buffers of a layer-major call are lent from the expert-cache tail
+  (`HIVE_GLM_PREFILL_ELASTIC`). The span of one call is `HIVE_GLM_PREFILL_TILES` × `max_chunk` rows, lowered in whole blocks to what the
+  lendable tail holds (`GlmEngine::layer_major_span`; below two blocks the prompt runs chunked, logged as `[glm] layer-major span`).
+  `HIVE_GLM_PREFILL_ROWBLOCK=N` runs an expert's prefill rows through the GEMMs in blocks of at most N rows, so the per-expert scratch
+  (28,680 B per row, not lent) is bounded by N rows instead of the most rows one expert got in the call — +1.1 GB measured at a 64K
+  prompt before. With both, the 64K prompt runs in one pass: TTFT at 96 / 72 / 48 GB 19.9 / 20.7 / 21.9 → 15.7 / 15.9 / 16.2 s.
+- **Smaller up-front buffers** (72 / 48): `--max-chunk 8192` with layer-major blocks (work buffers 3.25 instead of 6.5 GiB, the same rows
+  per prefill call) and `HIVE_GLM_KV_BASE=4096`; the reserve drops 3000 → 1500 MiB with the row block. 48 GB: 730 → 1,428 slots.
+- **MTP for one stream, its experts lent while several decode** (72 / 48 / 32): `HIVE_MTP_BATCH=0` — batched verify of up to 32 rows ran
+  through a small cache with many more CPU misses. Then the NextN layer's 288 FP8 experts (6.75 GiB) sit idle while several streams
+  decode: `HIVE_GLM_MTP_LEND=1` frees them after `HIVE_GLM_MTP_LEND_AFTER` (16) consecutive multi-stream steps and the expert cache grows
+  into the space (~510 slots); after `HIVE_GLM_MTP_RECLAIM_AFTER` (8) consecutive single-stream draft calls the cache gives the tail back
+  and the experts are copied back from a pinned host copy (~0.32 s). No switch within `HIVE_GLM_MTP_LEND_GAP_MS` (2000) of the previous
+  one. While lent the step decodes without drafts — the same output. Needs `HIVE_MTP_BATCH=0` and CUDA VMM (logged and off otherwise).
+  c4 / c8 at 32 / 48 / 72 GB: 29.3 / 32.6 → 39.2 / 44.0 · 48.4 / 55.1 → 54.8 / 64.2 · 70.3 / 87.5 → 74.0 / 96.6 tok/s; c1 unchanged.
+- **CPU expert chunks** (48): `HIVE_GLM_CPU_CHUNKS=4` lets the row chunks of the 1–2 CPU experts per layer halve down to 4 chunks per
+  worker (floor 8 rows) so all workers get work: c4 / c8 +2 %, c1 within noise.
+
 ## Switches of this family
 
 | Variable | Default | Meaning |
@@ -304,7 +355,12 @@ The reference comparison (next-token top-1 and hidden states) passes on every pa
 | `HIVE_GLM_SPIN_US` | 3000 | CPU workers spin this long for the next batch before sleeping |
 | `HIVE_GLM_DECODE_FUSED` | on | fused decode kernels (`glm_decode.h`); `0` = the cuBLAS/unfused path |
 | `HIVE_GLM_SHORT_PREFILL` | 64 | prompt chunks up to this many rows (capped at 64) use the decode expert path (VRAM hits + CPU misses) instead of streaming experts |
-| `HIVE_GLM_PREFILL_TILES` | 4 | blocks of `max_chunk` rows one prefill call runs layer-major (1 = block by block) |
+| `HIVE_GLM_PREFILL_TILES` | 4 | blocks of `max_chunk` rows one prefill call runs layer-major (1 = block by block); lowered per call to what the expert-cache tail can lend ([Smaller VRAM budgets](#smaller-vram-budgets)) |
+| `HIVE_GLM_PREFILL_ROWBLOCK` | 0 = off | an expert's prefill rows go through the GEMMs in blocks of at most N rows (bounds the per-expert scratch); profiles 96: 16384, 72 / 48 / 32: 8192 |
+| `HIVE_GLM_MTP_LEND` | off (profiles 72 / 48 / 32: 1) | lend the NextN layer's experts to the expert cache while several streams decode; needs `HIVE_MTP_BATCH=0` and CUDA VMM |
+| `HIVE_GLM_MTP_LEND_AFTER` / `HIVE_GLM_MTP_RECLAIM_AFTER` | 16 / 8 | consecutive multi-stream decode steps before lending / single-stream draft calls before taking the experts back |
+| `HIVE_GLM_MTP_LEND_GAP_MS` | 2000 | minimum time between two lend / reclaim switches |
+| `HIVE_GLM_CPU_CHUNKS` | 1 (profile 48: 4) | CPU expert row chunks halve down to N per worker of a node, floor 8 rows (1 = one chunk per worker, floor 32 rows) |
 | `HIVE_GLM_PREFILL_ELASTIC` | on | layer-major buffers borrowed from the expert-cache tail while a long prompt runs; `0` = reserved at start |
 | `HIVE_GLM_PREFILL_CPU` | on | prefill experts computed by the CPU next to the GPU's streamed ones (fewest rows first, while the CPU share finishes before the copies) |
 | `HIVE_GLM_PREFILL_ADAPT` | on | the CPU/streaming split uses the measured cost of a streamed record and of an 8-row CPU pass (moving averages over the previous prefill layers, shown on `[glm-prefill]` as `est copy … pass …`) instead of fixed 0.507 / 0.17 ms; an expert goes to the CPU while its CPU cost is below one copy. Only the split changes; the CPU (fp32) and GPU (bf16) results of an expert can differ by rounding, as they already did when the cache state moved the split. `0` = the fixed estimates and the 24-row limit. Motivation: a record measured 0.65–0.85 ms, the CPU finished its share early and the GPU streamed 1,257 records per 65–256-row prefill (1,072 of 1,135 ms) |

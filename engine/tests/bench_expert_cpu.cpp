@@ -87,6 +87,12 @@ int compare_multi(const uint8_t* W, const uint8_t* sw, int N, int K, const std::
   for (int r = 0; r < R; ++r) p2[r] = y2[r].data();
   cpu::gemv_e2m1_rows_multi_v3(W, sw, N, K, ap.data(), sp.data(), R, n0, n1, p2.data());
   for (int r = 0; r < R; ++r) for (int n = 0; n < N; ++n) if (std::memcmp(&y0[r][n], &y2[r][n], 4) != 0) ++bad;
+  // HIVE_CPU_E2M1_REG: _v4 (template R, register accumulators, whole rows) — same bits, untouched rows stay 7
+  std::vector<std::vector<float>> y3(R, std::vector<float>((size_t)N, 7.f));
+  std::vector<float*> p3(R);
+  for (int r = 0; r < R; ++r) p3[r] = y3[r].data();
+  cpu::gemv_e2m1_rows_multi_v4(W, sw, N, K, ap.data(), sp.data(), R, n0, n1, p3.data());
+  for (int r = 0; r < R; ++r) for (int n = 0; n < N; ++n) if (std::memcmp(&y0[r][n], &y3[r][n], 4) != 0) ++bad;
   return bad;
 }
 

@@ -482,6 +482,28 @@ int main() {
       EXPECT(od < nw, "pre-MB1 rule (drafts after every backoff) loses more than MB1 (%.4f vs %.4f)", od / base, nw / base);
     }
   }
+  // (R1) cold first sample of a larger verify slot (measured 2026-10-09, DS 96 GB bench_chat c1 after a cold start): T(3) was sampled at ~90 ms while T(1) was
+  //   ~110 ms with an empty expert cache; afterwards T(1) 17, T(2) 22 ms stayed fresh and T(3) stale — k = 1 for 6,412 of 6,414 decisions. The stale larger slot must be
+  //   re-measured once per kStale window, after which the fresh slope picks k ≥ 2.
+  {
+    hive::mtpg::Gate g;
+    g.observe_step(1, 110.0); g.observe_step(2, 44.0); g.observe_step(3, 90.0);   // cold start samples (trace values)
+    float conf[5] = {4.f, 4.f, 4.f, 4.f, 4.f};
+    for (int i = 0; i < 6; ++i) g.observe_accept(false, conf, 5, 5);
+    int k2 = 0, first2 = -1;
+    for (long d = 0; d < 3 * hive::mtpg::kStale; ++d) {
+      g.tick();
+      g.observe_step(1, 17.0);
+      const int k = g.choose_k(false, conf, 5, 5, -1.f, 1000);
+      if (k >= 2) { ++k2; if (first2 < 0) first2 = (int)d; }
+      g.observe_step(k + 1, k == 0 ? 17.0 : 22.0 + 3.0 * (k - 1));   // warm verify cost: 22 ms for 2 rows, +3 ms per row
+    }
+    fprintf(stderr, "[R1 stale cold slot] first k >= 2 at decision %d · %d of %ld decisions with k >= 2\n", first2, k2, 3 * hive::mtpg::kStale);
+    EXPECT(first2 > 100, "the trap is not reproduced: k >= 2 already at decision %d (the cold T(3) should block it until it is stale)", first2);
+    EXPECT(first2 >= 0 && first2 <= hive::mtpg::kStale + 2, "stale cold verify slot was never re-measured (first k >= 2 at %d)", first2);
+    EXPECT(k2 > hive::mtpg::kStale, "after the re-measurement k >= 2 should dominate (%d)", k2);
+    EXPECT(k2 < 3 * hive::mtpg::kStale - hive::mtpg::kStale + 2, "k >= 2 before the slot went stale (%d)", k2);
+  }
   if (fails) { fprintf(stderr, "test_mtp_gate_cpu: %d FAILED\n", fails); return 1; }
   fprintf(stderr, "test_mtp_gate_cpu: all passed\n");
   return 0;

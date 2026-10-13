@@ -109,7 +109,7 @@ inline cudaError_t cudaMalloc(void** p, size_t n) {
 template <class T> inline cudaError_t cudaMalloc(T** p, size_t n) { return cudaMalloc(reinterpret_cast<void**>(p), n); }
 inline cudaError_t cudaFree(void* p) { if (p) { free(p); ++fakecuda::counters().dev_free; } return cudaSuccess; }
 inline cudaError_t cudaMemGetInfo(size_t* fr, size_t* tot) { *fr = 64ull << 30; *tot = 96ull << 30; return cudaSuccess; }
-struct cudaDeviceProp { char name[256]; int major, minor; };  // hived start-up fitness check (reports a Blackwell-class device)
+struct cudaDeviceProp { char name[256]; int major, minor; int pciDomainID, pciBusID, pciDeviceID; };  // hived start-up fitness check (reports a Blackwell-class device); PCI ids for HIVE_VRAM_LIMIT_MB (0)
 inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp* p, int) { *p = cudaDeviceProp{}; const char* n = "fake"; for (int i = 0; n[i]; ++i) p->name[i] = n[i]; p->major = 12; p->minor = 0; return cudaSuccess; }
 inline cudaError_t cudaHostAlloc(void** p, size_t n, unsigned) { *p = malloc(n ? n : 1); if (!*p) return cudaErrorMemoryAllocation; ++fakecuda::counters().host_alloc; return cudaSuccess; }
 inline cudaError_t cudaMallocHost(void** p, size_t n) { return cudaHostAlloc(p, n, 0); }

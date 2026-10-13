@@ -39,9 +39,18 @@ void dev_scratch_free(void* p) { if (p && !devmem::free_if_owned(p)) cudaFree(p)
 }  // namespace
 
 
-GlmExperts::GlmExperts(GlmModel& m, size_t cache_bytes, int cpu_threads, int staging_slots) : m_(m), cpu_threads_(std::max(1, cpu_threads)) {
+ExpertSpec ExpertSpec::of(GlmModel& m) {
   const GlmConfig& c = m.cfg();
-  H_ = c.hidden; I_ = c.moe_inter; E_ = c.n_routed; K_ = c.n_act; n_moe_ = c.n_moe; limit_ = c.swiglu_limit;
+  ExpertSpec s;
+  s.hidden = c.hidden; s.inter = c.moe_inter; s.n_routed = c.n_routed; s.n_act = c.n_act; s.limit = c.swiglu_limit;
+  for (int l = 0; l < c.n_layers; ++l) if (c.is_moe[l]) s.moe_layers.push_back(l);
+  s.ckpt = &m.ckpt();
+  return s;
+}
+
+GlmExperts::GlmExperts(const ExpertSpec& spec, size_t cache_bytes, int cpu_threads, int staging_slots) : spec_(spec), cpu_threads_(std::max(1, cpu_threads)) {
+  H_ = spec_.hidden; I_ = spec_.inter; E_ = spec_.n_routed; K_ = spec_.n_act; n_moe_ = (int)spec_.moe_layers.size(); limit_ = spec_.limit;
+  HIVE_CHECK(spec_.ckpt && H_ % 32 == 0 && I_ % 32 == 0 && E_ > 0 && K_ > 0 && n_moe_ > 0, "experts: incomplete ExpertSpec");
   L_ = ExpertRecLayout::make(H_, I_);
   host_bytes_ = (size_t)n_keys() * L_.total;
   // interleaved pinned host memory (both NUMA nodes feed the CPU pool and the PCIe copies)
@@ -204,19 +213,17 @@ void GlmExperts::build_halves(int threads) {
 }
 
 void GlmExperts::load_all(int threads) {
-  const GlmConfig& c = m_.cfg();
-  Checkpoint& ck = m_.ckpt();
+  Checkpoint& ck = *spec_.ckpt;
   const double t0 = now_ms();
   struct Src { const uint8_t* p[9]; size_t n[9]; };
   std::vector<Src> src(n_keys());
   const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
-  for (int l = 0; l < c.n_layers; ++l) {
-    if (!c.is_moe[l]) continue;
-    const int li = c.moe_index[l];
+  for (int li = 0; li < n_moe_; ++li) {
+    const int l = spec_.moe_layers[li];
     for (int e = 0; e < E_; ++e) {
       Src& s = src[(size_t)li * E_ + e];
       for (int j = 0; j < 3; ++j) {
-        const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + "." + proj[j] + ".";
+        const std::string b = spec_.prefix + std::to_string(l) + ".mlp.experts." + std::to_string(e) + "." + proj[j] + ".";
         const TensorInfo& tw = ck.get(b + "weight");
         const TensorInfo& ts = ck.get(b + "weight_scale");
         const TensorInfo& tg = ck.get(b + "weight_scale_2");
@@ -260,7 +267,7 @@ int GlmExperts::alloc_cache(size_t bytes) {
   devmem::Backend* be = getenv("HIVE_GLM_SLOTS_VMM") && strcmp(getenv("HIVE_GLM_SLOTS_VMM"), "0") == 0 ? nullptr : grow_backend();
   if (be && n > 0) {
     slot_step_ = devmem::round_up(4 * L_.total, be->gran);  // 56 MiB (4 records rounded up to the 2 MiB granularity): the unit the cache shrinks and grows by
-    slot_buf_.reserve((size_t)n * L_.total);
+    slot_buf_.reserve((size_t)(n + va_extra_) * L_.total);   // va_extra_: address space only (grow_extra)
     slots_ = slot_buf_.as<uint8_t>(); slots_vmm_ = true; max_slots_ = n;
     for (size_t b = slot_step_; ; b += slot_step_) {
       const size_t want = std::min(b, slot_buf_.n);
@@ -272,8 +279,10 @@ int GlmExperts::alloc_cache(size_t bytes) {
     max_slots_ = n;
   }
   n_slots_ = n;
-  key_of_slot_.assign(max_slots_, -1);
-  pending_.assign(max_slots_, 0);
+  base_max_ = max_slots_;
+  va_slots_ = slots_vmm_ ? max_slots_ + va_extra_ : max_slots_;
+  key_of_slot_.assign(va_slots_, -1);
+  pending_.assign(va_slots_, 0);
   fprintf(stderr, "[glm] expert cache: %d slots (%.1f GiB, %.1f %% of %d experts)%s\n", n, (double)n * L_.total / 1073741824.0, 100.0 * n / n_keys(), n_keys(),
           slots_vmm_ ? (" · mapped in " + std::to_string(slot_step_ >> 20) + " MiB steps (long contexts can borrow the tail)").c_str() : "");
   return n;
@@ -320,6 +329,23 @@ int GlmExperts::regrow_cache(size_t reserve) {
   return n_slots_ - before;
 }
 
+int GlmExperts::grow_extra(size_t reserve) {
+  if (!slots_vmm_ || lent_ || asleep_ || va_slots_ <= max_slots_) return 0;
+  const int before = n_slots_;
+  max_slots_ = va_slots_;
+  regrow_cache(reserve);
+  max_slots_ = std::max(base_max_, n_slots_);   // KV growth / return (kv_reserve) works within this ceiling until release_extra
+  return n_slots_ - before;
+}
+
+size_t GlmExperts::release_extra(size_t bytes) {
+  if (!slots_vmm_ || lent_ || asleep_) return 0;
+  const size_t freed = shrink_cache(bytes);
+  if (n_slots_ <= base_max_) max_slots_ = base_max_;
+  else max_slots_ = n_slots_;  // could not give back enough (caller checks the free VRAM)
+  return freed;
+}
+
 size_t GlmExperts::sleep_release() {
   if (asleep_) return 0;
   HIVE_CHECK(lent_ == 0, "GLM sleep: cache slots are lent to a prefill");
@@ -355,6 +381,7 @@ int GlmExperts::wake_alloc(int slots, size_t reserve) {
 }
 
 void GlmExperts::cpu_experts(int li, const std::vector<std::pair<int, std::vector<std::pair<int, float>>>>& jobs, const float* x_host, float* y_host) {
+  for (const auto& j : jobs) HIVE_CHECK(j.second.size() <= 64, "cpu_experts: more than 64 rows in one job");  // the per-job pointer arrays below hold 64
   // phase 1: gate/up rows (per node: that node's half of the rows) · phase 2: down rows (same split)
   // HIVE_GLM_CPU_BALANCE=1 (off by default — measured within noise): each node's rows of all jobs are laid end to end and cut into one equal
   //   range per worker of that node, instead of fixed 128-row chunks. A/B (hived, 32 threads, c1 chat ×12, interleaved twice): CPU
@@ -398,7 +425,11 @@ void GlmExperts::cpu_experts(int li, const std::vector<std::pair<int, std::vecto
       static const bool adapt = !(getenv("HIVE_GLM_CPU_ADAPT") && strcmp(getenv("HIVE_GLM_CPU_ADAPT"), "0") == 0);
       int CH = split_ ? 128 : 256;
       const int per_node = split_ ? std::max(P0, P1) : cpu_threads_;
-      if (adapt) while (CH > 32 && (long)nj * ((rows + CH - 1) / CH) < per_node) CH /= 2;
+      // HIVE_GLM_CPU_CHUNKS=N (default 1 = unchanged): halve down to N chunks per worker of a node, floor 8 rows (instead of 1, floor 32) so a
+      //   slow worker can be balanced. Pool bench (bench_nvfp4_pool_cpu shape, v2 kernels, interleaved): GLM 4096/2048 J=1-4 experts
+      //   per layer: busy 55-78 % → 76-87 %, 62-92 → 85-103 GB/s; J=8 unchanged. FN 2560/640: J ≥ 4 +4-14 %, J ≤ 2 −6..−19 % (tiny phases).
+      static const int cpw = [] { const char* v = getenv("HIVE_GLM_CPU_CHUNKS"); const int x = v ? atoi(v) : 1; return x >= 1 && x <= 16 ? x : 1; }();
+      if (adapt) while (CH > (cpw > 1 ? 8 : 32) && (long)nj * ((rows + CH - 1) / CH) < (long)cpw * per_node) CH /= 2;
       const int chunks = (rows + CH - 1) / CH, n = (int)nj * chunks;
       run_tasks(n, split_ ? n : 0, [&](int node, int t) { const int j = t / chunks, c = t % chunks; body(node, j, c * CH, std::min(rows, (c + 1) * CH)); });
       return;
@@ -469,6 +500,26 @@ void GlmExperts::cpu_experts(int li, const std::vector<std::pair<int, std::vecto
     }
   }
   (void)li;
+}
+
+void GlmExperts::cpu_rows(int li, int M, const int32_t* ids, const float* w, const float* x, float* y) {
+  deferred_wait();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::pair<int, std::vector<std::pair<int, float>>>> jobs;
+  std::vector<int> job_of(E_, -1);
+  uint64_t n = 0;
+  for (int m = 0; m < M; ++m)
+    for (int k = 0; k < K_; ++k) {
+      const int e = ids[(size_t)m * K_ + k];
+      if (e < 0 || e >= E_) continue;   // not a CPU pair (QwenEngine's hybrid route passes -1 for the experts its GPU computes)
+      ++n;
+      int& j = job_of[e];
+      if (j < 0 || jobs[j].second.size() == 64) { j = (int)jobs.size(); jobs.push_back({li * E_ + e, {}}); }  // cpu_experts takes ≤ 64 rows per job
+      jobs[j].second.push_back({m, w[(size_t)m * K_ + k]});
+    }
+  if (!jobs.empty()) cpu_experts(li, jobs, x, y);
+  stats_.cpu += n; stats_.routed += n;
+  stats_.ms_cpu += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void GlmExperts::deferred_wait() {
@@ -586,6 +637,14 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
   for (int t = 0; t < T; ++t)
     for (int k = 0; k < K_; ++k) { const int e = ids[t * K_ + k]; per[e].push_back({t, w[t * K_ + k]}); score_[li * E_ + e] += 1.f; }
   int maxR = 0; for (auto& v : per) maxR = std::max<int>(maxR, v.size());
+  // HIVE_GLM_PREFILL_ROWBLOCK=N (0/unset = off): an expert's rows go through the GEMMs in blocks of at most N rows, so the per-expert scratch
+  //   below (28,680 B per row, not elastic) is bounded by N rows instead of the most rows any expert got in the call — up to the whole
+  //   layer-major span (65,536 rows ≈ 1.9 GB) when the routing concentrates. Measured: +1070 / +1090 MiB of
+  //   untracked VRAM at the 64K prompt on a 48 GB cap, which is why the cache reserve had to stay at 3000 MiB. Rows are independent in
+  //   these GEMMs; only cuBLAS's choice of kernel for the smaller M can round differently.
+  static const int row_block = getenv("HIVE_GLM_PREFILL_ROWBLOCK") ? std::max(0, atoi(getenv("HIVE_GLM_PREFILL_ROWBLOCK"))) : 0;
+  const int RB = row_block > 0 ? row_block : (1 << 30);
+  maxR = std::min(maxR, RB);
   if (maxR > rows_cap_) {
     for (void* p : {(void*)rows_x_, (void*)rows_gu_, (void*)rows_y_, (void*)rows_o_, (void*)rows_idx_, (void*)rows_w_}) dev_scratch_free(p);
     rows_cap_ = maxR;
@@ -653,8 +712,9 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
       for (auto& [r, wt] : per[e]) {
         if (cmap[r] < 0) { cmap[r] = (int32_t)crow.size(); crow.push_back(r); }
         rows.push_back({cmap[r], wt});
+        if (rows.size() == 64) cjobs.push_back({li * E_ + e, std::move(rows)}), rows.clear();  // cpu_experts takes ≤ 64 rows per job
       }
-      cjobs.push_back({li * E_ + e, std::move(rows)});
+      if (!rows.empty()) cjobs.push_back({li * E_ + e, std::move(rows)});
     }
   }
   const int nc = (int)crow.size();
@@ -717,11 +777,14 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
     const int32_t* ri = pf_idx_d_ + off[e];
     const float* rwp = pf_w_d_ + off[e];
     expert_dequant(L_, rec, H_, I_, deq_gu_, deq_d_, st);
-    gather_rows(x_dev, ri, R, H_, rows_x_, st);
-    blas.gemm_bf16(rows_x_, deq_gu_, rows_gu_, R, 2 * I_, H_);
-    swiglu_rows(rows_gu_, R, I_, limit_, rows_y_, st);
-    blas.gemm_bf16(rows_y_, deq_d_, rows_o_, R, H_, I_);
-    scatter_add_rows(rows_o_, ri, rwp, R, H_, out_dev, st);
+    for (int b0 = 0; b0 < R; b0 += RB) {
+      const int rb = std::min(RB, R - b0);
+      gather_rows(x_dev, ri + b0, rb, H_, rows_x_, st);
+      blas.gemm_bf16(rows_x_, deq_gu_, rows_gu_, rb, 2 * I_, H_);
+      swiglu_rows(rows_gu_, rb, I_, limit_, rows_y_, st);
+      blas.gemm_bf16(rows_y_, deq_d_, rows_o_, rb, H_, I_);
+      scatter_add_rows(rows_o_, ri + b0, rwp + b0, rb, H_, out_dev, st);
+    }
     if (si >= 0) CUDA_CHECK(cudaEventRecord(stage_ev_[si], st));
   }
   const double tp2 = pf_now_ms();

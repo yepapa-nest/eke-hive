@@ -94,10 +94,23 @@ struct MtpW {
 class GlmModel {
  public:
   GlmModel(const std::string& ckpt_dir, bool load_mtp = true);
+  ~GlmModel();
   const GlmConfig& cfg() const { return cfg_; }
   Checkpoint& ckpt() { return ckpt_; }
-  const LayerW& layer(int l) const { return layers_[l]; }
+  // A CPU-placed layer being streamed for a prefill (stream_in) returns its staging copy.
+  const LayerW& layer(int l) const { return l < n_gpu_ || !active_[l] ? layers_[l] : *active_[l]; }
+  // Prefill streaming of CPU-placed layers (HIVE_GLM_STREAM_PREFILL, default on with CPU-placed layers): each such layer's GPU-format
+  //   weights are kept in pinned RAM; stream_in(l, st) copies them into a staging layer in VRAM (one per layer kind) on `st`, and layer(l)
+  //   returns it until another layer of the same kind is streamed in.
+  bool streaming() const { return stream_on_ && n_gpu_ < cfg_.n_layers; }
+  void stream_in(int l, cudaStream_t st);
+  size_t stream_bytes(int l) const;
+  // Layers placed on the GPU: 0 .. n_gpu_layers() − 1 (HIVE_GLM_GPU_LAYERS, or derived from HIVE_VRAM_LIMIT_MB — gpu_layers_for_limit). The
+  //   rest run on the CPU (GlmEngine's hybrid path, hive/glm/glm_cpu.h); their weights are not loaded here. = n_layers: everything on the GPU.
+  int n_gpu_layers() const { return n_gpu_; }
+  const std::string& dir() const { return dir_; }
   const MtpW* mtp() const { return mtp_.get(); }
+  MtpW* mtp_mut() { return mtp_.get(); }   // GlmEngine HIVE_GLM_MTP_LEND frees / replaces the routed-expert arena
   const bf16* embed_host() const { return embed_host_.data(); }  // [vocab, hidden] bf16 in host RAM
   const Mat& lm_head() const { return lm_head_; }
   const DevBuf& final_norm() const { return final_norm_; }
@@ -116,6 +129,18 @@ class GlmModel {
   void load_moe(const std::string& p, MoeW& w);
   void load_hc(const std::string& p, const char* which, HcW& w);
   GlmConfig cfg_;
+  std::string dir_;
+  int n_gpu_ = 0;
+  int gpu_layers_for_limit(bool load_mtp);
+  void load_layer(int l, LayerW& L);
+  static void bufs_of(LayerW& L, std::vector<DevBuf*>& out);
+  void keep_streamed(int l);
+  bool stream_on_ = false;
+  struct Streamed { std::vector<std::pair<uint8_t*, size_t>> blobs; float g[3] = {1, 1, 1}; };
+  std::vector<Streamed> streamed_;          // per CPU-placed layer: pinned copies of its device buffers (bufs_of order)
+  std::unique_ptr<LayerW> staging_[2][2];   // [kda][moe]
+  std::vector<const LayerW*> active_;
+  size_t layer_bytes(int l);
   Checkpoint ckpt_;
   std::unique_ptr<Checkpoint> fp8_;
   int n_fp8_ = 0;

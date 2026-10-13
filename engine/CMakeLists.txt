@@ -94,6 +94,62 @@ endforeach()
 add_executable(glm_check tests/glm_check.cpp)
 target_link_libraries(glm_check hive_glm)
 
+# Qwen3.8-Flash-Next family (model_type qwen4_exp: Gated DeltaNet + QSA attention, hyper-connections, PLE n-gram table, NVFP4 experts
+#   through the GLM family's expert store): its own library on top of hive_glm
+add_library(hive_qwen STATIC
+  src/qwen/qwen_config.cpp
+  src/qwen/qwen_model.cpp
+  src/qwen/qwen_kernels.cu
+  src/qwen/gdn.cu
+  src/qwen/qsa.cu
+  src/qwen/ple.cpp
+  src/qwen/ple_kernels.cu
+  src/qwen/qwen_vision.cu
+  src/qwen/qwen_engine.cpp
+  src/qwen/qwen_prefill.cpp
+  src/qwen/qwen_mtp.cpp
+  src/qwen/qwen_runtime.cpp
+)
+target_link_libraries(hive_qwen PUBLIC hive_glm)
+foreach(t test_qwen_gdn test_qwen_qsa)
+  add_executable(${t} tests/${t}.cu)
+  target_link_libraries(${t} hive_qwen)
+endforeach()
+add_executable(test_qwen_ple_cpu tests/test_qwen_ple_cpu.cpp)
+target_include_directories(test_qwen_ple_cpu PRIVATE include third_party)
+target_link_libraries(test_qwen_ple_cpu CUDA::cudart)
+target_compile_definitions(test_qwen_ple_cpu PRIVATE HIVE_SOURCE_DIR_HINT="${CMAKE_CURRENT_SOURCE_DIR}")
+# forward validation against the CPU oracle (oracle/qwen4_oracle.py dumps)
+add_executable(qwen_check tests/qwen_check.cpp)
+target_link_libraries(qwen_check hive_qwen)
+
+# CPU-only builds (no CUDA): the shared CPU backend and the CPU-only daemons. engine/cpu_shim provides CUDA stand-in headers (device
+#   memory = host memory) so hived.cpp and the family code compile unchanged; the real libnuma is used.
+file(GLOB HIVE_CPU_SRC CONFIGURE_DEPENDS src/cpu/cpu_*.cpp)
+add_library(hive_cpu STATIC ${HIVE_CPU_SRC} src/cpu/expert_cpu.cpp src/cpu/expert_cpu_nvfp4.cpp src/safetensors.cpp src/engram_hash.cpp)
+target_include_directories(hive_cpu BEFORE PUBLIC cpu_shim)
+target_include_directories(hive_cpu PUBLIC include third_party)
+target_link_libraries(hive_cpu PUBLIC ${NUMA_LIB} Threads::Threads)
+target_compile_definitions(hive_cpu PUBLIC HIVE_CPU_ONLY=1)
+file(GLOB HIVE_QWEN_CPU_SRC CONFIGURE_DEPENDS src/qwen/cpu/*.cpp)
+add_library(hive_qwen_cpu STATIC ${HIVE_QWEN_CPU_SRC} src/qwen/qwen_config.cpp src/qwen/ple.cpp)
+target_link_libraries(hive_qwen_cpu PUBLIC hive_cpu)
+add_executable(hived_qwen_cpu src/hived.cpp src/qwen/qwen_cpu_runtime.cpp)
+target_link_libraries(hived_qwen_cpu hive_qwen_cpu)
+foreach(t test_cpu_backend_cpu bench_cpu_backend)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)
+    add_executable(${t} tests/${t}.cpp)
+    target_link_libraries(${t} hive_cpu)
+  endif()
+endforeach()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen_cpu_check.cpp)
+  add_executable(qwen_cpu_check tests/qwen_cpu_check.cpp)
+  target_link_libraries(qwen_cpu_check hive_qwen_cpu)
+endif()
+# the CPU engine's AVX2 element-wise kernels against their scalar twins (bit for bit)
+add_executable(test_qwen_cpu_simd tests/test_qwen_cpu_simd.cpp)
+target_link_libraries(test_qwen_cpu_simd hive_cpu)
+
 add_executable(test_kernels tests/test_kernels.cu)
 target_link_libraries(test_kernels hive_core)
 
@@ -214,6 +270,17 @@ target_compile_definitions(hived PRIVATE HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
 add_executable(hived_glm src/hived.cpp)
 target_link_libraries(hived_glm hive_glm)
 target_compile_definitions(hived_glm PRIVATE HIVE_FAMILY_GLM HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
+# hived for the Qwen3.8-Flash-Next family (family types from hive/qwen/hived_family.h)
+add_executable(hived_qwen src/hived.cpp)
+target_link_libraries(hived_qwen hive_qwen)
+target_compile_definitions(hived_qwen PRIVATE HIVE_FAMILY_QWEN HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
+target_compile_definitions(hived_qwen_cpu PRIVATE HIVE_FAMILY_QWEN_CPU HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
+
+# Further families (one file each: cmake/family_<name>.cmake — the CPU-only GLM / DeepSeek daemons, Qwen3.8-27B); HIVE_SOURCE_SHA is set above.
+file(GLOB HIVE_FAMILY_CMAKE CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/family_*.cmake)
+foreach(f IN LISTS HIVE_FAMILY_CMAKE)
+  include(${f})
+endforeach()
 
 add_executable(st_inspect tools/st_inspect.cpp)
 target_link_libraries(st_inspect hive_core)

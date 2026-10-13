@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
 #include "hive/glm/hived_family.h"
+#include "hive/image_reaper.h"
 
 #include <algorithm>
 #include <cmath>
@@ -112,7 +113,9 @@ void Runtime::reset_seq(Seq& s) const {
 void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) const {
   const GlmConfig& c = model_.glm().cfg();
   const double t0 = hive::mono_ms();
-  const size_t n_bufs = s.conv.size() * 2 + s.c.size() * 4 + (s.h_last.p ? 5 : 0);
+  // hybrid (CPU-placed layers): their state follows as the CpuSeq's own byte buffers (always copied whole)
+  const std::vector<std::vector<uint8_t>> cpu_bytes = s.cpu ? s.cpu->save_bytes() : std::vector<std::vector<uint8_t>>{};
+  const size_t n_bufs = s.conv.size() * 2 + s.c.size() * 4 + (s.h_last.p ? 5 : 0) + cpu_bytes.size();
   static const bool delta = [] { const char* v = getenv("HIVE_CKPT_DELTA"); return v && *v && strcmp(v, "0") != 0; }();  // env_on convention
   if (!delta || !base || base == &img || base->generation != s.generation || base->pos > s.pos || base->bufs.size() != n_bufs ||
       base->tokens.size() > s.tokens.size() || !std::equal(base->tokens.begin(), base->tokens.end(), s.tokens.begin())) base = nullptr;
@@ -133,6 +136,7 @@ void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) cons
   std::vector<uint8_t> vtmp;
   auto grab = [&](const auto& b, size_t bytes, size_t keep) {  // keep = leading bytes of the base's buffer that are still exact
     HostImageBuffer dst;
+    if (!b.p) { out.bufs.push_back(std::move(dst)); return; }  // a CPU-placed layer's buffer (its state is in the CpuSeq part)
     size_t prefix = 0;
     if (base) {
       keep = std::min(keep, bytes);
@@ -154,7 +158,7 @@ void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) cons
       v_bytes += prefix;
     }
     if (bytes > prefix) {
-      std::shared_ptr<uint8_t> p(new uint8_t[bytes - prefix], std::default_delete<uint8_t[]>());
+      std::shared_ptr<uint8_t> p = hive::reaped_bytes(bytes - prefix);   // freed off the engine thread (hive/image_reaper.h)
       CUDA_CHECK(cudaMemcpy(p.get(), static_cast<const uint8_t*>(b.p) + prefix, bytes - prefix, cudaMemcpyDeviceToHost));
       dst.segments.push_back({std::move(p), bytes - prefix});
       copied += bytes - prefix;
@@ -174,6 +178,14 @@ void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) cons
     grab(s.mtp_c, P * row_c, BM * row_c); grab(s.mtp_kI, P * row_i, BM * row_i); grab(s.mtp_gs, P * row_i, BM * row_i);
     grab(s.mtp_pooled, (P / pool) * row_i, (BM / pool) * row_i); grab(s.h_last, s.h_last.n, 0);
   }
+  for (const auto& b : cpu_bytes) {
+    HostImageBuffer dst;
+    std::shared_ptr<uint8_t> p = hive::reaped_bytes(b.size());
+    if (!b.empty()) std::memcpy(p.get(), b.data(), b.size());
+    dst.segments.push_back({std::move(p), b.size()});
+    copied += b.size(); total += b.size();
+    out.bufs.push_back(std::move(dst));
+  }
   img = std::move(out);
   static const bool trace = getenv("HIVE_PROFILE") && atoi(getenv("HIVE_PROFILE")) > 0;
   if (trace)  // [glm-ckpt] (tools/hive_monitor.py): one line per image — what was copied against the image size, and the host time
@@ -190,6 +202,7 @@ void Runtime::load_image(Seq& s, const SeqImage& img) const {
   size_t k = 0;
   auto put = [&](auto& b) {
     HIVE_CHECK(k < img.bufs.size() && img.bufs[k].size() <= b.n, "GLM image layout mismatch");
+    if (!b.p) { ++k; return; }
     size_t off = 0;
     for (const auto& sg : img.bufs[k].segments) {
       CUDA_CHECK(cudaMemcpy(static_cast<uint8_t*>(b.p) + off, sg.data.get(), sg.n, cudaMemcpyHostToDevice));
@@ -200,6 +213,16 @@ void Runtime::load_image(Seq& s, const SeqImage& img) const {
   for (size_t i = 0; i < s.conv.size(); ++i) { put(s.conv[i]); put(s.state[i]); }
   for (size_t i = 0; i < s.c.size(); ++i) { put(s.c[i]); put(s.kI[i]); put(s.gs[i]); put(s.pooled[i]); }
   if (s.h_last.p) { put(s.mtp_c); put(s.mtp_kI); put(s.mtp_gs); put(s.mtp_pooled); put(s.h_last); }
+  if (s.cpu) {
+    std::vector<std::vector<uint8_t>> b;
+    for (; k < img.bufs.size(); ++k) {
+      std::vector<uint8_t> v(img.bufs[k].size());
+      size_t off = 0;
+      for (const auto& sg : img.bufs[k].segments) { std::memcpy(v.data() + off, sg.data.get(), sg.n); off += sg.n; }
+      b.push_back(std::move(v));
+    }
+    s.cpu->load_bytes(b);
+  }
   HIVE_CHECK(k == img.bufs.size(), "GLM image layout mismatch (count)");
   s.pos = img.pos; s.tokens = img.tokens; s.generation = img.generation; s.broken = false;
   s.engram_history.clear();

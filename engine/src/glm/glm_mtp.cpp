@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <cstring>
 
+#include "hive/clock.h"
+#include "hive/devmem.h"
+#include "hive/grow_buf.h"
 #include "hive/glm/glm_engine.h"
 #include "hive/glm/glm_kernels.h"
 #include "hive/glm/glm_moe_fp8.h"
@@ -124,7 +127,86 @@ void GlmEngine::mtp_step(GlmSeq& s, int step, int32_t tok, const bf16* h_in, int
   row_max_sumexp(logits_dev_.as<float>(), 1, c_.vocab, one_f_.as<float>(), mtp_conf_d_.as<float>() + 2 * step, mtp_conf_d_.as<float>() + 2 * step + 1, stream_);
 }
 
+// HIVE_GLM_MTP_LEND (glm_engine.h): step counters and the two switches.
+void GlmEngine::mtp_note_steps(int streams) {
+  if (streams >= 2) { ++lend_.multi; lend_.single = 0; }
+  else { ++lend_.single; lend_.multi = 0; }
+  const double now = hive::mono_ms();
+  if (now - lend_.last_ms < lend_.gap_ms) return;
+  if (!lend_.lent && lend_.multi >= lend_.lend_after) mtp_lend();
+  else if (lend_.lent && lend_.single >= lend_.reclaim_after) mtp_reclaim();
+}
+
+void GlmEngine::mtp_lend() {
+  const double t0 = hive::mono_ms();
+  CUDA_CHECK(cudaDeviceSynchronize());  // every stream (promotion / prefetch copies too): measured separately from the free below
+  const double t1 = hive::mono_ms();
+  MtpW& w = *m_.mtp_mut();
+  if (lend_.own) { if (!devmem::free_if_owned(lend_.dev)) CUDA_CHECK(cudaFree(lend_.dev)); }
+  else w.expert_arena.free();
+  lend_.dev = nullptr; lend_.own = false; lend_.lent = true;
+  const double t2 = hive::mono_ms();
+  const int added = ex_.grow_extra(kv_headroom_);
+  lend_.last_ms = hive::mono_ms(); ++lend_.switches;
+  fprintf(stderr, "[glm] MTP lend #%ld: NextN experts' %.2f GiB → expert cache +%d slots (now %d) · %.0f ms (sync %.0f · free %.0f · map %.0f)\n", lend_.switches,
+          lend_.bytes / 1073741824.0, added, ex_.n_slots(), lend_.last_ms - t0, t1 - t0, t2 - t1, lend_.last_ms - t2);
+}
+
+void* GlmEngine::mtp_arena_alloc() {
+  void* p = nullptr;
+  if (devmem::on()) {
+    // Not a "keep" region even when called inside the Runtime constructor's keep_begin..keep_end: a keep region gets a pinned shadow of its
+    //   size at startup (devmem::prepare_shadows), and dropping that 6.75 GiB shadow made the first lend take 2,227 ms in free (measured,
+    //   t_v2c; a region allocated later freed in 6 ms). This arena has its own pinned copy (lend_.host); level-3 sleep still copies non-keep
+    //   regions at sleep time.
+    int depth;
+    { std::lock_guard<std::mutex> lk(devmem::st().mu); depth = devmem::st().keep_depth; devmem::st().keep_depth = 0; }
+    p = devmem::alloc(lend_.bytes);
+    { std::lock_guard<std::mutex> lk(devmem::st().mu); devmem::st().keep_depth = depth; }
+  }
+  else if (cudaMalloc(&p, lend_.bytes) != cudaSuccess) { (void)cudaGetLastError(); p = nullptr; }
+  return p;
+}
+
+void GlmEngine::mtp_arena_load(void* p) {
+  CUDA_CHECK(cudaMemcpyAsync(p, lend_.host, lend_.bytes, cudaMemcpyHostToDevice, stream_));
+  const uint8_t* b = static_cast<const uint8_t*>(p);
+  std::vector<std::array<Fp8BMat, 3>> tab(lend_.rel.size());
+  for (size_t e = 0; e < tab.size(); ++e)
+    for (int j = 0; j < 3; ++j) {
+      Fp8BMat m = lend_.rel[e][j];
+      m.w = b + (uintptr_t)m.w; m.s = (const float*)(b + (uintptr_t)m.s);
+      tab[e][j] = m;
+    }
+  CUDA_CHECK(cudaMemcpyAsync(mtp_moe_tab_, tab.data(), sizeof(Fp8BMat) * 3 * tab.size(), cudaMemcpyHostToDevice, stream_));
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+bool GlmEngine::mtp_reclaim() {
+  const double t0 = hive::mono_ms();
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  size_t fr = 0, tot = 0;
+  CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+  const size_t need = lend_.bytes + kv_headroom_;
+  const int slots0 = ex_.n_slots();
+  if (fr < need) ex_.release_extra(need - fr);
+  void* p = mtp_arena_alloc();
+  lend_.last_ms = hive::mono_ms();
+  if (!p) {  // the tail could not be given back (slots lent to a prefill, KV growth): stay lent, try again after the gap
+    ex_.grow_extra(kv_headroom_);
+    fprintf(stderr, "[glm] MTP reclaim deferred: no room for %.2f GiB (free %.0f MiB) — drafts stay off\n", lend_.bytes / 1073741824.0, fr / 1048576.0);
+    return false;
+  }
+  mtp_arena_load(p);
+  lend_.dev = p; lend_.own = true; lend_.lent = false;
+  lend_.last_ms = hive::mono_ms(); ++lend_.switches;
+  fprintf(stderr, "[glm] MTP reclaim #%ld: expert cache −%d slots (now %d) · NextN experts back in VRAM · %.0f ms\n", lend_.switches,
+          std::max(0, slots0 - ex_.n_slots()), ex_.n_slots(), lend_.last_ms - t0);
+  return true;
+}
+
 int GlmEngine::mtp_draft(GlmSeq& s, int32_t tok, int k, int32_t* drafts, float* conf) {
+  if (lend_.on) { mtp_note_steps(1); if (lend_.lent) return 0; }
   if (!mtp_on() || !s.h_last_valid || k <= 0) return 0;
   k = std::min(k, mtp_k_);
   const int64_t p = s.pos - 1;  // entry index of (h_last, tok)
@@ -201,6 +283,7 @@ void GlmEngine::rollback_batch(const int* n_keep, int S) {
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+  if (cpu_) cpu_->restore_verify(n_keep, S);  // the CPU-placed layers' KDA states
   vparts_.clear();
 }
 

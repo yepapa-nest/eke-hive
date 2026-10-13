@@ -376,6 +376,73 @@ void gemv_e2m1_rows_multi_v3(const uint8_t* W, const uint8_t* sw, int N, int K, 
   }
 }
 
+// ---- HIVE_CPU_E2M1_REG (default on; "0" = off; with HIVE_CPU_GEMV2): multi-row R = 2..8 with register accumulators, whole rows (_v4 below) ----
+// _v2 multi-row keeps acc[r] of a runtime R on the stack (a load + store per fma chain step); with R a template constant the accumulators stay
+//   in registers. Whole weight rows, no K tiles. Measured (engine/tests/bench_e2m1_pool_cpu.cpp — the ExpertStore::Pool shape: 2 nodes × 16
+//   pinned threads, half records, 32-row items, J experts × R rows; 3975WX, interleaved, median of 3, GB/s), the shipped setting
+//   (GEMV2 + MULTIROW2=5: _v2 for R ≤ 4, _v3 tiled for R ≥ 5) → _v4:  R=2 88-104 → 93-107 · R=3 76-93 → 85-103 · R=4 58-76 → 71-86 ·
+//   R=5 51-63 → 59-71 · R=8 31-38 → 31-39. HIVE_CPU_E2M1_REG takes R = 2..8 before HIVE_CPU_MULTIROW2.
+//   Numerics are **bit-identical** to _v2 (= _ref): per output (n, r) the same chain — d = w0·a0 → fma(w1,a1) → fma(w2,a2) → fma(w3,a3),
+//   acc = fma(d, sa·sw, acc) in block order, the same sa·sw products (8-block vector multiply), the same hsum256 (bench_expert_cpu compares the bits).
+namespace {
+template <int R>
+void multi_v4(const uint8_t* W, const uint8_t* sw, int K, const float* const* a_f32, const float* const* sa_f32, int n0, int n1, float* const* y) {
+  const int nb = K / 32;
+  const V2Tabs t;
+  const float* ar[R];
+  const float* sr_a[R];
+  for (int r = 0; r < R; ++r) { ar[r] = a_f32[r]; sr_a[r] = sa_f32[r]; }
+  for (int n = n0; n < n1; ++n) {
+    const uint8_t* wr = W + (size_t)n * (K / 2);
+    const uint8_t* sr = sw + (size_t)n * nb;
+    __m256 acc[R];
+#pragma GCC unroll 8
+    for (int r = 0; r < R; ++r) acc[r] = _mm256_setzero_ps();
+    int b = 0;
+    for (; b + 8 <= nb; b += 8) {
+      alignas(32) float s[R][8];
+      v2_prefetch(wr + b * 16);
+      const __m256 swb = e8m0x8(sr + b);
+#pragma GCC unroll 8
+      for (int r = 0; r < R; ++r) _mm256_store_ps(s[r], _mm256_mul_ps(_mm256_loadu_ps(sr_a[r] + b), swb));
+      for (int j = 0; j < 8; ++j) {
+        __m256 w0, w1, w2, w3;
+        nib_to_f32x4_v2(wr + (b + j) * 16, t, w0, w1, w2, w3);
+#pragma GCC unroll 8
+        for (int r = 0; r < R; ++r) acc[r] = _mm256_fmadd_ps(blk_dot(w0, w1, w2, w3, ar[r] + (b + j) * 32), _mm256_broadcast_ss(s[r] + j), acc[r]);
+      }
+    }
+    for (; b < nb; ++b) {
+      __m256 w0, w1, w2, w3;
+      nib_to_f32x4_v2(wr + b * 16, t, w0, w1, w2, w3);
+      const float swb = e8m0_fast(sr[b]);
+#pragma GCC unroll 8
+      for (int r = 0; r < R; ++r) acc[r] = _mm256_fmadd_ps(blk_dot(w0, w1, w2, w3, ar[r] + b * 32), _mm256_set1_ps(sr_a[r][b] * swb), acc[r]);
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < R; ++r) y[r][n] = hsum256(acc[r]);
+  }
+}
+}  // namespace
+
+void gemv_e2m1_rows_multi_v4(const uint8_t* W, const uint8_t* sw, int N, int K, const float* const* a_f32, const float* const* sa_f32, int R,
+                             int n0, int n1, float* const* y) {
+  switch (R) {
+    case 2: multi_v4<2>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    case 3: multi_v4<3>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    case 4: multi_v4<4>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    case 5: multi_v4<5>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    case 6: multi_v4<6>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    case 7: multi_v4<7>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    case 8: multi_v4<8>(W, sw, K, a_f32, sa_f32, n0, n1, y); return;
+    default: gemv_e2m1_rows_multi_v2(W, sw, N, K, a_f32, sa_f32, R, n0, n1, y); return;  // R = 1 or > 8: _v2
+  }
+}
+bool e2m1_reg_enabled() {
+  static const bool on = [] { const char* v = getenv("HIVE_CPU_E2M1_REG"); return !(v && strcmp(v, "0") == 0); }();
+  return on;
+}
+
 // Switch HIVE_CPU_MULTIROW2 — unset / empty / "0" = off (0 — default entry unchanged). On = multi-row calls with R ≥ the minimum row count go to _v3:
 //   an integer 2..8 = that minimum; any other "on" value ("1" included — absorbed, not rejected) = 5. Basis (Ryzen 9 9955HX, 16 threads, w1 5120×2304, 32-row jobs):
 //   _v2 → _v3 ms/matrix R=3 0.114→0.108 · 4 0.114→0.109 · 5 0.143→0.121 · 6 0.163→0.139 · 7 0.192→0.162 · 8 0.213→0.184 — for R ≤ 4 DRAM streaming is
@@ -404,6 +471,7 @@ void gemv_e2m1_rows(const uint8_t* W, const uint8_t* sw, int N, int K, const flo
 }
 void gemv_e2m1_rows_multi(const uint8_t* W, const uint8_t* sw, int N, int K, const float* const* a_f32, const float* const* sa_f32, int R,
                           int n0, int n1, float* const* y) {
+  if (gemv2_enabled() && R >= 2 && R <= 8 && e2m1_reg_enabled()) { gemv_e2m1_rows_multi_v4(W, sw, N, K, a_f32, sa_f32, R, n0, n1, y); return; }  // HIVE_CPU_E2M1_REG (same bits; before MULTIROW2 — measured faster at every R)
   if (R >= 2 && multirow2_enabled() && R >= multirow2_min_rows()) { gemv_e2m1_rows_multi_v3(W, sw, N, K, a_f32, sa_f32, R, n0, n1, y); return; }  // HIVE_CPU_MULTIROW2 (same bits)
   if (gemv2_enabled()) gemv_e2m1_rows_multi_v2(W, sw, N, K, a_f32, sa_f32, R, n0, n1, y);
   else gemv_e2m1_rows_multi_ref(W, sw, N, K, a_f32, sa_f32, R, n0, n1, y);

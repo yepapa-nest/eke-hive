@@ -63,7 +63,7 @@ def contracts():
     body = rt[i:rt.index('\n}\n', i)]
     a = body.index('moe_decode_experts(L, l, M, stats, p, true, true, true);')
     b = body.index('moe_decode_finish(p, stats);')
-    assert a < b and body.index('if (host_fast_ && l + 1 < model_.n_loaded_layers())') > a
+    assert a < b and body.index('if (host_fast_ && l + 1 < gpu_layers())') > a
     # forward_batch: ubatch only when M >= 2 and no dump/inject/expert trace; else the layer loop
     j = rt.index('void Runtime::forward_batch(')
     fb = rt[j:rt.index('\n}\n', j)]
@@ -73,7 +73,7 @@ def contracts():
     k = rt.index('void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardStats* stats, MoePend& p,')
     ln = rt[k:rt.index('\n}\n', k)]
     assert ln.count('store_.observe(') == 1 and ln.count('observe_rows();') == 2
-    assert 'if (!fast && pump) promo_pump(l, model_.n_loaded_layers());' in ln
+    assert 'if (!fast && pump) promo_pump(l, gpu_layers());' in ln
     print('ubatch CPU: runtime.cpp O1 contracts OK')
 
 

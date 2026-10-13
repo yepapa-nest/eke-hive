@@ -1,4 +1,5 @@
 engine/build/
+engine/build-*/
 __pycache__/
 *.pyc
 run/

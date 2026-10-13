@@ -69,7 +69,7 @@ def runtime_source():
     stager = _slice(rt, '// ---- Host tile staging BEGIN', '// ---- Host tile staging END')
     fake = (FAKE / 'fake_runtime.inc').read_text()
     assert fake.count('@@RUNTIME_CTOR_OPTIONS@@') == 1
-    head = ('#include "hive/runtime.h"\n#include "hive/kv_pack.h"\n#include "hive/engram_ssd.h"\n#include "hive/pregate.h"\n#include <algorithm>\n#include <chrono>\n#include <cmath>\n'
+    head = ('#include "hive/runtime.h"\n#include "hive/image_reaper.h"\n#include "hive/kv_pack.h"\n#include "hive/engram_ssd.h"\n#include "hive/pregate.h"\n#include <algorithm>\n#include <chrono>\n#include <cmath>\n'
             '#include <cstring>\n#include <exception>\n#include <functional>\n#include <mutex>\n#include <stdexcept>\n#include <thread>\n'
             'namespace hive {\nnamespace {\n' + env_on + helpers + '}  // namespace\n' + stager + '}  // namespace hive\n')
     return (head + fake.replace('@@RUNTIME_CTOR_OPTIONS@@', ctor) +

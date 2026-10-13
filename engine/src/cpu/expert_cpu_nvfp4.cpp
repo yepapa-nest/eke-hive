@@ -5,6 +5,7 @@
 #include <immintrin.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "hive/common.h"
@@ -67,7 +68,7 @@ void gemv_nvfp4_rows_scalar(const uint8_t* W, const uint8_t* sw, float gscale, i
 }
 
 // 32-column blocks: elements 0-15 use scale[2b], 16-31 use scale[2b+1]. Partial sums stay in 8 lanes and are reduced at the row end.
-void gemv_nvfp4_rows(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a, int n0, int n1, float* y) {
+void gemv_nvfp4_rows_ref(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a, int n0, int n1, float* y) {
   HIVE_CHECK(K % 32 == 0, "nvfp4 gemv needs K % 32 == 0");
   const float* L = e4m3_lut().v;
   const __m256i lut = _mm256_load_si256(reinterpret_cast<const __m256i*>(kNibF16Hi));
@@ -91,10 +92,10 @@ void gemv_nvfp4_rows(const uint8_t* W, const uint8_t* sw, float gscale, int N, i
   }
 }
 
-void gemv_nvfp4_rows_multi(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a, int R, int n0, int n1,
-                           float* const* y) {
+void gemv_nvfp4_rows_multi_ref(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a, int R, int n0, int n1,
+                               float* const* y) {
   HIVE_CHECK(K % 32 == 0 && R >= 1 && R <= 8, "nvfp4 multi gemv");
-  if (R == 1) { gemv_nvfp4_rows(W, sw, gscale, N, K, a[0], n0, n1, y[0]); return; }
+  if (R == 1) { gemv_nvfp4_rows_ref(W, sw, gscale, N, K, a[0], n0, n1, y[0]); return; }
   const float* L = e4m3_lut().v;
   const __m256i lut = _mm256_load_si256(reinterpret_cast<const __m256i*>(kNibF16Hi));
   const int nb = K / 32;
@@ -119,6 +120,177 @@ void gemv_nvfp4_rows_multi(const uint8_t* W, const uint8_t* sw, float gscale, in
     }
     for (int r = 0; r < R; ++r) y[r][n] = hsum256(acc[r]) * gscale;
   }
+}
+
+// ---- _v2: faster kernels, same bits -------------------------------------------------------------------------------------------------------------------
+// Where the time went (engine/tests/bench_nvfp4_pool_cpu.cpp: the GlmExperts::cpu_experts task shape — 2 NUMA nodes × 16 pinned threads,
+//   node-local half records, phase 1 gate+up / phase 2 down, J experts × R rows per MoE layer, 128→32-row chunks; 3975WX, read ceiling
+//   ~120 GB/s; kernels interleaved in one process, median of 3 — separate runs on the shared machine differed by up to ±25 %):
+//   _ref at R = 1 is memory bound; at R ≥ 2 it is compute bound: acc[r] of a runtime R lives on the stack (a load + store per chain step)
+//   and every (row, block) also pays the cvtph unpack share. GLM R=2 55-83, R=3 53-68, R=4 43-61, R=8 14-31 GB/s.
+//   Tiling K so the R activation rows stay in L1 (tried first, like the e2m1 _v3) LOST 5-15 % at R ≤ 4: DRAM streaming of whole weight
+//   rows is the limit, and jumping between rows per tile disturbs the hardware prefetcher — so each weight row is walked once, whole.
+//   A pre-scaled variant (w·e4m3 scale folded into the decoded weights, 4 fma per (row, block), fp32 reassociation) was within ±2 % of
+//   this _v2 (R=2, 3: −6 … +2 %) once _v2 kept its accumulators in registers — not kept (no gain, not bit-identical).
+// _v2 keeps the _ref operation chain for every output (n, r) — per 32-column block in ascending order
+//   lo = w0·a[0:8] → fma(w2, a[8:16], lo) · hi = w1·a[16:24] → fma(w3, a[24:32], hi) · acc = fma(lo, e4m3(s[2b]), acc) → fma(hi, e4m3(s[2b+1]), acc),
+//   y = hsum256(acc) · gscale — and changes only how the work is issued: (a) nibble → fp32 by byte shuffles (the expert_cpu.cpp _v2 unpack:
+//   same layout, same values for all 16 codes, no fp16 convert), (b) R = 1: 4 weight rows per pass (4 independent fma chains, activations
+//   loaded once per block), (c) R ≥ 2: R is a template constant — accumulators in registers, the block's weights decoded once for all R rows.
+//   tests/test_nvfp4_cpu.cpp compares all output bits _v2 vs _ref (GLM / FN half shapes, R = 1..8, odd row ranges).
+//   Pool bench GB/s _ref → _v2 (J = 1..8 experts per layer):  GLM (4096/2048) R=1 75-108 → 78-107 · R=2 55-83 → 82-111 · R=3 53-68 → 64-97 ·
+//   R=4 43-61 → 50-88 · R=5 32-61 → 35-71 · R=6 24-48 → 24-52 · R=8 14-31 → 25-44.  FN (2560/640) R=1 56-86 → 63-89 · R=2 47-64 → 53-88 ·
+//   R=3 40-55 → 54-81 · R=4 37-49 → 46-67 · R=5 27-46 → 30-56 · R=8 17-31 → 20-34.
+namespace {
+alignas(32) const uint8_t kV2IdxLo[32] = {0x00, 0x80, 0x01, 0x80, 0x08, 0x80, 0x09, 0x80, 0x04, 0x80, 0x05, 0x80, 0x0C, 0x80, 0x0D, 0x80,
+                                          0x02, 0x80, 0x03, 0x80, 0x0A, 0x80, 0x0B, 0x80, 0x06, 0x80, 0x07, 0x80, 0x0E, 0x80, 0x0F, 0x80};
+alignas(32) const uint8_t kV2IdxHi[32] = {0x80, 0x00, 0x80, 0x01, 0x80, 0x08, 0x80, 0x09, 0x80, 0x04, 0x80, 0x05, 0x80, 0x0C, 0x80, 0x0D,
+                                          0x80, 0x02, 0x80, 0x03, 0x80, 0x0A, 0x80, 0x0B, 0x80, 0x06, 0x80, 0x07, 0x80, 0x0E, 0x80, 0x0F};
+alignas(32) const uint8_t kV2B3[32] = {0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40, 0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0,
+                                       0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40, 0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+alignas(32) const uint8_t kV2B2[32] = {0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0, 0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+                                       0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0, 0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+struct NvTabs {
+  __m256i lo, hi, b3, b2, m;
+  NvTabs() : lo(_mm256_load_si256(reinterpret_cast<const __m256i*>(kV2IdxLo))), hi(_mm256_load_si256(reinterpret_cast<const __m256i*>(kV2IdxHi))),
+             b3(_mm256_load_si256(reinterpret_cast<const __m256i*>(kV2B3))), b2(_mm256_load_si256(reinterpret_cast<const __m256i*>(kV2B2))),
+             m(_mm256_set1_epi8(0x0F)) {}
+};
+// 16 nibble bytes → w0 = elements 0-7, w1 = 16-23, w2 = 8-15, w3 = 24-31 (the nib_to_f32x4 layout and values)
+inline void nib4_v2(const uint8_t* wp, const NvTabs& t, __m256& w0, __m256& w1, __m256& w2, __m256& w3) {
+  const __m256i raw = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wp)));
+  const __m256i lo = _mm256_and_si256(raw, t.m), hi = _mm256_and_si256(_mm256_srli_epi16(raw, 4), t.m);
+  const __m256i x = _mm256_or_si256(_mm256_shuffle_epi8(lo, t.lo), _mm256_shuffle_epi8(hi, t.hi));
+  const __m256i b3 = _mm256_shuffle_epi8(t.b3, x), b2 = _mm256_shuffle_epi8(t.b2, x);
+  const __m256i wl = _mm256_unpacklo_epi8(b2, b3), wh = _mm256_unpackhi_epi8(b2, b3);
+  const __m256i z = _mm256_setzero_si256();
+  w0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(z, wl));
+  w1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(z, wl));
+  w2 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(z, wh));
+  w3 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(z, wh));
+}
+// one block of one activation row into acc — the _ref chain
+inline __m256 nv_blk(const __m256& w0, const __m256& w1, const __m256& w2, const __m256& w3, const float* ap, const __m256& sl, const __m256& sh,
+                     __m256 acc) {
+  __m256 lo = _mm256_mul_ps(w0, _mm256_loadu_ps(ap));
+  lo = _mm256_fmadd_ps(w2, _mm256_loadu_ps(ap + 8), lo);
+  __m256 hi = _mm256_mul_ps(w1, _mm256_loadu_ps(ap + 16));
+  hi = _mm256_fmadd_ps(w3, _mm256_loadu_ps(ap + 24), hi);
+  acc = _mm256_fmadd_ps(lo, sl, acc);
+  return _mm256_fmadd_ps(hi, sh, acc);
+}
+
+// NR weight rows × 1 activation row (_v2, R = 1)
+template <int NR>
+inline void rows1_v2(const uint8_t* W, const uint8_t* sw, float gscale, int K, const float* a, int n, float* y, const NvTabs& t, const float* L) {
+  const int nb = K / 32;
+  const uint8_t* wr[NR]; const uint8_t* sr[NR];
+  __m256 acc[NR];
+#pragma GCC unroll 4
+  for (int i = 0; i < NR; ++i) { wr[i] = W + (size_t)(n + i) * (K / 2); sr[i] = sw + (size_t)(n + i) * (K / 16); acc[i] = _mm256_setzero_ps(); }
+  for (int b = 0; b < nb; ++b) {
+    const float* ap = a + b * 32;
+    const __m256 a0 = _mm256_loadu_ps(ap), a1 = _mm256_loadu_ps(ap + 8), a2 = _mm256_loadu_ps(ap + 16), a3 = _mm256_loadu_ps(ap + 24);
+#pragma GCC unroll 4
+    for (int i = 0; i < NR; ++i) {
+      __m256 w0, w1, w2, w3;
+      nib4_v2(wr[i] + b * 16, t, w0, w1, w2, w3);
+      __m256 lo = _mm256_mul_ps(w0, a0);
+      lo = _mm256_fmadd_ps(w2, a1, lo);
+      __m256 hi = _mm256_mul_ps(w1, a2);
+      hi = _mm256_fmadd_ps(w3, a3, hi);
+      acc[i] = _mm256_fmadd_ps(lo, _mm256_broadcast_ss(L + sr[i][2 * b]), acc[i]);
+      acc[i] = _mm256_fmadd_ps(hi, _mm256_broadcast_ss(L + sr[i][2 * b + 1]), acc[i]);
+    }
+  }
+#pragma GCC unroll 4
+  for (int i = 0; i < NR; ++i) y[n + i] = hsum256(acc[i]) * gscale;
+}
+
+// G activation rows (a[0..G)) over one whole weight row into acc[0..G) (_v2)
+template <int G>
+inline void row_v2(const uint8_t* wr, const uint8_t* sr, int nb, const float* const* a, __m256* acc, const NvTabs& t, const float* L) {
+  for (int b = 0; b < nb; ++b) {
+    __m256 w0, w1, w2, w3;
+    nib4_v2(wr + b * 16, t, w0, w1, w2, w3);
+    const __m256 sl = _mm256_broadcast_ss(L + sr[2 * b]), sh = _mm256_broadcast_ss(L + sr[2 * b + 1]);
+#pragma GCC unroll 8
+    for (int r = 0; r < G; ++r) acc[r] = nv_blk(w0, w1, w2, w3, a[r] + b * 32, sl, sh, acc[r]);
+  }
+}
+// R activation rows (2..8). R ≤ 6: one pass (R accumulators + 4 weights + 2 scales in the 16 ymm registers); R = 7, 8: two passes over the same
+//   weight row (the second reads it from L1) — pbench GLM R=5 single 74 vs split 59 GB/s, R=6 47-55 vs 51, R=7 34-37 vs 46, R=8 14-28 vs 23-37 (spills).
+constexpr int kSplitV2 = 6;
+template <int R>
+void multi_v2(const uint8_t* W, const uint8_t* sw, float gscale, int K, const float* const* a, int n0, int n1, float* const* y, const NvTabs& t,
+              const float* L) {
+  constexpr int G0 = R <= kSplitV2 ? R : (R + 1) / 2, G1 = R - G0;
+  const int nb = K / 32;
+  for (int n = n0; n < n1; ++n) {
+    const uint8_t* wr = W + (size_t)n * (K / 2);
+    const uint8_t* sr = sw + (size_t)n * (K / 16);
+    __m256 acc[G0];
+#pragma GCC unroll 8
+    for (int r = 0; r < G0; ++r) acc[r] = _mm256_setzero_ps();
+    row_v2<G0>(wr, sr, nb, a, acc, t, L);
+#pragma GCC unroll 8
+    for (int r = 0; r < G0; ++r) y[r][n] = hsum256(acc[r]) * gscale;
+    if constexpr (G1 > 0) {
+      __m256 acc1[G1 > 0 ? G1 : 1];
+#pragma GCC unroll 8
+      for (int r = 0; r < G1; ++r) acc1[r] = _mm256_setzero_ps();
+      row_v2<G1>(wr, sr, nb, a + G0, acc1, t, L);
+#pragma GCC unroll 8
+      for (int r = 0; r < G1; ++r) y[G0 + r][n] = hsum256(acc1[r]) * gscale;
+    }
+  }
+}
+
+}  // namespace
+
+void gemv_nvfp4_rows_v2(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a, int n0, int n1, float* y) {
+  HIVE_CHECK(K % 32 == 0, "nvfp4 gemv needs K % 32 == 0");
+  (void)N;
+  const NvTabs t;
+  const float* L = e4m3_lut().v;
+  int n = n0;
+  for (; n + 4 <= n1; n += 4) rows1_v2<4>(W, sw, gscale, K, a, n, y, t, L);
+  for (; n < n1; ++n) rows1_v2<1>(W, sw, gscale, K, a, n, y, t, L);
+}
+
+#define HIVE_NV_DISPATCH(fn)                                                \
+  switch (R) {                                                              \
+    case 2: fn<2>(W, sw, gscale, K, a, n0, n1, y, t, L); return;            \
+    case 3: fn<3>(W, sw, gscale, K, a, n0, n1, y, t, L); return;            \
+    case 4: fn<4>(W, sw, gscale, K, a, n0, n1, y, t, L); return;            \
+    case 5: fn<5>(W, sw, gscale, K, a, n0, n1, y, t, L); return;            \
+    case 6: fn<6>(W, sw, gscale, K, a, n0, n1, y, t, L); return;            \
+    case 7: fn<7>(W, sw, gscale, K, a, n0, n1, y, t, L); return;            \
+    default: fn<8>(W, sw, gscale, K, a, n0, n1, y, t, L); return;           \
+  }
+void gemv_nvfp4_rows_multi_v2(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a, int R, int n0, int n1,
+                              float* const* y) {
+  HIVE_CHECK(K % 32 == 0 && R >= 1 && R <= 8, "nvfp4 multi gemv");
+  if (R == 1) { gemv_nvfp4_rows_v2(W, sw, gscale, N, K, a[0], n0, n1, y[0]); return; }
+  const NvTabs t;
+  const float* L = e4m3_lut().v;
+  HIVE_NV_DISPATCH(multi_v2)
+}
+#undef HIVE_NV_DISPATCH
+
+// HIVE_CPU_NVFP4_V2: unset / anything but "0" = _v2 (bit-identical to _ref) · "0" = the _ref kernels (A/B, fallback). Read once per process.
+bool nvfp4_v2_enabled() {
+  static const bool on = [] { const char* v = getenv("HIVE_CPU_NVFP4_V2"); return !(v && strcmp(v, "0") == 0); }();
+  return on;
+}
+void gemv_nvfp4_rows(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a, int n0, int n1, float* y) {
+  if (nvfp4_v2_enabled()) gemv_nvfp4_rows_v2(W, sw, gscale, N, K, a, n0, n1, y);
+  else gemv_nvfp4_rows_ref(W, sw, gscale, N, K, a, n0, n1, y);
+}
+void gemv_nvfp4_rows_multi(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a, int R, int n0, int n1,
+                           float* const* y) {
+  if (nvfp4_v2_enabled()) gemv_nvfp4_rows_multi_v2(W, sw, gscale, N, K, a, R, n0, n1, y);
+  else gemv_nvfp4_rows_multi_ref(W, sw, gscale, N, K, a, R, n0, n1, y);
 }
 
 void expert_forward_nvfp4(const ExpertDescNvfp4& e, const float* a, float route_w, float swiglu_limit, float* out, float* tmp) {

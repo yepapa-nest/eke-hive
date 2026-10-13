@@ -56,7 +56,7 @@ def contracts():
                    '  if (!sh) {\n  for (int i = 0; i < n_miss_e; ++i) {\n    if (gpu_share_left > 0) { --gpu_share_left; str_e[n_str_e++] = miss_e[i]; }\n'
                    '    else cpu_e[n_cpu_e++] = miss_e[i];\n  }\n  n_str_dma = n_str_e;\n',
                    'const int pre = sh ? str_si[ei] : -1;',
-                   'if (!fast && pump && !defer_copy) promo_pump(l, model_.n_loaded_layers());',
+                   'if (!fast && pump && !defer_copy) promo_pump(l, gpu_layers());',
                    '  bm_report(M);'):
         assert rt.count(needle) == 1, f'runtime.cpp contract missing or duplicated: {needle[:90]!r}'
     assert rt.count('bmiss_ = std::make_shared<BatchMiss>();') == 1

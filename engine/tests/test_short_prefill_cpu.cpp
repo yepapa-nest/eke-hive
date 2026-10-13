@@ -183,7 +183,7 @@ int main() {
              "if (small_fwd_ && opt_.promote_misses > 0) for (int e = 0; e < E; ++e) if (!by_e[e].empty() && store_.slot_of(l, e) < 0) step_miss_.push_back(l * c.n_routed + e);",
              "auto mshort = [&](int rows) { return sp::multi_short(spo_.multi_tail_short, opt_.cpu_for_misses, rows, opt_.prefill_threshold); };",
              "if (n_short == 0) { moe_experts_multi(model_.layer(l), l, subs, stats); return; }",
-             "return tail_len > 0 && M >= opt_.prefill_threshold && M > tail_len && tail_layer >= 0 && tail_layer < model_.n_loaded_layers();"})
+             "return tail_len > 0 && M >= opt_.prefill_threshold && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();"})
       EXPECT(rt.find(needle) != std::string::npos, "runtime.cpp contract missing: %s", needle);
     // Q3: forward_multi encoder layers [0, L) keep the default call (no short-path branch) · only the two upper-layer sites (L · L+1..) use up_experts
     const size_t a = rt.find("// ---- Encoder layers [0, L): all units"), b = rt.find("// ---- Tail layer L (last kv source)"), z = rt.find("// ---- Last layer tail → head (logits)");

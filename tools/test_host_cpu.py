@@ -83,6 +83,7 @@ signature_check=src[src.index('    auto images_match ='):src.index('    // Pick 
 LIFETIME=r'''
 struct SnapshotFence {int waits=0;void wait(){++waits;}};
 struct DevBuf {};
+namespace ds::cpu { struct CpuSeq {}; }  // Seq::cpu (CPU-placed layers' state) — opaque here, never set
 '''+image_types+r'''
 int main(){
  auto fence=std::make_shared<SnapshotFence>();

@@ -17,6 +17,30 @@
 namespace hive::glm {
 using namespace hive::k;
 
+size_t GlmEngine::layer_major_bytes(int T) const {
+  const size_t a = 256, H = c_.hidden, HC = (size_t)c_.hc * H, E = c_.n_routed, K = c_.n_act, t = (size_t)std::max(0, T);
+  auto up = [&](size_t x) { return (x + a - 1) / a * a; };
+  return up(t * HC * 2) + up(t * H * 2) + up(t * H * 4) + up(t * c_.hc * 4) + up(t * c_.hc * c_.hc * 4) + up(t * E * 4) + 2 * up(t * K * 4);
+}
+
+// Span of one layer-major call. With elastic buffers (default) the whole-prompt arrays are lent from the expert-cache tail, and
+//   GlmExperts::lend_tail_slots needs fewer slots than the cache has. On a small card the cache can be smaller than tiles × max_chunk rows
+//   need, and kv_reserve (called first) may already have taken tail steps for the sequence KV — e.g. a 32 GB cap: 323 slots, a 65,536-row
+//   call needs 272 slots (3.58 GiB, docs/vram-footprint.md §1.3) and the 64K KV ~1.2 GB more. Instead of failing the request, the span drops
+//   to the whole blocks the lendable tail holds (rows, causal order and chunk boundaries inside a block do not change); below two blocks the
+//   prompt runs chunked, as with HIVE_GLM_PREFILL_TILES=1. A shipped 96 GB start (4,323 slots, 272 needed) never takes this branch.
+int GlmEngine::layer_major_span() const {
+  const int C = max_chunk_;
+  if (tiles_ < 2) return 0;
+  if (!elastic_) return tiles_ * C;
+  const size_t rec = ex_.layout().total;
+  const int lendable = ex_.n_slots() - 1;  // lend_tail_slots: n < n_slots
+  if (lendable < 1 || rec == 0) return 0;
+  int nb = tiles_;
+  while (nb >= 2 && (layer_major_bytes(nb * C) + rec - 1) / rec > (size_t)lendable) --nb;
+  return nb >= 2 ? nb * C : 0;
+}
+
 void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float* logits_last) {
   const int H = c_.hidden, HC = c_.hc * H, C = max_chunk_, E = c_.n_routed, K = c_.n_act, I = c_.moe_inter;
   HIVE_CHECK(T <= C * tiles_ && s.pos + T <= s.cap, "GLM layer-major prefill size");
@@ -33,7 +57,7 @@ void GlmEngine::prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float*
     auto up = [&](size_t x) { return (x + a - 1) / a * a; };
     const size_t sz[8] = {up((size_t)T * HC * 2), up((size_t)T * H * 2), up((size_t)T * H * 4), up((size_t)T * c_.hc * 4),
                           up((size_t)T * c_.hc * c_.hc * 4), up((size_t)T * E * 4), up((size_t)T * K * 4), up((size_t)T * K * 4)};
-    size_t total = 0; for (size_t x : sz) total += x;
+    const size_t total = layer_major_bytes(T);  // = the sum of sz (one formula for this call and for prefill_body's span)
     const size_t rec = ex_.layout().total;
     const int n = (int)((total + rec - 1) / rec);
     uint8_t* p = ex_.lend_tail_slots(n);

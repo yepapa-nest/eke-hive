@@ -15,7 +15,7 @@
 
 namespace hive::mtpg {
 
-constexpr int kMaxRows = 8;            // forward_verify limit (runtime.cpp: M ≤ 8)
+constexpr int kMaxRows = 64;           // largest verify row count of any family (Qwen FN: 64 — kDecRows; the others report ≤ 8 through mtp_batch_rows())
 constexpr long kStale = 512;           // only slots measured within this many decisions count as "current cost"
 constexpr double kPriorSlope = 0.151;  // per-row increment / T(1) when only one slot is measured (layer-chain measurement above)
 constexpr double kAlpha = 0.2;         // cost EMA
@@ -105,6 +105,7 @@ struct Gate {
     return any && clock - probe_at > kStale;
   }
   mutable long probe_at = -(kStale + 1);  // decision time of the last re-measurement (written by choose_k)
+  mutable long reprobe_at = -(kStale + 1);  // decision time of the last re-measurement of a stale larger verify slot (choose_k)
   double p_accept(bool sampled, float c) const {
     const int b = bucket(c), s = sampled ? 1 : 0;
     return (hit[s][b] + kPriorW * prior_p(b)) / (tried[s][b] + kPriorW);
@@ -144,6 +145,21 @@ struct Gate {
       if (e_out) *e_out = 1.0 + p_accept(sampled, conf[0]);
       if (ms_out) *ms_out = vcost(2);
       return 1;
+    }
+    // Re-measurement of the next larger verify slot when it is stale (measured once, not chosen for kStale decisions) — one per window. Measured 2026-10-09 (DS 96 GB,
+    //   300 W, bench_chat c1 on a cold start, HIVE_TRACE_MTP): the only 3-row verifies came at the first steps, while T(1) was 109.8 ms with an empty expert cache
+    //   (87.5 / 96.5 ms, 460 CPU misses each). T(2) stayed fresh (k = 1 every step) but T(3) stayed at ~90 ms (stale slots are still used while fewer than two
+    //   verify slots are fresh), T(6) extrapolated to 284 ms — so k ≥ 2 was never chosen again: 6,412 of 6,414 decisions k = 1, drafts per step 1.0, c1 70.2 tok/s
+    //   warm vs 2.4–3 drafts per step on runs whose first verifies were not cold. probe_due only re-measures when every verify slot is stale. Loss bound as
+    //   probe_due: one verify with one more draft per kStale decisions.
+    if (k >= 1 && k < max_k && k < n_drafts && k < remaining && k + 2 <= kMaxRows && conf[k] >= conf_min && n[k + 2] > 0 && !fresh(k + 2) &&
+        clock - reprobe_at > kStale) {
+      reprobe_at = clock;
+      double ch = 1.0, ee = 1.0;
+      for (int i = 0; i <= k; ++i) { ch *= p_accept(sampled, conf[i]); ee += ch; }
+      if (e_out) *e_out = ee;
+      if (ms_out) *ms_out = vcost(k + 2);
+      return k + 1;
     }
     return k;
   }

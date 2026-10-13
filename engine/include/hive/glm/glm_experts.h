@@ -37,10 +37,24 @@ struct GlmCacheStats {
   double ms_defer_wait = 0;             // host time deferred_wait blocked for the helper thread (expert deferral)
 };
 
+// What GlmExperts needs from a model: the expert shape, which checkpoint layers hold routed experts, and where their tensors are.
+//   The tensors are read as `prefix + layer + ".mlp.experts." + e + ".{gate,up,down}_proj.{weight,weight_scale,weight_scale_2}"`
+//   (ModelOpt NVFP4: e2m1 [N, K/2] · e4m3 [N, K/16] · fp32 global). Any family with that checkpoint layout shares this class
+//   (GLM-5.3-Flash; Qwen3.8-Flash-Next, hive/qwen). limit = SwiGLU clamp (≤ 0 = none).
+struct ExpertSpec {
+  int hidden = 0, inter = 0, n_routed = 0, n_act = 0;
+  float limit = 0.f;
+  std::vector<int> moe_layers;  // checkpoint layer of each MoE layer, in MoE-layer order
+  Checkpoint* ckpt = nullptr;
+  std::string prefix = "model.language_model.layers.";
+  static ExpertSpec of(GlmModel& m);
+};
+
 class GlmExperts {
  public:
   // cache_bytes: VRAM for slots (0 = fit later with alloc_cache). cpu_threads: CPU expert workers.
-  GlmExperts(GlmModel& m, size_t cache_bytes, int cpu_threads, int staging_slots);
+  GlmExperts(const ExpertSpec& spec, size_t cache_bytes, int cpu_threads, int staging_slots);
+  GlmExperts(GlmModel& m, size_t cache_bytes, int cpu_threads, int staging_slots) : GlmExperts(ExpertSpec::of(m), cache_bytes, cpu_threads, staging_slots) {}
   ~GlmExperts();
   void load_all(int threads);                         // read every routed expert of layers 3..44 into pinned RAM
   int alloc_cache(size_t bytes);                      // allocate the slot area (returns slots)
@@ -67,6 +81,15 @@ class GlmExperts {
   size_t shrink_cache(size_t bytes);
   int regrow_cache(size_t reserve);
   int max_slots() const { return max_slots_; }
+  // Extra slot capacity (GlmEngine HIVE_GLM_MTP_LEND — the NextN layer's expert VRAM lent to this cache while several streams decode):
+  //   set_va_extra(n) before alloc_cache reserves address space for n more slots (VMM only; no memory). grow_extra maps up to that many more
+  //   slots while the free VRAM stays above `reserve` (they start empty — promotions fill them) and returns how many were added;
+  //   release_extra evicts tail slots until `bytes` are free again (shrink_cache) and lowers the slot ceiling back to the startup count.
+  //   Both need every reader of the slots idle (the caller synchronizes its compute stream). Without set_va_extra nothing changes.
+  void set_va_extra(int n) { va_extra_ = std::max(0, n); }
+  int grow_extra(size_t reserve);
+  size_t release_extra(size_t bytes);
+  int extra_slots() const { return std::max(0, n_slots_ - base_max_); }
   int n_slots() const { return n_slots_; }
   int n_keys() const { return n_moe_ * E_; }
   const ExpertRecLayout& layout() const { return L_; }
@@ -88,9 +111,23 @@ class GlmExperts {
   void deferred_wait();
   const float* deferred_y() const { return host_yd_[dbuf_]; }
   int deferred_rows() const { return drows_; }
+  // Every (row, expert) pair of MoE layer li on the CPU pool (layers placed on the CPU, GlmEngine HIVE_GLM_GPU_LAYERS): x fp32 [M, H] host
+  //   (bf16 values), y fp32 [M, H] host += Σ_k w · bf16(expert(x)) — the same arithmetic as the CPU misses of decode_layer. Any M (jobs of
+  //   more than 64 rows are split). Waits for a pending deferred batch first.
+  void cpu_rows(int li, int M, const int32_t* ids, const float* w, const float* x, float* y);
   // Prefill for one MoE layer: T rows, routing on host; GPU only (resident slots or streamed records).
   void prefill_layer(int li, int T, const int32_t* ids, const float* w, const bf16* x_dev, float* out_dev, cudaStream_t st);
   // After a decode step: score decay + asynchronous promotions (+ warm quota). Commits finished promotions first.
+  // The cache bookkeeping decode_layer does, for a step whose experts ran elsewhere (QwenEngine's mapped device routing): each routed key
+  //   scores +1, a non-resident one becomes a promotion candidate of the next after_step — the host route's policy.
+  void note_used(int li, const int32_t* ids, int n) {
+    for (int i = 0; i < n; ++i) {
+      if (ids[i] < 0 || ids[i] >= E_) continue;
+      const int key = li * E_ + ids[i];
+      score_[key] += 1.f; ++stats_.routed;
+      if (slot_of_[key] >= 0) ++stats_.hit; else { ++stats_.streamed; step_used_.push_back(key); }
+    }
+  }
   void after_step(int tokens = 1);   // promotion budget = promote_per_step_ × tokens processed in the step (a verify step processes several)
   void warm_quota(int n) { warm_left_ = n; }
   // Prediction prefetch (HIVE_GLM_PREFETCH=N): copy up to N predicted, non-resident experts of MoE layer li (ids/w host [rows·K]) into the
@@ -129,7 +166,7 @@ class GlmExperts {
   void promote_key(int key, const std::vector<int>& victims, size_t& next);
   std::vector<int> vic_;  // after_step: victim candidates of this step, ascending (score, slot)
   LayerMarks* marks_ = nullptr;
-  GlmModel& m_;
+  ExpertSpec spec_;
   int H_, I_, E_, K_, n_moe_;
   float limit_;
   ExpertRecLayout L_;
@@ -138,6 +175,7 @@ class GlmExperts {
   // VMM slot area (alloc_cache): one address range for max_slots_, physical memory mapped in steps of slot_step_ bytes (a multiple of the
   //   allocation granularity, independent of the record size — slots that straddle a step boundary stay usable only while both steps are mapped)
   GrowBuf slot_buf_;
+  int va_extra_ = 0, va_slots_ = 0, base_max_ = 0;  // set_va_extra / grow_extra
   bool slots_vmm_ = false; int max_slots_ = 0; size_t slot_step_ = 0;
   size_t slot_bytes_mapped(int n) const { return (((size_t)n * L_.total + slot_step_ - 1) / slot_step_) * slot_step_; }
   bool asleep_ = false; int slots_before_sleep_ = 0;

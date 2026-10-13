@@ -202,10 +202,11 @@ def source_exprs(td):
     exprs['HIVE_CACHE_FIT'] = expression('engine/src/hived.cpp', r'static const bool cache_fit = (env_on\("HIVE_CACHE_FIT"\));')
     exprs['HIVE_CACHE_RESERVE_MB'] = ('[] { const char* v = getenv("HIVE_CACHE_RESERVE_MB"); char* end = nullptr; const double x = v && *v ? strtod(v, &end) : 2400.0; const double mb = v && *v && !(end != v && end && *end == 0) ? 2400.0 : x; return std::isfinite(mb) && mb >= 0 ? std::min(mb, 1e7) : 2400.0; }()',
                                       expression('engine/include/hive/cache_reserve.h', r'(getenv\("HIVE_CACHE_RESERVE_MB"\))')[1])
-    # the parse lives in hive/cache_reserve.h (shared with the GLM KV growth); hived calls it once
+    # the parse lives in hive/cache_reserve.h (shared with the GLM KV growth)
     rssrc = (ROOT / 'engine/include/hive/cache_reserve.h').read_text()
     assert 'const double mb = v && *v && !(end != v && end && *end == 0) ? 2400.0 : x;' in rssrc, 'HIVE_CACHE_RESERVE_MB parse drifted'
-    assert (ROOT / 'engine/src/hived.cpp').read_text().count('cache_reserve_bytes()') == 1, 'hived must size the cache with cache_reserve_bytes()'
+    # the cache is sized with it exactly once (the HIVE_VRAM_LIMIT_MB plan reads the same value for its report)
+    assert (ROOT / 'engine/src/hived.cpp').read_text().count('const size_t cache_reserve = cache_reserve_bytes();') == 1, 'hived must size the cache with cache_reserve_bytes()'
     rtsrc = (ROOT / 'engine/src/runtime.cpp').read_text()
     assert 'w->eg_alias = env_on("HIVE_ENGRAM_ALIAS") && ' in rtsrc, 'HIVE_ENGRAM_ALIAS parse drifted'
     exprs['HIVE_ENGRAM_ALIAS'] = ('env_on("HIVE_ENGRAM_ALIAS")', expression('engine/src/runtime.cpp', r'(env_on\("HIVE_ENGRAM_ALIAS"\))')[1])
@@ -468,7 +469,7 @@ def launchers(td):
 def presence_audit():
     """Layer 3b: no HIVE_* switch may be decided by getenv(...) != nullptr alone."""
     bad, paths = [], []
-    conv = r'(atoi|atof|atoll|strtol|strtoll|strcmp|env_on|ly::parse_\w+|pg::parse_\w+)\s*\('  # T11 ly::parse_* = value parsing of hive/layer_yield.h (measured by the table)
+    conv = r'(atoi|atol|atof|atoll|strtol|strtoll|strcmp|env_on|ly::parse_\w+|pg::parse_\w+)\s*\('  # T11 ly::parse_* = value parsing of hive/layer_yield.h (measured by the table)
     for path in sorted((ROOT / 'engine/src').rglob('*.c*')):
         lines = path.read_text().splitlines()
         for n, line in enumerate(lines, 1):

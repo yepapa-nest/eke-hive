@@ -6,7 +6,9 @@
 #include <cstring>
 #include <fstream>
 
+#include "hive/cache_reserve.h"
 #include "hive/model_kernels.h"
+#include "hive/vram_limit.h"
 #include "nlohmann/json.hpp"
 
 namespace hive {
@@ -97,7 +99,89 @@ Model::Model(const std::string& dir, int max_layer, int64_t rope_len) : cfg_(Con
   }
   build_rope();
   int nl = max_layer < 0 ? cfg_.n_layers : std::min(max_layer + 1, cfg_.n_layers);
-  for (int l = 0; l < nl; ++l) load_layer(l);
+  n_gpu_ = plan_gpu_layers(nl);
+  for (int l = 0; l < n_gpu_; ++l) load_layer(l);
+  layers_.resize(nl);
+  for (int l = n_gpu_; l < nl; ++l) { layers_[l] = std::make_unique<LayerWeights>(); layers_[l]->id = l; }  // CPU-placed: placeholders
+}
+
+// VRAM one layer's dense weights take (load_block below: fp8 = values + per-row expanded scales [N, K/32], bf16 → fp32 conversions doubled)
+size_t Model::layer_vram_estimate(int l) {
+  const std::string p = "layers." + std::to_string(l), ap = p + ".attn";
+  size_t b = 0;
+  auto has = [&](const std::string& n) { return ckpt_.has(n); };
+  auto fp8 = [&](const std::string& n) {
+    if (!has(n + ".weight")) return;
+    const TensorInfo& t = ckpt_.get(n + ".weight");
+    b += t.nbytes + (size_t)t.shape[0] * (size_t)((t.shape[1] + 31) / 32);
+  };
+  auto raw = [&](const std::string& n) { if (has(n)) b += ckpt_.get(n).nbytes; };
+  auto f32 = [&](const std::string& n) { if (has(n)) b += (size_t)ckpt_.get(n).numel() * 4; };
+  fp8(ap + ".wq_a"); fp8(ap + ".wq_b"); fp8(ap + ".wkv"); fp8(ap + ".wo_b"); fp8(ap + ".wo_a");
+  raw(ap + ".q_norm.weight"); raw(ap + ".kv_norm.weight"); f32(ap + ".attn_sink");
+  if (cfg_.is_kv_source(l)) {
+    raw(ap + ".compressor.norm.weight");
+    if (cfg_.ratio(l) > 1) { f32(ap + ".compressor.wkv.weight"); f32(ap + ".compressor.wgate.weight"); }
+    else raw(ap + ".compressor.wkv.weight");
+  }
+  if (cfg_.is_index_source(l)) {
+    fp8(ap + ".indexer.wq_b"); raw(ap + ".indexer.weights_proj.weight");
+    if (cfg_.is_kv_source(l)) { raw(ap + ".indexer.wk.weight"); raw(ap + ".indexer.k_norm.weight"); }
+  }
+  f32(p + ".ffn.gate.weight"); f32(p + ".ffn.gate.bias"); f32(p + ".ffn.gate.bias_vl");
+  fp8(p + ".ffn.shared_experts.w1"); fp8(p + ".ffn.shared_experts.w2"); fp8(p + ".ffn.shared_experts.w3");
+  raw(p + ".attn_norm.weight"); raw(p + ".ffn_norm.weight");
+  for (const char* k : {"fn", "scale", "base"}) { f32(p + ".hc_attn_" + k); f32(p + ".hc_ffn_" + k); }
+  for (int el : cfg_.engram_layer_ids)
+    if (el == l) { fp8(p + ".engram.wkv"); b += (size_t)cfg_.hc * cfg_.dim * 4; }
+  return b;
+}
+
+// Layer-level placement (docs/vram-footprint.md §3.2). HIVE_DS_GPU_LAYERS=N (1 ≤ N ≤ nl; anything else = automatic) places layers [N, nl) on
+//   the CPU. Automatic: only under HIVE_VRAM_LIMIT_MB — every layer that fits stays on the GPU, counted from layer 0 (the CPU layers form one
+//   block at the end of the stack, so the hidden stream crosses PCIe once per forward each way). Budget = limit − CUDA context (the estimate
+//   hived also falls back to; HIVE_VRAM_CTX_MB overrides) − head and norm − RoPE tables − the startup plan's fixed part at the lean settings
+//   (vram_limit.h fixed_bytes: --max-chunk HIVE_DS_PLACE_CHUNK (default 4096), 2 sessions, 1 batch, staging 8, no MTP — the MTP weights are
+//   dropped first) − the reserve (HIVE_CACHE_RESERVE_MB) − HIVE_DS_MIN_SLOTS expert slots (default 32) − 128 MiB slack. hived's startup plan then
+//   checks the measured weights as before.
+int Model::plan_gpu_layers(int nl) {
+  const double MiB = 1048576.0;
+  if (const char* v = getenv("HIVE_DS_GPU_LAYERS"); v && *v) {
+    char* end = nullptr;
+    const long n = strtol(v, &end, 10);
+    if (end != v && end && *end == 0 && n >= 1 && n <= nl) {
+      if (n < nl) fprintf(stderr, "[model] layer placement (HIVE_DS_GPU_LAYERS): layers 0..%ld on the GPU, %ld..%d on the CPU\n", n - 1, n, nl - 1);
+      return (int)n;
+    }
+  }
+  const size_t limit = vram_limit::limit_bytes();
+  if (limit == 0 || nl < cfg_.n_layers) return nl;
+  double ctx = (double)vram_limit::kCtxFallback;
+  if (const char* v = getenv("HIVE_VRAM_CTX_MB"); v && atof(v) > 0) ctx = atof(v) * MiB;
+  const double head = (double)(head_.n + norm_.n);
+  const double rope = 2.0 * (double)rope_len_ * (cfg_.rd / 2) * 8.0;
+  vram_limit::Knobs k;
+  k.max_chunk = 4096;
+  if (const char* v = getenv("HIVE_DS_PLACE_CHUNK"); v && atoi(v) >= 256) k.max_chunk = atoi(v);
+  k.prefill_tile = 1; k.host_tiles = 0; k.staging = 8; k.max_batch = 1; k.max_sessions = 2; k.mtp = false; k.max_ctx = rope_req_;
+  const double fixed = vram_limit::fixed_bytes(vram_limit::Family::DeepSeek, k);
+  int min_slots = 32;
+  if (const char* v = getenv("HIVE_DS_MIN_SLOTS"); v && atoi(v) >= 0) min_slots = atoi(v);
+  const double slots = (double)min_slots * vram_limit::costs(vram_limit::Family::DeepSeek, false).record;
+  const double room = (double)limit - ctx - head - rope - fixed - (double)cache_reserve_bytes() - slots - 128 * MiB;
+  double used = 0;
+  int n = 0;
+  while (n < nl) {
+    const double lb = (double)layer_vram_estimate(n);
+    if (used + lb > room) break;
+    used += lb; ++n;
+  }
+  if (n >= nl) return nl;
+  n = std::max(n, 1);
+  fprintf(stderr, "[model] layer placement (HIVE_VRAM_LIMIT_MB %.0f, estimate): context %.0f + head %.0f + rope %.0f + fixed %.0f (chunk %d) + reserve %.0f + %d slots %.0f MiB "
+          "leave %.0f MiB for layers → layers 0..%d on the GPU (%.0f MiB), %d..%d on the CPU (MTP off)\n", limit / MiB, ctx / MiB, head / MiB, rope / MiB, fixed / MiB,
+          k.max_chunk, cache_reserve_bytes() / MiB, min_slots, slots / MiB, room / MiB, n - 1, used / MiB, n, nl - 1);
+  return n;
 }
 
 DevBuf Model::load_raw(const std::string& name) {
@@ -256,6 +340,10 @@ void Model::load_block(LayerWeights& L, const std::string& p, bool backbone) {
 void Model::load_mtp() {
   HIVE_CHECK(n_loaded_layers() == cfg_.n_layers, "load_mtp needs the full backbone");
   mtp_.clear();
+  if (n_gpu_ < n_loaded_layers()) {  // layer-level placement: the DSpark weights are the first block to leave the GPU (docs/vram-footprint.md §3.2)
+    fprintf(stderr, "[model] dspark off: %d of %d layers are on the CPU\n", n_loaded_layers() - n_gpu_, n_loaded_layers());
+    return;
+  }
   for (int s = 0;; ++s) {
     const std::string p = "mtp." + std::to_string(s);
     if (!ckpt_.has(p + ".attn_norm.weight")) break;

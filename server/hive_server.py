@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Eke Hive Authors
 """hive API server — OpenAI (/v1/chat/completions) and Anthropic (/v1/messages) compatible. Token ids are handed to the daemon
-(hived or hived_glm) over a Unix socket.
+(hived, hived_glm or hived_qwen) over a Unix socket.
   DeepSeek-V4.1-Flash: tokenization, the chat template, DSML tool-call parsing and image preprocessing reuse the reference
     encoding/ and inference/image_processor shipped with the checkpoint, unchanged.
   GLM-5.3-Flash: the checkpoint's chat_template.jinja through transformers, plus server/families/glm.py (tool-call parsing,
     image and video preprocessing).
+  Qwen3.8-Flash-Next: the same, with server/families/qwen.py.
 
 Run: python3 hive_server.py --ckpt /path/to/checkpoint --sock /tmp/hive.sock --port 8430
 """
@@ -130,8 +131,15 @@ class ClosingStreamingResponse(StreamingResponse):
 
 
 # ----------------------------------------------------------------------------------------------
-FAMILY = "deepseek_v4"   # model family of the checkpoint (config.json model_type); "glm5_next" uses server/families/glm.py
-STOP_IDS: list = []      # stop token ids (DeepSeek: the tokenizer's eos; GLM: config eos_token_id list)
+FAMILY = "deepseek_v4"   # model family of the checkpoint (config.json model_type); adapter families: ADAPTER_FAMILIES
+STOP_IDS: list = []      # stop token ids (DeepSeek: the tokenizer's eos; GLM: config eos_token_id list; Qwen: generation_config eos list)
+# model_type → adapter module in server/families (the checkpoint's chat template through transformers + the module's parsing / media)
+ADAPTER_FAMILIES = {"glm5_next": "glm", "qwen4_exp": "qwen", "qwen3_5": "q27"}
+
+
+def adapter_family() -> bool:
+    """True for a family served through a server/families adapter (GLM, Qwen) rather than DeepSeek's reference encoding."""
+    return FAMILY in ADAPTER_FAMILIES
 EOS_TEXTS: list = []     # their text forms (stripped from completions)
 
 
@@ -142,14 +150,19 @@ def load_modules(ckpt: str):
             cfg = json.load(f)
     except (OSError, ValueError):
         cfg = {}
-    if cfg.get("model_type") == "glm5_next":
+    if cfg.get("model_type") in ADAPTER_FAMILIES:
+        import importlib
+
         from transformers import AutoTokenizer
 
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from families import glm as fam  # noqa
+        fam = importlib.import_module("families." + ADAPTER_FAMILIES[cfg["model_type"]])
 
         TOK = AutoTokenizer.from_pretrained(ckpt)
-        fam.init(TOK, cfg)
+        if fam.FAMILY in ("qwen4_exp", "qwen3_5"):
+            fam.init(TOK, cfg, ckpt)  # stop ids from generation_config.json
+        else:
+            fam.init(TOK, cfg)
         ENC, FAMILY, STOP_IDS, EOS_TEXTS, DSML_START = fam, fam.FAMILY, list(fam.STOP_IDS), list(fam.EOS_TEXTS), fam.TOOL_START
         print(f"[server] family {FAMILY}: stop ids {STOP_IDS} · non-thinking requests -> {fam.nothink_mode()}")
         return
@@ -202,7 +215,7 @@ class VisionArgs:
 # ----------------------------------------------------------------------------------------------
 def effort_from_request(body: dict) -> tuple[str, Any]:
     """Extract thinking_mode and reasoning_effort from OpenAI/Anthropic fields. Default = thinking, 75 (DeepSeek's official default "high")."""
-    if FAMILY == "glm5_next":
+    if adapter_family():
         return ENC.effort_from_request(body)
     kw = body.get("chat_template_kwargs")
     kw = kw if isinstance(kw, dict) else {}
@@ -343,7 +356,7 @@ def tokenize_with_images(prompt: str, media: list[dict]):
     """Token ids plus, when images are present, patches and token types. Returns (ids, images_meta, bin_bytes)."""
     if not media:
         return TOK.encode(prompt), [], b""
-    if FAMILY == "glm5_next":  # GLM: the family adapter preprocesses images and video (server/families/glm.py)
+    if adapter_family():  # GLM / Qwen: the family adapter preprocesses images and video (server/families/glm.py, qwen.py)
         return ENC.prepare_inputs(prompt, media, TOK)
     if IMG is None:
         raise ValueError("image preprocessing module is not available")
@@ -1055,9 +1068,9 @@ def session_id_for(messages: list[dict], explicit: str | None) -> str:
 
 
 def parse_completion(text: str, thinking_mode: str, tools):
-    """The family parser. GLM also takes the request's tools — its tool-call format has no type marker, so argument types come from
-    the schemas (server/families/glm.py _arg_value); DeepSeek's DSML marks string arguments itself (string="true")."""
-    if FAMILY == "glm5_next":
+    """The family parser. GLM and Qwen also take the request's tools — their tool-call formats have no type marker, so argument types
+    come from the schemas (server/families/glm.py / qwen.py _arg_value); DeepSeek's DSML marks string arguments itself (string="true")."""
+    if adapter_family():
         return ENC.parse_message_from_completion_text(text, thinking_mode=thinking_mode, tools=tools)
     return ENC.parse_message_from_completion_text(text, thinking_mode=thinking_mode)
 
@@ -1515,11 +1528,13 @@ def stage_update(rid: str, ended: bool = False, **kw) -> None:
 
 class StageText:
     """Stage of the generated text (HIVE_STAGE_STATUS): thinking until </think> in thinking mode, then answer; tool_call from the family's
-    tool-call start on, with the tool name once the format has written it (GLM `<tool_call>name<arg_key>`, DeepSeek DSML `invoke name="…"`).
+    tool-call start on, with the tool name once the format has written it (GLM `<tool_call>name<arg_key>`, Qwen `<tool_call>\n<function=name>`,
+    DeepSeek DSML `invoke name="…"`).
     feed() returns True when the stage or the tool name changed."""
 
     _DS_NAME = re.compile(r'invoke name="([^"]+)"')
     _GLM_NAME = re.compile(r"^\s*([^<\s]+)\s*<")
+    _QWEN_NAME = re.compile(r"^\s*<function=([^>\n]+)>")
 
     def __init__(self, thinking: bool):
         self.stage = "thinking" if thinking else "answer"
@@ -1541,7 +1556,7 @@ class StageText:
             if j >= 0:
                 self.stage, self.buf = "tool_call", self.buf[j + len(DSML_START):]
         if self.stage == "tool_call" and not self.tool:
-            m = self._DS_NAME.search(self.buf) or self._GLM_NAME.match(self.buf)
+            m = self._DS_NAME.search(self.buf) or self._QWEN_NAME.match(self.buf) or self._GLM_NAME.match(self.buf)
             if m:
                 self.tool = m.group(1)[:80]
         return (self.stage, self.tool) != before
@@ -1878,7 +1893,7 @@ async def chat(request: Request):
         in_think = thinking_mode == "thinking"
         tool_buf = ""
         in_tool = False
-        tstream = DsmlToolStream(ENC) if os.environ.get("HIVE_TOOL_STREAM", "1") != "0" and FAMILY != "glm5_next" else None
+        tstream = DsmlToolStream(ENC) if os.environ.get("HIVE_TOOL_STREAM", "1") != "0" and not adapter_family() else None
         done = {}
 
         def tool_chunks(piece):
@@ -2150,7 +2165,7 @@ async def anthropic_messages(request: Request):
 # ----------------------------------------------------------------------------------------------
 def main():
     global CFG, ARGS, DAEMON
-    parser = argparse.ArgumentParser(description="Eke Hive API server (OpenAI chat and Anthropic messages) in front of hived / hived_glm.")
+    parser = argparse.ArgumentParser(description="Eke Hive API server (OpenAI chat and Anthropic messages) in front of hived / hived_glm / hived_qwen.")
     parser.add_argument("--ckpt", default=os.environ.get("HIVE_CKPT"), help="checkpoint directory (default: $HIVE_CKPT)")
     parser.add_argument("--sock", default="/tmp/hive.sock", help="Unix socket of the running daemon")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")

@@ -5,16 +5,18 @@ environment switches and the HTTP request fields. For each engine switch it give
 value in the recommended configuration ([`config/hive.env`](../config/hive.env)) and, where one exists, the
 measurement that decided it. The measurements themselves are described in [performance.md](performance.md).
 
-Internal identifiers keep the short name: the daemons are `hived` (DeepSeek-V4.1-Flash) and `hived_glm` (GLM-5.3-Flash, the
-same source built with the GLM family types), the CLI is `hive`, variables start with `HIVE_`.
+Internal identifiers keep the short name: the daemons are `hived` (DeepSeek-V4.1-Flash), `hived_glm` (GLM-5.3-Flash) and `hived_qwen`
+(Qwen3.8-Flash-Next) — the same source built with each family's types —, the CLI is `hive`, variables start with `HIVE_`.
 
 ## Model families
 
-The launcher reads the checkpoint's `config.json`: `model_type` `glm5_next` selects GLM-5.3-Flash (`hived_glm`), anything else
-DeepSeek-V4.1-Flash (`hived`); `HIVE_MODEL_FAMILY=deepseek|glm` overrides it. The configuration file follows the family:
-[`config/hive.env`](../config/hive.env) for DeepSeek, [`config/glm.env`](../config/glm.env) for GLM, unless `HIVE_CONFIG` names one.
+The launcher reads the checkpoint's `config.json`: `model_type` `glm5_next` selects GLM-5.3-Flash (`hived_glm`), `qwen4_exp`
+Qwen3.8-Flash-Next (`hived_qwen`), `qwen3_5` Qwen3.8-27B (`hived_q27`), anything else DeepSeek-V4.1-Flash (`hived`); `HIVE_MODEL_FAMILY=deepseek|glm|qwen|q27` overrides it. The
+configuration file follows the family: [`config/hive.env`](../config/hive.env) for DeepSeek, [`config/glm.env`](../config/glm.env) for GLM,
+[`config/qwen.env`](../config/qwen.env) for Qwen3.8-Flash-Next ([qwen.md](qwen.md)), [`config/q27.env`](../config/q27.env) for Qwen3.8-27B
+([q27.md](q27.md)), unless `HIVE_CONFIG` names one.
 
-- **Launcher keys, the API server settings and the HTTP request fields** apply to both families (differences are noted).
+- **Launcher keys, the API server settings and the HTTP request fields** apply to every family (differences are noted).
 - **Daemon-level switches** (scheduler, sessions, prefix sharing, the speculative-decoding gate, `HIVE_CACHE_FIT`,
   `HIVE_CACHE_RESERVE_MB`, `HIVE_CACHE_PRIOR`, sleep) are read by the shared `hived.cpp` and apply to both:
   `HIVE_CACHE_FIT`, `HIVE_CACHE_RESERVE_MB`, `HIVE_CACHE_PRIOR`(`_TOPJ`), `HIVE_PREFIX_SHARE`, `HIVE_PREFIX_ADAPTIVE`,
@@ -25,6 +27,10 @@ DeepSeek-V4.1-Flash (`hived`); `HIVE_MODEL_FAMILY=deepseek|glm` overrides it. Th
   `HIVE_PREFETCH*`, the kernel switches, and the `hived` flags `--gpu-share`, `--promote`, `--promote-misses`, `--prefill-tile`,
   `--decoder-tail`, `--decoder-replay`, `--engram`) apply to DeepSeek only.
 - **GLM's own switches** (`HIVE_GLM_*`) are listed in [glm.md](glm.md#switches-of-this-family).
+- **Qwen3.8-Flash-Next's own switches** (`HIVE_QWEN_*` — VRAM budget, device routing, PLE table placement, MTP) are listed in
+  [qwen.md](qwen.md#switches-of-this-family); its expert store is the GLM family's, so the `HIVE_GLM_*` switches of that store apply to it.
+- **Qwen3.8-27B's own switches** (`HIVE_Q27_*` — placement under a VRAM budget, the KV tier, DFlash2 drafter, low-precision copies) are
+  listed in [q27.md](q27.md).
 
 ## How configuration works
 
@@ -43,6 +49,35 @@ corresponding keys, and any flag it does not know is passed on to `hived`. See [
 step-by-step setup.
 
 Most engine switches are read once when the daemon starts; change them and restart.
+
+### Model and VRAM profile
+
+Instead of picking a configuration file, name the model and the card in two lines (environment or `HIVE_LOCAL_ENV`):
+
+```
+HIVE_MODEL=ds          # ds (DeepSeek-V4.1-Flash) · glm (GLM-5.3-Flash) · fn (Qwen3.8-Flash-Next) · 27b (Qwen3.8-27B)
+HIVE_VRAM_GB=24        # 96 (default) · 72 · 48 · 32 · 24 · 16 · 12 · 8 · 0 = CPU only
+```
+
+`scripts/lib.sh` (`hive_apply_profile`) then derives:
+
+| | derived value |
+|---|---|
+| checkpoint | `HIVE_CKPT` = the first `<dir>/<name>/config.json` over `HIVE_MODELS_DIR` (colon list, default `/models`), names from `config/profiles/<model>.env` |
+| family / daemon | `HIVE_MODEL_FAMILY` from the profile; `HIVE_VRAM_GB=0` sets `HIVE_GPU=none` and starts the family's CPU daemon (`hived_ds_cpu`, `hived_glm_cpu`, `hived_qwen_cpu`, `hived_q27_cpu`) |
+| VRAM cap | `HIVE_VRAM_LIMIT_MB` = GB × 1024 below 96; 96 leaves it unset (the whole card) |
+| knobs | `config/profiles/<model>-<size>.env`. The measured sizes are 96 / 72 / 48 / 32 GB (the table in the [README](../README.md#performance-by-vram-size)); their files hold the measured overrides, each with its measurement in a comment: GLM — layer-major prefill blocks and row block (`HIVE_GLM_PREFILL_TILES`, `HIVE_GLM_PREFILL_ROWBLOCK`), `--max-chunk 8192` with `HIVE_GLM_KV_BASE=4096` (72 / 48), single-stream MTP with its experts lent to the cache (`HIVE_MTP_BATCH=0`, `HIVE_GLM_MTP_LEND=1`), `HIVE_GLM_CPU_CHUNKS=4` (48), the lean set at 32; FN — `HIVE_QWEN_GRAPH_ROWS=8` (48 / 32) and `HIVE_QWEN_HYB_PCIE=4` (48); 27B — `--max-ctx 262144` (the engine's KV tier keeps every context, [q27.md](q27.md#vram-budget-and-the-kv-tier)); DS — none. Smaller cards (24 / 16 / 12 / 8 GB) start from the lean set of [vram-footprint.md](vram-footprint.md) §2 (`--max-chunk 4096`, `--max-batch 1`, 2 sessions, `--max-ctx 32768`, reserve 1,700 / 500 MiB), then no MTP and no images, then layers on the CPU (§3.2) — estimates (**E**), not measured. They are data files, not code |
+| big table | DS Engram (203 GB, `HIVE_ENGRAM_SSD`; CPU only `HIVE_DS_CPU_ENGRAM=mmap`) and FN PLE (47.7 GB, `HIVE_QWEN_PLE=ssd`) stay on disk when installed RAM − 8 GiB is below the profile's RAM-mode need (`HIVE_PROFILE_RAM_GB` vs `HIVE_PROFILE_RAM_GB_SSD`) |
+| RAM wait | `HIVE_RAM_WAIT_GB` = the need of the chosen placement |
+
+Precedence is unchanged: the environment, `HIVE_LOCAL_ENV` and an explicitly set `HIVE_CONFIG` win over the profile; the family's shipped
+configuration fills whatever the profile leaves open. Without `HIVE_MODEL` nothing of this runs.
+
+Pre-flight (`hive_profile_preflight`, printed as `[profile] …`): MemAvailable below the need and a checkpoint smaller than the full
+download (`HIVE_PROFILE_DISK_GB`) are warnings; a disk-resident table on a rotating disk and less than 2 GB free under `HIVE_STATE_DIR` too.
+The start stops only when the installed RAM − 8 GiB cannot hold the need even with the table on disk (or with an explicit RAM setting —
+the message names the switch to change). `HIVE_DRY_RUN=1 scripts/hive-start.sh` prints the resolved `HIVE_*` settings and the daemon
+command line without docker or a GPU; `tools/test_profiles_cpu.sh` dry-runs every combination.
 
 ### Value conventions
 
@@ -88,11 +123,12 @@ Read by the scripts in `scripts/` (and forwarded into the container). The second
 | `HIVE_MAX_CHUNK` | `16384` / `16384` | Prefill chunk (rows per sub-chunk) → `--max-chunk` |
 | `HIVE_CPU_THREADS` | `16` / `32` | CPU expert worker threads, split over the NUMA nodes → `--cpu-threads` |
 | `HIVE_MAX_BATCH` | `8` / `8` | Sequences in one decode batch → `--max-batch` |
-| `HIVE_HOST_SESSION_MB` | — / `98304` | RAM budget for conversations evicted from the VRAM session pool → `--host-session-mb` (hived default 32768; oldest dropped first). A 145K-token GLM conversation keeps ~3 GB: twelve of them, then the first one again, 37.0 s → 1.6 s to the first token ([performance.md](performance.md#steps-in-order-1) GLM step 27) |
+| `HIVE_HOST_SESSION_MB` | `98304` / `98304` (also `config/q27.env`) | RAM budget for conversations evicted from the VRAM session pool → `--host-session-mb` (hived default 32768; oldest dropped first). `scripts/lib.sh` lowers it on smaller hosts to 25 % of (installed RAM − `HIVE_RAM_WAIT_GB` − 8 GiB), at least 4096 — the shipped 98304 fit a 1 TB host. A 145K-token GLM conversation keeps ~3 GB: twelve of them, then the first one again, 37.0 s → 1.6 s to the first token ([performance.md](performance.md#steps-in-order-1) GLM step 27) |
 | `HIVE_DAEMON_ARGS` | `--gpu-share 0 --promote 8 --prefill-tile 3 --decoder-replay` / — | Extra `hived` arguments (empty when unset) |
 | `HIVE_RAM_WAIT_GB` | `480` / `390` | `hive-start.sh` waits (up to 10 min) until the previous `hived` has exited and this much RAM is available; values above the installed RAM are clamped to MemTotal − 8 GiB. Use ~360 in SSD mode |
+| `HIVE_START_WAIT_OTHERS` | `1` | `hive-start.sh` waits for every other GPU daemon (`hived`, `hived_glm`, `hived_qwen`, `hived_q27` and the CPU daemons) to exit before it starts. `0` = wait only for the RAM (`HIVE_RAM_WAIT_GB`): for running a second model beside one that stays up (asleep, or two daemons under VRAM caps — see `HIVE_VRAM_BALLAST_RELEASE`). CPU-only starts (`HIVE_GPU=none`) never wait for GPU daemons |
 | `HIVE_BUILD` | `build` | Build directory under `engine/`. `hive-start.sh` ignores a value from the shell on purpose and uses only `--build DIR`; `build.sh` and the test scripts use it |
-| `HIVE_START_ASLEEP` | off | Start in the sleeping state (see [Sleep and wake](#sleep-and-wake)); `hive-start.sh` then only requires 14,000 MiB of free VRAM instead of cache + 12,000 MiB (with `HIVE_CACHE_FIT` on: 12,000 MiB + `HIVE_CACHE_RESERVE_MB`) |
+| `HIVE_START_ASLEEP` | off | Start in the sleeping state (see [Sleep and wake](#sleep-and-wake)); `hive-start.sh` then only requires 14,000 MiB of free VRAM instead of cache + 12,000 MiB (with `HIVE_CACHE_FIT` on: 12,000 MiB + `HIVE_CACHE_RESERVE_MB`; with `HIVE_VRAM_LIMIT_MB` set: that value) |
 | `HIVE_SLEEP_LEVEL` | `1` | `hive-sleep.sh sleep`: 1 = free the expert cache · 2 = also move session KV to RAM · 3 = also move dense weights, work buffers and cuBLAS state to host (needs `HIVE_SLEEP_VMM=1` or `HIVE_START_ASLEEP=1`, otherwise the daemon uses 2) |
 | `HIVE_SLEEP_TIMEOUT_S` | wait forever | `hive-sleep.sh`: give up sleeping if running requests take longer |
 | `HIVE_SLEEP_LOG` | — | `hive-sleep.sh` log file |
@@ -113,7 +149,7 @@ The ones that depend on the hardware, and how to set them elsewhere:
 | `HIVE_RAM_WAIT_GB` | 480 / 390 | Below the installed RAM (the start script clamps to MemTotal − 8 GiB); ~360 in SSD mode |
 | `HIVE_ENGRAM_SSD` | off | Turn on with less than ~512 GB of RAM (295 GB resident, needs a fast NVMe: ~48 random row reads per token) |
 | `HIVE_PREFILL_HOST_MB`, `HIVE_CKPT_PINNED_POOL_MB` | 1920, 4096 | Pinned host buffers for prefill tiles and prompt checkpoints; lower them when RAM is tight (checkpoints then fall back to pageable copies) |
-| `HIVE_MAX_CTX`, `HIVE_MAX_BATCH` | 262144, 8 / 262144, 4 | DeepSeek reserves session KV per slot in VRAM (`session pool` line in the log); fewer or shorter sessions free VRAM for the cache. GLM maps KV as conversations grow ([glm.md](glm.md#context-and-kv-memory)) |
+| `HIVE_MAX_CTX`, `HIVE_MAX_BATCH` | 262144, 8 / 262144, 4 | DeepSeek reserves session KV per slot in VRAM (`session pool` line in the log); fewer or shorter sessions free VRAM for the cache. GLM maps KV as conversations grow ([glm.md](glm.md#context-and-kv-memory)). DeepSeek-V4.1-Flash and GLM-5.3-Flash accept up to `1048576` (their checkpoints declare 1,048,576 positions) — measured in the [README](../README.md#reference-1m-token-context-glm-53-flash-deepseek-v41-flash) |
 
 ## `hived` command line
 
@@ -179,6 +215,8 @@ read by `hived_glm` too; `config/glm.env` sets `HIVE_CACHE_FIT`, `HIVE_CACHE_RES
 | --- | --- | --- | --- | --- |
 | `HIVE_CACHE_FIT` | off | `1` | Size the expert cache after the session pool is allocated: free VRAM minus `HIVE_CACHE_RESERVE_MB`. `--vram-cache-mb` is then ignored | adopted (step 10): +81 slots |
 | `HIVE_CACHE_RESERVE_MB` | 2400 | — | VRAM left free by `HIVE_CACHE_FIT` (lazy vision encoder, image patches, graph growth) | 1800 rejected: image requests ran out of VRAM |
+| `HIVE_VRAM_LIMIT_MB` | unset | — | Run as if the card had this many MiB (GPU daemons `hived`, `hived_glm`, `hived_qwen`, `hived_q27`; ignored by the CPU-only daemons). Everything counts: CUDA context (measured with NVML before / after it is created; 984 MiB estimate without NVML), weights (measured after loading), work buffers, sessions, KV, graphs, cuBLAS. After the weights load, a startup plan estimates the rest ([vram-footprint.md](vram-footprint.md) §1.3) and, if it does not fit beside `HIVE_CACHE_RESERVE_MB`, lowers in this order and logs each step (`[hived] VRAM plan:`): DeepSeek host tiles → `--prefill-tile` → `HIVE_STAGING` → `HIVE_MTP_BATCH` → halve `--max-chunk` (≥ 1,024) → halve `--max-batch` with `--max-sessions` capped at it. If the weights alone, or the lowest settings, do not fit: prints the shortfall and the number of layers that would have to leave the GPU, and exits with code 2. Then one ballast allocation holds the rest of the card, so `HIVE_CACHE_FIT`, KV growth, vision and wake all see the smaller card; stats report used / total without it (`vram.limit_ballast_mib`). `hive-start.sh` then requires exactly this much free VRAM instead of its 12,000 MiB + reserve rule. `HIVE_QWEN_VRAM_MB` (Qwen only) still works; it does not count the context | measured at 96 / 72 / 48 / 32 GB for all four families ([README](../README.md#performance-by-vram-size)) |
+| `HIVE_VRAM_BALLAST_RELEASE` | off | — | With `HIVE_VRAM_LIMIT_MB`: the limit is held by a VRAM ballast allocation for the life of the process. On, the ballast is freed just before `[hived] ready`: every startup decision (layer placement, VRAM plan, session pool, cache fit) is made under the limit exactly as without the switch, then the rest of the card is free for a second daemon (start them one after the other). Growth after start (KV, lent MTP experts, image buffers) then sees the card's real free memory instead of the limit | opt-in: GLM-5.3-Flash at 48 GB + Qwen3.8-27B at 32 GB on one 96 GB card — [README](../README.md#reference-two-models-on-one-card) |
 | `HIVE_CACHE_ELASTIC` | off | `1` | Lend the prefill-only work buffers to the expert cache as extra slots while no prefill runs; a chunk larger than S rows takes them back by a table update (no copy). Value S = small-buffer rows (`1` = decode minimum) | adopted (step 10): +638 slots, reclaimed in 3.9 ms; joint A/B c4 +12 %, c8 +13 % |
 | `HIVE_CACHE_POLICY` | score policy | `seq` | `seq` = request-aware residency by expected use count. Tuning form `seq:alpha=8:pre=8:min=0.025:gd=0.999:od=0.99:idle=8`; unknown names fall back to the default policy | adopted (step 3): real-trace replay −5 to −8 % misses on natural language |
 | `HIVE_PROMOTE_SCORE` | off | `1` | Score-based victim choice for promoted misses | adopted, no separate A/B |
@@ -269,6 +307,8 @@ read by `hived_glm` too; `config/glm.env` sets `HIVE_CACHE_FIT`, `HIVE_CACHE_RES
 | `HIVE_CPU_GEMV2` | off | `1` | CPU fp4 GEMV v2: e2m1 straight to fp32, vectorised scales, prefetch (bit-identical) | adopted (step 7): c1 +3 %, 6–9 W lower |
 | `HIVE_CPU_UNPACK2` | off | `1` | Vectorised unpacking of the CPU input activations | adopted (step 9): c8 +6.4 % |
 | `HIVE_CPU_MULTIROW2` | off | `1` | K-tiled multi-row kernel for jobs with ≥ N rows (2–8; `1` = 5) | adopted (step 9): 1K prefill −7.8 %, c4 +2.8 % |
+| `HIVE_CPU_E2M1_REG` | on | — | With `HIVE_CPU_GEMV2`: the e2m1 (MXFP4) multi-row kernel for 2–8 rows keeps its accumulators in registers (the row count is a template constant), whole weight rows; taken before `HIVE_CPU_MULTIROW2`. Bit-identical to the v2 kernel (`bench_expert_cpu` compares the bits); `0` = off | adopted: pool microbenchmark (`engine/tests/bench_e2m1_pool_cpu.cpp`, 3975WX, GB/s) R=2 88–104 → 93–107 · R=4 58–76 → 71–86 · R=8 31–38 → 31–39 |
+| `HIVE_CPU_NVFP4_V2` | on | — | NVFP4 CPU expert kernels (GLM-5.3-Flash, Qwen3.8-Flash-Next and their CPU daemons): byte-shuffle unpack, 4 weight rows per pass for one row, register accumulators for 2–8 rows. The same operation chain per output as the reference kernel — bit-identical (`test_nvfp4_cpu` compares every bit); `0` = the reference kernels | adopted: pool microbenchmark (`engine/tests/bench_nvfp4_pool_cpu.cpp`) — numbers in `engine/src/cpu/expert_cpu_nvfp4.cpp` |
 | `HIVE_CPU_FINE` | off | — | Finer work items for multi-row jobs | rejected (no effect on the step-9 base) |
 | `HIVE_CPU_SPLIT13` | off | — | Split CPU phase 1 into separate w1 and w3 items | rejected: within noise, c1 −3.2 % |
 | `HIVE_CPU_P2_PREFETCH` | off | — | Prefetch the w2 rows into L2 while waiting for phase 2 | rejected: CPU benchmark 8–15 % slower |

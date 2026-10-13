@@ -57,6 +57,11 @@ bool gemv2_enabled();
 void gemv_e2m1_rows_multi_v3(const uint8_t* W, const uint8_t* sw, int N, int K, const float* const* a_f32, const float* const* sa_f32, int R,
                              int n0, int n1, float* const* y);
 bool multirow2_enabled();
+// HIVE_CPU_E2M1_REG (default on; "0" = off; needs HIVE_CPU_GEMV2): multi-row R = 2..8 runs _v4 (ahead of HIVE_CPU_MULTIROW2) — R as a template
+//   constant (accumulators in registers), whole rows; bit-identical to _v2 (= _ref).
+void gemv_e2m1_rows_multi_v4(const uint8_t* W, const uint8_t* sw, int N, int K, const float* const* a_f32, const float* const* sa_f32, int R,
+                             int n0, int n1, float* const* y);
+bool e2m1_reg_enabled();
 int multirow2_min_rows();  // 0 = off
 // HIVE_CPU_UNPACK2: unpack one activation row — vector version bit-identical to a_f[d] = e4m3_to_f32(q[d]) · a_s[b] = e8m0_to_f32(s[b])
 //   (b < dim/32) / the scalar formula (_ref).
@@ -74,6 +79,16 @@ void gemv_nvfp4_rows(const uint8_t* W, const uint8_t* sw, float gscale, int N, i
 // R activations (R ≤ 8) per weight row: the row is unpacked once (batched decode rows that hit the same expert).
 void gemv_nvfp4_rows_multi(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a_f32, int R, int n0, int n1,
                            float* const* y);
+// HIVE_CPU_NVFP4_V2 (default on; "0" = off): the two entry points above run _v2 — the _ref accumulation chain per output, bit-identical
+//   (tests/test_nvfp4_cpu.cpp compares every output bit), faster: shuffle unpack, 4 weight rows per pass at R = 1, register accumulators at
+//   R ≥ 2 (expert_cpu_nvfp4.cpp has the measurements). _ref / _v2 directly = tests and benchmarks.
+void gemv_nvfp4_rows_ref(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a_f32, int n0, int n1, float* y);
+void gemv_nvfp4_rows_v2(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a_f32, int n0, int n1, float* y);
+void gemv_nvfp4_rows_multi_ref(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a_f32, int R, int n0, int n1,
+                               float* const* y);
+void gemv_nvfp4_rows_multi_v2(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* const* a_f32, int R, int n0, int n1,
+                              float* const* y);
+bool nvfp4_v2_enabled();
 // Scalar reference of gemv_nvfp4_rows (tests).
 void gemv_nvfp4_rows_scalar(const uint8_t* W, const uint8_t* sw, float gscale, int N, int K, const float* a_f32, int n0, int n1, float* y);
 

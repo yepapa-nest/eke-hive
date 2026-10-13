@@ -113,6 +113,10 @@ class Model {
   Checkpoint& ckpt() { return ckpt_; }
   const LayerWeights& layer(int l) const { return *layers_[l]; }
   int n_loaded_layers() const { return (int)layers_.size(); }
+  // Layer-level placement: layers [0, n_gpu_layers()) have their dense weights on the GPU; [n_gpu_layers(), n_loaded_layers()) are placed on the
+  //   CPU (Runtime::CpuLayers) — their LayerWeights are empty placeholders. Chosen at construction: HIVE_DS_GPU_LAYERS=N, or under
+  //   HIVE_VRAM_LIMIT_MB the most layers whose estimated VRAM fits beside the head and the startup plan (plan_gpu_layers in model.cpp).
+  int n_gpu_layers() const { return n_gpu_; }
   const bf16* embed_host() const { return embed_host_; }  // [vocab, dim] bf16 (checkpoint mmap)
   const bf16* head() const { return head_.as<bf16>(); }
   const bf16* norm() const { return norm_.as<bf16>(); }
@@ -133,6 +137,9 @@ class Model {
   std::vector<std::unique_ptr<LayerWeights>> layers_;
   std::vector<std::unique_ptr<MtpWeights>> mtp_;
   void load_block(LayerWeights& L, const std::string& p, bool backbone);
+  int n_gpu_ = 0;
+  int plan_gpu_layers(int nl);
+  size_t layer_vram_estimate(int l);
   const bf16* embed_host_ = nullptr;
   void* embed_owned_ = nullptr;
   DevBuf head_, norm_, rope_window_, rope_compress_;

@@ -5,6 +5,8 @@
 //   two 16-column scales of a 32-column block must change the result.
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -55,6 +57,45 @@ int main() {
     gemv_nvfp4_rows(W.data(), S2.data(), g, N, K, a.data(), 0, N, ys2.data());
     std::vector<float> y0(N); gemv_nvfp4_rows(W.data(), S.data(), g, N, K, a.data(), 0, N, y0.data());
     EXPECT(rel(ys2, y0, 0, N) > 1e-3, "swapped 16-column scales must change the result");
+  }
+  // _v2 == _ref bit for bit: GLM (4096/2048, NUMA halves 1024×4096 / 2048×2048) and FN (2560/640, halves 320×2560 / 1280×640) shapes,
+  //   R = 1..8, odd row ranges (tails of the 4-row and 16-row groups), scale codes over the whole e4m3 range incl. zero / negative / subnormal,
+  //   activations with outliers, zeros and negative zeros. Negative control: changing one block of activations changes the output bits.
+  {
+    long cmp = 0, diff = 0;
+    for (auto [N, K] : {std::pair{1024, 4096}, {2048, 2048}, {320, 2560}, {1280, 640}, {37, 96}}) {
+      std::vector<uint8_t> W((size_t)N * K / 2), S((size_t)N * K / 16);
+      for (auto& b : W) b = rng() & 0xFF;
+      for (auto& b : S) b = (uint8_t)(rng() & 0xFF);
+      for (auto& b : S) if ((b & 0x7F) == 0x7F) b = 0x38;  // 0x7F / 0xFF = NaN in e4m3fn: not produced by the checkpoints
+      std::normal_distribution<float> nd(0.f, 1.f);
+      std::vector<std::vector<float>> as(8, std::vector<float>(K));
+      for (auto& r : as) for (auto& v : r) { v = nd(rng) * (rng() % 64 == 0 ? 50.f : 1.f); if (rng() % 97 == 0) v = 0.f; if (rng() % 101 == 0) v = -0.f; }
+      for (int R = 1; R <= 8; ++R)
+        for (auto [n0, n1] : {std::pair{0, N}, {1, N - 2}, {5, std::min(N, 23)}}) {
+          std::vector<std::vector<float>> y1(R, std::vector<float>(N, 7.f)), y2(R, std::vector<float>(N, 7.f));
+          std::vector<const float*> ap; std::vector<float*> p1, p2;
+          for (int r = 0; r < R; ++r) { ap.push_back(as[r].data()); p1.push_back(y1[r].data()); p2.push_back(y2[r].data()); }
+          const float g = 0.0137f;
+          gemv_nvfp4_rows_multi_ref(W.data(), S.data(), g, N, K, ap.data(), R, n0, n1, p1.data());
+          gemv_nvfp4_rows_multi_v2(W.data(), S.data(), g, N, K, ap.data(), R, n0, n1, p2.data());
+          for (int r = 0; r < R; ++r)
+            for (int n = 0; n < N; ++n) { ++cmp; diff += memcmp(&y1[r][n], &y2[r][n], 4) != 0; }
+          if (R == 1) {  // single-row entry too
+            std::vector<float> s1(N, 7.f), s2(N, 7.f);
+            gemv_nvfp4_rows_ref(W.data(), S.data(), g, N, K, as[0].data(), n0, n1, s1.data());
+            gemv_nvfp4_rows_v2(W.data(), S.data(), g, N, K, as[0].data(), n0, n1, s2.data());
+            for (int n = 0; n < N; ++n) { ++cmp; diff += memcmp(&s1[n], &s2[n], 4) != 0; }
+          }
+        }
+      // negative control (the comparison can see a change)
+      std::vector<float> b0(N), b1(N); std::vector<float> a2 = as[0]; for (int k = 0; k < 32; ++k) a2[K / 2 + k] += 0.25f;  // one block: some row with a nonzero weight there must change
+      gemv_nvfp4_rows_v2(W.data(), S.data(), 1.f, N, K, as[0].data(), 0, N, b0.data());
+      gemv_nvfp4_rows_v2(W.data(), S.data(), 1.f, N, K, a2.data(), 0, N, b1.data());
+      EXPECT(memcmp(b0.data(), b1.data(), 4 * N) != 0, "negative control: changed activation must change the output (N %d K %d)", N, K);
+    }
+    EXPECT(diff == 0, "_v2 != _ref in %ld of %ld outputs", diff, cmp);
+    printf("nvfp4 CPU: _v2 == _ref bitwise over %ld outputs (R 1..8, GLM/FN half shapes, odd ranges)\n", cmp);
   }
   if (fails) { fprintf(stderr, "nvfp4 CPU: %d failures\n", fails); return 1; }
   puts("nvfp4 CPU: AVX2 gemv == scalar reference · multi-row == single row (bitwise) · per-16 scales matter");

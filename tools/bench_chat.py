@@ -36,15 +36,16 @@ P.add_argument("--out", default=os.path.join(os.environ.get("HIVE_STATE_DIR", "r
 P.add_argument("--max-tokens", type=int, default=600)
 P.add_argument("--conc", default="1,2,4,8,16,32", help="concurrency levels")
 P.add_argument("--long", default="17000,42000,54000", help="approximate prompt sizes in tokens for the long-prompt step ('' = skip)")
+P.add_argument("--long-timeout", type=float, default=0, help="seconds; a long prompt with no first token by then is recorded as a timeout and the longer ones are not sent (0 = no cap; the published VRAM-size tables use 600 s)")
 A = P.parse_args()
 
 
-def stream(prompt, max_tokens):
+def stream(prompt, max_tokens, timeout=3600):
     body = json.dumps({"model": "hive", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0,
                        "reasoning_effort": "none", "stream": True, "stream_options": {"include_usage": True}}).encode()
     t0 = time.time(); first = None; n = 0; usage = None
     req = urllib.request.Request(A.base + "/v1/chat/completions", body, {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=3600) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode().strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -97,8 +98,21 @@ for N in [int(x) for x in A.conc.split(",") if x.strip()]:
           + (f" · by kind: Korean {row['ko']} · English {row['en']} · code {row['code']} · creative {row['creative']}" if N == 1 else ""), flush=True)
 if A.long.strip():
     corpus = "".join(p.read_text() for p in sorted((Path(__file__).resolve().parents[1] / "docs").glob("*.md"))) * 20
+    capped = 0
     for T in [int(x) for x in A.long.split(",") if x.strip()]:
-        r = stream("Read the following and then summarize its first section in two sentences.\n\n" + corpus[: int(T * 3.5)], 256)
+        if A.long_timeout and capped:
+            res[f"long{T}"] = {"timeout": True, "ttft_gt": A.long_timeout, "skipped_after": capped}
+            print(f"long ~{T}: not sent - the shorter ~{capped} prompt already exceeded {A.long_timeout:.0f} s", flush=True)
+            continue
+        try:
+            r = stream("Read the following and then summarize its first section in two sentences.\n\n" + corpus[: int(T * 3.5)], 256, A.long_timeout or 3600)
+        except OSError as e:  # socket timeout (TimeoutError is an OSError)
+            if not A.long_timeout:
+                raise
+            capped = T
+            res[f"long{T}"] = {"timeout": True, "ttft_gt": A.long_timeout}
+            print(f"long ~{T}: TTFT > {A.long_timeout:.0f} s (timeout, {type(e).__name__})", flush=True)
+            continue
         res[f"long{T}"] = {"prompt_tokens": r["prompt"], "ttft": round(r["ttft"], 2), "prefill_tps": round((r["prompt"] or 0) / r["ttft"]) if r["ttft"] else None,
                            "decode_tps": round(r["dec_tps"], 1)}
         print(f"long ~{T}: prompt {r['prompt']} tokens · TTFT {r['ttft']:.2f} s · prefill {res[f'long{T}']['prefill_tps']} tok/s · decode after it {r['dec_tps']:.1f} tok/s", flush=True)

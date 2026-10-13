@@ -201,7 +201,7 @@ class HostSampler:
         if self.on:
             first = self.sample()
             if not any(k.endswith("rss_mb") for k in first):
-                self.notes.append("no hived/hive_server process visible in /proc (not on the ws host, or other pid namespace)")
+                self.notes.append("no hived/hive_server process visible in /proc (not on this host, or another pid namespace)")
             if "vram_used_mb" not in first:
                 self.notes.append("nvidia-smi unavailable")
             self.th = threading.Thread(target=self._loop, daemon=True)

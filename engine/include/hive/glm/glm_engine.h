@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Eke Hive Authors
 // GLM-5.3-Flash forward pass (text): prefill of one sequence in chunks and batched decode (one token per sequence).
 #pragma once
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "hive/early_route.h"
 #include "hive/grow_buf.h"
 #include "hive/glm/dsa.h"
+#include "hive/glm/glm_cpu.h"
 #include "hive/glm/glm_decode.h"
 #include "hive/glm/glm_experts.h"
 #include "hive/glm/glm_model.h"
@@ -36,6 +38,8 @@ struct GlmSeq {
   DevBuf h_last;                 // bf16 [hidden]: final normed hidden of the last processed position
   bool h_last_valid = false;
   int64_t mtp_written = 0;
+  // CPU-placed layers (GlmEngine hybrid path): their KDA states and DSA caches in host memory; nullptr when every layer is on the GPU
+  std::unique_ptr<cpu::CpuSeq> cpu;
 };
 
 // HIVE_GLM_PREDICT_EVAL=1 (decode only, measurement — outputs unchanged): at each MoE layer l the routers of the next MoE layers (distance
@@ -47,6 +51,7 @@ struct GlmPredictStats { uint64_t pairs[3] = {}, pred[3] = {}, miss[3] = {}, mis
 struct GlmForwardStats {
   double ms_attn = 0, ms_moe = 0, ms_total = 0;
   // HIVE_GLM_PROF=1: synchronized per-block timings (adds syncs; for breakdowns only)
+  double ms_cpu_layers = 0, ms_stream = 0;   // hybrid: the CPU-placed layers (copies across PCIe included)
   double ms_hc = 0, ms_kda = 0, ms_dsa = 0, ms_dense = 0, ms_router = 0, ms_shared = 0, ms_experts = 0, ms_head = 0, ms_embed = 0, ms_kda_proj = 0, ms_kda_core = 0, ms_predict = 0;
   int steps = 0;
 };
@@ -64,7 +69,13 @@ class GlmEngine {
   //   not enough, tail chunks of the expert cache are given back first (GlmExperts::shrink_cache). Throws if even that is not enough.
   //   reset_seq trims a sequence back to HIVE_GLM_KV_BASE positions (default max_chunk — what every sequence keeps from startup) and returns
   //   the freed memory to the expert cache (regrow_cache).
-  void kv_reserve(GlmSeq& s, int64_t tokens);
+  //   reclaim: before lending expert-cache slots, ask kv_reclaim_ to free idle sessions' KV (false from init_seq — hived may hold its
+  //   session lock there).
+  void kv_reserve(GlmSeq& s, int64_t tokens, bool reclaim = true);
+  // hived's KV reclaim hook (Runtime::set_kv_reclaim): evicts the least recently used idle session to a host image and trims its sequence —
+  //   one per call; false when no idle session holds a sequence.
+  std::function<bool()> kv_reclaim_;
+  bool kv_above_base(const GlmSeq& s) const { return s.kv_tokens > std::min<int64_t>(kv_base_, s.cap); }   // reset_seq would free device KV
   // Vision input: rows of the next prefill whose embedding comes from the vision encoder instead of the token table. `row` is the index in
   //   the ids passed to prefill(), `dev` holds n rows of bf16 [hidden] on the device. The caller clears it after the prefill.
   struct EmbedOverride { int64_t row; int n; const bf16* dev; };
@@ -72,7 +83,7 @@ class GlmEngine {
   // Device memory for `bytes` while HIVE_CACHE_RESERVE_MB stays free: expert-cache tail slots are given back first when needed (as for KV
   //   growth); give_back_room() lets the cache take them again once the memory is freed.
   void make_room(size_t bytes);
-  void give_back_room() { ex_.regrow_cache(kv_headroom_); }
+  void give_back_room() { if (!no_regrow_) ex_.regrow_cache(kv_headroom_); }
   // Positions a call may write past pos + its own rows: verify writes up to 8 rows (decode kernel M ≤ 8) and the MTP draft chain writes
   //   scratch entries up to k ≤ 8 positions ahead — reserving this much more keeps every write inside mapped memory.
   static constexpr int64_t kKvSlack = 16;
@@ -85,6 +96,8 @@ class GlmEngine {
   //   probability of each draft). verify: the main model over [tok, drafts…] (M ≤ 8 rows of one sequence), logits of every row → host.
   //   rollback: keep the first n_keep rows (KDA states restored from the per-row snapshots, positions trimmed, MTP entries written).
   bool mtp_on() const { return mtp_k_ > 0 && m_.mtp() != nullptr; }
+  bool hybrid() const { return cpu_ != nullptr; }
+  int n_gpu_layers() const { return n_gpu_; }
   int mtp_k() const { return mtp_k_; }
   int mtp_draft(GlmSeq& s, int32_t tok, int k, int32_t* drafts, float* conf);
   void verify(GlmSeq& s, const int32_t* ids, int M, float* logits_host);
@@ -130,6 +143,11 @@ class GlmEngine {
   // Layer-major prefill (HIVE_GLM_PREFILL_TILES blocks of max_chunk rows per call, default 4): every layer runs over all blocks before the
   //   next layer, and its MoE runs once over all rows — each routed expert crosses PCIe once per layer per call instead of once per block.
   void prefill_layer_major(GlmSeq& s, const int32_t* ids, int T, float* logits_last);
+  // device bytes of the whole-prompt buffers for T rows (the 8 arrays of prefill_layer_major, each rounded up to 256 B)
+  size_t layer_major_bytes(int T) const;
+  // rows one layer-major call may take now: tiles × max_chunk, lowered (in whole blocks) to what the lendable cache tail holds when the
+  //   buffers are borrowed (elastic) — see prefill_body. 0 = run chunked.
+  int layer_major_span() const;
   int tiles_ = 1;
   bool elastic_ = true;   // HIVE_GLM_PREFILL_ELASTIC: layer-major buffers live in lent expert-cache slots only while a long prompt runs
   DevBuf hall_, xnall_, outall_, postall_, comball_, rlog_all_, rids_all_, rw_all_;
@@ -143,6 +161,27 @@ class GlmEngine {
   DevBuf draft_rows_, draft_idx_;          // HIVE_GLM_DRAFT_VOCAB: lm_head rows the draft head scores, argmax index per draft step
   int draft_n_ = 0;                        // 0 = the draft head scores the whole vocabulary
   Fp8BMat* mtp_moe_tab_ = nullptr;
+  // HIVE_GLM_MTP_LEND=1 (profiles of capped cards; off = unchanged): with HIVE_MTP_BATCH off the NextN layer drafts only for a single
+  //   stream, so while several streams decode its routed experts (6.75 GiB FP8) sit idle. After lend_after_ consecutive multi-stream
+  //   decode steps their VRAM is released and the expert cache grows into it (GlmExperts::grow_extra); after reclaim_after_ consecutive
+  //   single-stream draft requests the cache gives the tail back (release_extra) and the experts are copied back from a pinned host copy.
+  //   No switch within switch_gap_ms_ of the previous one (hysteresis). While lent mtp_draft returns 0 drafts — a plain decode step, so
+  //   the output is the same; only the speed changes. Every switch is logged and counted.
+  struct MtpLend {
+    bool on = false, lent = false;
+    int lend_after = 16, reclaim_after = 8; double gap_ms = 2000;
+    int multi = 0, single = 0; long switches = 0; double last_ms = -1e18;
+    uint8_t* host = nullptr;           // pinned copy of the arena (E × per bytes)
+    void* dev = nullptr;               // the arena while not lent (first: MtpW::expert_arena, after a reclaim: our own allocation)
+    bool own = false;                  // dev is ours (devmem / cudaMalloc), not MtpW::expert_arena
+    size_t bytes = 0;
+    std::vector<std::array<Fp8BMat, 3>> rel;  // matrices with pointers relative to the arena start (offsets)
+  } lend_;
+  void mtp_note_steps(int streams);    // step counters (decode: M streams; draft: 1)
+  void mtp_lend();
+  bool mtp_reclaim();
+  void* mtp_arena_alloc();             // device arena for the experts (devmem with VMM, else cudaMalloc); nullptr if it does not fit
+  void mtp_arena_load(void* p);        // copy the pinned experts into p and point the device table at them (stream_, synchronized)
   void mtp_after_forward(GlmSeq* const* seqs, int M, const int32_t* ids, int T, bool prefill, const int64_t* pos_before);
   int mtp_k_ = 0;
   bool verify_ = false;                    // forward() is running a verify chunk (rows = consecutive tokens of one sequence)
@@ -156,6 +195,22 @@ class GlmEngine {
   DevBuf fx_, fh_;                         // [rows, hidden] stream mean / final normed hidden of every row of the last forward
   bf16* mtp_emb_pin_ = nullptr;            // pinned [max_chunk, hidden] embedding rows for MTP entries (read by rmsnorm via UVA)
   DevBuf mtp_en_, mtp_hn_, mtp_cat_, mtp_x0_, mtp_xn_, mtp_h1_, mtp_tmp_, mtp_hout_, one_f_;
+  // Hybrid placement (GlmModel::n_gpu_layers() < n_layers): layers 0..n_gpu_−1 run here, the rest on the CPU engine (same math as hived_glm_cpu,
+  //   routed experts through ex_.cpu_rows); the hc streams cross PCIe once each way per forward (cpu_tail)
+  int n_gpu_ = 0;
+  std::unique_ptr<cpu::GlmCpuEngine> cpu_;
+  bf16* tail_pin_ = nullptr; size_t tail_rows_ = 0;
+  std::vector<float> tail_h_;
+  void cpu_tail(GlmSeq* const* seqs, int M, int T, bool prefill);
+  // Prefill streaming of CPU-placed layers (GlmModel::streaming, prompts ≥ HIVE_GLM_STREAM_ROWS rows, default 32): the layer's weights are
+  //   copied to the staging layer and its state (KDA conv / recurrent state, DSA rows below pos) from the sequence's CpuSeq to staging device
+  //   buffers; after the layer the state (and the new DSA rows) goes back to the CpuSeq, which decode then continues on the CPU.
+  int stream_rows_ = 32;
+  DevBuf s_conv_, s_state_;
+  GrowBuf s_c_, s_kI_, s_gs_, s_pool_;
+  int64_t s_cap_ = 0;
+  void stream_begin(int l, GlmSeq& s, int T);
+  void stream_end(int l, GlmSeq& s, int T);
   GlmModel& m_;
   GlmExperts& ex_;
   const GlmConfig& c_;
@@ -167,10 +222,14 @@ class GlmEngine {
   int64_t emb_base_ = 0;                   // index (in the prefill call's ids) of the first row of the forward / block being embedded
   void apply_embed_override(bf16* x_dev, int64_t base, int rows);
   size_t kv_headroom_ = 0;                 // HIVE_CACHE_RESERVE_MB (hive/cache_reserve.h)
+  bool no_regrow_ = false;                 // inside kv_reserve's reclaim: memory freed by trimmed idle sequences is for the growing one
   size_t kv_bytes(const GlmSeq& s, int64_t tokens) const;
   void kv_trim(GlmSeq& s, int64_t tokens);
   int n_kda_ = 0, n_dsa_ = 0;
   std::vector<int> kda_index_, dsa_index_;
+  std::vector<int> kda_layer_, dsa_layer_;   // KDA / DSA index → checkpoint layer
+  int kda_layer_of(int ki) const { return kda_layer_[ki]; }
+  int dsa_layer_of(int di) const { return dsa_layer_[di]; }
   // work buffers (rows ≤ max_chunk)
   DevBuf h_, x_, xn_, attn_, mix_f32_, mixes_, rsq_, pre_, post_, comb_;
   DevBuf qkv_, gpre_, gate_, beta_, fa_, ga_, kda_out_;

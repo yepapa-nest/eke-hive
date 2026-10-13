@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The Eke Hive Authors
+# Qwen3.8-27B family (config model_type "qwen3_5": dense, Gated DeltaNet + full attention, FP8 / NVFP4 / BF16 weights) — docs/q27.md.
+#   hive_q27_cpu / hived_q27_cpu: CPU only (engine/cpu_shim stand-in headers, like hived_qwen_cpu).
+#   hive_q27 / hived_q27: GPU (sm_120a) with layer-level placement under a VRAM cap — the CPU-placed layers run the same CPU engine, compiled
+#   here against the real CUDA headers (the CPU backend sources are compiled into hive_q27; hive_core does not contain them).
+# Every target is guarded by the existence of its sources: this file is included by every configure of the tree.
+set(_q27 ${CMAKE_CURRENT_SOURCE_DIR})
+file(GLOB HIVE_Q27_CPU_SRC CONFIGURE_DEPENDS ${_q27}/src/q27/cpu/q27_cpu_*.cpp)
+list(FILTER HIVE_Q27_CPU_SRC EXCLUDE REGEX "q27_cpu_runtime\\.cpp$")
+
+if(HIVE_Q27_CPU_SRC AND EXISTS ${_q27}/src/q27/q27_config.cpp AND TARGET hive_cpu)
+  add_library(hive_q27_cpu STATIC ${HIVE_Q27_CPU_SRC} src/q27/q27_config.cpp)
+  target_link_libraries(hive_q27_cpu PUBLIC hive_cpu)
+  if(EXISTS ${_q27}/src/q27/cpu/q27_cpu_runtime.cpp AND EXISTS ${_q27}/include/hive/q27/hived_family_cpu.h)
+    add_executable(hived_q27_cpu src/hived.cpp src/q27/cpu/q27_cpu_runtime.cpp)
+    target_link_libraries(hived_q27_cpu hive_q27_cpu)
+    target_compile_definitions(hived_q27_cpu PRIVATE HIVE_FAMILY_Q27_CPU HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
+  endif()
+  # forward dump for validation against oracle/q27_oracle.py (tools/compare_q27.py)
+  if(EXISTS ${_q27}/tests/q27_cpu_check.cpp)
+    add_executable(q27_cpu_check tests/q27_cpu_check.cpp)
+    target_link_libraries(q27_cpu_check hive_q27_cpu)
+  endif()
+  # the 27B element-wise kernels against their scalar twins (bit for bit)
+  if(EXISTS ${_q27}/tests/q27_cpu_simd_test.cpp)
+    add_executable(test_q27_cpu_simd tests/q27_cpu_simd_test.cpp)
+    target_link_libraries(test_q27_cpu_simd hive_cpu)
+  endif()
+endif()
+
+file(GLOB HIVE_Q27_GPU_SRC CONFIGURE_DEPENDS ${_q27}/src/q27/*.cu ${_q27}/src/q27/*.cpp)
+list(FILTER HIVE_Q27_GPU_SRC EXCLUDE REGEX "q27_config\\.cpp$")
+if(HIVE_Q27_GPU_SRC AND HIVE_Q27_CPU_SRC AND TARGET hive_glm)
+  file(GLOB _q27_cpu_backend CONFIGURE_DEPENDS ${_q27}/src/cpu/cpu_*.cpp)
+  add_library(hive_q27 STATIC ${HIVE_Q27_GPU_SRC} ${HIVE_Q27_CPU_SRC} ${_q27_cpu_backend} src/q27/q27_config.cpp)
+  target_link_libraries(hive_q27 PUBLIC hive_glm)
+  if(EXISTS ${_q27}/include/hive/q27/hived_family.h)
+    add_executable(hived_q27 src/hived.cpp)
+    target_link_libraries(hived_q27 hive_q27)
+    target_compile_definitions(hived_q27 PRIVATE HIVE_FAMILY_Q27 HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
+  endif()
+  if(EXISTS ${_q27}/tests/q27_check.cpp)
+    add_executable(q27_check tests/q27_check.cpp)
+    target_link_libraries(q27_check hive_q27)
+  endif()
+  # decode / verify GEMV microbenchmark (time and bit identity across M)
+  if(EXISTS ${_q27}/tests/q27_gemv_bench.cu)
+    add_executable(q27_gemv_bench tests/q27_gemv_bench.cu)
+    target_link_libraries(q27_gemv_bench hive_q27)
+  endif()
+endif()
