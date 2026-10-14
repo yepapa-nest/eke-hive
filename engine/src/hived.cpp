@@ -19,6 +19,7 @@
 //   {"op":"set","mtp_batch":1|0|-1} -> {"ok":true,"mtp_batch":v} — run-time HIVE_MTP_BATCH override (-1 = startup value; needs the verify decode path allocated at startup)
 //   {"op":"flush"} — drop every reusable prompt state (session tokens/checkpoints/history, archived sessions, shared boundary snapshots)
 //     when no request is decoding; replies {"ok":true,...} or {"error":"not idle",...}. The expert VRAM cache (weights) is kept.
+//   (optional) generate's "history":true — the conversation already has a turn (enables the long re-read boundary snapshot; HIVE_PREFIX_SHARE only).
 //   (optional) generate's "prefix_extra":N — per-request extra-chunk budget for boundary cuts (overrides HIVE_PREFIX_EXTRA_CHUNKS; HIVE_PREFIX_SHARE only).
 // Sessions: if a session's previous token sequence is a prefix of the new request, only the remainder is prefilled (conversation cache).
 // If the prefix breaks, resume from whichever of the prompt-end checkpoint and the RAM-held states reaches furthest.
@@ -1196,6 +1197,7 @@ int main(int argc, char** argv) {
     Request r;
     std::string sid;
     Session* S = nullptr;
+    std::shared_ptr<SeqImage> ckpt_base;  // this request's deepest boundary snapshot — the prompt checkpoint's delta base (shares its rows)
     std::atomic<bool>* cancel = nullptr;  // = r.cancel.get() (the Request owns its lifetime)
     std::vector<float> logits;
     std::mt19937_64 rng;
@@ -1240,7 +1242,12 @@ int main(int argc, char** argv) {
   auto save_prompt_ckpt = [&](Active& X, const std::vector<float>& logits) {
     Session* S = X.S;
     auto img = std::make_shared<SeqImage>();
-    rt.save_image(*S->seq, *img, S->ckpt.get());
+    // Base = this request's deepest boundary snapshot when it took one, else the session's previous checkpoint. After a re-read the old
+    //   checkpoint belongs to an earlier generation (nothing shared), so the checkpoint copied the whole prompt again right next to a boundary
+    //   snapshot holding the same rows: measured 2026-10-14 27B (192K tokens), 12 GB + 12 GB over its 16 GB host budget — the snapshot was
+    //   reclaimed before the next turn could resume from it. save_image checks lineage and prefix and copies everything when they differ.
+    std::shared_ptr<SeqImage> base = std::move(X.ckpt_base);
+    rt.save_image(*S->seq, *img, base ? base.get() : S->ckpt.get());
     host_total(img.get());  // replacement peak, shared segments counted once
     static const int history_limit = getenv("HIVE_CKPT_HISTORY") ? std::max(1, atoi(getenv("HIVE_CKPT_HISTORY"))) : 1;
     if (S->ckpt && history_limit > 1)
@@ -1437,6 +1444,7 @@ int main(int argc, char** argv) {
     bool has_images = false, last_upper_skipped = false;
     std::vector<size_t> hints;
     std::shared_ptr<SeqImage> last_boundary;
+    bool last_boundary_full = false;  // last_boundary was taken with the upper layers on (a complete state — usable as the checkpoint's base)
     ForwardStats st{};
     std::unique_ptr<PrefillPending> pending;
     // current chunk (chunk_begin -> chunk_end)
@@ -1554,6 +1562,7 @@ int main(int argc, char** argv) {
     host_total(img.get());
     shared_snaps[key] = SharedSnap{img, sg, skipped, now_ms()};
     last_boundary = img;
+    J.last_boundary_full = !skipped;
     ++shared_saves;
     fprintf(stderr, "[hived] %s: prefix snapshot at %zu (upper %s · %zu entries)\n", A->sid.c_str(), at, skipped ? "skip" : "on", shared_snaps.size());
     host_total();
@@ -1751,6 +1760,14 @@ int main(int argc, char** argv) {
     //   read as "the session lost its state" when the client had in fact rewritten an earlier part of the prompt (2026-10-06 audit of 145 such
     //   lines: 88 rewritten prompts, 50 identical re-sends, 4 changed outputs, 3 after a cancel — none was a lost session)
     const size_t session_tokens = S->tokens.size();
+    // A reset means no saved state of this session is a prefix of the request (the history frames were tried above): they are states the
+    //   conversation moved away from. Release them now — kept as the admitted session's state they outranked this request's own boundary
+    //   snapshots in the host budget. Measured 2026-10-14, 27B with a 16 GB budget, a 192K conversation re-read from the top: its old 12 GB
+    //   checkpoint stayed and the boundary snapshot of the re-read was reclaimed, so the next turn re-read everything again.
+    if (pick == 0 && (S->ckpt || !S->history.empty())) {
+      S->ckpt.reset(); std::vector<float>().swap(S->ckpt_logits); std::vector<Session::ImgSig>().swap(S->ckpt_sig);
+      S->history.clear();
+    }
     if (pick == 0 || pick == 2 || pick == 3) {
       if (pick == 0) { rt.reset_seq(*S->seq); S->img_sig.clear(); }
       else { rt.load_image(*S->seq, pick == 2 ? *S->ckpt : *S->live); S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig; }
@@ -1905,6 +1922,24 @@ int main(int argc, char** argv) {
     //   Anything else (missing, negative, non-integer) is absorbed as "use the global budget".
     J.extra_left = q.contains("prefix_extra") && q["prefix_extra"].is_number_integer() && q["prefix_extra"].get<int64_t>() >= 0
                        ? (int)std::min<int64_t>(q["prefix_extra"].get<int64_t>(), std::numeric_limits<int>::max()) : prefix_extra;
+    // A long re-read saves its deepest conversation boundary on the engine's own evidence, whatever the server or client knew. When the rows
+    //   between the reused prefix and that boundary fill at least one prefill chunk, the cut adds at most one chunk to a run of two or more,
+    //   while a next turn that changes the tail (reasoning templates drop the last turn's thinking — GLM clear_thinking, Qwen
+    //   last_query_index, DeepSeek) would otherwise re-read at least that chunk again. Measured 2026-10-14 GLM (96 GB, 300 W): a 378K
+    //   conversation re-read from the top (its head changed) saved no snapshot because the server saw no tail change → the next turn re-read
+    //   379K again (130 s, then 139 s). The server's tracker only knows its own history; a session evicted or reset inside the daemon is
+    //   invisible to it.
+    //   Only for a conversation that already has a turn (the request's "history": true, from the API server) — a first turn keeps the
+    //   server's first-turn policy (HIVE_PREFIX_FIRST_TURN: a system block nobody else sent is not cut).
+    const bool history = q.contains("history") && q["history"].is_boolean() && q["history"].get<bool>();
+    if (history && J.extra_left <= 0 && !hints.empty()) {
+      size_t deepest = 0;
+      for (size_t h : hints) if (ids.size() - h > 16) deepest = h;  // a conversation boundary, not the generation-suffix hint
+      if (deepest > common && deepest - common >= J.chunk_cap) {
+        J.extra_left = 1;
+        fprintf(stderr, "[hived] %s: long re-read (%zu → boundary %zu) — boundary snapshot kept for the next turn\n", A->sid.c_str(), common, deepest);
+      }
+    }
     J.pending = std::make_unique<PrefillPending>(PrefillPending{rt, A->sid, prefill_pending_n});
     J.i = common;
     return Jp;
@@ -2019,6 +2054,7 @@ int main(int argc, char** argv) {
       S->img_sig = std::move(keep);
     }
     if (prefill_complete && !reused_exact && (all_images.empty() || image_ckpt) && (int)ids.size() >= ckpt_min_tokens && !fake_head) {
+      if (J.last_boundary_full) A->ckpt_base = J.last_boundary;  // a snapshot with skipped upper layers holds unfinished rows — never a base
       if (defer_ckpt) A->defer_ckpt = true;  // HIVE_DEFER_CKPT: after the first token (decode_step)
       else save_prompt_ckpt(*A, A->logits);
     }

@@ -276,11 +276,20 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   with different content marks that point), so content that begins like the template's next text cannot extend it.
   A generation-suffix hint marks where the next turn's prompt leaves this one (a reasoning template ends the prompt
   in a reasoning-start token the next turn does not have); the daemon cuts that tail of a few tokens on the short path,
-  so every turn leaves a shared snapshot the next one resumes from exactly.
+  so every turn leaves a shared snapshot the next one resumes from exactly. When the whole prompt is a text prefix of
+  the next turn but its last token is not (Qwen ends the prompt in `<think>\n`, and the next turn merges that newline
+  into `\n\n`), the hint sits one token before the end.
   With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
   on a conversation whose tail is replaced between turns (the previous request is not a prefix of the new one
-  but shares a boundary), or on a conversation with earlier turns that it has not seen yet (after a restart), so
-  the next turn resumes from that boundary instead of prefilling everything again.
+  but shares a boundary), on a conversation with earlier turns that it has not seen yet (after a restart), or on one
+  re-read from the top because its head changed, so the next turn resumes from that boundary instead of prefilling
+  everything again.
+- **Long re-reads.** The daemon also decides on its own evidence: when a request of a conversation with earlier turns
+  (`"history": true` from the server) must prefill at least one full chunk before its deepest boundary — the server's
+  view says append-only, but the daemon lost the state (evicted, reset, flushed) — it keeps a snapshot at that boundary,
+  so the turn after it does not re-read the whole conversation a second time. The prompt checkpoint of that request
+  shares the snapshot's rows (delta base), and a reset releases the session's checkpoints that the conversation has
+  moved away from, so both fit the host budget together.
   With `HIVE_PREFIX_FIRST_TURN=seen` it asks for that chunk on a first turn whose system/tools block another
   conversation already sent (it keeps a hash per block), so the third and later conversations with a repeated block
   resume from it while a block that never repeats costs nothing.

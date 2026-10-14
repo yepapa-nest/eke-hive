@@ -562,7 +562,11 @@ class TailChangeTracker:
             plen, phash, phints = prev
             append = len(ids) >= plen and self._hash(view, plen * w) == phash
             if not append:
-                flag = any(h <= len(ids) and self._hash(view, h * w) == hh for h, hh in phints)
+                # history: a conversation re-read from the top (its head changed — 2026-10-14: a client re-sent its tool list in a different
+                #   JSON key order) shares none of its old boundaries, so it went unflagged and saved no snapshot; its next turn changes
+                #   the tail (GLM clear_thinking drops the last turn's reasoning) and re-read everything again (GLM 379K: 130 s, then 139 s —
+                #   the second request was flagged and saved 375500, the third resumed). Flag it the same way as a first sight with history.
+                flag = history or any(h <= len(ids) and self._hash(view, h * w) == hh for h, hh in phints)
         # A generation-suffix hint (≤ GEN_TAIL_MAX before the end) marks where the next turn continues — the next request extends the
         #   prompt up to there, not the reasoning-start token after it. Compared over the whole prompt, every turn with reasoning on
         #   looked "not append-only" and paid an extra boundary chunk it no longer needs (2026-10-08: 3 chunks instead of 2).
@@ -785,6 +789,20 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
         if done is not None and not media:
             c = min(_common_prefix_len(done, prompt), _common_prefix_len(done, other))
             t = bisect.bisect_right(ends, c)
+            # The whole prompt is a text prefix of the next turn (Qwen: the prompt ends "<think>\n", the next turn has "<think>\n\n</think>"
+            #   there) — but not a token prefix: the last "\n" merges with the next one into a "\n\n" token. Measured 2026-10-14, 27B: the
+            #   next turn diverged one token before the prompt end, so neither the prompt checkpoint nor any snapshot matched and every
+            #   follow-up turn after a long one re-read it all (62K tokens, 15.4 s). Cut one token earlier — only when the next turn
+            #   really tokenizes that place differently (a few dozen characters re-tokenized from the start of the last token).
+            if t == len(ids) and c >= len(prompt) and len(ids) >= 2:
+                try:
+                    s0 = ends[-2]
+                    enc = TOK(done[s0:s0 + 64], return_offsets_mapping=True)
+                    first = next((i for i, (a, b) in zip(enc["input_ids"], enc["offset_mapping"]) if b > a), None)  # skip a zero-width BOS
+                    if first != ids[-1]:
+                        t -= 1
+                except Exception:
+                    pass
             if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
                 out.add(t)
     # HIVE_HINT_CACHE: probe renders seen on an earlier request are reused (HintProbeCache). Off (or inputs that cannot be
@@ -1663,6 +1681,8 @@ async def chat(request: Request):
         # ignore_eos (benchmark harnesses measure throughput at a fixed output length): no stop token, run to max_tokens
         "stop_ids": [] if body.get("ignore_eos") else stop_ids(),
         **({"prefix_extra": 1} if prefix_extra else {}),
+        # the conversation already has a turn: the daemon keeps a boundary snapshot on a long re-read (hived "history")
+        **({"history": True} if hints and has_turns else {}),
         **({"priority": prio} if (prio := request_priority(body)) else {}),
     }
     think_cap = think_cap_from_request(body) if thinking_mode == "thinking" else None

@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <thread>
 #include <sys/mman.h>
 
@@ -359,18 +360,31 @@ void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) cons
 void Runtime::load_image(Seq& s, const SeqImage& img) const {
   if (img.fence) img.fence->wait();   // its host copies finished
   std::vector<std::pair<const uint8_t*, size_t>> v;
-  std::vector<std::vector<uint8_t>> flat;   // pieces held in several segments (shared prefixes) are joined first
+  std::vector<std::vector<uint8_t>> flat;   // small pieces held in several segments (header, tokens, rope — read on the host) are joined
   flat.reserve(img.bufs.size());
+  // Large pieces in several segments (an image sharing a boundary snapshot's prefix) go to the device segment by segment: joining them
+  //   first copied the whole KV once more on the engine thread — measured 2026-10-14, a 192K-token prompt checkpoint built on its boundary
+  //   snapshot: 12 GB joined at ~1.5 GB/s (page faults) held the next request 12.5 s in the queue. Only the device copy reads them (load_views
+  //   hands each such view whole to h2d), so the view's pointer is a key into `segs`.
+  std::unordered_map<const uint8_t*, const HostImageBuffer*> segs;
+  constexpr size_t kJoinMax = (size_t)64 << 20;
   for (const auto& hb : img.bufs) {
     if (hb.segments.empty()) { v.push_back({nullptr, 0}); continue; }
     if (hb.segments.size() == 1) { v.push_back({hb.segments[0].data.get(), hb.segments[0].n}); continue; }
+    if (hb.size() > kJoinMax) { segs[hb.segments[0].data.get()] = &hb; v.push_back({hb.segments[0].data.get(), hb.size()}); continue; }
     std::vector<uint8_t> f(hb.size());
     size_t off = 0;
     for (const auto& sg : hb.segments) { memcpy(f.data() + off, sg.data.get(), sg.n); off += sg.n; }
     flat.push_back(std::move(f));
     v.push_back({flat.back().data(), flat.back().size()});
   }
-  s.load_views(v, model_.eng().stream(), [this](void* d, const uint8_t* h, size_t n) { staged_h2d(d, h, n); });
+  s.load_views(v, model_.eng().stream(), [&](void* d, const uint8_t* h, size_t n) {
+    const auto it = segs.find(h);
+    if (it == segs.end()) { staged_h2d(d, h, n); return; }
+    HIVE_CHECK(n == it->second->size(), "q27 segmented image piece read partially");
+    size_t off = 0;
+    for (const auto& sg : it->second->segments) { staged_h2d((uint8_t*)d + off, sg.data.get(), sg.n); off += sg.n; }
+  });
   HIVE_CHECK(s.pos == img.pos, "q27 image position mismatch");
   s.tokens = img.tokens; s.generation = img.generation; s.broken = false; s.engram_history.clear();
   s.mtp_hidden_valid = s.h_last_valid && model_.eng().mtp_on();

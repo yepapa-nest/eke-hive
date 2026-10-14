@@ -5,6 +5,13 @@
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
+- **The turn after a long re-read resumes** (all families, [docs/performance.md](docs/performance.md) step 33): a conversation re-read
+  from the top (its head changed, or the daemon lost the state) now keeps a boundary snapshot — decided in the daemon on its own evidence
+  (`"history"` from the server, at least one prefill chunk before the deepest boundary) and flagged by the server's tail tracker — so the
+  next user message (reasoning templates drop the last turn's thinking) resumes instead of re-reading everything again. The prompt
+  checkpoint shares the snapshot's rows, a reset releases checkpoints the conversation moved away from, Qwen's generation-suffix hint sits
+  one token before the end (`<think>\n` merges into `\n\n`), and segmented 27B images load without joining. Next turn after a re-read:
+  GLM 54 → 4.8 s, Flash-Next 29 → 1.0 s, 27B 81 → 6.0 s (and 27B after a 62K turn 15.4 → 1.2 s). `tools/reread_check.py` reproduces it.
 - **GLM-5.3-Flash at 72 / 48 / 32 GB** ([docs/glm.md](docs/glm.md#smaller-vram-budgets)): the layer-major prefill span is lowered to what
   the expert-cache tail can lend (`GlmEngine::layer_major_span`) instead of failing; `HIVE_GLM_PREFILL_ROWBLOCK` bounds the per-expert
   prefill scratch, so the 64K prompt runs in one pass (64K first token 20.2 / 20.9 / 22.0 / 28.2 → 16.2 / 16.3 / 16.4 / 22.4 s at

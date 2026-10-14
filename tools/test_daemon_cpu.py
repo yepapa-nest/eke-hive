@@ -171,8 +171,10 @@ class Hived:
         return self.op({'op': 'cancel', 'session': session, **({} if rid is None else {'rid': rid})})
 
     def generate(self, session, ids, max_tokens, images=(), on_token=None, close_after=None, rid=None, boundaries=None, prefix_extra=None,
-                 priority=None):
+                 priority=None, history=None):
         req = {'op': 'generate', 'session': session, 'ids': ids, 'temperature': 0}
+        if history is not None:
+            req['history'] = history
         if priority is not None:
             req['priority'] = priority
         if prefix_extra is not None:
@@ -875,6 +877,23 @@ def sc_share_free(h, ck):
         req_extra = bad if bad is not None else 'absent'
         done_ok(ck, f'per-request extra {req_extra!r}: absorbed', h.generate(sid, Z, 3, boundaries=[300], prefix_extra=bad), Z, 3, 0)
         ck.eq(f'per-request extra {req_extra!r}: global budget (no cut)', chunks(h, sid), [(256, 'on'), (94, 'on')])
+    # 2026-10-14 long re-read: a conversation with a turn ("history") whose re-read spans >= one chunk before its deepest boundary keeps
+    #   a snapshot there even with extra budget 0 — the next turn (tail changed) resumes from it instead of re-reading everything again
+    L = tokens(350, 160)
+    done_ok(ck, 'long re-read: history, boundary 300 >= chunk 256', h.generate('la', L, 3, boundaries=[300], history=True), L, 3, 0)
+    ck.eq('long re-read: cut at the boundary', chunks(h, 'la'), [(256, 'on'), (44, 'on'), (50, 'on')])
+    ck.true('long re-read: snapshot there', any('la: prefix snapshot at 300' in l for l in log_lines(h, 'prefix snapshot')))
+    # the prompt checkpoint at 350 was saved with that snapshot as its delta base (shared rows): restoring it must be exact (oracle)
+    L3 = L + tokens(20, 165)
+    done_ok(ck, 'long re-read: prompt checkpoint built on the snapshot restores exactly', h.generate('la', L3, 3, history=True), L3, 3, 350)
+    L2 = L[:300] + tokens(30, 161)  # the tail changed (the previous turn re-rendered without its reasoning)
+    done_ok(ck, 'long re-read: the next turn resumes at the boundary', h.generate('la', L2, 3, boundaries=[300], history=True), L2, 3, 300)
+    S2 = tokens(350, 162)
+    done_ok(ck, 'long re-read: re-read shorter than a chunk', h.generate('lb', S2, 3, boundaries=[200], history=True), S2, 3, 0)
+    ck.eq('long re-read: short span not cut', chunks(h, 'lb'), [(256, 'on'), (94, 'on')])
+    N2 = tokens(350, 163)
+    done_ok(ck, 'long re-read: no history (first turn policy)', h.generate('lc', N2, 3, boundaries=[300]), N2, 3, 0)
+    ck.eq('long re-read: first turn not cut', chunks(h, 'lc'), [(256, 'on'), (94, 'on')])
 
 
 def sc_share_free_cost(h, ck):

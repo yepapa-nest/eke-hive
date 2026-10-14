@@ -790,6 +790,25 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             for k in added: MARKERS.pop(k)
             s.encode_prompt=hint_encode
 
+    def test_generation_suffix_hint_text_prefix(self):
+        """2026-10-14: a Qwen-style prompt ends "<think>\n" and the next turn has "<think>\n\n</think>\n\n" there — the whole prompt is
+        a text prefix of the next turn, but its last token is not (it merges into "\n\n"). The hint is one token before the end."""
+        def qwen_encode(messages, tools, thinking_mode, effort):
+            text=''
+            for m in messages:
+                text+='<|'+m['role']+'|>'+('<think>\n\n</think>\n\n' if m['role']=='assistant' else '')+(m.get('content') or '')
+                if m['role']=='assistant': text+='<|eos|>'
+            return text+'<|assistant|><think>\n', []
+        added={'<think>':7, '</think>':8, '\n\n':9}   # "\n\n" is one token, as in the Qwen vocabulary
+        MARKERS.update(added); s.encode_prompt=qwen_encode
+        try:
+            msgs=self.conv()
+            prompt,_=qwen_encode(msgs, None, 'chat', None); ids=s.TOK.encode(prompt)
+            self.assertIn(len(ids)-1, s.boundary_hints(msgs, None, 'chat', None, prompt, ids, gen_cut=True))
+        finally:
+            for k in added: MARKERS.pop(k)
+            s.encode_prompt=hint_encode
+
     def test_request_priority(self):
         self.assertEqual(s.request_priority({}), 0)
         self.assertEqual(s.request_priority({'priority': 3}), 3)
@@ -879,6 +898,11 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(t4.observe('g', [1]*59+[5]*20, [20]))
             self.assertFalse(t2.observe('c', [2]*60, [20, 40]))
             self.assertTrue(t2.observe('c', [2]*40+[3]*30, [20, 40]))
+            # 2026-10-14: a conversation with turns whose head changed (re-read from the top) still saves a boundary for its next turn
+            t5=s.TailChangeTracker()
+            t5.observe('r', [1]*60, [20, 40, 59], history=True)   # first sight with history (flagged; covered above)
+            self.assertTrue(t5.observe('r', [7]*80, [20, 40, 79], history=True))
+            self.assertFalse(t5.observe('r', [7]*79+[4]*10, [20, 40, 79, 88], history=True), 'append-only stays unflagged')
         finally:
             os.environ.pop('HIVE_PREFIX_ADAPTIVE', None)
             s.TAILS=s.TailChangeTracker()
