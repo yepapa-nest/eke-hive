@@ -40,7 +40,7 @@ for m in ds glm fn 27b; do
     run HIVE_MODEL=$m HIVE_VRAM_GB=$gb
     check "$c rc" "$RC" 0
     [ "$RC" = 0 ] || { echo "$OUT" | tail -5; continue; }
-    check "$c profile" "$(val HIVE_PROFILE)" "$c"
+    check "$c profile" "$(val HIVE_PROFILE_NAME)" "$c"
     check "$c family" "$(val HIVE_MODEL_FAMILY)" "${FAM[$m]}"
     check "$c ckpt" "$(val HIVE_CKPT)" "$T/models/${CK[$m]}"
     if [ "$gb" = 0 ]; then
@@ -95,7 +95,7 @@ run HIVE_CKPT="$T/models/Qwen3.8-Flash-Next-NVFP4"
 check "no profile rc" "$RC" 0
 check "no profile family" "$(val HIVE_MODEL_FAMILY)" qwen
 check "no profile chunk" "$(val HIVE_MAX_CHUNK)" 16384
-check "no profile key" "$(val HIVE_PROFILE)" ""
+check "no profile key" "$(val HIVE_PROFILE_NAME)" ""
 n=$((n + 1)); grep -q '^\[profile\]' <<< "$OUT" && { fails=$((fails + 1)); echo "FAIL no profile: pre-flight printed"; }
 # 5. the big table: RAM when the installed RAM holds the RAM-mode need, disk otherwise; an explicit switch is kept
 MEMT=512 run HIVE_MODEL=ds HIVE_VRAM_GB=96
@@ -135,7 +135,7 @@ check "bad model rc" "$RC" 1
 run HIVE_MODEL=ds HIVE_VRAM_GB=40
 check "bad size rc" "$RC" 1
 run HIVE_MODEL=fn
-check "default size" "$(val HIVE_PROFILE)" fn-96
+check "default size" "$(val HIVE_PROFILE_NAME)" fn-96
 
 echo "test_profiles_cpu: $((n - fails))/$n passed"
 [ "$fails" = 0 ]

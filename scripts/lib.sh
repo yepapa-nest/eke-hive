@@ -41,10 +41,12 @@ hive_apply_profile() {
   : "${HIVE_VRAM_GB:=96}"
   case "$HIVE_VRAM_GB" in 96|72|48|32|24|16|12|8|0) ;; *) echo "HIVE_VRAM_GB must be one of 96 72 48 32 24 16 12 8 0 (got '$HIVE_VRAM_GB')" >&2; exit 1 ;; esac
   export HIVE_MODEL HIVE_VRAM_GB
-  HIVE_PROFILE=$HIVE_MODEL-$HIVE_VRAM_GB; export HIVE_PROFILE
+  # the profile's name is HIVE_PROFILE_NAME: HIVE_PROFILE is the engines' timing switch (N > 0 = [glm-prefill] lines, sampled steps), and
+  #   writing the name there turned profiling off for every launch with HIVE_MODEL (atoi("glm-96") = 0)
+  HIVE_PROFILE_NAME=$HIVE_MODEL-$HIVE_VRAM_GB; export HIVE_PROFILE_NAME
   local dir=$HIVE_ROOT/config/profiles
-  [ -f "$dir/$HIVE_PROFILE.env" ] || { echo "profile not found: $dir/$HIVE_PROFILE.env" >&2; exit 1; }
-  hive_load_env_file "$dir/$HIVE_PROFILE.env"   # the size's knobs (may also override the model's needs)
+  [ -f "$dir/$HIVE_PROFILE_NAME.env" ] || { echo "profile not found: $dir/$HIVE_PROFILE_NAME.env" >&2; exit 1; }
+  hive_load_env_file "$dir/$HIVE_PROFILE_NAME.env"   # the size's knobs (may also override the model's needs)
   hive_load_env_file "$dir/$HIVE_MODEL.env"      # the model's data
   : "${HIVE_MODEL_FAMILY:=$HIVE_PROFILE_FAMILY}"; export HIVE_MODEL_FAMILY
   if [ -z "${HIVE_CKPT:-}" ]; then
@@ -57,7 +59,7 @@ hive_apply_profile() {
     done
     IFS=$IFS_save
     if [ -n "${HIVE_CKPT:-}" ]; then export HIVE_CKPT
-    else echo "profile $HIVE_PROFILE: no checkpoint ($HIVE_PROFILE_CKPT_NAMES) under HIVE_MODELS_DIR=${HIVE_MODELS_DIR:-/models} — set HIVE_CKPT or HIVE_MODELS_DIR" >&2; fi
+    else echo "profile $HIVE_PROFILE_NAME: no checkpoint ($HIVE_PROFILE_CKPT_NAMES) under HIVE_MODELS_DIR=${HIVE_MODELS_DIR:-/models} — set HIVE_CKPT or HIVE_MODELS_DIR" >&2; fi
   fi
   if [ "$HIVE_VRAM_GB" = 0 ]; then : "${HIVE_GPU:=none}"; export HIVE_GPU
   elif [ "$HIVE_VRAM_GB" != 96 ]; then : "${HIVE_VRAM_LIMIT_MB:=$((HIVE_VRAM_GB * 1024))}"; export HIVE_VRAM_LIMIT_MB
@@ -86,7 +88,7 @@ hive_profile_preflight() {
   [ -n "${HIVE_MODEL:-}" ] || return 0
   local total avail need=${HIVE_PROFILE_NEED_GB:-0} ok=1
   total=$(hive_mem_gb MemTotal); avail=$(hive_mem_gb MemAvailable)
-  echo "[profile] $HIVE_PROFILE: family $HIVE_MODEL_FAMILY · checkpoint ${HIVE_CKPT:-?} · ${HIVE_VRAM_LIMIT_MB:+VRAM limit $HIVE_VRAM_LIMIT_MB MiB · }${HIVE_GPU:+GPU $HIVE_GPU · }big table: $HIVE_PROFILE_TABLE · RAM need $need GB (installed $total, available $avail)${HIVE_HOST_SESSION_MB:+ · session images ≤ $HIVE_HOST_SESSION_MB MiB}"
+  echo "[profile] $HIVE_PROFILE_NAME: family $HIVE_MODEL_FAMILY · checkpoint ${HIVE_CKPT:-?} · ${HIVE_VRAM_LIMIT_MB:+VRAM limit $HIVE_VRAM_LIMIT_MB MiB · }${HIVE_GPU:+GPU $HIVE_GPU · }big table: $HIVE_PROFILE_TABLE · RAM need $need GB (installed $total, available $avail)${HIVE_HOST_SESSION_MB:+ · session images ≤ $HIVE_HOST_SESSION_MB MiB}"
   if [ "$need" -gt $((total - 8)) ]; then
     if [ -n "${HIVE_PROFILE_SSD_KEY:-}" ] && [ "$HIVE_PROFILE_TABLE" = ram ] && [ "${HIVE_PROFILE_RAM_GB_SSD:-0}" -le $((total - 8)) ]; then
       echo "[profile] the RAM-mode need ($need GB) is above the installed RAM − 8 ($((total - 8)) GB): set $HIVE_PROFILE_SSD_KEY=$HIVE_PROFILE_SSD_ON (needs ${HIVE_PROFILE_RAM_GB_SSD} GB) or unset it to let the profile choose" >&2

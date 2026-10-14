@@ -42,6 +42,8 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
   turn, now get a boundary at the end of that block too (`boundary_hints`), so new conversations resume the whole shared head instead
   of only the system/tools block. hived logs a reset of a conversation revived from the host archive (it printed nothing) with its
   common prefix, and says why the deepest shared snapshot matching a reset prompt's head was not used.
+- **Fix (launcher):** with `HIVE_MODEL` the launcher wrote the size profile's name (e.g. `glm-96`) into `HIVE_PROFILE`, the engines' timing
+  switch, so `HIVE_PROFILE=N` never reached a daemon started that way. The name is now `HIVE_PROFILE_NAME`.
 - **Fix (DeepSeek CPU daemon):** an empty `HIVE_DS_CPU_TAIL` skipped the daemon's decoder-tail default while the engine ignored the
   empty value; empty now means unset in both places. The CPU suite's option audit is clean again (the GLM / Flash-Next CPU daemons'
   `HIVE_*_MTP_K` test and the 27B `HIVE_Q27_TIMING` interval parse were flagged only by the audit's line matching).
