@@ -697,11 +697,16 @@ void GlmExperts::prefill_layer(int li, int T, const int32_t* ids, const float* w
     std::vector<int> miss;
     for (int e = 0; e < E_; ++e) if (!per[e].empty() && slot_of_[li * E_ + e] < 0) miss.push_back(e);
     std::stable_sort(miss.begin(), miss.end(), [&](int a, int b) { return per[a].size() < per[b].size(); });
+    // HIVE_GLM_PREFILL_BALANCE (default off): drop the per-expert test and fill the CPU until its estimate meets the GPU's remaining
+    //   transfer time (the second test below) — an expert dearer on the CPU than one copy still shortens the layer while the CPU would
+    //   otherwise wait. Measured motivation (2026-10-14, GLM 96 GB, 947-token prompt): CPU join 0.4 ms of 2.58 s MoE GPU time — the CPU
+    //   finished its share early in every layer while the GPU streamed 87 experts per layer.
+    static const bool balance = getenv("HIVE_GLM_PREFILL_BALANCE") && atoi(getenv("HIVE_GLM_PREFILL_BALANCE")) > 0;
     double gpu_t = miss.size() * kPcieMs, cpu_t = 0;
     for (int e : miss) {
       const size_t R = per[e].size();
       const double cc = ((R + 7) / 8) * kCpuPassMs;
-      if (adapt ? cc >= kPcieMs : R > 24) break;  // fewest rows first: once one expert is cheaper to copy, the rest are too
+      if (!balance && (adapt ? cc >= kPcieMs : R > 24)) break;  // fewest rows first: once one expert is cheaper to copy, the rest are too
       if (cpu_t + cc > gpu_t - kPcieMs) break;
       on_cpu[e] = 1; cpu_t += cc; gpu_t -= kPcieMs;
     }

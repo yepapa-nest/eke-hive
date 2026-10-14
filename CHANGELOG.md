@@ -42,6 +42,9 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
   turn, now get a boundary at the end of that block too (`boundary_hints`), so new conversations resume the whole shared head instead
   of only the system/tools block. hived logs a reset of a conversation revived from the host archive (it printed nothing) with its
   common prefix, and says why the deepest shared snapshot matching a reset prompt's head was not used.
+- **Faster GLM prompt reads** (`HIVE_GLM_PREFILL_BALANCE`, on in `config/glm.env`): the CPU takes prefill experts until its share meets
+  the GPU's transfer time instead of only those cheaper than one copy, so fewer experts cross PCIe (−20…−30 %). Time to first token at
+  96 GB: 1.9K 3.90 → 3.17 s, 3.6K 4.84 → 4.11, 7.5K 5.98 → 5.37, 16K 7.44 → 6.98 s; decode unchanged.
 - **Fix (launcher):** with `HIVE_MODEL` the launcher wrote the size profile's name (e.g. `glm-96`) into `HIVE_PROFILE`, the engines' timing
   switch, so `HIVE_PROFILE=N` never reached a daemon started that way. The name is now `HIVE_PROFILE_NAME`.
 - **Fix (DeepSeek CPU daemon):** an empty `HIVE_DS_CPU_TAIL` skipped the daemon's decoder-tail default while the engine ignored the
