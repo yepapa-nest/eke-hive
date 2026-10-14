@@ -52,7 +52,7 @@ context 262,144, vision on, Threadripper PRO 3975WX + 8-channel DDR4-2667 + PCIe
 | | 72 (69) | 479 | 78.7 | 0.26 | 108.8 / 29.3 | 149.2 / 19.7 | 153.8 / 19.7 | 4.1 / 6.9 / 12.0 |
 | | 48 (45) | 479 | 67.3 | 0.31 | 87.7 / 22.5 | 105.5 / 14.3 | 111.2 / 14.3 | 4.4 / 7.2 / 12.8 |
 | | 32 (29) | 479 | 56.6 | 0.33 | 64.8 / 16.6 | 72.5 / 9.7 | 76.0 / 9.5 | 4.7 / 7.6 / 13.5 |
-| GLM-5.3-Flash | 96 (92) | 366 | 71.8 | 0.47 | 103.7 / 29.8 | 130.0 / 17.3 | 133.4 / 17.5 | 5.9 / 10.1 / 16.2 |
+| GLM-5.3-Flash | 96 (92) | 366 | 71.8 | 0.47 | 103.7 / 29.8 | 130.0 / 17.3 | 133.4 / 17.5 | 5.4 / 10.1 / 16.2 |
 | | 72 (70) | 360 | 64.5 | 0.54 | 86.8 / 23.7 | 117.7 / 16.2 | 116.1 / 16.2 | 6.2 / 9.8 / 16.3 |
 | | 48 (46) | 360 | 53.3 | 0.64 | 67.1 / 17.9 | 77.8 / 10.4 | 80.5 / 10.6 | 6.9 / 10.3 / 16.4 |
 | | 32 (30) | 358 | 34.9 | 0.75 | 46.2 / 12.2 | 50.9 / 6.6 | 52.7 / 6.8 | 7.4 / 10.5 / 22.4 |
@@ -66,12 +66,6 @@ context 262,144, vision on, Threadripper PRO 3975WX + 8-channel DDR4-2667 + PCIe
 | | 32 (32) | 27 | 158.8 | 0.03 | 444.2 / 122.5 | 745.2 / 112.1 | 825.6 / 59.6 | 0.99 / 4.6 / 11.8 |
 
 DeepSeek's 72 / 48 / 32 GB rows were measured with a 1-stream warm pass (the other rows: 1 + 4 + 8 streams).
-
-GLM-5.3-Flash prompt reads got faster after this table was measured (`HIVE_GLM_PREFILL_BALANCE`, on in `config/glm.env`; the CPU
-now takes prefill experts until its share meets the GPU's transfer time, so 20–30 % fewer experts cross PCIe). Measured at 96 GB
-with the same start and warm pass but 1 stream and 1K–16K prompts, off / on interleaved twice: time to first token 0.9K 2.99 → 2.76 s,
-1.9K 3.90 → 3.17, 3.6K 4.84 → 4.11, 7.5K 5.98 → 5.37, 16K 7.44 → 6.98; decode unchanged. The GLM 8K / 32K / 64K column above
-predates it and will be re-measured with the full harness.
 
 How speed falls with VRAM depends on the model. For the three MoE models the speed is set by how many of the needed experts are
 in the VRAM cache; the misses are computed by the CPU from RAM.
