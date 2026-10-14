@@ -298,6 +298,44 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([x['stage'] for x in seen], ['answer', 'answer', 'tool_call'])
         self.assertEqual(seen[-1].get('tool_name'), 'web_search')
 
+    async def test_prefill_rate_eta_and_seen(self):
+        """Rate and time left come from this engine's own chunks: before the first chunk ends, from the last large chunk of an earlier
+        request (small chunks never set it); after, from this request's last chunk. seen_before = the server served the conversation."""
+        s.STAGE_STATUS = True
+        saved_time, saved_rate = s.time.time, dict(s.PREFILL_RATE)
+        clock = [1000.0]
+        s.time.time = lambda: clock[0]
+        try:
+            s.PREFILL_RATE['tok_s'] = None; s.STAGE_SEEN.clear()
+            s.stage_open('a', 300000, 'conv1')
+            self.assertFalse(s.STAGES['a']['seen_before'])
+            s.stage_prefill('a', 0, total=240000, cached=60000)
+            self.assertIsNone(s.STAGES['a']['prefill_eta_s'])                    # no rate known yet
+            clock[0] += 20.0; s.stage_prefill('a', 80000)                         # 4,000 tok/s
+            st = s.STAGES['a']
+            self.assertEqual((st['prefill_done'], st['prefill_rate'], st['prefill_eta_s']), (80000, 4000, 40.0))
+            clock[0] += 40.0; s.stage_prefill('a', 160000)                        # slower chunk: 2,000 tok/s
+            self.assertEqual((s.STAGES['a']['prefill_rate'], s.STAGES['a']['prefill_eta_s']), (2000, 40.0))
+            s.stage_open('b', 1000, 'conv2'); s.stage_prefill('b', 0, total=1000, cached=0)
+            clock[0] += 2.0; s.stage_prefill('b', 1000)                           # a small chunk does not set the prior
+            self.assertEqual(s.PREFILL_RATE['tok_s'], 2000)
+            s.stage_open('c', 300000, 'conv1')                                    # the same conversation again
+            self.assertTrue(s.STAGES['c']['seen_before'])
+            s.stage_prefill('c', 0, total=100000, cached=0)
+            self.assertEqual((s.STAGES['c']['prefill_rate'], s.STAGES['c']['prefill_eta_s']), (2000, 50.0))
+            s.stage_prefill('zzz', 5)                                             # unknown request: ignored
+            with tempfile.TemporaryDirectory() as d:                             # the rate survives a restart (file next to the socket)
+                f = os.path.join(d, 'prefill-rate.json')
+                s.prefill_rate_load(f)                                            # no file yet: the rate is kept
+                self.assertEqual(s.PREFILL_RATE['tok_s'], 2000)
+                s.stage_open('d', 300000, 'conv3'); s.stage_prefill('d', 0, total=90000, cached=0)
+                clock[0] += 30.0; s.stage_prefill('d', 90000)                     # 3,000 tok/s -> saved
+                s.PREFILL_RATE['tok_s'] = None
+                s.prefill_rate_load(f)
+                self.assertEqual(s.PREFILL_RATE['tok_s'], 3000)
+        finally:
+            s.time.time = saved_time; s.PREFILL_RATE.update(saved_rate); s.STAGE_SEEN.clear(); s.PREFILL_RATE_FILE = None
+
     async def test_entries_expire(self):
         s.STAGE_STATUS = True
         s.stage_open('old', 1); s.stage_update('old', stage='done', ended=True)

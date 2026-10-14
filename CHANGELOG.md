@@ -5,6 +5,10 @@
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
+- **Reading progress with a time left** (`HIVE_STAGE_STATUS`): while a prompt is read, the request stage also gives the measured read
+  rate, the seconds left and whether the server already served the conversation, so a client can show "43% · about 1 min 23 s left"
+  instead of a bare spinner during a long first read (380K tokens took 138 s on GLM). The rate is the engine's own — it differs per
+  model and falls as the prompt grows.
 - **The turn after a long re-read resumes** (all families, [docs/performance.md](docs/performance.md) step 33): a conversation re-read
   from the top (its head changed, or the daemon lost the state) now keeps a boundary snapshot — decided in the daemon on its own evidence
   (`"history"` from the server, at least one prefill chunk before the deepest boundary) and flagged by the server's tail tracker — so the

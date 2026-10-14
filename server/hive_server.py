@@ -1524,20 +1524,90 @@ async def models():
 # HIVE_STAGE_STATUS (default off): the engine-side stage of each request, for clients that want to show what a response is waiting on.
 #   GET /v1/hive/requests/{id} (id = the response id, "chatcmpl-…", sent in the first stream chunk) →
 #   {"id", "stage": queued | prefill | thinking | tool_call | answer | done | error, "prompt_tokens", "cached_tokens", "prefill_total",
-#    "prefill_done", "tool_name", "updated"}. queued = waiting for the engine to admit it (other requests run), prefill = reading the
+#    "prefill_done", "prefill_rate", "prefill_eta_s", "seen_before", "tool_name", "updated"}. queued = waiting for the engine to admit it (other requests run), prefill = reading the
 #   prompt (cached_tokens reused, prefill_total to read, prefill_done after each chunk), then the generated text's stage. Off = the route
 #   answers 404 and nothing else changes (responses are byte-identical; the daemon line "admitted" is only sent when asked for).
 #   Entries live while the request runs and STAGE_KEEP_S after it ends.
+#   While reading: "prefill_rate" (tokens/s of the last chunk read, or of the last large chunk of an earlier request before this
+#   request's first chunk ends) and "prefill_eta_s" (seconds left at "updated" = what is left / that rate), so a client can show the
+#   time left and count it down between chunks (one chunk can take ~25 s on a long prompt). The rate comes from this engine, not a
+#   table: it differs per model (measured 2026-10-14/15, full prefill: FN ~6,600 tok/s · GLM ~2,800-3,400 · 27B ~2,400) and falls as the
+#   prompt grows (GLM 380K: 24 s for the first 81,920-token chunk, 30 s for the fourth). "seen_before" = this server already served
+#   this conversation (since it started), so a full read is a re-read rather than its first read — keyed on the client's conversation
+#   key when it sends one (a room keeps its key when its system text changes; the session also hashes that text), else the session.
+#   The last large-chunk rate is kept next to the daemon socket (prefill-rate.json) so a restarted server has it before the first
+#   chunk of the first request ends (measured 2026-10-15 GLM: no time left for the first 25 s after a restart without it).
 STAGE_STATUS = env_on("HIVE_STAGE_STATUS")
 STAGE_KEEP_S = 120.0
 STAGES: dict = {}
+STAGE_SEEN: OrderedDict = OrderedDict()  # conversations this server has served (LRU)
+STAGE_SEEN_CAP = 4096
+STAGE_RATE_MIN = 16384  # chunks at least this large set the rate used before a request's own first chunk ends (a 1K prompt reads at ~470 tok/s)
+PREFILL_RATE: dict = {"tok_s": None}
+PREFILL_RATE_FILE: str | None = None
 
 
-def stage_open(rid: str, prompt_tokens: int) -> None:
+def prefill_rate_load(path: str) -> None:
+    global PREFILL_RATE_FILE
+    PREFILL_RATE_FILE = path
+    try:
+        v = json.load(open(path)).get("tok_s")
+        if isinstance(v, (int, float)) and v > 0:
+            PREFILL_RATE["tok_s"] = float(v)
+    except Exception:  # noqa: BLE001 — no file yet / unreadable: learnt again from the first large chunk
+        pass
+
+
+def prefill_rate_save() -> None:
+    if not PREFILL_RATE_FILE:
+        return
+    try:
+        tmp = PREFILL_RATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"tok_s": round(PREFILL_RATE["tok_s"], 1), "at": round(time.time())}, f)
+        os.replace(tmp, PREFILL_RATE_FILE)
+    except Exception:  # noqa: BLE001 — display aid only
+        pass
+
+
+def stage_open(rid: str, prompt_tokens: int, session: str | None = None) -> None:
     now = time.time()
     for k in [k for k, v in STAGES.items() if v.get("_ended") and now - v["_ended"] > STAGE_KEEP_S]:
         STAGES.pop(k, None)
-    STAGES[rid] = {"stage": "queued", "prompt_tokens": prompt_tokens, "updated": round(now, 3)}
+    seen = False
+    if session:
+        seen = session in STAGE_SEEN
+        STAGE_SEEN[session] = True
+        STAGE_SEEN.move_to_end(session)
+        while len(STAGE_SEEN) > STAGE_SEEN_CAP:
+            STAGE_SEEN.popitem(last=False)
+    STAGES[rid] = {"stage": "queued", "prompt_tokens": prompt_tokens, "seen_before": seen, "updated": round(now, 3)}
+
+
+def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | None = None) -> None:
+    """Prefill progress: admitted (total/cached given, done 0) or a chunk read (done = tokens read so far, excluding the reused ones)."""
+    st = STAGES.get(rid)
+    if st is None:
+        return
+    now = time.time()
+    if total is not None:
+        st.update(stage="prefill", cached_tokens=cached or 0, prefill_total=total, prefill_done=0, _t_last=now, _done_last=0)
+        rate = PREFILL_RATE["tok_s"]
+    else:
+        if st.get("stage") != "prefill":
+            return
+        delta, dt = done - st.get("_done_last", 0), now - st.get("_t_last", now)
+        rate = st.get("prefill_rate")
+        if delta > 0 and dt > 0:
+            rate = delta / dt
+            if delta >= STAGE_RATE_MIN:
+                PREFILL_RATE["tok_s"] = rate
+                prefill_rate_save()
+        st.update(prefill_done=done, _t_last=now, _done_last=done)
+    left = max(0, int(st.get("prefill_total") or 0) - int(st.get("prefill_done") or 0))
+    st["prefill_rate"] = round(rate) if rate else None
+    st["prefill_eta_s"] = round(left / rate, 1) if rate else None
+    st["updated"] = round(now, 3)
 
 
 def stage_update(rid: str, ended: bool = False, **kw) -> None:
@@ -1697,7 +1767,7 @@ async def chat(request: Request):
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     if STAGE_STATUS:  # GET /v1/hive/requests/{rid} (stage_status) — the daemon adds its "admitted" line only to requests that ask
-        stage_open(rid, len(ids))
+        stage_open(rid, len(ids), conv_key or session)
         sampling["stages"] = True
     stream = bool(body.get("stream"))
     # Reserve before yielding the response; two streams may be created before either
@@ -1790,10 +1860,9 @@ async def chat(request: Request):
                     elif "admitted" in msg or "progress" in msg:  # sent with "stages" (admitted) / after each prefill chunk (progress)
                         if STAGE_STATUS:
                             if "admitted" in msg:
-                                stage_update(rid, stage="prefill", cached_tokens=int(msg.get("cached") or 0), prefill_done=0,
-                                             prefill_total=max(0, int(msg.get("total") or 0) - int(msg.get("cached") or 0)))
+                                stage_prefill(rid, 0, total=max(0, int(msg.get("total") or 0) - int(msg.get("cached") or 0)), cached=int(msg.get("cached") or 0))
                             elif STAGES.get(rid, {}).get("stage") == "prefill":
-                                stage_update(rid, prefill_done=max(0, int(msg.get("progress") or 0) - int(STAGES[rid].get("cached_tokens") or 0)))
+                                stage_prefill(rid, max(0, int(msg.get("progress") or 0) - int(STAGES[rid].get("cached_tokens") or 0)))
                         continue
                     elif msg.get("done"):
                         terminal = True
@@ -2203,6 +2272,8 @@ def main():
     ARGS = VisionArgs(CFG)
     load_modules(a.ckpt)
     DAEMON = Daemon(a.sock)
+    if STAGE_STATUS:
+        prefill_rate_load(os.path.join(os.path.dirname(os.path.abspath(a.sock)), "prefill-rate.json"))
     import uvicorn
 
     uvicorn.run(app, host=a.host, port=a.port, log_level="info")
