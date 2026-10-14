@@ -138,6 +138,7 @@ steps 13–20 give the metric named in the row, step 21 the real-chat benchmark.
 | 27 | Request priority (`priority` / `service_tier`): a decode step runs only the best priority; the queue admits by priority | Two overlapping streams ran at about half speed each because a batch of two runs without speculation. A 400-token answer sent 3 s after a 1500-token background answer: 8.64 → 5.11 s with the background at priority 1 (its own total unchanged, 25.5 / 25.7 s) | |
 | 28 | Server: on a conversation-key miss the token cache takes the kept prompt with the longest common prefix | A conversation under a new key was tokenized whole: 154K tokens 285 → 8 ms, same ids | |
 | 29 | Short-prefill DMA band (`HIVE_DMA_BAND_SHORT=1.05`) and per-layer expert-split logging | A service day (715 short chunks) showed the adaptive CPU / DMA share of short prefills sitting at the edge of its ±20 % band: in every size bucket the GPU window (resident compute + DMA) ended 15–25 % after the CPU share, and the GPU side set the layer time (front + MoE = layer time). The two short kinds now use a 5 % band, and on the short streaming kind pre-copied experts count toward the DMA share. `[prefill-prof]` now prints the experts sent to the CPU / DMA per layer group and the pre-copies used / wasted, so the next change can be judged from the log | not measured on its own — rolled out with steps 30–32; expected 3–8 % on short prefills (the CPU side runs at ~100–120 GB/s, near the memory bandwidth) |
+| 30 | Prefill CPU share filled up to the GPU's transfer time (`HIVE_GLM_PREFILL_BALANCE`): the CPU took an expert only while it was cheaper there than one copy and then waited (CPU join 0.4 ms of 2.58 s MoE time at 947 tokens) | `cell.sh` with 1 stream and 1K–16K prompts, off / on interleaved twice (not the table's official cell): first token 0.9K 2.99 → 2.76 s, 1.9K 3.90 → 3.17, 3.6K 4.84 → 4.11, 7.5K 5.98 → 5.37, 16K 7.44 → 6.98; experts streamed −20…−30 %; c1 unchanged; `gap_eval` boundary pass counts unchanged |
 | 30 | Intra-layer yields (`HIVE_LAYER_YIELD_INTRA`, look-ahead cap `HIVE_LAYER_YIELD_CAP` 200 ms) — decode-only yield points inside a layer: between embedding units, between unit / tile fronts, before the expert pass, between indexer row batches. The paused prefill's staging records are held (decode misses go to the CPU), Work buffers outside the elastic layout are parked | GPU check: a 65,536-row prompt with two decoders, off / on / off: the paused prompt's logits and saved state bit-identical. Live, 85K prompt + one decoder + four short requests (`tools/layer_yield_check.py`), off → on, on: decoder tokens during the long prompt 57 → 106, 132; its longest gap 1.86 → 1.49, 1.16 s (the rest is short admissions at layer boundaries); the long prompt's first token 20.28 → 21.82, 22.21 s (+8–10 %); short requests within noise | |
 | 31 | Batched speculation re-measured on the current build (`HIVE_MTP_BATCH=1`, switchable at run time with `{"op":"set","mtp_batch":N}`) | Rejected twice on older builds (c2 +0 %, c4 down). Interleaved off / on twice in one service run at a 300 W cap: total c2 88.2 / 87.9 → 98.7 / 101.0 tok/s, c4 118.1 / 118.2 → 117.7 / 113.9, c8 147.6 / 148.8 → 147.7 / 148.8; first token median c2 0.48–0.52 → 0.25–0.26 s, c4 0.71–0.73 → 0.26–0.27 s | |
 | 32 | Server: boundary-hint probe renders reused across turns (`HIVE_HINT_CACHE`, `HIVE_HINT_CACHE_MB`) — each turn rendered the template about 12 times over the whole conversation to find its boundaries; probes whose messages are unchanged (compared by an exact snapshot, not a key) reuse the kept render | CPU, real encoder and tokenizer, 30-turn agent conversations: hints per turn 80K 12.0 → 4.9 ms, 156K 29.1 → 12.2 ms; hints identical to the uncached path on every turn | |
@@ -216,7 +217,9 @@ steps 25–28: 70.3 / 85.2 / 97.9 / 129.1 / 128.3 / 129.6; before steps 17–21
 - Before cache-aware routing about half of a single-stream step was that CPU phase (a 3-row verify: 26.2 ms of 47.8 ms in the
   routed experts, 23.2 ms of it CPU); the rest is GPU work outside the experts — 34 KDA layers (~10 ms), DSA, the
   hyper-connection mixing, the shared expert, router and head ([glm.md](glm.md#where-a-c1-step-goes-hived-hive_glm_prof2-real-chat)).
-- Prefill is bound by PCIe: every expert a prompt uses and the cache does not hold has to cross it.
+- Prefill is bound by PCIe: every expert a prompt uses and the cache does not hold has to cross it. Measured 2026-10-14 (96 GB,
+  `HIVE_PROFILE=1`): from 1K to 4K tokens nearly every expert of every layer is used, and 91–93 % of the time to the first token
+  is the MoE phase streaming 52–93 GB of experts at 20–22 GB/s (attention and the rest 0.2–0.4 s).
 
 ### Steps, in order
 
@@ -274,10 +277,14 @@ Steps 13 and 14 were then carried over to DeepSeek as its step 21.
 | Shorter layer-yield period (250 ms) or 8 decode steps per yield instead of 4, for decoders running during a long prefill | 57K-token prefill with a running decoder: decoder chunks/s 4.65 / 4.65 / 4.72 (500 ms) vs 4.56 / 4.88 (250 ms) vs 4.09 / 5.59 (8 steps); the longest gap stays ~1.0 s in every run — set by the time between yield points, not by these switches |
 | Boundary snapshot on the first turn (`HIVE_PREFIX_FIRST_TURN`) | six new conversations sharing a 4.4K-token system block: 3.85 s to the first token from the second one either way — the system-block snapshot is already saved by the first conversation — measured with the default `HIVE_PREFIX_EXTRA_CHUNKS=1`, which already cut every first turn; superseded by step 29 |
 | Equal row ranges per CPU worker (`HIVE_GLM_CPU_BALANCE`) | 18.65 / 19.98 vs 19.44 / 19.73 ms per 3-row verify |
+| Prefill: resident experts' compute spread between the streamed ones, or 32 staging slots instead of 8 (2026-10-14) | 1K–16K first token within ±3 % of off — the staging ring was not what kept PCIe idle |
+| Prefill: the next MoE layer's likely experts copied ahead during the current layer (48 / 96 slots, also gated by expected rows) | 7.5K / 16K first token −7…−10 %, but 1K +12 % (the copies took experts the CPU would have computed) and no gain at 2–4K |
 
 ### Open problem
 
 With cache-aware routing the CPU share of a decode step is under a quarter; what remains is mostly GPU work outside the
 experts, led by the 34 KDA layers whose projections are BF16 (5.2 ms of a 34 ms 4-row verify, at the HBM limit for those
 weights), and the hyper-connection mixing. A CUPTI timeline of one stream still shows the GPU idle about a quarter of the time:
-waits for CPU experts and for deferred experts (routing is posted early since step 22). Prefill stays bound by PCIe 4.0.
+waits for CPU experts and for deferred experts (routing is posted early since step 22). Prefill stays bound by PCIe 4.0: at the
+measured 20–22 GB/s even a fully overlapped transfer leaves 1K / 4K prompts at about 2.1 / 3.9 s; fewer bytes over the link (a
+larger CPU share, step 30) is what moves it.
