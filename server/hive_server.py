@@ -417,6 +417,9 @@ class TokenCache:
         self.supported = False
         self.disabled = False
         self.hits = 0
+        # per conversation key: (tokens of its previous prompt, tokens this prompt shares with it) — the request record's prev_prompt_tokens
+        #   and diverge_at (how far the conversation stayed a prefix of itself; tools/reread_report.py)
+        self.last_diverge: dict = {}
 
     @staticmethod
     def enabled() -> bool:
@@ -468,10 +471,16 @@ class TokenCache:
             if best[0] >= 4096:
                 c, e = best
         cut = None
+        same_key = e is not None and c is None  # the kept prompt is this conversation's own previous prompt
         if e is not None:
             p_old, ids_old, ends_old, starts_old, cuts = e
             if c is None:
                 c = _common_prefix_len(p_old, prompt)
+            if same_key:
+                with self.lock:
+                    self.last_diverge[key] = (len(ids_old), bisect.bisect_right(ends_old, c))
+                    while len(self.last_diverge) > 4096:
+                        self.last_diverge.pop(next(iter(self.last_diverge)))
             j = bisect.bisect_right(cuts, c) - 1  # last cut point starting at or before the divergence
             while j >= 0 and cuts[j] == 0:
                 j -= 1
@@ -1832,6 +1841,7 @@ async def chat(request: Request):
         session = (hashlib.sha256(str(body['hive_session_id']).encode()).hexdigest()[:32]
                    if body.get('hive_session_id') else session_id_for(messages, conv_key))
         has_turns = any(m.get("role") == "assistant" for m in messages)
+        diverge: dict = {}  # request record: this conversation's previous prompt length and how much of it this prompt shares (TokenCache)
         def prepare():
             t0 = time.perf_counter()
             with ENCODE_LOCK:
@@ -1843,6 +1853,10 @@ async def chat(request: Request):
                     try:
                         ids, ends = TOKCACHE.tokenize(session, prompt)
                         images, blob = [], b""
+                        with TOKCACHE.lock:
+                            prev = TOKCACHE.last_diverge.pop(session, None)
+                        if prev:
+                            diverge.update(prev_prompt_tokens=prev[0], diverge_at=prev[1])
                     except Exception:  # noqa: BLE001 — a tokenizer without offsets: the plain path below
                         ends = None
                         ids, images, blob = tokenize_with_images(prompt, media)
@@ -1959,7 +1973,7 @@ async def chat(request: Request):
 
     req_rec = {"t_recv": t_recv, "t_first": None, "endpoint": endpoint, "stream": stream, "max_tokens": sampling["max_tokens"], "session": session,
                "rid": rid, "daemon_rid": daemon_rid, "prompt_tokens": len(ids), "client": client_tags(request, body), "outcome": "closed", "done": None,
-               "prep_ms": prep_ms, **({"priority": sampling["priority"]} if "priority" in sampling else {}),
+               "prep_ms": prep_ms, **({"priority": sampling["priority"]} if "priority" in sampling else {}), **diverge,
                # record thinking mode and effort so it can be checked whether the requested effort actually arrived
                "thinking_mode": thinking_mode, "effort": effort,
                # thinking cap as received (null if none) — whether it was forced is done.think_forced (daemon), also lifted to the top level below

@@ -533,6 +533,47 @@ class ThinkingPregate(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class Reread(unittest.TestCase):
+    """tools/reread_report.py: a follow-up turn's tokens read again, split into client rewrite / engine loss, and the daily report section."""
+    def test_split_and_section(self):
+        import reread_report as rr
+        t0 = time.mktime((2026, 10, 1, 12, 0, 0, 0, 0, -1)) * 1000
+
+        def rec(i, sess, prompt, cached, prev=None, at=None, endpoint="/v1/chat/completions", pre_tokens=None):
+            r = {"t_recv": t0 + i * 1000, "t_done": t0 + i * 1000 + 500, "endpoint": endpoint, "session": sess, "prompt_tokens": prompt,
+                 "outcome": "done", "done": {"n": 5, "finish": "stop", "cached_prefix": cached, "prefill_ms": 100.0,
+                                             **({"prefill_tokens": pre_tokens} if pre_tokens is not None else {})}}
+            if prev is not None:
+                r["prev_prompt_tokens"], r["diverge_at"] = prev, at
+            return r
+        recs = [rec(0, "a", 10000, 0),                              # first turn: no divergence fields, not a follow-up
+                rec(1, "a", 12000, 10000, prev=10000, at=9999),     # append (one template token) + full reuse: ok
+                rec(2, "a", 13000, 4000, prev=12000, at=4000),      # client rewrote from 4000: 8000 read again, cause client
+                rec(3, "b", 9000, 0, prev=8000, at=8000),           # shared all 8000, engine reused none: engine loss
+                rec(4, "a~next", 13500, 13000, endpoint="turn-prerender", pre_tokens=500)]
+        c = [rr.classify(r) for r in recs]
+        self.assertIsNone(c[0])
+        self.assertEqual((c[1]["cause"], c[1]["reread"]), ("ok", 0))
+        self.assertEqual((c[2]["cause"], c[2]["reread"], c[2]["rewrite"], c[2]["loss"]), ("client", 8000, 8000, 0))
+        self.assertEqual((c[3]["cause"], c[3]["reread"], c[3]["loss"]), ("engine", 8000, 8000))
+        R = rr.summarize_reread(recs)
+        self.assertEqual((R["followups"], R["conversations"], R["reread_tokens"], R["client_tokens"], R["engine_tokens"]), (3, 2, 16000, 8000, 8000))
+        self.assertEqual((R["prerender"]["n"], R["prerender"]["tokens"]), (1, 500))
+        self.assertEqual([w["cause"] for w in R["worst"]], ["client", "engine"])
+        tmp = tempfile.mkdtemp(prefix="hiverr-")
+        try:
+            out = Path(tmp)
+            (out / "requests-server.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+            self.assertEqual(hr.main(["--root", str(out), "--day", "2026-10-01"]), 0)
+            S = json.loads((out / "reports" / "2026-10-01.json").read_text())["summary"]
+            self.assertEqual((S["reread"]["client_turns"], S["reread"]["engine_turns"]), (1, 1))
+            md = (out / "reports" / "2026-10-01.md").read_text()
+            for h in ("Re-read per conversation", "client rewrite 1 turns", "largest re-reads"):
+                self.assertIn(h, md)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def collapse_supported(d):
     p = Path(d) / "probe"
     p.write_bytes(b"x" * 8192)

@@ -163,7 +163,9 @@ Hooks (`HIVE_HOOK_BEFORE_SLEEP`, `HIVE_HOOK_AFTER_WAKE`, ...) let a front proxy 
 
 With the monitoring switches on (see the end of `config/hive.env`), `tools/hive_monitor.py` follows
 `hived.log` and writes per-request and per-minute records, and `tools/hive_daily_report.py` turns them into a daily
-report (latency, cache hit rate, speculative decoding, reasoning length, errors).
+report (latency, cache hit rate, speculative decoding, reasoning length, re-read per conversation, errors).
+`tools/reread_report.py` gives the re-read part on its own: for each follow-up turn, how many tokens already read once were read
+again, and whether the client rewrote an earlier part of the conversation or the engine no longer held it.
 
 The monitor follows `hived.log` by inode and logical offset. Do not rotate that file with copy-truncate tools while it runs; if
 you rotate it, cut the front with `fallocate --collapse-range` and record `{inode, mode, logical_start, cut, archive}`

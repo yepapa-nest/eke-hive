@@ -1500,6 +1500,31 @@ class TokenCacheTests(unittest.TestCase):
         self.check('short-key', self.render([('user', 'unrelated and short')]))   # below the 4,096-character floor: whole
         self.assertEqual(self.cache.hits, h1)
 
+    def test_divergence_record(self):
+        """last_diverge: the previous prompt's length and how many of its tokens this prompt keeps (tools/reread_report.py) — only
+        for the conversation's own previous prompt, not for a prompt borrowed by content under another key."""
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        base = [('user', 'a ' * 30), ('assistant', 'b ' * 30), ('user', 'c ' * 30), ('assistant', 'd ' * 30)]
+        first = self.check('d1', self.render(base + [('user', 'q')]))
+        self.assertNotIn('d1', self.cache.last_diverge)                       # a first prompt: nothing to compare
+        grown = self.render(base + [('user', 'q'), ('assistant', 'r'), ('user', 'q2')])
+        self.check('d1', grown)
+        prev, at = self.cache.last_diverge.pop('d1')
+        self.assertEqual(prev, len(first))
+        self.assertGreaterEqual(at, len(first) - 2)                            # an append keeps (nearly) the whole previous prompt
+        edited = self.render([base[0], ('assistant', 'B CHANGED ' * 5)] + base[2:] + [('user', 'q')])
+        self.check('d1', grown)                                                # re-seed the kept prompt
+        self.cache.last_diverge.pop('d1')
+        self.check('d1', edited)
+        prev, at = self.cache.last_diverge.pop('d1')
+        whole = s.TOK(edited, return_offsets_mapping=True)['input_ids']
+        self.assertLess(at, prev // 2)                                         # rewritten early history: diverges in the second message
+        self.assertEqual(list(whole[:at]), list(s.TOK(grown)['input_ids'][:at]))  # the shared tokens really are shared
+        long_sys = [('user', 'the engine streams experts over PCIe ' * 200), ('assistant', 'ok')]
+        self.check('d2', self.render(long_sys + [('user', 'first')]))
+        self.check('d3', self.render(long_sys + [('user', 'other')]))         # new key served by content: not its own history
+        self.assertNotIn('d3', self.cache.last_diverge)
+
     def test_off_switch_and_lstrip_markers(self):
         os.environ['HIVE_TOKEN_CACHE'] = '0'
         p = self.render([('user', 'x'), ('assistant', 'y')])

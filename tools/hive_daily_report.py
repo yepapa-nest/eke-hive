@@ -19,6 +19,8 @@ Definitions (all values come from hived.log — engine clock):
   thinking (reasoning) = from the server log <root>/requests-server.jsonl (hive_server.py log_request · per request thinking_mode, effort, think_cap; requests that
              received a cap also carry think_forced and think_tokens), requests completed that day (local date of t_done) by mode and effort — output tokens, latency, cap-hit rate.
              effort number → name follows DeepSeek's official mapping (50 low · 75 medium · 100 xhigh).
+  re-read per conversation = from the same server records (prev_prompt_tokens · diverge_at · done.cached_prefix): tokens of a follow-up turn
+             that were read once already, split into client rewrite / engine loss — definitions in tools/reread_report.py.
   traffic filter (--clients or HIVE_REPORT_CLIENTS = comma-separated user-agent prefixes; empty = all traffic) = keep only engine requests whose
              server record (joined by daemon request id) came from one of those clients and carries no x-client-test tag — benchmark and test clients
              drop out of the per-request sections. Engine-wide sections built from minute metrics (concurrency, engine steps, expert cache, MTP,
@@ -36,6 +38,7 @@ from datetime import date, timedelta
 
 sys.path[:0] = [os.path.dirname(os.path.abspath(__file__))]
 from hive_monitor import hist_merge, hist_quantile  # noqa: E402
+import reread_report  # noqa: E402
 
 EFFORT_NAME = {50: "low", 75: "medium", 100: "xhigh"}  # DeepSeek's official effort levels (hive_server effort_from_request)
 BUCKETS = [("<1K", 0, 1024), ("1-4K", 1024, 4096), ("4-16K", 4096, 16384), ("16-64K", 16384, 65536), ("64K+", 65536, 1 << 62)]
@@ -412,6 +415,7 @@ def summarize(reqs, mets, top=10, server=None):
                     "aborted_share": round(pg["aborted"] / (pg["finished"] + pg["aborted"]), 4) if (pg["finished"] + pg["aborted"]) else None,
                     "note": "sum of total differences over sample steps ([pregate] lines = HIVE_PROFILE cadence) — a sum over sampled intervals, not a full count"}
     S["thinking"] = summarize_thinking(server or [], top)
+    S["reread"] = reread_report.summarize_reread(server or [], top)
     errs: dict = {}
     for e in errors:
         k = (e.get("kind"), (e.get("msg") or "")[:120])
@@ -603,6 +607,8 @@ def render_md(day, S, cmp_, prev_day):
         L += [f"| {i+1} | {t['effort']} | {f(t['completion'])} | {f(t['think_tokens'])} | {t['forced'] if t['forced'] is not None else '–'} | {t['finish']} | "
               f"{f(t['latency_s'])} | {f(t['prompt'])} | `{t['session']}` |" for i, t in enumerate(th["longest"])]
         L += ["", f"- {th['note']}", ""]
+    if "reread" in S:
+        L += reread_report.render_md(S["reread"])
     mt = S["mtp"]
     L += ["## MTP", "",
           f"- accept rate {f(mt['accept_rate'] and 100*mt['accept_rate'],1)}% · verify steps {f(mt['verify_steps'])} (no draft {f(mt['no_draft_steps'])}) · tokens per verify {f(mt['tokens_per_verify'],2)}",
