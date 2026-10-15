@@ -1224,6 +1224,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> stop_ids;
     std::string finish = "length";
     bool client_ok = true;
+    bool stages = false;  // the request asked for stage lines ("stages": true) — also gets read progress inside a forward (pg_targets)
     bool defer_ckpt = false, defer_warm = false;  // HIVE_DEFER_CKPT: prompt checkpoint and warm_after_prefill deferred until after the first token is sent
     double t0 = 0, t1 = 0;
     size_t common = 0, prompt_len = 0;
@@ -1904,8 +1905,8 @@ int main(int argc, char** argv) {
     A->prompt_len = ids.size();
     // "stages": true (the API server's HIVE_STAGE_STATUS — the engine status of a request): one line once the reuse is decided, before the
     //   prefill — how much of the prompt is reused and how much will be read. Requests without it get no new line.
-    if (q.contains("stages") && q["stages"].is_boolean() && q["stages"].get<bool>() &&
-        !send_json(A->r.fd, {{"admitted", true}, {"cached", (int)common}, {"total", (int)ids.size()}}))
+    A->stages = q.contains("stages") && q["stages"].is_boolean() && q["stages"].get<bool>();
+    if (A->stages && !send_json(A->r.fd, {{"admitted", true}, {"cached", (int)common}, {"total", (int)ids.size()}}))
       A->client_ok = false;
     // Boundaries supplied by the server (the request's "boundaries") — integers only, inside (0, length), sorted and deduplicated. Unknown formats are dropped (absorbed).
     auto& hints = J.hints;
@@ -1994,6 +1995,16 @@ int main(int argc, char** argv) {
     J.M = M;
     return true;
   };
+  // Read progress inside a forward (layer_yield.h Progress, installed below): the requests of the running prefill forward that asked for stages.
+  //   A scope sets them around each forward and restores the previous list (forwards admitted inside a layer yield never report: depth > 0).
+  struct PgTarget { int fd; size_t start, M, total; };
+  std::vector<PgTarget> pg_targets;
+  struct PgScope {
+    std::vector<PgTarget>& v; std::vector<PgTarget> old;
+    PgScope(std::vector<PgTarget>& v_, std::vector<PgTarget> n) : v(v_), old(std::move(v_)) { v = std::move(n); }
+    ~PgScope() { v = std::move(old); }
+  };
+  auto pg_of = [](PJob& J) { return J.A->stages ? std::vector<PgTarget>{{J.A->r.fd, J.i, (size_t)J.M, J.ids.size()}} : std::vector<PgTarget>{}; };
   // After a chunk: C1 record, EMA, chunk log, boundary snapshot, stats, cancel, progress notice. false = end the loop (cancel, disconnect).
   auto chunk_end = [&](PJob& J, double tc, size_t rows) -> bool {
     auto& A = J.A; auto& ids = J.ids; auto& st = J.st; auto& hints = J.hints; size_t& i = J.i; auto& n_chunks = J.n_chunks;
@@ -2107,7 +2118,10 @@ int main(int argc, char** argv) {
       const ly::Stats ly0 = rt.layer_yield_stats();
       if (!rt.in_layer_yield()) { ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0; }  // HIVE_LAYER_YIELD_MID
       ++prefill_epoch;
-      rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
+      {
+        PgScope pg{pg_targets, pg_of(J)};
+        rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
+      }
       const double tend = now_ms();
       // HIVE_LAYER_YIELD: tc = the prefill share (minus layer-yield time — so the EMA and the decode_between budget do not count yield time as prefill)
       J.ly_n = rt.layer_yield_stats().yields - ly0.yields;
@@ -2349,6 +2363,9 @@ int main(int argc, char** argv) {
           for (auto& Jp : jobs) if (Jp) ly_rest_rows += Jp->ids.size() - Jp->i;
           ly_rest_rows -= std::min(ly_rest_rows, rows);
         }
+        std::vector<PgTarget> pgv;
+        for (size_t m = 0; m < multi.size(); ++m) for (auto& t : pg_of(*jobs[multi[m]])) pgv.push_back(t);
+        PgScope pg{pg_targets, std::move(pgv)};
         try {
           ++prefill_epoch;
           rt.forward_multi(ps, &rs);
@@ -2392,7 +2409,10 @@ int main(int argc, char** argv) {
           const ly::Stats ly0 = rt.layer_yield_stats();
           ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0;  // HIVE_LAYER_YIELD_MID (solo forward of a batch round)
           ++prefill_epoch;
-          rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
+          {
+            PgScope pg{pg_targets, pg_of(J)};
+            rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, J.upper_needed);
+          }
           const double tend = now_ms();
           J.ly_n = rt.layer_yield_stats().yields - ly0.yields;  // HIVE_LAYER_YIELD (same as the single path)
           J.ly_last = J.ly_n > 0 ? tend - rt.layer_yield_resume_ms() : 0;
@@ -2981,6 +3001,27 @@ int main(int argc, char** argv) {
       fprintf(stderr, "[hived] layer yield done: admitted %d · decode steps %d · %.0f ms\n", n, steps, now_ms() - t0);
     };
     rt.set_layer_yield(std::move(h));
+  }
+  // HIVE_STAGE_PROGRESS_MS (default 1000; 0 = off): read progress inside a prefill forward for requests that asked for stages — the chunk
+  //   notices alone left a long prompt at 0 % for a whole chunk (2026-10-15: GLM ~25 s, DS ~20 s, FN ~9 s). {"progress":i,"total":n} with
+  //   i = chunk start + rows × the fraction of layers done (below the chunk end; the chunk notice follows as before) and "partial": true —
+//   a layer fraction is not a position, so the API server shows it but fits its time-left cost to whole chunks only. Cost: one clock read per
+  //   layer boundary and one short line per period (layer_yield.h Progress) — no GPU sync.
+  {
+    const char* v = getenv("HIVE_STAGE_PROGRESS_MS");
+    const double pg_ms = v && *v ? std::max(0.0, atof(v)) : 1000.0;
+    if (pg_ms > 0) {
+      ly::Progress p;
+      p.period_ms = pg_ms;
+      p.fn = [&pg_targets](double f) {
+        for (const auto& t : pg_targets) {
+          if (t.M == 0) continue;
+          const size_t at = t.start + std::min(t.M - 1, (size_t)((double)t.M * f));
+          send_json(t.fd, {{"progress", (int)at}, {"total", (int)t.total}, {"partial", true}});  // a closed client is noticed at the chunk notice
+        }
+      };
+      rt.set_progress(std::move(p));
+    }
   }
   struct SleepWaiter { int fd; double deadline; int level; };
   std::vector<SleepWaiter> sleep_waiters;

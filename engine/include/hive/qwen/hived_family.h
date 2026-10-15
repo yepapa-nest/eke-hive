@@ -28,6 +28,7 @@
 #include "hive/qwen/qwen_vision.h"
 #include "hive/host_image.h"
 #include "hive/layer_yield.h"
+#include "hive/gpu_marks.h"  // read progress the GPU has reached (HIVE_STAGE_PROGRESS_MS)
 
 namespace hive::qwen::fam {
 
@@ -303,6 +304,9 @@ class Runtime {
   //   boundaries (QwenEngine::layer_boundary) so hived can admit short requests and run decode steps of the active set. Nothing is copied:
   //   the inner forwards use rows the outer prefill does not hold (QwenEngine::yield_enter).
   void set_layer_yield(ly::Hooks h) { ly_.h = std::move(h); }
+  void set_progress(ly::Progress p) { prog_ = std::move(p); }  // read progress inside a prefill forward (layer_yield.h Progress)
+  void progress_point() { ly::progress_point(prog_, ly_progress_, ly_.depth, ly::steady_ms); }
+  void progress_point_gpu() { ly::progress_point_f(prog_, [this] { return pg_marks_.reached(); }, ly_.depth, ly::steady_ms); }  // GPU runtimes: what the GPU passed
   bool layer_yield_on() const { return ly_.on(); }
   int layer_yield_kind() const { return ly::kLayer; }  // HIVE_LAYER_YIELD_INTRA is DeepSeek-only: this family pauses at layer boundaries only
   bool in_layer_yield() const { return ly_.depth > 0; }
@@ -369,6 +373,8 @@ class Runtime {
   bool ly_small_ = false;                  // HIVE_LAYER_YIELD_SMALL: also yield inside prefills below prefill_threshold (above the decode-path size)
   std::vector<float> prefill_logits_;      // logits of a prefill's last row (not logits_h_: decode steps run inside its layer yields resize that)
   double ly_progress_ = 0;
+  ly::Progress prog_;                        // set_progress
+  ly::GpuMarks pg_marks_;                    // layer-boundary events of the reporting forward
   void layer_yield_point();
   int rows_cap_ = 0;
   bool mtp_batch_ = false;                 // HIVE_MTP_BATCH (constructor)

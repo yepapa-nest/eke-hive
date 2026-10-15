@@ -5,6 +5,15 @@
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
+- **Reading progress inside a chunk** (`HIVE_STAGE_PROGRESS_MS`, default 1000): requests that asked for stages now get how much is read
+  about once a second while a prefill forward runs its layers, not only after each chunk — a long prompt no longer sits at 0 % for a
+  whole chunk (about 25 s on GLM, 20 s on DeepSeek, 9 s on Qwen3.8-Flash-Next). Taken at the layer boundaries the engine already
+  visits — on the GPU as what the GPU has executed (an event per layer boundary, queried without waiting), and on Qwen3.8-Flash-Next
+  across the sub-forwards a chunk is split into (one clock read and one event record per layer, no GPU synchronization; independent
+  of `HIVE_LAYER_YIELD`). Measured on all four models: updates every 1-1.5 s (the longest gap 3.5-5.5 s, at the first layer of a
+  chunk), the same read time as before, and the predicted end within -8 % to +5 % once a request has read a few chunks (in-chunk
+  points only move the shown progress; the time left is fitted to whole chunks and keeps the last long read's fit until a request's
+  own chunks span a quarter of the read).
 - **Reading progress with a time left** (`HIVE_STAGE_STATUS`): while a prompt is read, the request stage also gives the measured read
   rate, the seconds left and whether the server already served the conversation, so a client can show "43% · about 1 min 23 s left"
   instead of a bare spinner during a long first read (380K tokens took 138 s on GLM). The estimate is the engine's own: a cost per token that grows with

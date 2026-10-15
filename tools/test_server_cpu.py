@@ -321,7 +321,7 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
             s.stage_prefill('a', 0, total=200000, cached=0)
             self.assertIsNone(s.STAGES['a']['prefill_eta_s'])                    # nothing known yet
             etas = read('a', 0, 200000, 20000)
-            for got, want in etas[1:]:                                            # from the second chunk on: within 2 %
+            for got, want in etas[3:]:                                            # once the chunks span a quarter of the read: within 2 %
                 self.assertAlmostEqual(got, want, delta=max(0.2, 0.02 * want))
             self.assertEqual(s.STAGES['a']['prefill_rate'], 1000)
             s.stage_open('b', 1000, 'conv2'); s.stage_prefill('b', 0, total=1000, cached=0)
@@ -344,12 +344,64 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         finally:
             s.time.time = saved_time; s.PREFILL_COST.update(saved_cost); s.STAGE_SEEN.clear(); s.PREFILL_RATE_FILE = None
 
+    async def test_partial_points_show_progress_but_not_the_fit(self):
+        """In-chunk points (daemon HIVE_STAGE_PROGRESS_MS, "partial") move the shown progress; the fit uses whole chunks only (a layer
+        fraction is not a position — fitting it swung the time left to 997 s on GLM, 2026-10-15). Before any fit they give the level."""
+        s.STAGE_STATUS = True
+        saved_time, saved_cost = s.time.time, dict(s.PREFILL_COST)
+        clock = [1000.0]
+        s.time.time = lambda: clock[0]
+        try:
+            s.PREFILL_COST.update(a=None, b=None)
+            s.stage_open('p', 200000, 'convp'); s.stage_prefill('p', 0, total=200000, cached=0)
+            clock[0] += 2.0; s.stage_prefill('p', 10000, partial=True)            # no fit yet: level = 5,000 tok/s
+            st = s.STAGES['p']
+            self.assertEqual((st['prefill_done'], st['prefill_rate'], st['prefill_eta_s']), (10000, 5000, 38.0))
+            clock[0] += 0.5; s.stage_prefill('p', 30000, partial=True)            # a fast-looking layer stretch: no slope from it
+            self.assertEqual(st['_chunks'], [])
+            self.assertEqual(st['prefill_done'], 30000)
+            s.stage_prefill('p', 20000, partial=True)                             # never goes back
+            self.assertEqual(st['prefill_done'], 30000)
+            clock[0] += 9.5; s.stage_prefill('p', 50000)                          # chunk end: 50,000 in 12 s
+            self.assertEqual(len(st['_chunks']), 1)
+            self.assertAlmostEqual(st['prefill_eta_s'], 150000 * 12 / 50000, delta=0.2)
+            eta = st['prefill_eta_s']
+            clock[0] += 6.0; s.stage_prefill('p', 75000, partial=True)            # inside the next chunk: same fit, less left
+            self.assertAlmostEqual(st['prefill_eta_s'], eta - 25000 * 12 / 50000, delta=0.2)
+            self.assertEqual(len(st['_chunks']), 1)
+        finally:
+            s.time.time = saved_time; s.PREFILL_COST.update(saved_cost)
+
     def test_prefill_fit_fallbacks(self):
         """One chunk keeps the prior slope; a fit that is not positive over the read falls back to the plain average."""
         a, b = s.prefill_fit([(1000, 500.0, 1.0)], 1e-9)
         self.assertEqual(b, 1e-9); self.assertAlmostEqual(a + b * 500, 1e-3)
         a, b = s.prefill_fit([(1000, 500.0, 1.0), (1000, 1500.0, 0.5)], None)   # faster later: no negative slope
         self.assertEqual(b, 0.0); self.assertAlmostEqual(a, 0.75e-3)
+        a, b = s.prefill_fit([(1000, 500.0, 0.2), (1000, 1500.0, 0.6)], 1e-9, min_span=5000)   # too narrow a stretch: prior slope
+        self.assertEqual(b, 1e-9)
+
+    async def test_early_estimate_keeps_the_prior(self):
+        """With a prior fit: it stands until STAGE_FIT_MIN tokens are read, then the slope stays the prior one until the chunks span a
+        quarter of the read — small early chunks no longer swing the time left (27B, 2026-10-15: 756 s for a 114 s read)."""
+        s.STAGE_STATUS = True
+        saved_time, saved_cost = s.time.time, dict(s.PREFILL_COST)
+        clock = [1000.0]
+        s.time.time = lambda: clock[0]
+        A, B = 1 / 5000, 4e-9
+        true = lambda p0, p1: A * (p1 - p0) + B * (p1 * p1 - p0 * p0) / 2
+        try:
+            s.PREFILL_COST.update(a=A, b=B)
+            s.stage_open('e', 200000, 'conve'); s.stage_prefill('e', 0, total=200000, cached=0)
+            worst, prev = 0.0, 0
+            for done, noise in ((2048, 3.0), (4096, .2), (6144, 1.5), (8192, .3), (16384, 1.0), (24576, 1.0), (40000, 1.0), (60000, 1.0)):
+                clock[0] += true(prev, done) * noise; prev = done                 # noisy small early chunks (admission, layer mix)
+                s.stage_prefill('e', done)
+                want = true(done, 200000)
+                worst = max(worst, abs(s.STAGES['e']['prefill_eta_s'] - want) / want)
+            self.assertLess(worst, 0.25)
+        finally:
+            s.time.time = saved_time; s.PREFILL_COST.update(saved_cost)
 
     async def test_entries_expire(self):
         s.STAGE_STATUS = True

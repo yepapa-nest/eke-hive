@@ -2013,6 +2013,10 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   //   Forwards called inside a yield have ly_.depth > 0 and are not eligible (no recursion). Off (not installed) = ly_ok false = base path.
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && in_prefill_ && (!small_fwd || ly_small_) && !batch_ && (M_orig >= opt_.prefill_threshold || small_fwd) &&
                      opt_.dump_dir.empty() && opt_.inject_dir.empty();
+  // read progress (layer_yield.h Progress — the API server's stage status): the same layer points report it even when the yield is off
+  //   or not allowed here; the yield point itself still runs only for ly_ok
+  const bool pg_ok = prog_.on() && ly_.depth == 0 && in_prefill_ && !small_fwd && !batch_ && M_orig >= opt_.prefill_threshold;
+  if (pg_ok) pg_marks_.begin();
   if (ly_ok) ly_begin({{&seq, M_orig}});
   struct LyLive { bool& f; bool was; ~LyLive() { f = was; } } ly_live{ly_live_, ly_live_};  // T11b: intra points (moe, indexer) of this forward (a forward inside a yield sets its own)
   ly_live_ = ly_ok && ly_intra_;
@@ -2045,7 +2049,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       if (pprof_) pprof_->moe_done();
       for (int s = 0; s < T; ++s) { tile_select(s); layer_tail(l, tM[s]); }
       if (pprof_) pprof_->layer_end(stats, prefetch_issued_, st_);
-      if (ly_ok) { ly_progress_ = ly_prog(l, tail_layer, gpu_layers(), true); layer_yield_point(); }  // T11 (after the layer tails are issued — the yield point switches the slot to 0 and back)
+      if (ly_ok || pg_ok) { ly_progress_ = ly_prog(l, tail_layer, gpu_layers(), true); if (pg_ok) { pg_marks_.mark(st_, ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); }  // T11 (after the layer tails are issued — the yield point switches the slot to 0 and back)
     }
     // Layer 20 (last kv source): compressed KV and indexer keys of all sub-chunks (all rows) → keep the last sub-chunk in Work and continue with the tail loop below (TileGuard resets to 0 at the end)
     for (int s = 0; s < T - 1; ++s) { tile_select(s); prepare_decoder_tail(seq, tail_layer, tM[s], tStart[s], 0); }
@@ -2070,7 +2074,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       if (opt_.decoder_replay) win_min_pos_ = start_pos;
     }
     layer_forward(seq, l, M, start_pos, stats, skip);
-    if (ly_ok && l + 1 < gpu_layers()) { ly_progress_ = ly_prog(l, tail_layer, gpu_layers(), tail_mode); layer_yield_point(); }  // T11 (after the layer tail; no yield after the last layer, only the head remains)
+    if ((ly_ok || pg_ok) && l + 1 < gpu_layers()) { ly_progress_ = ly_prog(l, tail_layer, gpu_layers(), tail_mode); if (pg_ok) { pg_marks_.mark(st_, ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); }  // T11 (after the layer tail; no yield after the last layer, only the head remains)
   }
   win_min_pos_ = 0;
   if (cpul_ && !upper_skipped) {  // layer-level placement: the CPU-placed layers for this chunk's rows (tail rows when the GPU switched to them)
@@ -2254,6 +2258,8 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
   struct PrefillFlag { bool* f; ~PrefillFlag() { *f = false; } } prefill_flag{&in_prefill_};
   // T11 HIVE_LAYER_YIELD: forward_multi is always a prefill (injection was rejected at the head) — yield at layer boundaries (after the expert stage, where every unit has left via unit_select(-1)).
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && opt_.dump_dir.empty();
+  const bool pg_ok = prog_.on() && ly_.depth == 0;  // read progress (see forward)
+  if (pg_ok) pg_marks_.begin();
   if (ly_ok) {
     std::vector<std::pair<Seq*, int>> own;
     for (auto& p : parts) own.push_back({p.seq, p.M});
@@ -2362,7 +2368,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     });
     moe_experts_multi(model_.layer(l), l, subs, stats);
     pmark("moe");
-    if (ly_ok) { ly_progress_ = ly_prog(l, L, nl, L < nl); layer_yield_point(); }  // T11 (tail l is done by the next pass's visit — acc, post_f, comb_f and h are the inter-layer state to park)
+    if (ly_ok || pg_ok) { ly_progress_ = ly_prog(l, L, nl, L < nl); if (pg_ok) { pg_marks_.mark(st_, ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); }  // T11 (tail l is done by the next pass's visit — acc, post_f, comb_f and h are the inter-layer state to park)
   }
   // ---- Tail layer L (last kv source): earlier units only produce compressed KV and indexer keys (all rows); the last unit shrinks to the tail rows (ends here with C1) or continues with all rows
   std::vector<int> up;
@@ -2401,7 +2407,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     });
     for (size_t u = 0; u < units_.size(); ++u) if (units_[u].up) up.push_back((int)u);
     if (!subs.empty()) { up_experts(L); pmark("moe"); }  // Q3 (off = plain moe_experts_multi(L, subs))
-    if (ly_ok && !subs.empty()) { ly_progress_ = ly_prog(L, L, nl, true); layer_yield_point(); }  // T11
+    if ((ly_ok || pg_ok) && !subs.empty()) { ly_progress_ = ly_prog(L, L, nl, true); if (pg_ok) { pg_marks_.mark(st_, ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); }  // T11
     // ---- upper layers (L, nl): the last units that continue
     for (int l = L + 1; l < nl; ++l) {
       if (up.empty()) break;
@@ -2418,7 +2424,7 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
       });
       up_experts(l);  // Q3 (off = plain moe_experts_multi(l, subs))
       pmark("moe");
-      if (ly_ok) { ly_progress_ = ly_prog(l, L, nl, true); layer_yield_point(); }  // T11 (upper layers — 128 tail rows make layers short: until the period is reached it only reads the clock)
+      if (ly_ok || pg_ok) { ly_progress_ = ly_prog(l, L, nl, true); if (pg_ok) { pg_marks_.mark(st_, ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); }  // T11 (upper layers — 128 tail rows make layers short: until the period is reached it only reads the clock)
     }
   } else {
     for (size_t u = 0; u < units_.size(); ++u) if (units_[u].last) { units_[u].up = true; up.push_back((int)u); }

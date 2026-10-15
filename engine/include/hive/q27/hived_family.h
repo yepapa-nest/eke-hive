@@ -234,6 +234,8 @@ class Runtime {
   int wake_warm(const std::vector<int32_t>&, const std::function<void(int, int)>& = {}) { return 0; }
   bool asleep() const { return false; }
   void set_layer_yield(ly::Hooks h) { ly_.h = std::move(h); }
+  void set_progress(ly::Progress p) { prog_ = std::move(p); }  // read progress inside a prefill forward (layer_yield.h Progress)
+  void progress_point() { ly::progress_point(prog_, ly_progress_, ly_.depth, ly::steady_ms); }
   bool layer_yield_on() const { return ly_.on(); }
   int layer_yield_kind() const { return ly::kLayer; }
   bool in_layer_yield() const { return ly_.depth > 0; }
@@ -312,6 +314,7 @@ class Runtime {
   bool prefill_pending_ = false;
   ly::State ly_;
   double ly_progress_ = 0;
+  ly::Progress prog_;                        // set_progress
   bool mtp_batch_ = false, mtp_batch_seen_ = false, mtp_batch_start_ = false;
   std::vector<Seq*> vb_seqs_;
   std::vector<float> logits_, inv_temp_, cand_val_, rmax_, rsum_;

@@ -123,6 +123,14 @@ class QwenEngine {
   std::function<void(int layer, bf16* h_dev, int rows)> layer_inject;
   // Layer yield (see GlmEngine): called between layers of a prefill; the callback may run other forwards inside yield_enter / yield_exit.
   std::function<void(int layer)> layer_boundary;
+  // false = the hook only reports read progress (layer_yield.h Progress) and never runs another forward — the combine + next-norm fusion
+  //   (combine_mlp may_fuse) stays on, so a progress-only hook costs nothing on the GPU side
+  bool layer_boundary_yields = true;
+  // Where the running sub-forward sits in the prefill call: prefill() runs a long chunk as several forwards (max_chunk rows, or
+  //   layer-major spans), each over all layers — a layer index alone restarted at 0 for every one of them, so read progress jumped to
+  //   ~98 % of a 65,536-row chunk within 2.5 s and then stood still for 6.5 s (measured 2026-10-15). Fraction of the call =
+  //   boundary_base + boundary_span × (layers done / layers).
+  double boundary_base = 0, boundary_span = 1;
   double pf_yield_body_ms = 0;
   struct YieldSave { bf16* hcur = nullptr; std::vector<EmbedOverride> emb; int64_t emb_base = 0; bool on = false; };
   bool yield_enter(YieldSave& s);

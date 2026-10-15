@@ -16,6 +16,7 @@
 //   accumulation order" — the same forward is merely paused between layers).
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -242,6 +243,33 @@ template <class Park, class Unpark, class Now> bool yield_point_intra(State& s, 
   s.st.max_gap_ms = std::max(s.st.max_gap_ms, gap);
   s.h.run(R, gap);
   return true;
+}
+
+// ---- Read progress inside a prefill forward (the API server's HIVE_STAGE_STATUS) ------------------------------------------------------------------------
+// Problem (measured 2026-10-15): the engine reported prefill progress only after each chunk — GLM 81,920 rows ≈ 25 s, DS 98,304 ≈ 20 s,
+//   FN 65,536 ≈ 9 s — so a client showing "how much is read" sat at 0 % for that long while the forward ran its layers.
+// Fix: at the same layer boundaries (host side, after the layer is issued — no GPU sync is added), report the fraction of layers done at most
+//   once per period; hived turns it into rows (chunk start + rows × fraction) for requests that asked for stages. Independent of
+//   HIVE_LAYER_YIELD (FN runs without it): the runtimes install their layer hook when either is on, and call the yield point only when the
+//   yield itself is allowed. Only the outer forward reports (depth 0): forwards run inside a yield are other requests.
+// Cost: one clock read per layer boundary (a layer is ~0.1-0.5 s on long prompts) and one short socket line per period.
+struct Progress {
+  std::function<void(double)> fn;  // hived: fraction of layers done in the running forward
+  double period_ms = 0;            // 0 = off
+  double last = 0;
+  bool on() const { return fn && period_ms > 0; }
+};
+inline double steady_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+// frac() is evaluated only when the period is due (GPU runtimes query events there — hive/gpu_marks.h)
+template <class Frac, class Now> void progress_point_f(Progress& p, Frac&& frac, int depth, Now&& now) {
+  if (!p.on() || depth > 0) return;
+  const double t = now();
+  if (t - p.last < p.period_ms) return;
+  p.last = t;
+  p.fn(std::min(1.0, std::max(0.0, (double)frac())));
+}
+template <class Now> void progress_point(Progress& p, double frac, int depth, Now&& now) {
+  progress_point_f(p, [frac] { return frac; }, depth, now);
 }
 
 }  // namespace hive::ly

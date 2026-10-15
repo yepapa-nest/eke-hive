@@ -423,7 +423,7 @@ static void fake_prefill_checks(Runtime* rt, bool verify, bool held) {
   if (held && !rt->in_layer_yield()) throw std::runtime_error("fake state: staging hold left set outside a yield");
 }
 static void fake_layers(Runtime* rt, bool ly_ok, int ms, const std::vector<uint64_t>& vals, size_t cap, const std::function<void()>& yield,
-                        const std::function<void(int, int, bool)>& intra = {}) {
+                        const std::function<void(int, int, bool)>& intra = {}, const std::function<void(double)>& progress = {}) {
   const int FL = std::max(1, fake_env("FAKE_LAYERS", 1));
   static const int NI = std::max(0, fake_env("FAKE_INTRA", 0));
   static const int kinds[3] = {ly::kUnit, ly::kIndex, ly::kMoe};
@@ -435,6 +435,9 @@ static void fake_layers(Runtime* rt, bool ly_ok, int ms, const std::vector<uint6
       fake_work_check(vals, l, cap, "after intra yield");
     }
     if (ms > 0) std::this_thread::sleep_for(std::chrono::microseconds((long)ms * 1000 / FL / (ly_ok && intra ? NI + 1 : 1)));
+    // production: the layer hook reports read progress even when the yield is off. The fraction goes to the reporter directly — this
+    //   fake keeps ly_progress_ at 0 (the layer-yield scenarios, e.g. the mid rule's remaining-rows estimate, are written against that)
+    if (l + 1 < FL && progress) progress((l + 1.0) / FL);
     if (l + 1 < FL && ly_ok) {
       fake_work_check(vals, l, cap, "before yield");
       yield();
@@ -463,6 +466,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   //   HIVE_LAYER_YIELD_SMALL (production: also HIVE_PREFILL_SMALL forwards below the threshold) — here: any forward below the threshold
   static const bool ly_small = [] { const char* v = getenv("HIVE_LAYER_YIELD_SMALL"); return v && *v && strcmp(v, "0") != 0; }();
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && !verify_ && (M >= opt_.prefill_threshold || ly_small);
+  const bool pg_ok = prog_.on() && ly_.depth == 0 && !verify_ && M >= opt_.prefill_threshold && !fake_env("FAKE_NO_PROGRESS", 0);  // read progress (runtime.cpp pg_ok) · FAKE_NO_PROGRESS = negative control
   fake_prefill_checks(this, verify_, store_.staging_held());
   if (ly_ok) ly_begin({{&seq, M}});
   struct LyLive { bool& f; bool was; ~LyLive() { f = was; } } ly_live{ly_live_, ly_live_};  // production forward (T11b)
@@ -484,7 +488,8 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   {
     const int ms = M < opt_.prefill_threshold && getenv("FAKE_PREFILL_SHORT_MS") ? fake_env("FAKE_PREFILL_SHORT_MS", 0) : fake_env("FAKE_PREFILL_MS", 0);
     fake_layers(this, ly_ok, ms, *vals, (size_t)opt_.max_chunk, [this] { layer_yield_point(); },  // FAKE_LAYERS 1 = one sleep (no per-layer yield)
-                [this](int k, int l, bool last) { layer_yield_point(k, l, last); });
+                [this](int k, int l, bool last) { layer_yield_point(k, l, last); },
+                pg_ok ? std::function<void(double)>([this](double f) { ly::progress_point(prog_, f, ly_.depth, ly::steady_ms); }) : std::function<void(double)>{});
   }
   CUDA_CHECK(cudaStreamSynchronize(st_));
   const int32_t next = fake_next(seq, model_.cfg().window);
@@ -534,8 +539,10 @@ void Runtime::forward_multi(std::vector<PrefillPart>& parts, ForwardStats* stats
     if (const char* f = getenv("FAKE_FAIL_TOKEN")) for (int m = 0; m < p.M; ++m) if (p.ids[m] == atoi(f)) fail = true;
   }
   if (fail) { CUDA_CHECK(cudaStreamSynchronize(st_)); throw std::runtime_error("fake injected forward failure"); }
+  const bool pg_ok = prog_.on() && ly_.depth == 0 && !fake_env("FAKE_NO_PROGRESS", 0);  // read progress (runtime.cpp forward_multi pg_ok)
   fake_layers(this, ly_ok, fake_env("FAKE_PREFILL_MS", 0), vals0, (size_t)opt_.max_chunk, [this] { layer_yield_point(); },  // one layer-first pass for all parts (FAKE_LAYERS)
-              [this](int k, int l, bool last) { layer_yield_point(k, l, last); });
+              [this](int k, int l, bool last) { layer_yield_point(k, l, last); },
+              pg_ok ? std::function<void(double)>([this](double f) { ly::progress_point(prog_, f, ly_.depth, ly::steady_ms); }) : std::function<void(double)>{});
   CUDA_CHECK(cudaStreamSynchronize(st_));
   for (auto& p : parts) {
     p.next = fake_next(*p.seq, model_.cfg().window);

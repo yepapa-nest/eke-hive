@@ -617,13 +617,19 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   // layer yields: only an outer prefill (not one run inside a yield) of at least prefill_threshold rows — or, with HIVE_LAYER_YIELD_SMALL,
   //   of more rows than the decode-path size (64: those run in tens of milliseconds)
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && (M >= opt_.prefill_threshold || (ly_small_ && M > 64));
+  // read progress (layer_yield.h Progress — the API server's stage status): the layer hook is also installed when only it is on;
+  //   the yield point still runs only for ly_ok
+  const bool pg_ok = prog_.on() && ly_.depth == 0 && M >= opt_.prefill_threshold;
+  const bool hook_on = ly_ok || pg_ok;
   struct LyHook {  // restores the hook of the forward this one runs inside (a level-2 yield)
-    QwenEngine& e; bool on; std::function<void(int)> prev;
-    ~LyHook() { if (on) e.layer_boundary = std::move(prev); }
-  } ly_hook{*eng_, ly_ok, ly_ok ? eng_->layer_boundary : std::function<void(int)>{}};
-  if (ly_ok) {
-    if (ly_.depth == 0) ly_.last = hive::mono_ms();
-    eng_->layer_boundary = [this](int l) { ly_progress_ = (l + 1.0) / std::max(1, model_.qm().cfg().n_layers); layer_yield_point(); };
+    QwenEngine& e; bool on; std::function<void(int)> prev; bool prev_yields;
+    ~LyHook() { if (on) { e.layer_boundary = std::move(prev); e.layer_boundary_yields = prev_yields; } }
+  } ly_hook{*eng_, hook_on, hook_on ? eng_->layer_boundary : std::function<void(int)>{}, eng_->layer_boundary_yields};
+  if (pg_ok) pg_marks_.begin();
+  if (hook_on) {
+    if (ly_ok && ly_.depth == 0) ly_.last = hive::mono_ms();
+    eng_->layer_boundary_yields = ly_ok;
+    eng_->layer_boundary = [this, ly_ok, pg_ok](int l) { ly_progress_ = eng_->boundary_base + eng_->boundary_span * (l + 1.0) / std::max(1, model_.qm().cfg().n_layers); if (pg_ok && ly_.depth == 0) { pg_marks_.mark(eng_->stream(), ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); };
   }
   try {
     prefill_logits_.resize(c.vocab);

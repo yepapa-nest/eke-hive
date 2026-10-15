@@ -1585,12 +1585,14 @@ def stage_open(rid: str, prompt_tokens: int, session: str | None = None) -> None
     STAGES[rid] = {"stage": "queued", "prompt_tokens": prompt_tokens, "seen_before": seen, "updated": round(now, 3)}
 
 
-def prefill_fit(chunks: list, prior_b: float | None) -> tuple:
+def prefill_fit(chunks: list, prior_b: float | None, min_span: float = 0.0) -> tuple:
     """Seconds per prompt token = a + b * position, fitted to the chunks read so far ((tokens, mid position, seconds) each) by least
     squares on the chunk times. The cost grows with the position (attention over everything before it): measured 2026-10-15, 27B
     227K tokens read at 4,376 tok/s near the start and 1,088 near the end, so the last chunk's rate alone predicted half the real
-    time. One chunk (or a fit that is not positive over the read) keeps the prior slope and fits the level only."""
-    if len(chunks) >= 2:
+    time. One chunk, chunks spanning less than min_span positions, or a fit that is not positive over the read keep the prior slope
+    and fit the level only — a slope from a narrow stretch swings wildly (measured 2026-10-15, 27B with 2,048-row chunks: the time
+    left jumped to 756 s and 425 s within the first 10 % of a 114 s read)."""
+    if len(chunks) >= 2 and chunks[-1][1] - chunks[0][1] >= min_span:
         s11 = sum(n * n for n, m, t in chunks); s12 = sum(n * n * m for n, m, t in chunks); s22 = sum((n * m) ** 2 for n, m, t in chunks)
         t1 = sum(n * t for n, m, t in chunks); t2 = sum(n * m * t for n, m, t in chunks)
         det = s11 * s22 - s12 * s12
@@ -1607,9 +1609,13 @@ def prefill_fit(chunks: list, prior_b: float | None) -> tuple:
     return a, b
 
 
-def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | None = None) -> None:
-    """Prefill progress: admitted (total/cached given, done 0) or a chunk read (done = tokens read so far, excluding the reused ones).
-    prefill_rate = the current speed (tok/s at the position reached), prefill_eta_s = the fitted cost summed over what is left."""
+def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | None = None, partial: bool = False) -> None:
+    """Prefill progress: admitted (total/cached given, done 0), a chunk read (done = tokens read so far, excluding the reused ones) or,
+    with partial, a point inside the running chunk (the daemon's HIVE_STAGE_PROGRESS_MS: chunk start + rows × the fraction of layers done).
+    prefill_rate = the current speed (tok/s at the position reached), prefill_eta_s = the fitted cost summed over what is left.
+    Only whole chunks feed the fit: a layer fraction is not a position (all rows of a chunk advance together), and fitting those points
+    swung the slope — measured 2026-10-15 GLM 250K, time left 997 s for a moment inside the first chunk instead of ~85 s. A partial point
+    moves the shown progress (and, before any fit exists, gives the level: the chunk's own speed so far)."""
     st = STAGES.get(rid)
     if st is None:
         return
@@ -1622,14 +1628,31 @@ def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | N
             return
         last, dt = st.get("_done_last", 0), now - st.get("_t_last", now)
         base = int(st.get("cached_tokens") or 0)
-        if done > last and dt > 0:
-            st["_chunks"].append((done - last, base + (last + done) / 2.0, dt))
-        st.update(prefill_done=done, _t_last=now, _done_last=done)
-        cost = prefill_fit(st["_chunks"], PREFILL_COST["b"]) if st["_chunks"] else st.get("_cost")
-        if cost and done >= STAGE_FIT_MIN:
-            PREFILL_COST.update(a=cost[0], b=cost[1])
-            prefill_rate_save()
-    st["_cost"] = cost
+        if partial:
+            if done <= int(st.get("prefill_done") or 0):
+                return
+            st["prefill_done"] = done
+            cost = st.get("_cost")
+            if not cost and done > last and dt > 0:
+                cost = (dt / (done - last), 0.0)
+        else:
+            if done > last and dt > 0:
+                st["_chunks"].append((done - last, base + (last + done) / 2.0, dt))
+            st.update(prefill_done=done, _t_last=now, _done_last=done)
+            # the prior fit (the last long read) until this request has read STAGE_FIT_MIN tokens; then its own chunks, with a new slope
+            #   only once they span a quarter of the whole read (prefill_fit min_span)
+            prior = (PREFILL_COST["a"], PREFILL_COST["b"]) if PREFILL_COST["a"] else None
+            if prior and done < STAGE_FIT_MIN:
+                cost = prior
+            else:
+                span = 0.25 * int(st.get("prefill_total") or 0)
+                cost = prefill_fit(st["_chunks"], PREFILL_COST["b"], span) if st["_chunks"] else st.get("_cost")
+            if cost and cost is not prior and done >= STAGE_FIT_MIN:
+                PREFILL_COST.update(a=cost[0], b=cost[1])
+                prefill_rate_save()
+            st["_cost"] = cost
+    if total is not None:
+        st["_cost"] = cost
     p0 = int(st.get("cached_tokens") or 0) + int(st.get("prefill_done") or 0)
     p1 = int(st.get("cached_tokens") or 0) + int(st.get("prefill_total") or 0)
     if cost:
@@ -1893,7 +1916,8 @@ async def chat(request: Request):
                             if "admitted" in msg:
                                 stage_prefill(rid, 0, total=max(0, int(msg.get("total") or 0) - int(msg.get("cached") or 0)), cached=int(msg.get("cached") or 0))
                             elif STAGES.get(rid, {}).get("stage") == "prefill":
-                                stage_prefill(rid, max(0, int(msg.get("progress") or 0) - int(STAGES[rid].get("cached_tokens") or 0)))
+                                stage_prefill(rid, max(0, int(msg.get("progress") or 0) - int(STAGES[rid].get("cached_tokens") or 0)),
+                                              partial=bool(msg.get("partial")))
                         continue
                     elif msg.get("done"):
                         terminal = True

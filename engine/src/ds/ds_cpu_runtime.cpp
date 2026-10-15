@@ -126,11 +126,15 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   }
   const double t0 = hive::mono_ms();
   const bool ly_ok = ly_.on() && ly_.depth < ly_.h.max_depth && M >= opt_.prefill_threshold;
+  // read progress (layer_yield.h Progress — the API server's stage status): the layer hook is also installed when only it is on;
+  //   the yield point still runs only for ly_ok
+  const bool pg_ok = prog_.on() && ly_.depth == 0 && M >= opt_.prefill_threshold;
+  const bool hook_on = ly_ok || pg_ok;
   struct LyHook { cpu::DsCpuEngine& e; bool on; std::function<void(int)> prev; ~LyHook() { if (on) e.layer_boundary = std::move(prev); } }
-      lh{e, ly_ok, ly_ok ? e.layer_boundary : std::function<void(int)>{}};
-  if (ly_ok) {
-    if (ly_.depth == 0) ly_.last = hive::mono_ms();
-    e.layer_boundary = [this](int l) { ly_progress_ = (l + 1.0) / std::max(1, model_.eng().n_loaded_layers()); layer_yield_point(); };
+      lh{e, hook_on, hook_on ? e.layer_boundary : std::function<void(int)>{}};
+  if (hook_on) {
+    if (ly_ok && ly_.depth == 0) ly_.last = hive::mono_ms();
+    e.layer_boundary = [this, ly_ok](int l) { ly_progress_ = (l + 1.0) / std::max(1, model_.eng().n_loaded_layers()); progress_point(); if (ly_ok) layer_yield_point(); };
   }
   const int V = e.cfg().vocab;
   std::vector<float> lg(V, 0.f);

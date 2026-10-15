@@ -883,7 +883,7 @@ void QwenEngine::forward(const std::vector<RowInfo>& rows, const int32_t* ids, b
     if (l > 0 && layer_inject) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_inject(l, h, R); }
     layer_front(l, rows, ids, prefill, h);
     moe_layer(l, R, prefill, x_.as<bf16>(), y_.as<bf16>());
-    combine_mlp(l, h, R, !layer_hook && !layer_inject && !(prefill && layer_boundary));
+    combine_mlp(l, h, R, !layer_hook && !layer_inject && !(prefill && layer_boundary && layer_boundary_yields));
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, h, R); }
     if (prefill && layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);
   }
@@ -902,6 +902,8 @@ void QwenEngine::forward(const std::vector<RowInfo>& rows, const int32_t* ids, b
 void QwenEngine::prefill(QwenSeq& s, const int32_t* ids, int T, float* logits_last) {
   HIVE_CHECK(T >= 1 && s.pos + T <= s.cap, "qwen: sequence capacity exceeded");
   HIVE_CHECK((int64_t)s.tokens.size() == s.pos, "qwen: sequence tokens out of step with its position");
+  // boundary_base/span (qwen_engine.h): restored on exit — a short prefill admitted inside a layer yield of this one runs this function too
+  struct BoundaryKeep { QwenEngine& e; double base, span; ~BoundaryKeep() { e.boundary_base = base; e.boundary_span = span; } } boundary_keep{*this, boundary_base, boundary_span};
   kv_reserve(s, std::min<int64_t>(s.cap, s.pos + T + kKvSlack));
   if (ple_ && strcmp(ple_->kind(), "ram") != 0) {  // SSD: read the whole prompt's rows ahead (they depend on the token ids only)
     std::vector<int64_t> pr((size_t)T * kPleHeads);
@@ -923,6 +925,7 @@ void QwenEngine::prefill(QwenSeq& s, const int32_t* ids, int T, float* logits_la
     for (int off = 0; off < T; off += span) {
       const int n = std::min(span, T - off);
       emb_base_ = off;
+      boundary_base = (double)off / T; boundary_span = (double)n / T;
       if (n > max_chunk_) prefill_layer_major(s, ids + off, n, off + n == T ? logits_last : nullptr);
       else {
         std::vector<RowInfo> rows(n);
@@ -934,6 +937,7 @@ void QwenEngine::prefill(QwenSeq& s, const int32_t* ids, int T, float* logits_la
     for (int off = 0; off < T; off += max_chunk_) {
       const int n = std::min(max_chunk_, T - off);
       emb_base_ = off;
+      boundary_base = (double)off / T; boundary_span = (double)n / T;
       std::vector<RowInfo> rows(n);
       for (int i = 0; i < n; ++i) rows[i] = {&s, s.pos + i};
       forward(rows, ids + off, true, off + n == T ? logits_last : nullptr, false);

@@ -19,6 +19,7 @@
 #include "hive/vision.h"
 #include "hive/host_image.h"
 #include "hive/layer_yield.h"  // HIVE_LAYER_YIELD (yield at layer boundaries — host scaffolding)
+#include "hive/gpu_marks.h"  // read progress the GPU has reached (HIVE_STAGE_PROGRESS_MS)
 
 #include <cstdio>
 
@@ -243,6 +244,9 @@ class Runtime {
   //   forward_batch, mtp_draft, forward_verify(_batch), rollback(_batch), save_image/load_image/reset_seq (on sequences other than the outer prefill's) are allowed;
   //   warm_cache is not (long synchronous upload — hived skips it inside a yield). Inside a yield, promotion is paused (same flag as set_prefill_pending) and elastic slots are not lent.
   void set_layer_yield(ly::Hooks h) { if (!cpul_) ly_.h = std::move(h); }  // off with CPU-placed layers (the CPU block runs at the end of a forward, not between layers)
+  void set_progress(ly::Progress p) { if (!cpul_) prog_ = std::move(p); }  // read progress inside a prefill forward (layer_yield.h Progress)
+  void progress_point() { ly::progress_point(prog_, ly_progress_, ly_.depth, ly::steady_ms); }
+  void progress_point_gpu() { ly::progress_point_f(prog_, [this] { return pg_marks_.reached(); }, ly_.depth, ly::steady_ms); }  // GPU runtimes: what the GPU passed
   bool layer_yield_on() const { return ly_.on(); }
   bool in_layer_yield() const { return ly_.depth > 0; }
   const ly::Stats& layer_yield_stats() const { return ly_.st; }
@@ -613,6 +617,8 @@ class Runtime {
   // HIVE_LAYER_YIELD ("T11" header comment in runtime.cpp)
   ly::State ly_;
   double ly_progress_ = 0;                       // layer_yield_progress (set right before each layer_yield_point call)
+  ly::Progress prog_;                        // set_progress
+  ly::GpuMarks pg_marks_;                    // layer-boundary events of the reporting forward
   double ly_prog(int l, int L, int nl, bool tail) const {  // progress after layer l (L = tail layer, nl = layers)
     if (!tail || L <= 0 || L >= nl) return (l + 1.0) / std::max(1, nl);
     return l < L ? 0.9 * (l + 1.0) / L : 0.9 + 0.1 * (l + 1.0 - L) / std::max(1, nl - L);
