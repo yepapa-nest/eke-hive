@@ -299,42 +299,57 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[-1].get('tool_name'), 'web_search')
 
     async def test_prefill_rate_eta_and_seen(self):
-        """Rate and time left come from this engine's own chunks: before the first chunk ends, from the last large chunk of an earlier
-        request (small chunks never set it); after, from this request's last chunk. seen_before = the server served the conversation."""
+        """Time left from a cost per token that grows with the position (a dense model slows ~4x over a long prompt, measured
+        2026-10-15): fitted to this request's chunks, the prior fit before the first chunk ends, kept across a restart in a file.
+        seen_before = the server served the conversation key before."""
         s.STAGE_STATUS = True
-        saved_time, saved_rate = s.time.time, dict(s.PREFILL_RATE)
+        saved_time, saved_cost = s.time.time, dict(s.PREFILL_COST)
         clock = [1000.0]
         s.time.time = lambda: clock[0]
+        A, B = 1 / 5000, 4e-9                                                     # 5,000 tok/s at 0 -> 1,000 tok/s at 200K
+        true = lambda p0, p1: A * (p1 - p0) + B * (p1 * p1 - p0 * p0) / 2
+        def read(rid, cached, total, step):
+            etas = []
+            for done in range(step, total + 1, step):
+                clock[0] += true(cached + done - step, cached + done); s.stage_prefill(rid, done)
+                etas.append((s.STAGES[rid]['prefill_eta_s'], true(cached + done, cached + total)))
+            return etas
         try:
-            s.PREFILL_RATE['tok_s'] = None; s.STAGE_SEEN.clear()
-            s.stage_open('a', 300000, 'conv1')
+            s.PREFILL_COST.update(a=None, b=None); s.STAGE_SEEN.clear()
+            s.stage_open('a', 200000, 'conv1')
             self.assertFalse(s.STAGES['a']['seen_before'])
-            s.stage_prefill('a', 0, total=240000, cached=60000)
-            self.assertIsNone(s.STAGES['a']['prefill_eta_s'])                    # no rate known yet
-            clock[0] += 20.0; s.stage_prefill('a', 80000)                         # 4,000 tok/s
-            st = s.STAGES['a']
-            self.assertEqual((st['prefill_done'], st['prefill_rate'], st['prefill_eta_s']), (80000, 4000, 40.0))
-            clock[0] += 40.0; s.stage_prefill('a', 160000)                        # slower chunk: 2,000 tok/s
-            self.assertEqual((s.STAGES['a']['prefill_rate'], s.STAGES['a']['prefill_eta_s']), (2000, 40.0))
+            s.stage_prefill('a', 0, total=200000, cached=0)
+            self.assertIsNone(s.STAGES['a']['prefill_eta_s'])                    # nothing known yet
+            etas = read('a', 0, 200000, 20000)
+            for got, want in etas[1:]:                                            # from the second chunk on: within 2 %
+                self.assertAlmostEqual(got, want, delta=max(0.2, 0.02 * want))
+            self.assertEqual(s.STAGES['a']['prefill_rate'], 1000)
             s.stage_open('b', 1000, 'conv2'); s.stage_prefill('b', 0, total=1000, cached=0)
-            clock[0] += 2.0; s.stage_prefill('b', 1000)                           # a small chunk does not set the prior
-            self.assertEqual(s.PREFILL_RATE['tok_s'], 2000)
+            clock[0] += 2.0; s.stage_prefill('b', 1000)                           # a short read does not replace the prior
+            self.assertAlmostEqual(s.PREFILL_COST['b'], B, delta=B * 0.02)
             s.stage_open('c', 300000, 'conv1')                                    # the same conversation again
             self.assertTrue(s.STAGES['c']['seen_before'])
-            s.stage_prefill('c', 0, total=100000, cached=0)
-            self.assertEqual((s.STAGES['c']['prefill_rate'], s.STAGES['c']['prefill_eta_s']), (2000, 50.0))
+            s.stage_prefill('c', 0, total=150000, cached=50000)                   # before its first chunk: the prior fit
+            self.assertAlmostEqual(s.STAGES['c']['prefill_eta_s'], true(50000, 200000), delta=0.02 * true(50000, 200000))
             s.stage_prefill('zzz', 5)                                             # unknown request: ignored
-            with tempfile.TemporaryDirectory() as d:                             # the rate survives a restart (file next to the socket)
+            with tempfile.TemporaryDirectory() as d:                             # the fit survives a restart (file next to the socket)
                 f = os.path.join(d, 'prefill-rate.json')
-                s.prefill_rate_load(f)                                            # no file yet: the rate is kept
-                self.assertEqual(s.PREFILL_RATE['tok_s'], 2000)
-                s.stage_open('d', 300000, 'conv3'); s.stage_prefill('d', 0, total=90000, cached=0)
-                clock[0] += 30.0; s.stage_prefill('d', 90000)                     # 3,000 tok/s -> saved
-                s.PREFILL_RATE['tok_s'] = None
+                s.prefill_rate_load(f)                                            # no file yet: the fit is kept
+                self.assertAlmostEqual(s.PREFILL_COST['b'], B, delta=B * 0.02)
+                s.stage_open('d', 100000, 'conv3'); s.stage_prefill('d', 0, total=100000, cached=0)
+                read('d', 0, 100000, 25000)                                       # saved
+                s.PREFILL_COST.update(a=None, b=None)
                 s.prefill_rate_load(f)
-                self.assertEqual(s.PREFILL_RATE['tok_s'], 3000)
+                self.assertAlmostEqual(s.PREFILL_COST['a'], A, delta=A * 0.02)
         finally:
-            s.time.time = saved_time; s.PREFILL_RATE.update(saved_rate); s.STAGE_SEEN.clear(); s.PREFILL_RATE_FILE = None
+            s.time.time = saved_time; s.PREFILL_COST.update(saved_cost); s.STAGE_SEEN.clear(); s.PREFILL_RATE_FILE = None
+
+    def test_prefill_fit_fallbacks(self):
+        """One chunk keeps the prior slope; a fit that is not positive over the read falls back to the plain average."""
+        a, b = s.prefill_fit([(1000, 500.0, 1.0)], 1e-9)
+        self.assertEqual(b, 1e-9); self.assertAlmostEqual(a + b * 500, 1e-3)
+        a, b = s.prefill_fit([(1000, 500.0, 1.0), (1000, 1500.0, 0.5)], None)   # faster later: no negative slope
+        self.assertEqual(b, 0.0); self.assertAlmostEqual(a, 0.75e-3)
 
     async def test_entries_expire(self):
         s.STAGE_STATUS = True

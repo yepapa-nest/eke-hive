@@ -1528,22 +1528,23 @@ async def models():
 #   prompt (cached_tokens reused, prefill_total to read, prefill_done after each chunk), then the generated text's stage. Off = the route
 #   answers 404 and nothing else changes (responses are byte-identical; the daemon line "admitted" is only sent when asked for).
 #   Entries live while the request runs and STAGE_KEEP_S after it ends.
-#   While reading: "prefill_rate" (tokens/s of the last chunk read, or of the last large chunk of an earlier request before this
-#   request's first chunk ends) and "prefill_eta_s" (seconds left at "updated" = what is left / that rate), so a client can show the
-#   time left and count it down between chunks (one chunk can take ~25 s on a long prompt). The rate comes from this engine, not a
+#   While reading: "prefill_rate" (tokens/s at the position reached) and "prefill_eta_s" (seconds left at "updated"), so a client can
+#   show the time left and count it down between chunks (one chunk can take ~25 s on a long prompt). Both come from a cost per token
+#   that grows with the position (prefill_fit), fitted to this request's chunks — before its first chunk ends, the fit of the last
+#   long read. The rate comes from this engine, not a
 #   table: it differs per model (measured 2026-10-14/15, full prefill: FN ~6,600 tok/s · GLM ~2,800-3,400 · 27B ~2,400) and falls as the
 #   prompt grows (GLM 380K: 24 s for the first 81,920-token chunk, 30 s for the fourth). "seen_before" = this server already served
 #   this conversation (since it started), so a full read is a re-read rather than its first read — keyed on the client's conversation
 #   key when it sends one (a room keeps its key when its system text changes; the session also hashes that text), else the session.
-#   The last large-chunk rate is kept next to the daemon socket (prefill-rate.json) so a restarted server has it before the first
+#   The last fit is kept next to the daemon socket (prefill-rate.json) so a restarted server has it before the first
 #   chunk of the first request ends (measured 2026-10-15 GLM: no time left for the first 25 s after a restart without it).
 STAGE_STATUS = env_on("HIVE_STAGE_STATUS")
 STAGE_KEEP_S = 120.0
 STAGES: dict = {}
 STAGE_SEEN: OrderedDict = OrderedDict()  # conversations this server has served (LRU)
 STAGE_SEEN_CAP = 4096
-STAGE_RATE_MIN = 16384  # chunks at least this large set the rate used before a request's own first chunk ends (a 1K prompt reads at ~470 tok/s)
-PREFILL_RATE: dict = {"tok_s": None}
+STAGE_FIT_MIN = 16384  # tokens a request must have read before its fitted cost becomes the prior for later requests
+PREFILL_COST: dict = {"a": None, "b": None}  # seconds per prompt token = a + b * position (prior from the last long read)
 PREFILL_RATE_FILE: str | None = None
 
 
@@ -1551,10 +1552,10 @@ def prefill_rate_load(path: str) -> None:
     global PREFILL_RATE_FILE
     PREFILL_RATE_FILE = path
     try:
-        v = json.load(open(path)).get("tok_s")
-        if isinstance(v, (int, float)) and v > 0:
-            PREFILL_RATE["tok_s"] = float(v)
-    except Exception:  # noqa: BLE001 — no file yet / unreadable: learnt again from the first large chunk
+        d = json.load(open(path))
+        if isinstance(d.get("a"), (int, float)) and d["a"] > 0 and isinstance(d.get("b"), (int, float)) and d["b"] >= 0:
+            PREFILL_COST.update(a=float(d["a"]), b=float(d["b"]))
+    except Exception:  # noqa: BLE001 — no file yet / unreadable: learnt again from the first long read
         pass
 
 
@@ -1564,7 +1565,7 @@ def prefill_rate_save() -> None:
     try:
         tmp = PREFILL_RATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"tok_s": round(PREFILL_RATE["tok_s"], 1), "at": round(time.time())}, f)
+            json.dump({"a": PREFILL_COST["a"], "b": PREFILL_COST["b"], "at": round(time.time())}, f)
         os.replace(tmp, PREFILL_RATE_FILE)
     except Exception:  # noqa: BLE001 — display aid only
         pass
@@ -1584,29 +1585,59 @@ def stage_open(rid: str, prompt_tokens: int, session: str | None = None) -> None
     STAGES[rid] = {"stage": "queued", "prompt_tokens": prompt_tokens, "seen_before": seen, "updated": round(now, 3)}
 
 
+def prefill_fit(chunks: list, prior_b: float | None) -> tuple:
+    """Seconds per prompt token = a + b * position, fitted to the chunks read so far ((tokens, mid position, seconds) each) by least
+    squares on the chunk times. The cost grows with the position (attention over everything before it): measured 2026-10-15, 27B
+    227K tokens read at 4,376 tok/s near the start and 1,088 near the end, so the last chunk's rate alone predicted half the real
+    time. One chunk (or a fit that is not positive over the read) keeps the prior slope and fits the level only."""
+    if len(chunks) >= 2:
+        s11 = sum(n * n for n, m, t in chunks); s12 = sum(n * n * m for n, m, t in chunks); s22 = sum((n * m) ** 2 for n, m, t in chunks)
+        t1 = sum(n * t for n, m, t in chunks); t2 = sum(n * m * t for n, m, t in chunks)
+        det = s11 * s22 - s12 * s12
+        if det > 1e-9 * s11 * s22:
+            a, b = (t1 * s22 - t2 * s12) / det, (s11 * t2 - s12 * t1) / det
+            last = chunks[-1][1]
+            if b >= 0 and a + b * last > 0 and a + b * chunks[0][1] > 0:
+                return a, b
+    n_all = sum(n for n, m, t in chunks); t_all = sum(t for n, m, t in chunks); nm = sum(n * m for n, m, t in chunks)
+    b = prior_b or 0.0
+    a = (t_all - b * nm) / n_all
+    if a <= 0:
+        a, b = t_all / n_all, 0.0
+    return a, b
+
+
 def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | None = None) -> None:
-    """Prefill progress: admitted (total/cached given, done 0) or a chunk read (done = tokens read so far, excluding the reused ones)."""
+    """Prefill progress: admitted (total/cached given, done 0) or a chunk read (done = tokens read so far, excluding the reused ones).
+    prefill_rate = the current speed (tok/s at the position reached), prefill_eta_s = the fitted cost summed over what is left."""
     st = STAGES.get(rid)
     if st is None:
         return
     now = time.time()
     if total is not None:
-        st.update(stage="prefill", cached_tokens=cached or 0, prefill_total=total, prefill_done=0, _t_last=now, _done_last=0)
-        rate = PREFILL_RATE["tok_s"]
+        st.update(stage="prefill", cached_tokens=cached or 0, prefill_total=total, prefill_done=0, _t_last=now, _done_last=0, _chunks=[])
+        cost = (PREFILL_COST["a"], PREFILL_COST["b"]) if PREFILL_COST["a"] else None
     else:
         if st.get("stage") != "prefill":
             return
-        delta, dt = done - st.get("_done_last", 0), now - st.get("_t_last", now)
-        rate = st.get("prefill_rate")
-        if delta > 0 and dt > 0:
-            rate = delta / dt
-            if delta >= STAGE_RATE_MIN:
-                PREFILL_RATE["tok_s"] = rate
-                prefill_rate_save()
+        last, dt = st.get("_done_last", 0), now - st.get("_t_last", now)
+        base = int(st.get("cached_tokens") or 0)
+        if done > last and dt > 0:
+            st["_chunks"].append((done - last, base + (last + done) / 2.0, dt))
         st.update(prefill_done=done, _t_last=now, _done_last=done)
-    left = max(0, int(st.get("prefill_total") or 0) - int(st.get("prefill_done") or 0))
-    st["prefill_rate"] = round(rate) if rate else None
-    st["prefill_eta_s"] = round(left / rate, 1) if rate else None
+        cost = prefill_fit(st["_chunks"], PREFILL_COST["b"]) if st["_chunks"] else st.get("_cost")
+        if cost and done >= STAGE_FIT_MIN:
+            PREFILL_COST.update(a=cost[0], b=cost[1])
+            prefill_rate_save()
+    st["_cost"] = cost
+    p0 = int(st.get("cached_tokens") or 0) + int(st.get("prefill_done") or 0)
+    p1 = int(st.get("cached_tokens") or 0) + int(st.get("prefill_total") or 0)
+    if cost:
+        a, b = cost
+        st["prefill_rate"] = round(1.0 / (a + b * p0)) if a + b * p0 > 0 else None
+        st["prefill_eta_s"] = round(max(0.0, a * (p1 - p0) + b * (p1 * p1 - p0 * p0) / 2.0), 1)
+    else:
+        st["prefill_rate"] = st["prefill_eta_s"] = None
     st["updated"] = round(now, 3)
 
 
