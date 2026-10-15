@@ -1742,6 +1742,18 @@ async def stage_status(rid: str):
 TURN_PRERENDER = env_on("HIVE_TURN_PRERENDER")
 PRERENDER_MIN = 4096
 PRERENDERING: set = set()
+# Strong references to the read-ahead tasks: the event loop keeps only weak ones, so an unreferenced task waiting on the daemon was
+#   garbage-collected mid-request (measured 2026-10-15/16 GLM server.log: 13 of 59 read-aheads "Task was destroyed but it is pending",
+#   each logged as error "aclose(): asynchronous generator is already running" and its snapshot never made).
+PRERENDER_TASKS: set = set()
+# conversation -> the text the read-ahead rendered (up to where the next user message's content starts); the next request of that
+#   conversation compares its prompt with it and records how much matched (prerender_chars / prerender_kept_chars), and when it did
+#   not match, where and what differed (prerender_miss) — the read-ahead's snapshot is only used when the client sends exactly this.
+PRERENDER_TEXT: "OrderedDict[str, str]" = OrderedDict()
+PRERENDER_TEXT_MAX = 32
+PRERENDER_TEXT_LOCK = threading.Lock()  # written on the event loop, read in the request's prepare thread
+PRERENDER_SEEN: "OrderedDict[str, float]" = OrderedDict()  # conversation -> when its last request was prepared (a read-ahead that
+#   finishes after the next request arrived is not kept — it would be compared with the turn after, a false miss)
 
 
 def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_text: str):
@@ -1788,11 +1800,11 @@ def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_
     if b < PRERENDER_MIN or b >= len(ids):
         return None
     hints = boundary_hints(hist + [{"role": "user", "content": "x"}], tools, thinking_mode, effort, pa, ids, ends) if env_on("HIVE_PREFIX_SHARE") else []
-    return ids[: b + 1], sorted({h for h in hints if 0 < h < b} | {b})
+    return ids[: b + 1], sorted({h for h in hints if 0 < h < b} | {b}), pa[:c]
 
 
 async def turn_prerender(session: str, plan) -> None:
-    ids, boundaries = plan
+    ids, boundaries, text = plan
     key = session + "~next"
     if key in PRERENDERING:
         return
@@ -1807,6 +1819,14 @@ async def turn_prerender(session: str, plan) -> None:
                     rec["outcome"] = "done"
                 elif msg.get("error"):
                     rec["error"] = str(msg["error"])[:200]
+        if rec["outcome"] == "done":
+            with PRERENDER_TEXT_LOCK:
+                if PRERENDER_SEEN.get(session, 0.0) * 1000.0 > rec["t_recv"]:
+                    return
+                PRERENDER_TEXT[session] = text
+                PRERENDER_TEXT.move_to_end(session)
+                while len(PRERENDER_TEXT) > PRERENDER_TEXT_MAX:
+                    PRERENDER_TEXT.popitem(last=False)
     except Exception as e:  # noqa: BLE001 — background work: a failure only loses the snapshot
         rec["error"] = str(e)[:200]
     finally:
@@ -1822,7 +1842,29 @@ def schedule_prerender(messages, tools, thinking_mode, effort, session: str, raw
         plan = await asyncio.to_thread(prerender_plan, messages, tools, thinking_mode, effort, raw_text)
         if plan:
             await turn_prerender(session, plan)
-    asyncio.get_running_loop().create_task(go())
+    task = asyncio.get_running_loop().create_task(go())
+    PRERENDER_TASKS.add(task)
+    task.add_done_callback(PRERENDER_TASKS.discard)
+
+
+def prerender_match(session: str, prompt: str, ends) -> dict:
+    """Request record fields: how much of this conversation's read-ahead text the prompt kept, and where it first differs (one use)."""
+    with PRERENDER_TEXT_LOCK:
+        pre = PRERENDER_TEXT.pop(session, None)
+        if TURN_PRERENDER:
+            PRERENDER_SEEN[session] = time.time()
+            PRERENDER_SEEN.move_to_end(session)
+            while len(PRERENDER_SEEN) > 4096:
+                PRERENDER_SEEN.popitem(last=False)
+    if not pre:
+        return {}
+    c = _common_prefix_len(pre, prompt)
+    out = {"prerender_chars": len(pre), "prerender_kept_chars": c}
+    if c < len(pre):
+        import bisect
+        out["prerender_miss"] = {"at_token": bisect.bisect_right(ends, c) if ends is not None else None,
+                                 "pre": pre[max(0, c - 40): c + 80], "got": prompt[max(0, c - 40): c + 80]}
+    return out
 
 
 @app.post("/v1/chat/completions")
@@ -1857,6 +1899,7 @@ async def chat(request: Request):
                             prev = TOKCACHE.last_diverge.pop(session, None)
                         if prev:
                             diverge.update(prev_prompt_tokens=prev[0], diverge_at=prev[1])
+                        diverge.update(prerender_match(session, prompt, ends))
                     except Exception:  # noqa: BLE001 — a tokenizer without offsets: the plain path below
                         ends = None
                         ids, images, blob = tokenize_with_images(prompt, media)

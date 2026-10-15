@@ -157,7 +157,13 @@ def filter_traffic(reqs, server, index, prefixes):
             c = (rec or {}).get("client") or {}
             dropped["(no server record)" if rec is None else ("test-tagged" if c.get("x-client-test") else (c.get("user-agent") or "(empty)")[:32])] += 1
     info = {"clients": prefixes, "kept": len(kept), "total": len(reqs), "excluded": dict(dropped.most_common())}
-    return kept, [r for r in server if client_kept(r, prefixes)], info
+    srv = [r for r in server if client_kept(r, prefixes)]
+    # Read-ahead requests (turn-prerender) are the server's own and carry no client headers: keep those of kept conversations
+    #   (session "<conversation>~next"). Without this the 2026-10-15 report showed 0 read-aheads while the server had made 46.
+    convs = {r.get("session") for r in srv}
+    srv += [r for r in server if r.get("endpoint") == "turn-prerender" and str(r.get("session") or "").removesuffix("~next") in convs]
+    srv.sort(key=lambda r: r.get("t_recv") or 0)
+    return kept, srv, info
 
 
 def effort_key(r):

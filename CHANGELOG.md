@@ -13,7 +13,12 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
 - **Re-read per conversation** (`tools/reread_report.py`, a section of the daily report): the server records, for each follow-up
   request, the length of the conversation's previous prompt and how much of it the new prompt keeps (`prev_prompt_tokens`,
   `diverge_at`); with the engine's reused prefix this splits every token read a second time into a client rewrite (an earlier
-  message changed) or an engine loss (the conversation's state was gone), per conversation, next to what reading ahead cost.
+  message changed) or an engine loss (the conversation's state was gone, or no snapshot close to where it changed), per conversation,
+  next to what reading ahead cost, how many read-aheads failed and which next turns did not match their read-ahead (and where).
+- Fixed: read-ahead tasks were only weakly referenced and about one in five was garbage-collected before it finished (logged as
+  `Task was destroyed but it is pending` / `aclose(): asynchronous generator is already running`, no snapshot made); with a client
+  filter (`HIVE_REPORT_CLIENTS`) the daily report dropped every read-ahead and showed 0; a turn with both a client rewrite and an
+  engine part was counted whole under the engine.
 - **GLM keeps earlier reasoning** a client sends back (the official template's `clear_thinking` default; `HIVE_GLM_CLEAR_THINKING=1` = before).
 - **Reading progress inside a chunk** (`HIVE_STAGE_PROGRESS_MS`, default 1000): requests that asked for stages now get how much is read
   about once a second while a prefill forward runs its layers, not only after each chunk — a long prompt no longer sits at 0 % for a

@@ -550,25 +550,39 @@ class Reread(unittest.TestCase):
                 rec(1, "a", 12000, 10000, prev=10000, at=9999),     # append (one template token) + full reuse: ok
                 rec(2, "a", 13000, 4000, prev=12000, at=4000),      # client rewrote from 4000: 8000 read again, cause client
                 rec(3, "b", 9000, 0, prev=8000, at=8000),           # shared all 8000, engine reused none: engine loss
-                rec(4, "a~next", 13500, 13000, endpoint="turn-prerender", pre_tokens=500)]
+                rec(4, "a~next", 13500, 13000, endpoint="turn-prerender", pre_tokens=500),
+                # client rewrite from 111,567 resumed at a 108,121 snapshot (the 2026-10-15 GLM turn): split 33,619 client / 3,446 engine
+                rec(5, "c", 149632, 108121, prev=145186, at=111567)]
+        recs[5]["prerender_chars"], recs[5]["prerender_kept_chars"] = 500000, 400000
+        recs[5]["prerender_miss"] = {"at_token": 111567, "pre": "a|b", "got": "a`b"}
         c = [rr.classify(r) for r in recs]
         self.assertIsNone(c[0])
         self.assertEqual((c[1]["cause"], c[1]["reread"]), ("ok", 0))
         self.assertEqual((c[2]["cause"], c[2]["reread"], c[2]["rewrite"], c[2]["loss"]), ("client", 8000, 8000, 0))
         self.assertEqual((c[3]["cause"], c[3]["reread"], c[3]["loss"]), ("engine", 8000, 8000))
+        self.assertEqual((c[5]["cause"], c[5]["reread"], c[5]["client_part"], c[5]["engine_part"]), ("client", 37065, 33619, 3446))
         R = rr.summarize_reread(recs)
-        self.assertEqual((R["followups"], R["conversations"], R["reread_tokens"], R["client_tokens"], R["engine_tokens"]), (3, 2, 16000, 8000, 8000))
-        self.assertEqual((R["prerender"]["n"], R["prerender"]["tokens"]), (1, 500))
-        self.assertEqual([w["cause"] for w in R["worst"]], ["client", "engine"])
+        self.assertEqual((R["followups"], R["conversations"], R["reread_tokens"], R["client_tokens"], R["engine_tokens"]),
+                         (4, 3, 16000 + 37065, 8000 + 33619, 8000 + 3446))
+        self.assertEqual((R["prerender"]["n"], R["prerender"]["tokens"], R["prerender"]["failed"]), (1, 500, 0))
+        self.assertEqual((R["prerender"]["next_turns"], R["prerender"]["missed"]), (1, 1))
+        self.assertEqual([w["cause"] for w in R["worst"]], ["client", "client", "engine"])
+        self.assertIn("a'b", "\n".join(rr.render_md(R)))                   # a backtick in the text cannot break the table cell
+        # the daily report's client filter keeps the server's own read-aheads of kept conversations (they carry no client headers)
+        for r in recs[:4] + recs[5:]:
+            r["client"] = {"user-agent": "AsyncOpenAI/Python 2"}
+        recs.append(rec(6, "zz~next", 9000, 0, endpoint="turn-prerender", pre_tokens=9000))      # a conversation that was filtered out
+        _, srv, _ = hr.filter_traffic([], recs, {}, ["AsyncOpenAI"])
+        self.assertEqual([r["session"] for r in srv if r["endpoint"] == "turn-prerender"], ["a~next"])
         tmp = tempfile.mkdtemp(prefix="hiverr-")
         try:
             out = Path(tmp)
             (out / "requests-server.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
             self.assertEqual(hr.main(["--root", str(out), "--day", "2026-10-01"]), 0)
             S = json.loads((out / "reports" / "2026-10-01.json").read_text())["summary"]
-            self.assertEqual((S["reread"]["client_turns"], S["reread"]["engine_turns"]), (1, 1))
+            self.assertEqual((S["reread"]["client_turns"], S["reread"]["engine_turns"]), (2, 1))
             md = (out / "reports" / "2026-10-01.md").read_text()
-            for h in ("Re-read per conversation", "client rewrite 1 turns", "largest re-reads"):
+            for h in ("Re-read per conversation", "client rewrite 2 turns", "largest re-reads", "not matching the read-ahead"):
                 self.assertIn(h, md)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

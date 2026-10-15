@@ -960,7 +960,7 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
                     {'role': 'tool', 'content': 'error at line 3'}]
             plan = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
             self.assertIsNotNone(plan)
-            ids, bounds = plan
+            ids, bounds, text = plan
             nxt = [dict(m) for m in msgs]
             nxt[2].pop('reasoning_content')
             nxt += [{'role': 'assistant', 'content': 'Added the semicolon.'}, {'role': 'user', 'content': 'thanks, run the tests'}]
@@ -970,6 +970,7 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(b, len(ids) - 1)
             self.assertEqual(ids[:b], nids[:b])                                      # every token before the boundary is the next request's
             self.assertEqual(nids[b - 1], MARKERS['<|user|>'])                       # the boundary is where the next user message's content starts
+            self.assertTrue(prompt.startswith(text) and text.endswith('<|user|>'))  # the kept text = the next prompt up to the user's content
             # the conversation as sent now (reasoning kept in this turn) differs earlier — that is the re-read the plan saves
             now, _ = think_encode(msgs + [{'role': 'assistant', 'content': 'Added the semicolon.', 'reasoning_content': 'x'}], None, 'thinking', None)
             self.assertNotEqual(s.TOK.encode(now)[:b], nids[:b])
@@ -986,7 +987,7 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
                         text += m.get('content') or ''
                 return text + '<|assistant|><think>', []
             s.encode_prompt = keep_all
-            ids, bounds = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            ids, bounds, _ = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
             nids = s.TOK.encode(keep_all(nxt, None, 'thinking', None)[0])
             b = bounds[-1]
             self.assertEqual(ids[:b], nids[:b]); self.assertEqual(nids[b - 1], MARKERS['<|user|>'])
@@ -998,6 +999,69 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         finally:
             for k in added: MARKERS.pop(k)
             s.encode_prompt, s.ENC, s.PRERENDER_MIN = saved
+
+    def test_prerender_match_records_where_the_next_prompt_differs(self):
+        """HIVE_TURN_PRERENDER follow-up (2026-10-16): the next request of a conversation compares its prompt with the read-ahead text
+        once — kept length, and on a mismatch the token position and both texts around it; a read-ahead that finishes after the next
+        request arrived is not kept (it would be compared with the turn after)."""
+        saved = (s.TURN_PRERENDER, dict(s.PRERENDER_TEXT), dict(s.PRERENDER_SEEN))
+        s.TURN_PRERENDER = True
+        try:
+            s.PRERENDER_TEXT.clear(); s.PRERENDER_SEEN.clear()
+            self.assertEqual(s.prerender_match('c', 'anything', None), {})
+            s.PRERENDER_TEXT['c'] = 'sys|user a|asst ok|user '
+            r = s.prerender_match('c', 'sys|user a|asst ok|user next question', None)
+            self.assertEqual(r, {'prerender_chars': 24, 'prerender_kept_chars': 24})
+            self.assertEqual(s.prerender_match('c', 'sys|user a|asst ok|user next question', None), {})   # one use
+            s.PRERENDER_TEXT['c'] = 'sys|user a|asst ok|user '
+            prompt = 'sys|user a|asst OK|user next'
+            ends = array('l', range(1, len(prompt) + 1))                                                # one token per character
+            r = s.prerender_match('c', prompt, ends)
+            self.assertEqual((r['prerender_kept_chars'], r['prerender_miss']['at_token']), (16, 16))
+            self.assertTrue(r['prerender_miss']['pre'].endswith('ok|user ') and r['prerender_miss']['got'].endswith('OK|user next'))
+            # a read-ahead started before the conversation's latest request is dropped when it finishes
+            class D:
+                async def generate(self, *a, **k):
+                    yield {'done': True}
+            saved_d, saved_log = s.DAEMON, s.log_request
+            s.DAEMON, s.log_request = D(), (lambda rec: None)
+            try:
+                s.PRERENDER_SEEN['c'] = time.time() + 5
+                asyncio.run(s.turn_prerender('c', ([1, 2], [1], 'txt')))
+                self.assertNotIn('c', s.PRERENDER_TEXT)
+                s.PRERENDER_SEEN['c'] = 0.0
+                asyncio.run(s.turn_prerender('c', ([1, 2], [1], 'txt')))
+                self.assertEqual(s.PRERENDER_TEXT.get('c'), 'txt')
+            finally:
+                s.DAEMON, s.log_request = saved_d, saved_log
+        finally:
+            s.TURN_PRERENDER = saved[0]
+            s.PRERENDER_TEXT.clear(); s.PRERENDER_TEXT.update(saved[1]); s.PRERENDER_SEEN.clear(); s.PRERENDER_SEEN.update(saved[2])
+
+    def test_prerender_task_is_kept_until_done(self):
+        """The read-ahead task is strongly referenced until it ends (2026-10-15/16: 13 of 59 were garbage-collected mid-request)."""
+        saved = (s.TURN_PRERENDER, s.prerender_plan, s.turn_prerender)
+        seen = []
+        async def slow(session, plan):
+            import gc
+            gc.collect()
+            await asyncio.sleep(0.05)
+            seen.append(session)
+        async def main():
+            s.schedule_prerender([], None, 'thinking', None, 'c', 'x')
+            await asyncio.sleep(0)
+            self.assertEqual(len(s.PRERENDER_TASKS), 1)
+            for _ in range(50):
+                if seen: break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+        s.TURN_PRERENDER, s.prerender_plan, s.turn_prerender = True, (lambda *a: ([1], [1], 't')), slow
+        try:
+            asyncio.run(main())
+            self.assertEqual(seen, ['c'])
+            self.assertEqual(len(s.PRERENDER_TASKS), 0)
+        finally:
+            s.TURN_PRERENDER, s.prerender_plan, s.turn_prerender = saved
 
     def test_request_priority(self):
         self.assertEqual(s.request_priority({}), 0)
