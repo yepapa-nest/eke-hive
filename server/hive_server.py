@@ -1718,6 +1718,104 @@ async def stage_status(rid: str):
     return {"id": rid, **{k: v for k, v in st.items() if not k.startswith("_")}}
 
 
+# HIVE_TURN_PRERENDER (default off): when a turn ends with a final answer, read the conversation ahead in the form its next request
+#   will have, so the next user message resumes right before itself.
+#   Why: the next request drops this turn's reasoning — the DeepSeek and Qwen templates remove reasoning before the last user message,
+#   and many agent clients send reasoning back only within a turn — so everything after the last user message changes and the engine
+#   re-reads the whole last turn (measured 2026-10-15 GLM, an agent room: 399,622 of 457,095 tokens resumed from the boundary snapshot,
+#   the turn's 57,473 tokens re-read in 35.8 s after the user pressed send). Done ahead, that read overlaps the time the user takes to write.
+#   What: the history with the reasoning of this turn's assistant messages removed + this answer's content, rendered with the same
+#   template up to where the next user message's content starts (found like boundary_hints: two renders with different user text), sent as a
+#   one-token request of a separate session (the conversation's own session stays free for its next request) with that position as a
+#   boundary — the daemon keeps a boundary snapshot there, shared by every session. Lowest priority: real requests are admitted first.
+#   Only when the turn had reasoning (otherwise the next request continues the live state as it is) and the prefix is >= PRERENDER_MIN.
+#   A client that renders the answer differently (e.g. trims it) only loses this snapshot; nothing else changes.
+TURN_PRERENDER = env_on("HIVE_TURN_PRERENDER")
+PRERENDER_MIN = 4096
+PRERENDERING: set = set()
+
+
+def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_text: str):
+    """(ids, boundaries) of the next request's history, or None. ids end one token past the boundary (the daemon cuts inside a prompt)."""
+    try:
+        parsed = parse_completion(raw_text + TOK.eos_token, thinking_mode, tools)
+    except Exception:
+        return None
+    if parsed.get("tool_calls") or not parsed.get("content"):
+        return None
+    users = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"]
+    if not users:
+        return None
+    last_user = users[-1]
+    had_reasoning = bool(parsed.get("reasoning_content")) or any(
+        isinstance(m, dict) and m.get("role") == "assistant" and (m.get("reasoning_content") or m.get("reasoning")) for m in messages[last_user + 1:])
+    if not had_reasoning:
+        return None
+    hist = []
+    for i, m in enumerate(messages):
+        m = dict(m)
+        if i > last_user and m.get("role") == "assistant":
+            m.pop("reasoning_content", None)
+            m.pop("reasoning", None)
+        hist.append(m)
+    hist.append({"role": "assistant", "content": parsed["content"]})
+    pa, media_a = encode_prompt(hist + [{"role": "user", "content": "x"}], tools, thinking_mode, effort)
+    pb, _ = encode_prompt(hist + [{"role": "user", "content": "y"}], tools, thinking_mode, effort)
+    if media_a:
+        return None
+    c = 0
+    n = min(len(pa), len(pb))
+    while c < n and pa[c] == pb[c]:
+        c += 1
+    try:
+        enc = TOK(pa, return_offsets_mapping=True)
+    except Exception:
+        return None
+    ids = list(enc["input_ids"])
+    ends = [int(e) for _, e in enc["offset_mapping"]]
+    b = 0
+    while b < len(ends) and ends[b] <= c:
+        b += 1
+    if b < PRERENDER_MIN or b >= len(ids):
+        return None
+    hints = boundary_hints(hist + [{"role": "user", "content": "x"}], tools, thinking_mode, effort, pa, ids, ends) if env_on("HIVE_PREFIX_SHARE") else []
+    return ids[: b + 1], sorted({h for h in hints if 0 < h < b} | {b})
+
+
+async def turn_prerender(session: str, plan) -> None:
+    ids, boundaries = plan
+    key = session + "~next"
+    if key in PRERENDERING:
+        return
+    PRERENDERING.add(key)
+    rec = {"t_recv": time.time() * 1000.0, "endpoint": "turn-prerender", "session": key, "prompt_tokens": len(ids), "outcome": "error"}
+    try:
+        async with aclosing(DAEMON.generate(key, ids, [], b"", rid="pre-" + uuid.uuid4().hex[:16], boundaries=boundaries,
+                                            max_tokens=1, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, seed=0, stop_ids=[], priority=1000)) as src:
+            async for msg in src:
+                if msg.get("done"):
+                    rec["done"] = msg
+                    rec["outcome"] = "done"
+                elif msg.get("error"):
+                    rec["error"] = str(msg["error"])[:200]
+    except Exception as e:  # noqa: BLE001 — background work: a failure only loses the snapshot
+        rec["error"] = str(e)[:200]
+    finally:
+        PRERENDERING.discard(key)
+        rec["t_done"] = time.time() * 1000.0
+        log_request(rec)
+
+
+def schedule_prerender(messages, tools, thinking_mode, effort, session: str, raw_text: str) -> None:
+    if not TURN_PRERENDER:
+        return
+    async def go():
+        plan = await asyncio.to_thread(prerender_plan, messages, tools, thinking_mode, effort, raw_text)
+        if plan:
+            await turn_prerender(session, plan)
+    asyncio.get_running_loop().create_task(go())
+
+
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     t_recv = time.time() * 1000.0
@@ -1999,6 +2097,8 @@ async def chat(request: Request):
             else:
                 parsed = {"content": text}
         message = {"role": "assistant", "content": parsed.get("content") or ""}
+        if done.get("finish") == "stop" and not parsed.get("tool_calls"):
+            schedule_prerender(messages, tools, thinking_mode, effort, session, text)  # HIVE_TURN_PRERENDER (off = nothing)
         if parsed.get("reasoning_content"):
             message["reasoning_content"] = parsed["reasoning_content"]
         if parsed.get("tool_calls"):
@@ -2045,6 +2145,7 @@ async def chat(request: Request):
         in_tool = False
         tstream = DsmlToolStream(ENC) if os.environ.get("HIVE_TOOL_STREAM", "1") != "0" and not adapter_family() else None
         done = {}
+        gen_text = ""  # the generated text as one string (HIVE_TURN_PRERENDER parses it like the non-streaming path)
 
         def tool_chunks(piece):
             if tstream is None or tstream.broken:
@@ -2056,6 +2157,7 @@ async def chat(request: Request):
             source = run()
             async for kind, val in source:
                 if kind == "delta":
+                    gen_text += val
                     buf += val
                     while buf:
                         if in_think:
@@ -2137,6 +2239,8 @@ async def chat(request: Request):
         bad = invalid_tool_args(sent) if tool_buf and sent else []
         if bad:
             req_rec["tool_args_invalid"] = bad
+        if finish == "stop" and not tool_buf:
+            schedule_prerender(messages, tools, thinking_mode, effort, session, strip_eos(gen_text))  # HIVE_TURN_PRERENDER (off = nothing)
         last = {'index': 0, 'delta': {}, 'finish_reason': finish, **({'stop_reason': done['stop_sequence']} if done.get('stop_sequence') and finish == 'stop' else {})}  # D11
         yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [last], 'usage': openai_usage(len(ids), done)})}\n\n"
         yield "data: [DONE]\n\n"

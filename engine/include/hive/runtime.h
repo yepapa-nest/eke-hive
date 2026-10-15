@@ -74,6 +74,12 @@ struct SeqImage {
   std::vector<HostImageBuffer> cpu;     // CPU-placed layers' state (ds::cpu::CpuSeq::save_bytes, one buffer each); empty without CPU layers
   int64_t cpu_mirror_g = 0;
   std::shared_ptr<SnapshotFence> fence; // waits before buffers are freed
+  // session store (hive/session_store.h): every member in a fixed order · waits for the snapshot copies before the bytes are read
+  template <class A> void fields(A& a) {
+    a.i64(pos); a.u32(generation); a.vi32(tokens); a.vi64(engram_history); a.bufs(ring); a.bufs(mtp_ring);
+    a.bufmap(comp); a.bufmap(idx); a.bufmap(st_kv); a.bufmap(st_score); a.buf(mtp_hidden); a.flag(mtp_hidden_valid); a.i64(mtp_pos); a.bufs(cpu); a.i64(cpu_mirror_g);
+  }
+  void wait_ready() const { if (fence) fence->wait(); }
   ~SeqImage() { if(fence) fence->wait(); } // shared_ptr destruction alone does not wait if Seq still owns it
   size_t allocated_bytes(std::set<const void*>& seen) const {
     if (!seen.insert(this).second) return 0;

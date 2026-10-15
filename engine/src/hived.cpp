@@ -58,6 +58,7 @@
 #include "hive/socket_writer.h"
 #include "hive/vram_limit.h"
 #include "nlohmann/json.hpp"
+#include "hive/session_store.h"
 // Model family: the DeepSeek build (default), the GLM build (-DHIVE_FAMILY_GLM, target hived_glm) and the Qwen3.8-Flash-Next build
 //   (-DHIVE_FAMILY_QWEN, target hived_qwen; -DHIVE_FAMILY_QWEN_CPU, target hived_qwen_cpu: CPU only, built against engine/cpu_shim), the CPU-only
 //   GLM / DeepSeek builds (-DHIVE_FAMILY_GLM_CPU / -DHIVE_FAMILY_DS_CPU) and the Qwen3.8-27B builds (-DHIVE_FAMILY_Q27 / -DHIVE_FAMILY_Q27_CPU) share
@@ -812,6 +813,12 @@ int main(int argc, char** argv) {
   std::map<std::string, std::weak_ptr<std::atomic<bool>>> rid_flags;
   std::map<std::string, Session> sessions;
   std::map<std::string, Session> archived;  // sessions evicted from the pool (no seq, image in RAM only) — LRU within the host_session_mb budget
+  // HIVE_SESSION_STORE (hive/session_store.h): prompt checkpoints and boundary snapshots also on disk — set up once the session pool exists
+  //   (store_init below), so conversations survive an engine restart or a model switch
+  std::unique_ptr<hive::store::SessionStore<SeqImage>> sstore;
+  std::atomic<hive::store::SessionStore<SeqImage>*> sstore_live{nullptr};  // the same store for the stats op (socket thread): its counters live
+  auto to_store_sig = [](const std::vector<Session::ImgSig>& v) { std::vector<hive::store::Sig> o; for (const auto& x : v) o.push_back({x.start, x.end, x.hash}); return o; };
+  auto from_store_sig = [](const std::vector<hive::store::Sig>& v) { std::vector<Session::ImgSig> o; for (const auto& x : v) o.push_back({x.start, x.end, x.hash}); return o; };
   std::map<uint64_t, SharedSnap> shared_snaps;  // prefix hash -> boundary snapshot (shared by all sessions; reclaimed under the same budget in the same recency order)
   long shared_hits = 0, shared_saves = 0;
   size_t host_peak_bytes = 0;
@@ -869,6 +876,42 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[hived] session pool %d × %.0f MiB reserved · VRAM free %.0f MiB (= operating headroom: the only runtime allocation is the image patch buffer)\n", max_sessions,
             max_sessions ? (double)(fr0 - fr1) / 1048576.0 / max_sessions : 0.0, fr1 / 1048576.0);
   }
+  // HIVE_SESSION_STORE=<dir> (unset or empty = off: nothing is written or read, responses and logs unchanged) · HIVE_SESSION_STORE_GB (default
+  //   64) = disk budget, oldest entries dropped first. The layout key = this daemon + its build + the checkpoint's config.json + the shape of
+  //   an image (buffer counts, layer keys) of a fresh sequence: a store written by another build or model is never read (it ages out instead).
+  //   Set up here and, when the daemon starts asleep, at the first wake (the shape needs a sequence from the pool).
+  const std::string store_root = getenv("HIVE_SESSION_STORE") && strcmp(getenv("HIVE_SESSION_STORE"), "0") != 0 ? getenv("HIVE_SESSION_STORE") : "";  // "" / "0" = off
+  const double store_gb = getenv("HIVE_SESSION_STORE_GB") && *getenv("HIVE_SESSION_STORE_GB") ? std::max(0.000001, atof(getenv("HIVE_SESSION_STORE_GB"))) : 64.0;
+  auto store_init = [&] {
+    if (sstore || store_root.empty() || seq_pool.empty()) return;
+    SeqImage probe;
+    rt.save_image(*seq_pool.back(), probe);
+    probe.wait_ready();
+    hive::store::ShapeAr shape;
+    probe.fields(shape);
+    std::string cfg;
+    if (FILE* f = fopen((ckpt + "/config.json").c_str(), "rb")) { char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) cfg.append(b, n); fclose(f); }
+#ifdef HIVE_BUILD_ID
+    const std::string build = HIVE_BUILD_ID;
+#else
+    const std::string build = "unversioned";
+#endif
+    std::string daemon = argv[0];
+    if (auto sl = daemon.rfind('/'); sl != std::string::npos) daemon = daemon.substr(sl + 1);
+    const std::string id = build + "\n" + cfg + "\n" + shape.s;
+    const std::string key = daemon + "-" + hive::store::hex16(hive::store::hash_bytes(reinterpret_cast<const uint8_t*>(id.data()), id.size()));
+    try {
+      sstore = std::make_unique<hive::store::SessionStore<SeqImage>>(store_root, key, (size_t)(store_gb * 1073741824.0));
+    } catch (const std::exception& e) {
+      fprintf(stderr, "[hived] session store off: %s\n", e.what());
+      return;
+    }
+    sstore_live.store(sstore.get());
+    const json st = sstore->stats();
+    fprintf(stderr, "[hived] session store on: %s · %zu checkpoint(s) · %zu snapshot(s) · %.2f GB (budget %.0f GB)\n", sstore->dir().c_str(),
+            st["ckpts"].get<size_t>(), st["snaps"].get<size_t>(), st["bytes"].get<size_t>() / 1073741824.0, store_gb);
+  };
+  store_init();
   if (cache_fit && !start_asleep) {  // HIVE_CACHE_FIT: slot region (one contiguous block) from the headroom after the session pool -> warm start
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
@@ -955,6 +998,7 @@ int main(int argc, char** argv) {
     s["decode_streamed_records"] = tot_streamed.load();
     s["host_accounting_scope"] = "reuse state/capacities/pinned pool, approximate metadata; not process RSS";
     if (prefix_share) s["prefix_share"] = {{"entries", shared_snaps.size()}, {"hits", shared_hits}, {"saves", shared_saves}};
+    if (sstore) s["session_store"] = sstore->stats();
     s["state"] = power_name(power.load());  // sleep/wake state
     s["max_ctx"] = max_ctx;  // the server uses it to reject over-window requests with 400 before the stream starts
     if (power.load() != kPowerReady || last_stats - vram_ms >= 1000.0) {  // even on forced publishes (request end, every chunk) query the device at most once per second (every time during transitions)
@@ -1118,6 +1162,7 @@ int main(int argc, char** argv) {
         json s;
         { std::lock_guard<std::mutex> lk(stats_mu); s = stats_snapshot; }
         { std::lock_guard<std::mutex> lk2(mu); s["pending_requests"] = queue.size(); }
+        if (auto* ss = sstore_live.load()) s["session_store"] = ss->stats();  // live (writes finish on the store's thread after a publish)
         send_json(fd, s);
         finish_socket(fd); incoming.erase(fd);
         continue;
@@ -1257,6 +1302,7 @@ int main(int argc, char** argv) {
     S->ckpt = std::move(img);
     S->ckpt_logits = logits;
     S->ckpt_sig = S->img_sig;
+    if (sstore) sstore->put_ckpt(X.sid, S->ckpt, S->ckpt_logits, to_store_sig(S->ckpt_sig));  // written on the store's thread
     host_total();
     archive_trim(X.sid);
   };
@@ -1562,6 +1608,7 @@ int main(int argc, char** argv) {
     rt.save_image(*S->seq, *img, last_boundary ? last_boundary.get() : S->ckpt.get());
     host_total(img.get());
     shared_snaps[key] = SharedSnap{img, sg, skipped, now_ms()};
+    if (sstore) sstore->put_snap(key, img, to_store_sig(sg), skipped);  // written on the store's thread
     last_boundary = img;
     J.last_boundary_full = !skipped;
     ++shared_saves;
@@ -1648,6 +1695,33 @@ int main(int argc, char** argv) {
     }
     // session and prefix
     Session*& S = J.S;
+    // HIVE_SESSION_STORE: a session this daemon does not hold (a restart, a model switch, or long evicted) continues from its checkpoint on
+    //   disk — read here on the engine thread, outside the lock (GBs for a long conversation), and attached below like an archived session
+    std::unique_ptr<hive::store::Loaded<SeqImage>> disk_ckpt;
+    if (sstore) {
+      bool held;
+      { std::lock_guard<std::mutex> lk(mu); held = sessions.count(A->sid) || archived.count(A->sid); }
+      // a boundary snapshot deeper than the checkpoint that matches this prompt (on disk or in memory) serves the request below — then the
+      //   checkpoint would be read for nothing (measured 2026-10-15 GLM after a restart: both read, 2.74 GB each, 2.7 s + 2.6 s)
+      auto [cpos, ctok] = held ? std::pair<int64_t, int32_t>{-1, -1} : sstore->ckpt_at(A->sid);
+      // its last token must match too: a Qwen prompt ends "<think>\n" and the next turn merges it into another token, so a checkpoint at the
+      //   prompt end is often no prefix of the next turn (measured 2026-10-15 FN after a restart: 4.94 GB read for nothing, 4.7 s)
+      if (cpos > 0 && ((size_t)cpos >= J.ids.size() || J.ids[(size_t)cpos - 1] != ctok)) cpos = -1;
+      bool deeper = false;
+      const bool text_only = !(q.contains("images") && q["images"].is_array() && !q["images"].empty());  // (J.request_sig is filled below)
+      if (cpos >= 0 && prefix_share && text_only) {
+        const auto& pids = J.ids;
+        for (const auto& [key, pos] : sstore->snap_candidates(cpos, (int64_t)pids.size(), [&](int64_t p) { return pids[(size_t)p]; }))
+          if (prefix_key(pids.data(), (size_t)pos, {}) == key) { deeper = true; break; }
+        if (!deeper) {
+          std::lock_guard<std::mutex> lk(mu);
+          for (const auto& [key, e] : shared_snaps)
+            if (e.image && e.image->pos > cpos && (size_t)e.image->pos < pids.size() && e.image->tokens.size() == (size_t)e.image->pos &&
+                std::equal(e.image->tokens.begin(), e.image->tokens.end(), pids.begin())) { deeper = true; break; }
+        }
+      }
+      if (cpos >= 0 && !deeper) disk_ckpt = sstore->load_ckpt(A->sid);
+    }
     {
       std::lock_guard<std::mutex> lk(mu);
       auto it = sessions.find(A->sid);
@@ -1679,11 +1753,21 @@ int main(int argc, char** argv) {
                 //   delete the oldest state first — the one about to be revived). The revived state is in sessions, so it still counts toward the budget.
         auto ar = archived.find(A->sid);
         if (ar != archived.end()) { it = sessions.emplace(A->sid, std::move(ar->second)).first; archived.erase(ar); }
-        else it = sessions.emplace(A->sid, Session{}).first;
+        else {
+          Session fresh;
+          if (disk_ckpt) {
+            fresh.ckpt = disk_ckpt->image; fresh.ckpt_logits = std::move(disk_ckpt->logits); fresh.ckpt_sig = from_store_sig(disk_ckpt->sig);
+            fresh.last_used = now_ms();
+          }
+          it = sessions.emplace(A->sid, std::move(fresh)).first;
+        }
         if (evicted) archive_trim(A->sid);
       }
       S = &it->second;
     }
+    if (disk_ckpt && S->ckpt == disk_ckpt->image)
+      fprintf(stderr, "[hived] %s: checkpoint restored from the session store (pos %lld · %.2f GB in %.0f ms)\n", A->sid.c_str(),
+              (long long)disk_ckpt->image->pos, disk_ckpt->bytes / 1073741824.0, disk_ckpt->ms);
     A->S = S;
     // excluded from the KV reclaim from here on: before its sequence is taken from the pool and its image (checkpoint / archived state) is
     //   loaded. The load allocates KV, under VRAM pressure that allocation runs the reclaim, and the reclaim took the least recently used idle
@@ -1849,6 +1933,24 @@ int main(int argc, char** argv) {
         //   taken after a chunk that skipped the tail layers is used only if the first continuing chunk is committed in tail mode (text request ·
         //   first chunk = plan_chunk(k, cap_now()) as the loop will actually cut it — the state does not change in between), and after restoring,
         //   last_upper_skipped is set to that value so the first chunk's boundary cut also respects tail mode (hint_cut below).
+    // HIVE_SESSION_STORE: the deepest boundary snapshot on disk that matches this prompt and lies beyond the session's own state joins the
+    //   in-memory snapshots first (the selection below then takes it like any other) — a new conversation after a restart still resumes
+    //   from the system/tools block another conversation saved
+    if (prefix_share && sstore && (!has_images || image_ckpt)) {
+      const auto& pids = J.ids;
+      auto cands = sstore->snap_candidates((int64_t)common, (int64_t)pids.size(), [&](int64_t p) { return pids[(size_t)p]; });
+      for (const auto& [key, pos] : cands) {
+        if (shared_snaps.count(key)) break;  // already in memory
+        if (prefix_key(pids.data(), (size_t)pos, sig_upto_j(J, (size_t)pos)) != key) continue;
+        if (auto L = sstore->load_snap(key)) {
+          shared_snaps[key] = SharedSnap{L->image, from_store_sig(L->sig), L->upper_skipped, now_ms()};
+          fprintf(stderr, "[hived] %s: boundary snapshot at %lld restored from the session store (%.2f GB in %.0f ms)\n", A->sid.c_str(), (long long)pos,
+                  L->bytes / 1073741824.0, L->ms);
+          host_total();
+        }
+        break;
+      }
+    }
     if (prefix_share && (!has_images || image_ckpt) && !shared_snaps.empty()) {
       SharedSnap* best = nullptr;
       // in a batched prefill the first chunk may shrink this round to one slot (max_chunk) or the decoders-present size (busy/budget) — measure
@@ -1878,6 +1980,9 @@ int main(int argc, char** argv) {
       }
       if (best) {
         rt.load_image(*S->seq, *best->image);
+        // the restored rows are exact: this request's later boundary snapshots and its prompt checkpoint share them (HIVE_CKPT_DELTA) instead of
+        //   copying the whole prompt again (measured 2026-10-15 GLM 145K: 2.8 GB per checkpoint after a shared-prefix restore, 147 MB with a base)
+        if (!best->upper_skipped) { J.last_boundary = best->image; J.last_boundary_full = true; }
         S->tokens.assign(ids.begin(), ids.begin() + best_len);
         S->img_sig = best->sig;
         best->last_used = now_ms();
@@ -3161,6 +3266,7 @@ int main(int argc, char** argv) {
                    std::to_string((long long)(need >> 20)) + " MiB)";
       } else {
         for (int i = 0; i < max_sessions; ++i) seq_pool.push_back(rt.new_seq());
+        store_init();  // started asleep: the session store needs a sequence for its layout key
         size_t fr1 = 0;
         cudaMemGetInfo(&fr1, &tot);
         if (session_pool_bytes == 0 && fr > fr1) session_pool_bytes = fr - fr1;  // started asleep: measured at the first wake
@@ -3246,10 +3352,13 @@ int main(int argc, char** argv) {
       archived.clear();
       shared_snaps.clear();
     }
+    const size_t n_disk = sstore ? sstore->clear() : 0;  // the session store's copies are reusable state too
     rt.trim_snapshot_pool();
     host_total();
-    fprintf(stderr, "[hived] flush: cleared %zu session(s) · %zu archived · %zu shared snapshot(s) (expert cache kept)\n", n_sess, n_arch, n_snap);
-    for (int fd : fds) ctl_reply(fd, {{"ok", true}, {"sessions", n_sess}, {"archived", n_arch}, {"snapshots", n_snap}});
+    fprintf(stderr, "[hived] flush: cleared %zu session(s) · %zu archived · %zu shared snapshot(s) · %zu stored (expert cache kept)\n", n_sess, n_arch, n_snap, n_disk);
+    json fr = {{"ok", true}, {"sessions", n_sess}, {"archived", n_arch}, {"snapshots", n_snap}};
+    if (sstore) fr["stored"] = n_disk;
+    for (int fd : fds) ctl_reply(fd, fr);
     publish_stats(true);
   };
   auto handle_ctl = [&] {

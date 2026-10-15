@@ -403,6 +403,21 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         finally:
             s.time.time = saved_time; s.PREFILL_COST.update(saved_cost)
 
+    async def test_prerender_scheduled_on_final_answers_only(self):
+        """HIVE_TURN_PRERENDER hook: both paths hand the generated text to schedule_prerender when the turn ends with an answer, never for
+        a tool call (the turn goes on)."""
+        calls = []
+        saved = s.schedule_prerender
+        s.schedule_prerender = lambda *a: calls.append(a[-1])
+        try:
+            s.DSML_START = '<tool_call>'
+            await self.stream([1, 2, 3, 21], False)                             # <think>hm</think>x — an answer
+            self.assertEqual(len(calls), 1); self.assertIn('</think>', calls[0])
+            await self.stream([1, 2, 3, 4, 5, 6, 7, 8, 9], False)               # a tool call
+            self.assertEqual(len(calls), 1)
+        finally:
+            s.schedule_prerender = saved
+
     async def test_entries_expire(self):
         s.STAGE_STATUS = True
         s.stage_open('old', 1); s.stage_update('old', stage='done', ended=True)
@@ -913,6 +928,76 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         finally:
             for k in added: MARKERS.pop(k)
             s.encode_prompt=hint_encode
+
+    def test_turn_prerender_plan_matches_next_request(self):
+        """HIVE_TURN_PRERENDER (2026-10-15): the planned ids are the next request's tokens up to where its user message starts — that
+        request drops this turn's reasoning (templates that keep reasoning only after the last user message; clients that send it back
+        only within a turn) — and the boundary sits exactly there. No plan without reasoning, for a tool call, or for a short prefix."""
+        def think_encode(messages, tools, thinking_mode, effort):  # keeps reasoning only after the last user message (Qwen / DeepSeek style)
+            last = max(i for i, m in enumerate(messages) if m['role'] == 'user')
+            text = ''
+            for i, m in enumerate(messages):
+                text += '<|' + m['role'] + '|>'
+                if m['role'] == 'assistant':
+                    r = m.get('reasoning_content') or ''
+                    text += ('<think>' + r + '</think>' if i > last and r else '') + (m.get('content') or '') + ''.join('[call]' for _ in m.get('tool_calls') or []) + '<|eos|>'
+                else:
+                    text += m.get('content') or ''
+            return text + '<|assistant|><think>', []
+        class Parse:
+            def parse_message_from_completion_text(self, text, thinking_mode=None, **kw):
+                text = text.replace('<|eos|>', '')
+                r, c = text.split('</think>', 1) if '</think>' in text else ('', text)
+                out = {'reasoning_content': r, 'content': c}
+                if '[call]' in c: out = {'reasoning_content': r, 'content': c.replace('[call]', ''), 'tool_calls': [{'name': 'f', 'arguments': {}}]}
+                return out
+        added = {'<think>': 7, '</think>': 8}
+        MARKERS.update(added); saved = (s.encode_prompt, s.ENC, s.PRERENDER_MIN)
+        s.encode_prompt = think_encode; s.ENC = Parse(); s.PRERENDER_MIN = 16
+        try:
+            msgs = [{'role': 'system', 'content': self.SYS}, {'role': 'user', 'content': 'fix the build'},
+                    {'role': 'assistant', 'content': '', 'reasoning_content': 'look at the log', 'tool_calls': [{'id': 'c1', 'type': 'function', 'function': {'name': 'f', 'arguments': '{}'}}]},
+                    {'role': 'tool', 'content': 'error at line 3'}]
+            plan = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            self.assertIsNotNone(plan)
+            ids, bounds = plan
+            nxt = [dict(m) for m in msgs]
+            nxt[2].pop('reasoning_content')
+            nxt += [{'role': 'assistant', 'content': 'Added the semicolon.'}, {'role': 'user', 'content': 'thanks, run the tests'}]
+            prompt, _ = think_encode(nxt, None, 'thinking', None)
+            nids = s.TOK.encode(prompt)
+            b = bounds[-1]
+            self.assertEqual(b, len(ids) - 1)
+            self.assertEqual(ids[:b], nids[:b])                                      # every token before the boundary is the next request's
+            self.assertEqual(nids[b - 1], MARKERS['<|user|>'])                       # the boundary is where the next user message's content starts
+            # the conversation as sent now (reasoning kept in this turn) differs earlier — that is the re-read the plan saves
+            now, _ = think_encode(msgs + [{'role': 'assistant', 'content': 'Added the semicolon.', 'reasoning_content': 'x'}], None, 'thinking', None)
+            self.assertNotEqual(s.TOK.encode(now)[:b], nids[:b])
+            # GLM's official template keeps every assistant message's reasoning (clear_thinking false) and the client does not send it back
+            #   after the turn: the plan must drop it itself
+            def keep_all(messages, tools, thinking_mode, effort):
+                text = ''
+                for m in messages:
+                    text += '<|' + m['role'] + '|>'
+                    if m['role'] == 'assistant':
+                        r = m.get('reasoning_content') or ''
+                        text += ('<think>' + r + '</think>' if r else '') + (m.get('content') or '') + ''.join('[call]' for _ in m.get('tool_calls') or []) + '<|eos|>'
+                    else:
+                        text += m.get('content') or ''
+                return text + '<|assistant|><think>', []
+            s.encode_prompt = keep_all
+            ids, bounds = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            nids = s.TOK.encode(keep_all(nxt, None, 'thinking', None)[0])
+            b = bounds[-1]
+            self.assertEqual(ids[:b], nids[:b]); self.assertEqual(nids[b - 1], MARKERS['<|user|>'])
+            s.encode_prompt = think_encode
+            self.assertIsNone(s.prerender_plan(msgs[:2], None, 'thinking', None, 'Done.'))                       # no reasoning in the turn
+            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'again</think>[call]'))             # the turn goes on (a tool call)
+            s.PRERENDER_MIN = 10 ** 6
+            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'r</think>Added.'))                 # too short to be worth it
+        finally:
+            for k in added: MARKERS.pop(k)
+            s.encode_prompt, s.ENC, s.PRERENDER_MIN = saved
 
     def test_request_priority(self):
         self.assertEqual(s.request_priority({}), 0)

@@ -201,6 +201,9 @@ struct SeqImage {
   std::vector<HostImageBuffer> bufs;
   std::vector<std::vector<uint8_t>> tail;   // hybrid placement: the CPU-tail layers' state (cpu::CpuSeq::save_bytes)
   std::shared_ptr<CkptFence> fence;         // copies into bufs still in flight (load_image waits)
+  // session store (hive/session_store.h): every member in a fixed order · waits for the copies in flight before the bytes are read
+  template <class A> void fields(A& a) { a.i64(pos); a.i64(rope_delta); a.flag(h_last_valid); a.i64(mtp_written); a.u32(generation); a.vi32(tokens); a.vi64(engram_history); a.flag(mtp_hidden_valid); a.bufs(bufs); a.bytesv(tail); }
+  void wait_ready() const { if (fence) fence->wait(); }
   size_t allocated_bytes(std::set<const void*>& seen) const {
     if (!seen.insert(this).second) return 0;
     size_t b = sizeof(*this) + tokens.capacity() * 4 + bufs.capacity() * sizeof(HostImageBuffer);

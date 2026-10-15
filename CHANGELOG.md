@@ -5,6 +5,12 @@
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
+- **Conversations survive a restart** (`HIVE_SESSION_STORE`): prompt checkpoints and boundary snapshots are written to disk as they are
+  made (increments only, on a writer thread, atomic files with length and hash checks) and read back when a request needs a conversation
+  the daemon no longer holds — an engine restart or a model switch no longer means re-reading every long conversation once.
+- **The next turn starts where the user writes** (`HIVE_TURN_PRERENDER`): after an answer, the server reads the conversation ahead in the
+  form its next request will have (this turn's reasoning removed), so a new user message no longer re-reads the whole last turn.
+- **GLM keeps earlier reasoning** a client sends back (the official template's `clear_thinking` default; `HIVE_GLM_CLEAR_THINKING=1` = before).
 - **Reading progress inside a chunk** (`HIVE_STAGE_PROGRESS_MS`, default 1000): requests that asked for stages now get how much is read
   about once a second while a prefill forward runs its layers, not only after each chunk — a long prompt no longer sits at 0 % for a
   whole chunk (about 25 s on GLM, 20 s on DeepSeek, 9 s on Qwen3.8-Flash-Next). Taken at the layer boundaries the engine already

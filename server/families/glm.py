@@ -114,7 +114,11 @@ def encode_messages(messages: list[dict], thinking_mode: str = "thinking", reaso
                 except ValueError:
                     f["arguments"] = {}
         msgs.append(m)
-    kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True, "clear_thinking": True}
+    # clear_thinking: the official template's default (false = earlier turns keep their reasoning when the client sends it back) unless
+    #   HIVE_GLM_CLEAR_THINKING=1 (the previous fixed true: a new user message re-rendered the last turn without its reasoning)
+    kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+    if os.environ.get("HIVE_GLM_CLEAR_THINKING", "") not in ("", "0"):
+        kwargs["clear_thinking"] = True
     if reasoning_effort in ("low", "high", "max"):
         kwargs["reasoning_effort"] = reasoning_effort
     if tools:

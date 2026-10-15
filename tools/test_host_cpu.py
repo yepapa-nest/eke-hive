@@ -133,6 +133,8 @@ int main(int argc,char** argv){
  std::mutex mu,stats_mu;std::condition_variable cv;std::deque<Request> queue;
  std::map<std::string,std::shared_ptr<std::atomic<bool>>> cancel_flags;std::map<std::string,std::weak_ptr<std::atomic<bool>>> rid_flags;
  json stats_snapshot={{"build_id","cpu-fixture"}};
+ // the session store's live counters (hived HIVE_SESSION_STORE): off in this fixture, as in the default daemon
+ struct StoreStub{json stats(){return json::object();}};std::atomic<StoreStub*> sstore_live{nullptr};
  // graceful stop state (hived HIVE_GRACEFUL_STOP_S): off in this fixture, as in the default daemon
  std::atomic<int> stop_state{0};int stop_pipe[2]={-1,-1};const double graceful_stop_s=0;
  // Z1 sleep/wake control ops (hived {"op":"sleep"/"wake"}): queued for the engine thread — none in this fixture

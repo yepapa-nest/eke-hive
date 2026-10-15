@@ -175,6 +175,9 @@ struct SeqImage {
   bool mtp_hidden_valid = false;
   // in Runtime::save_image order; HIVE_CKPT_DELTA shares the still-exact prefix segments of the previous image (host_image.h)
   std::vector<HostImageBuffer> bufs;
+  // session store (hive/session_store.h): every member in a fixed order · nothing in flight (save_image copies synchronously)
+  template <class A> void fields(A& a) { a.i64(pos); a.flag(h_last_valid); a.i64(mtp_written); a.u32(generation); a.vi32(tokens); a.vi64(engram_history); a.flag(mtp_hidden_valid); a.bufs(bufs); }
+  void wait_ready() const {}
   size_t allocated_bytes(std::set<const void*>& seen) const {
     if (!seen.insert(this).second) return 0;
     size_t b = sizeof(*this) + tokens.capacity() * 4 + bufs.capacity() * sizeof(HostImageBuffer);

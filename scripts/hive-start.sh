@@ -64,6 +64,13 @@ if [ "${HIVE_MODEL_FAMILY:-}" = q27 ] && [ -n "${HIVE_Q27_DFLASH:-}" ] && [ "$HI
   FAMILY_MOUNTS+=(-v "$HIVE_Q27_DFLASH":"$HIVE_Q27_DFLASH":ro)
 fi
 
+# HIVE_SESSION_STORE: the persistent session store (docs/configuration.md) — a host directory, mounted read-write at the same path
+#   (the daemon keeps one subdirectory per model and build in it; several families may share the directory)
+if [ -n "${HIVE_SESSION_STORE:-}" ] && [ "$HIVE_SESSION_STORE" != 0 ]; then
+  mkdir -p "$HIVE_SESSION_STORE" || { echo "HIVE_SESSION_STORE=$HIVE_SESSION_STORE cannot be created" >&2; exit 1; }
+  FAMILY_MOUNTS+=(-v "$HIVE_SESSION_STORE":"$HIVE_SESSION_STORE")
+fi
+
 # Starting asleep (HIVE_START_ASLEEP=1 or --start-asleep) only needs VRAM for loading (dense weights + work buffers,
 # then moved to host copies); the expert cache is allocated by the first wake.
 asleep_start=0

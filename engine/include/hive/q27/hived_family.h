@@ -174,6 +174,9 @@ struct SeqImage {
   bool mtp_hidden_valid = false;
   std::vector<HostImageBuffer> bufs;   // Q27Seq::save_bytes, one buffer each
   std::shared_ptr<CkptFence> fence;    // host copies still in flight (load_image waits)
+  // session store (hive/session_store.h): every member in a fixed order · waits for the copies in flight before the bytes are read
+  template <class A> void fields(A& a) { a.i64(pos); a.u32(generation); a.vi32(tokens); a.vi64(engram_history); a.flag(mtp_hidden_valid); a.bufs(bufs); }
+  void wait_ready() const { if (fence) fence->wait(); }
   size_t allocated_bytes(std::set<const void*>& seen) const {
     if (!seen.insert(this).second) return 0;
     size_t b = sizeof(*this) + tokens.capacity() * 4 + bufs.capacity() * sizeof(HostImageBuffer);

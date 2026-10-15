@@ -52,6 +52,7 @@ python3 tools/test_prefill_yield_cpu.py
 python3 tools/test_layer_yield_cpu.py  # HIVE_LAYER_YIELD: yield at layer boundaries inside a long prefill forward (real hived.cpp, fake layer model, lent-state comparison, 4 mutants, lent-list text contract)
 python3 tools/test_layer_yield_intra_cpu.py  # HIVE_LAYER_YIELD_INTRA: decode-only intra-layer points (real hived.cpp, real ExpertStore staging hold abort, look-ahead, exceptions), staging-writer and Work-member contracts, mutants
 python3 tools/test_stage_progress_cpu.py  # HIVE_STAGE_PROGRESS_MS: read progress inside a prefill forward for stage requests (real hived.cpp, yield on/off, multi-chunk, batch round, off switch, 1 mutant)
+python3 tools/test_session_store_cpu.py  # HIVE_SESSION_STORE: checkpoints and boundary snapshots survive SIGKILL + restart (real hived.cpp), increment-only follow-up writes, damaged pack, other build, budget, flush, control
 T=$(mktemp -d)/gpu_marks; g++ -std=c++20 -O1 -pthread -Itools/cpu_fake/include -Iengine/include engine/tests/test_gpu_marks_cpu.cpp -o "$T" && "$T"  # hive/gpu_marks.h: reported read progress = what the stream executed (held stream not overtaken), drain, reuse, synchronous
 python3 tools/test_quality_eval_cpu.py
 python3 tools/test_gap_eval_cpu.py
