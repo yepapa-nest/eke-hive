@@ -7,8 +7,9 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
 
 - **Reading progress with a time left** (`HIVE_STAGE_STATUS`): while a prompt is read, the request stage also gives the measured read
   rate, the seconds left and whether the server already served the conversation, so a client can show "43% · about 1 min 23 s left"
-  instead of a bare spinner during a long first read (380K tokens took 138 s on GLM). The rate is the engine's own — it differs per
-  model and falls as the prompt grows.
+  instead of a bare spinner during a long first read (380K tokens took 138 s on GLM). The estimate is the engine's own: a cost per token that grows with
+  the position, fitted to the chunks read (measured on all four models, the predicted end at half read is within 2-8 % of the real one;
+  the last chunk's rate alone was 20 % short on the 27B model, whose speed falls ~4x over 227K tokens).
 - **The turn after a long re-read resumes** (all families, [docs/performance.md](docs/performance.md) step 33): a conversation re-read
   from the top (its head changed, or the daemon lost the state) now keeps a boundary snapshot — decided in the daemon on its own evidence
   (`"history"` from the server, at least one prefill chunk before the deepest boundary) and flagged by the server's tail tracker — so the
