@@ -428,7 +428,7 @@ Read by `server/hive_server.py` (the container runs it with `--ckpt $HIVE_CKPT_M
 | `HIVE_GLM_NOTHINK` | `low` | GLM only: what a no-thinking request becomes — `low` (the official minimum effort) or `empty` (an empty thinking block is prefilled; not an official mode) |
 | `HIVE_THINK_EXIT_TEXT` | "I have enough reasoning. I will now stop thinking and write the response." | Phrase forced before `</think>` when `max_thinking_tokens` is reached; empty = only `</think>` |
 | `HIVE_CUT_LEAK_STRIP` | unset (off) | `1` = when `max_thinking_tokens` cuts a response that calls a tool and its content is mostly Latin text (the unfinished reasoning written out in front of the call), later requests render that content as empty; the client's history is unchanged. Measured on DeepSeek-V4.1-Flash (Korean agent room): English preambles after a cut 49 % → 2 %. The request right after a cut re-reads from that response on |
-| `HIVE_CUT_LEAK_FILE` | `/out/cut-leaks.json` | Where `HIVE_CUT_LEAK_STRIP` keeps the fingerprints of those contents (kept across restarts; the newest 50,000) |
+| `HIVE_CUT_LEAK_FILE` | `/out/cut-leaks.json` | Where `HIVE_CUT_LEAK_STRIP` keeps the fingerprints of those contents (whitespace and think tags ignored; kept across restarts; the newest 50,000) |
 | `HIVE_BIND` | `127.0.0.1` | Address the API server binds (entrypoint); `0.0.0.0` exposes it on every interface of the host (host network) |
 | `HIVE_API_KEY` | unset | When set, every endpoint except `/health` requires `Authorization: Bearer <key>` or `x-api-key: <key>` (401 otherwise) |
 | `HIVE_MAX_BODY_MB` | `64` | Request bodies above this size are rejected with 413 before parsing |

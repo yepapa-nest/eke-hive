@@ -365,7 +365,12 @@ class CutLeaks:
 
     @staticmethod
     def key(text: str) -> str:
-        return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()[:20]  # whitespace-insensitive (clients trim or re-join content)
+        # Whitespace-insensitive (clients trim or re-join content) and without think tags: after a forced close the model can go on
+        #   thinking in the content and close it again with its own </think> before the tool call — clients drop that stray tag from
+        #   the content they send back (2026-10-17 04:15 KST: the kept key was the returned content + "</think>", so nothing was
+        #   stripped on the next request).
+        text = text.replace("<think>", " ").replace("</think>", " ")
+        return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()[:20]
 
     @staticmethod
     def is_leak(text) -> bool:

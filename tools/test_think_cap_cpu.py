@@ -330,6 +330,10 @@ def cut_leak_checks():
             spaced = [dict(hist[1], content='  I have enough understanding.\nLet me implement   it directly now. ')]
             check('cut leak: whitespace-insensitive', cl.strip(spaced)[1] == 1)
             check('cut leak: restart keeps the fingerprint', s.CutLeaks().strip(hist)[1] == 1)
+            # the model closed thinking again in the content ("...</think>") and the client sent it back without the stray tag
+            cl.note('I think I have enough. Let me write the report now and save it to the notes file.</think>')
+            back = [dict(hist[1], content='I think I have enough. Let me write the report now and save it to the notes file.')]
+            check('cut leak: stray </think> dropped by the client still matches', cl.strip(back)[1] == 1)
             with open(path, 'w') as f:
                 f.write('{damaged')
             check('cut leak: damaged file = empty (absorbed)', s.CutLeaks().strip(hist)[1] == 0)

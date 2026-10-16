@@ -10,7 +10,8 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
   How the thinking is closed made no difference (exit phrase or none, other phrases, closing at a newline or sentence end, a wrap-up
   phrase before the cap: 47-58 % of the answers began with such a preamble in a Korean DeepSeek-V4.1-Flash agent room); leaving those
   preambles out of what the model sees did (49 % → 2 %). The server keeps a fingerprint of each such content (on disk) and renders it
-  as empty on later requests; the client's history is unchanged.
+  as empty on later requests; the client's history is unchanged. The fingerprint ignores whitespace and think tags (a model that
+  closes its thinking again in the content leaves a stray `</think>` that clients drop before sending the history back).
 - **Conversations survive a restart** (`HIVE_SESSION_STORE`): prompt checkpoints and boundary snapshots are written to disk as they are
   made (increments only, on a writer thread, atomic files with length and hash checks) and read back when a request needs a conversation
   the daemon no longer holds — an engine restart or a model switch no longer means re-reading every long conversation once.
