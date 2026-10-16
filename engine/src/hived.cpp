@@ -1808,7 +1808,7 @@ int main(int argc, char** argv) {
     auto lcp = [&](const std::vector<int32_t>& a) { size_t k = 0; while (k < a.size() && k < ids.size() && a[k] == ids[k]) ++k; return k; };
     const size_t live_lcp = S->seq ? lcp(S->tokens) : 0;
     size_t& common = J.common;
-    int& pick = J.pick;  // 0 reset · 1 live state · 2 checkpoint · 3 archived last state
+    int& pick = J.pick;  // 0 reset · 1 live state · 2 checkpoint · 3 archived last state · 4 shared snapshot · 5 parent conversation's checkpoint
     // The live state is valid only if its KV position equals the session token count — after an exception during prefill or an "image span"
         //   failure, tokens are a prefix but seq.pos is ahead by the chunks already processed; continuing would silently misalign RoPE positions,
         //   ring cells and compressed rows.
@@ -1840,6 +1840,32 @@ int main(int argc, char** argv) {
       const size_t k = lcp(S->live->tokens);
       if (k == (size_t)S->live->pos && ids.size() > k) { common = k; pick = 3; }
     }
+    // An auxiliary session of a conversation ("<sid>~next" = the server's read-ahead of the next turn, "<sid>~k" = a concurrent request slot)
+    //   also continues from the conversation's own prompt checkpoints. Measured 2026-10-16 (DeepSeek, a chat client): a turn's first prompt ends
+    //   "<｜Assistant｜><think>" and the next turn renders that step as "<｜Assistant｜><think></think>…" (GLM the same), so the prompt checkpoint
+    //   at 13,468 was a prefix of the read-ahead, but the read-ahead looked only at its own session and the shared snapshots and prefilled
+    //   all 19,228 tokens from 0 (8.5 s); a 400K conversation's read-ahead re-read 63,835 tokens from an older snapshot the same way.
+    //   The parent's state is only copied (load_image) — its session is not touched.
+    std::shared_ptr<SeqImage> parent_img;
+    std::vector<Session::ImgSig> parent_sig;
+    if (!has_images || image_ckpt) {
+      if (const auto tilde = A->sid.find('~'); tilde != std::string::npos && tilde > 0) {
+        const std::string parent = A->sid.substr(0, tilde);
+        const Session* P = nullptr;
+        if (auto it = sessions.find(parent); it != sessions.end()) P = &it->second;
+        else if (auto ar = archived.find(parent); ar != archived.end()) P = &ar->second;
+        auto consider = [&](const std::shared_ptr<SeqImage>& img, const std::vector<Session::ImgSig>& sig) {
+          if (!img || (size_t)img->pos <= common) return;
+          const size_t k = lcp(img->tokens);
+          if (k != (size_t)img->pos || ids.size() <= k || !images_match(sig, k)) return;
+          common = k; pick = 5; parent_img = img; parent_sig = sig;
+        };
+        if (P) {
+          consider(P->ckpt, P->ckpt_sig);
+          for (const auto& f : P->history) consider(f.image, f.sig);
+        }
+      }
+    }
     if (!S->seq) S->seq = take_seq();
     // the session's token count before the decision below rewrites it — the log line used to print the count after a reset (always 0), which
     //   read as "the session lost its state" when the client had in fact rewritten an earlier part of the prompt (2026-10-06 audit of 145 such
@@ -1858,13 +1884,19 @@ int main(int argc, char** argv) {
       else { rt.load_image(*S->seq, pick == 2 ? *S->ckpt : *S->live); S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig; }
       S->tokens.assign(ids.begin(), ids.begin() + common);
     }
+    if (pick == 5) {  // the parent conversation's prompt checkpoint (above) — a complete prompt-end state, so also this request's delta base
+      rt.load_image(*S->seq, *parent_img);
+      S->img_sig = parent_sig;
+      S->tokens.assign(ids.begin(), ids.begin() + common);
+      J.last_boundary = parent_img; J.last_boundary_full = true;
+    }
     const size_t archived_lcp = S->live ? lcp(S->live->tokens) : 0;  // where a revived conversation left its archived state (log only)
     S->live.reset();  // an archived last state is used once (or dropped on mismatch) — the session is live again
     // session_tokens too: a session revived from the archive (no sequence, so live_lcp = 0) that resets left no line at all, which read
     //   as a lost session (2026-10-14 service log: a 188K conversation re-read after 7 h with no reuse line)
     if (!S->tokens.empty() || live_lcp || session_tokens)
       fprintf(stderr, "[hived] %s: reuse %zu/%zu via %s (session tokens %zu · common with live %zu · with archived %zu)\n", A->sid.c_str(), common,
-              ids.size(), pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : "reset", session_tokens, live_lcp, archived_lcp);
+              ids.size(), pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : pick == 5 ? "parent-ckpt" : "reset", session_tokens, live_lcp, archived_lcp);
     S->last_used = now_ms();
     A->cancel = A->r.cancel.get();
     // Images: metadata + bin (concatenated bf16 patches). A span must fit entirely in one prefill chunk (chunk boundaries are cut before the span).
@@ -1989,7 +2021,7 @@ int main(int argc, char** argv) {
         ++shared_hits;
         last_upper_skipped = best->upper_skipped;
         fprintf(stderr, "[hived] %s: reuse %zu/%zu via shared-prefix (was %s %zu · upper %s · %zu entries)\n", A->sid.c_str(), best_len, ids.size(),
-                pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : "reset", common, best->upper_skipped ? "skip" : "on", shared_snaps.size());
+                pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : pick == 5 ? "parent-ckpt" : "reset", common, best->upper_skipped ? "skip" : "on", shared_snaps.size());
         common = best_len; pick = 4;
       }
     }

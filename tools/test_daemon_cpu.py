@@ -792,6 +792,21 @@ def sc_share_cross(h, ck):
     done_ok(ck, 'H5 boundaries not a list: ignored', h.generate('sf', ids5, 3, boundaries={'a': 300}), ids5, 3, 300)
 
 
+def sc_parent_ckpt(h, ck):
+    # 2026-10-16: an auxiliary session ("<sid>~next" read-ahead, "<sid>~k" concurrent slot) continues from its conversation's prompt
+    #   checkpoint — the read-ahead of a first turn used to prefill everything from 0 (DeepSeek chat client: 19,228 tokens, 8.5 s).
+    A = tokens(300, 120)
+    r1 = done_ok(ck, 'parent T1', h.generate('pc', A, 5), A, 5, 0)
+    nxt = A + tokens(40, 121)  # the next-turn form diverges from the live state right after the prompt (the reasoning is dropped)
+    done_ok(ck, 'aux ~next resumes the parent prompt checkpoint', h.generate('pc~next', nxt, 4), nxt, 4, len(A))
+    ck.true('aux ~next: reuse via parent-ckpt', any('pc~next: reuse 300/340 via parent-ckpt' in l for l in log_lines(h, 'via parent-ckpt')))
+    done_ok(ck, 'parent unchanged after the aux copy', h.generate('pc', A + r1['tokens'] + tokens(20, 122), 3),
+            A + r1['tokens'] + tokens(20, 122), 3, len(A) + 4)
+    other = tokens(300, 123) + tokens(40, 121)
+    done_ok(ck, 'aux with a different prefix: no parent reuse', h.generate('pc~2', other, 3), other, 3, 0)
+    done_ok(ck, 'aux of an unknown parent: plain reset', h.generate('nobody~next', nxt, 3), nxt, 3, 0)
+
+
 def sc_share_edit(h, ck):
     SYS = tokens(300, 110)
     T1 = SYS + tokens(40, 111)
@@ -998,6 +1013,7 @@ def run_round2(exe, td):
     h = Hived(exe, td, {**SHARE, 'HIVE_IMAGE_CKPT': '1'}, name='share')
     try:
         sc_share_cross(h, ck)
+        sc_parent_ckpt(h, ck)
         sc_share_edit(h, ck)
         sc_share_image(h, ck)
     finally:
