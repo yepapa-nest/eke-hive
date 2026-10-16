@@ -5,6 +5,12 @@
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
+- **A thinking cut no longer spreads** (`HIVE_CUT_LEAK_STRIP`, off by default): when the thinking cap cuts a response, the model often
+  writes its unfinished reasoning as text in front of the tool call, and once that text is in the history the next answers copy it.
+  How the thinking is closed made no difference (exit phrase or none, other phrases, closing at a newline or sentence end, a wrap-up
+  phrase before the cap: 47-58 % of the answers began with such a preamble in a Korean DeepSeek-V4.1-Flash agent room); leaving those
+  preambles out of what the model sees did (49 % → 2 %). The server keeps a fingerprint of each such content (on disk) and renders it
+  as empty on later requests; the client's history is unchanged.
 - **Conversations survive a restart** (`HIVE_SESSION_STORE`): prompt checkpoints and boundary snapshots are written to disk as they are
   made (increments only, on a writer thread, atomic files with length and hash checks) and read back when a request needs a conversation
   the daemon no longer holds — an engine restart or a model switch no longer means re-reading every long conversation once.

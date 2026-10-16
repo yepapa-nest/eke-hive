@@ -381,6 +381,8 @@ DeepSeek-V4.1-Flash thinks before it answers. Two request fields control it:
   inserts a short exit phrase (`HIVE_THINK_EXIT_TEXT`) and closes the thinking block, and the model writes its
   answer from what it has. Uncapped by default; a cap trades answer quality on hard questions for a bounded response
   time, so pick it per use (chat vs. batch jobs).
+  After a cut a model may write the rest of its reasoning in front of a tool call; with `HIVE_CUT_LEAK_STRIP=1` such
+  text is left out of what the model sees on later requests, so it is not copied into the next answers.
 - Both are per request; nothing is restarted. Thinking text is returned as `reasoning_content` (streamed as it is
   generated), separate from the visible answer.
 

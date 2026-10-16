@@ -333,6 +333,117 @@ def think_exit_ids() -> list[int]:
     return _THINK_EXIT[2]
 
 
+# Leaked preambles after a thinking cut (HIVE_CUT_LEAK_STRIP; unset / "0" = off).
+#   Measured 2026-10-16 (DeepSeek-V4.1-Flash, one Korean agent conversation, the 15 responses its 1024-token cap cut, 3 samples each, the real
+#   prompts replayed through hived): after a cut the model often writes its unfinished reasoning as English text in front of the tool
+#   call ("I have enough understanding. Let me ..."), and once such text is in the history the next answers copy it — 79% of the answers
+#   in the later cases started with an English preamble, 14% in the earlier ones. How the thinking is closed did not change that (exit
+#   phrase or none, other phrases, closing at a newline or sentence end, a wrap-up phrase k tokens before the cap: 47-58% overall);
+#   removing those preambles from the history the model sees did: 49% -> 2% overall, 79% -> 4% in the later cases. Removing only the old
+#   exit phrase from the cut reasoning in the history did nothing (51%).
+#   So when the cap cuts a response that calls a tool and its content is such a preamble (Latin letters > half of the letters, over 20
+#   characters), its fingerprint is kept — on disk, so a restart keeps it — and later requests render that content as empty. Only what
+#   the model sees changes: the client's history and what the user sees stay as they are. The same messages always render the same way,
+#   so the prompt stays a stable prefix; the one cost is that the request right after a cut re-reads from that response on (the
+#   engine's session holds the generated text).
+CUT_LEAK_MAX = 50000  # fingerprints kept (oldest dropped first)
+
+
+class CutLeaks:
+    def __init__(self):
+        self.keys: OrderedDict = OrderedDict()
+        self.lock = threading.Lock()
+        self.loaded_from = False  # the file the keys were read from (False = not read yet)
+
+    @staticmethod
+    def enabled() -> bool:
+        return env_on("HIVE_CUT_LEAK_STRIP")
+
+    @staticmethod
+    def path():
+        return os.environ.get("HIVE_CUT_LEAK_FILE") or ("/out/cut-leaks.json" if os.path.isdir("/out") else None)
+
+    @staticmethod
+    def key(text: str) -> str:
+        return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()[:20]  # whitespace-insensitive (clients trim or re-join content)
+
+    @staticmethod
+    def is_leak(text) -> bool:
+        t = text.strip() if isinstance(text, str) else ""
+        if len(t) <= 20:
+            return False
+        latin = len(re.findall(r"[A-Za-z]", t))
+        hangul = len(re.findall(r"[\uac00-\ud7a3]", t))
+        return latin / max(1, latin + hangul) > 0.5
+
+    def _load(self):
+        p = self.path()
+        if self.loaded_from == p:
+            return
+        self.loaded_from = p
+        self.keys.clear()
+        if p:
+            try:
+                with open(p) as f:
+                    for k in json.load(f):
+                        self.keys[str(k)] = None
+            except (OSError, ValueError, TypeError):  # missing or damaged file: start empty (nothing is stripped)
+                self.keys.clear()
+
+    def note(self, content) -> bool:
+        """Remember the content of a response the cap cut, when it is a tool call's leaked preamble. True when kept."""
+        if not self.enabled() or not self.is_leak(content):
+            return False
+        k = self.key(content)
+        with self.lock:
+            self._load()
+            self.keys[k] = None
+            self.keys.move_to_end(k)
+            while len(self.keys) > CUT_LEAK_MAX:
+                self.keys.popitem(last=False)
+            p = self.path()
+            if p:
+                try:
+                    with open(p + ".tmp", "w") as f:
+                        json.dump(list(self.keys), f)
+                    os.replace(p + ".tmp", p)
+                except OSError:  # not writable: kept in memory only (lost on restart)
+                    pass
+        return True
+
+    def strip(self, messages):
+        """(messages with the kept preambles rendered empty, how many). The list and the changed messages are copies."""
+        if not self.enabled() or not isinstance(messages, list):
+            return messages, 0
+        with self.lock:
+            self._load()
+            if not self.keys:
+                return messages, 0
+            out, n = None, 0
+            for i, m in enumerate(messages):
+                if (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls") and isinstance(m.get("content"), str)
+                        and self.is_leak(m["content"]) and self.key(m["content"]) in self.keys):
+                    if out is None:
+                        out = list(messages)
+                    out[i] = {**m, "content": ""}
+                    n += 1
+        return (out if out is not None else messages), n
+
+
+CUT_LEAKS = CutLeaks()
+
+
+def content_before_tools(text: str, thinking_mode: str) -> str:
+    """The content part of a generated text: after </think> (thinking mode) and before the first DSML tool block."""
+    if thinking_mode == "thinking":
+        j = text.find("</think>")
+        if j < 0:
+            return ""
+        text = text[j + len("</think>"):]
+    k = text.find(DSML_START)
+    return text if k < 0 else text[:k]
+
+
 def encode_prompt(messages: list[dict], tools, thinking_mode: str, effort) -> tuple[str, list[dict]]:
     """Reference encoding.encode_messages: the tool list is attached to the first message as `tools`. Images come back in media["images"]."""
     check_image_parts(messages)
@@ -1875,6 +1986,9 @@ async def chat(request: Request):
         return bad
     endpoint = getattr(request, "hive_endpoint", "/v1/chat/completions")
     messages = body.get("messages", [])
+    # HIVE_CUT_LEAK_STRIP (off = unchanged): once here, so the prompt, boundary hints, the hint cache and read-ahead all see the same
+    #   messages. The session key only reads messages up to the first user message, so it does not move.
+    messages, cut_leaks = CUT_LEAKS.strip(messages)
     tools = body.get("tools")
     thinking_mode, effort = effort_from_request(body)
     try:
@@ -2021,7 +2135,13 @@ async def chat(request: Request):
                "thinking_mode": thinking_mode, "effort": effort,
                # thinking cap as received (null if none) — whether it was forced is done.think_forced (daemon), also lifted to the top level below
                "think_cap": think_cap,
-               **({"prefix_extra": 1} if prefix_extra else {})}
+               **({"prefix_extra": 1} if prefix_extra else {}),
+               **({"cut_leaks_stripped": cut_leaks} if cut_leaks else {})}  # HIVE_CUT_LEAK_STRIP: preambles rendered empty in this prompt
+
+    def note_cut_leak(content: str, has_tools: bool):
+        """HIVE_CUT_LEAK_STRIP: the cap cut this response and it calls a tool — remember its content when it is a leaked preamble."""
+        if has_tools and req_rec.get("think_forced") and CUT_LEAKS.note(content):
+            req_rec["cut_leak_noted"] = True
 
     async def run():
         det = Detok()
@@ -2154,6 +2274,7 @@ async def chat(request: Request):
             else:
                 parsed = {"content": text}
         message = {"role": "assistant", "content": parsed.get("content") or ""}
+        note_cut_leak(message["content"], bool(parsed.get("tool_calls")))
         if done.get("finish") == "stop" and not parsed.get("tool_calls"):
             schedule_prerender(messages, tools, thinking_mode, effort, session, text)  # HIVE_TURN_PRERENDER (off = nothing)
         if parsed.get("reasoning_content"):
@@ -2296,6 +2417,7 @@ async def chat(request: Request):
         bad = invalid_tool_args(sent) if tool_buf and sent else []
         if bad:
             req_rec["tool_args_invalid"] = bad
+        note_cut_leak(content_before_tools(gen_text, thinking_mode), bool(sent))
         if finish == "stop" and not tool_buf:
             schedule_prerender(messages, tools, thinking_mode, effort, session, strip_eos(gen_text))  # HIVE_TURN_PRERENDER (off = nothing)
         last = {'index': 0, 'delta': {}, 'finish_reason': finish, **({'stop_reason': done['stop_sequence']} if done.get('stop_sequence') and finish == 'stop' else {})}  # D11

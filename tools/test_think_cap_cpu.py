@@ -294,8 +294,116 @@ def server_checks():
     asyncio.run(go())
 
 
+def cut_leak_checks():
+    """HIVE_CUT_LEAK_STRIP: off = messages untouched; a capped response's leaked tool-call preamble is kept (on disk) and rendered empty
+    on later requests; Korean, short or tool-less content is never touched; the client's message objects are not mutated."""
+    import os
+    spec = importlib.util.spec_from_file_location('server_cl', T.harness.ROOT / 'server/hive_server.py')
+    s = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(s)
+    leak = 'I have enough understanding. Let me implement it directly now.'
+    call = [{'id': 'c1', 'type': 'function', 'function': {'name': 'shell', 'arguments': '{}'}}]
+    hist = [{'role': 'user', 'content': '\ub4f1\ub85d \uc54c\ub9bc\uc744 \uce74\ub4dc\ub85c \ubc14\uafd4\uc918'},
+            {'role': 'assistant', 'content': leak, 'tool_calls': call},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'ok'},
+            {'role': 'assistant', 'content': leak},                                   # same text, no tool call: kept
+            {'role': 'assistant', 'content': '\uc870\uc0ac\uac00 \ub05d\ub0ac\uc2b5\ub2c8\ub2e4. \uc774\uc81c \uad6c\ud604\ud569\ub2c8\ub2e4 — \uce74\ub4dc \ube4c\ub354\ub97c \uc501\ub2c8\ub2e4.', 'tool_calls': call}]
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'cut-leaks.json')
+        os.environ['HIVE_CUT_LEAK_FILE'] = path
+        try:
+            cl = s.CutLeaks()
+            check('cut leak: off = no note', cl.note(leak) is False and not os.path.exists(path))
+            out, n = cl.strip(hist)
+            check('cut leak: off = same list', out is hist and n == 0)
+            os.environ['HIVE_CUT_LEAK_STRIP'] = '1'
+            check('cut leak: Korean content not kept', cl.note('\uc870\uc0ac\uac00 \ub05d\ub0ac\uc2b5\ub2c8\ub2e4. \uc774\uc81c \uad6c\ud604\ud569\ub2c8\ub2e4 — \uce74\ub4dc \ube4c\ub354\ub97c \uc501\ub2c8\ub2e4.') is False)
+            check('cut leak: short content not kept', cl.note('Let me check.') is False)
+            out, n = cl.strip(hist)
+            check('cut leak: nothing kept = same list', out is hist and n == 0)
+            check('cut leak: English preamble kept', cl.note('\n\n' + leak + '\n') is True and os.path.exists(path))
+            before = json.dumps(hist, ensure_ascii=False)
+            out, n = cl.strip(hist)
+            check('cut leak: stripped once (tool call only)', n == 1 and out[1]['content'] == '' and out[1]['tool_calls'] == call
+                  and out[3]['content'] == leak and out[4]['content'] == hist[4]['content'], str(out))
+            check('cut leak: client messages not mutated', json.dumps(hist, ensure_ascii=False) == before and out is not hist)
+            spaced = [dict(hist[1], content='  I have enough understanding.\nLet me implement   it directly now. ')]
+            check('cut leak: whitespace-insensitive', cl.strip(spaced)[1] == 1)
+            check('cut leak: restart keeps the fingerprint', s.CutLeaks().strip(hist)[1] == 1)
+            with open(path, 'w') as f:
+                f.write('{damaged')
+            check('cut leak: damaged file = empty (absorbed)', s.CutLeaks().strip(hist)[1] == 0)
+            check('cut leak: content_before_tools', s.content_before_tools('think</think>Pre text\n\n<｜DSML｜ calls>x', 'thinking') == 'Pre text\n\n'
+                  and s.content_before_tools('no close', 'thinking') == '' and s.content_before_tools('plain<｜DSML｜ c', 'chat') == 'plain')
+
+            # through chat(): a capped response with a tool call notes its preamble; the next request renders it empty
+            os.remove(path)
+            s.CUT_LEAKS = s.CutLeaks()
+            seen, recs = [], []
+            s.log_request = lambda r: recs.append(r)
+            s.encode_prompt = lambda m, *a: (seen.append(m), ('prompt', []))[1]
+            s.tokenize_with_images = lambda *a: ([10, 11, 6], [], b'')
+            s.daemon_max_ctx = lambda: asyncio.sleep(0, result=0)
+            s.parse_completion = lambda text, mode, tools: {'reasoning_content': 'r', 'content': leak, 'tool_calls': [{'type': 'function', 'function': {'name': 'shell', 'arguments': '{}'}}]}
+
+            class Tok:
+                eos_token, eos_token_id = '<EOS>', 99
+
+                def decode(self, ids, **kw):
+                    return ''.join({1: 'a', 5: '</think>', 6: '<think>'}.get(i, '') for i in ids)
+
+                def convert_tokens_to_ids(self, t):
+                    return {'<think>': 6, '</think>': 5}.get(t, 0)
+
+                def encode(self, text, add_special_tokens=True):
+                    return []
+
+            class D:
+                def __init__(self, forced):
+                    self.forced = forced
+
+                async def generate(self, session, ids, images, blob, rid='', boundaries=None, **sampling):
+                    yield {'id': 1}
+                    yield {'done': True, 'n': 1, 'finish': 'stop', 'think_cap': 1, 'think_tokens': 1, 'think_forced': self.forced}
+
+                def cancel(self, session, rid=''):
+                    pass
+
+            class Req:
+                def __init__(self, body):
+                    self.body = body
+
+                async def json(self):
+                    return self.body
+
+                async def is_disconnected(self):
+                    return False
+
+            s.TOK = Tok()
+
+            async def go():
+                first = hist[:1]
+                s.DAEMON = D(False)
+                await s.chat(Req({'messages': first, 'max_thinking_tokens': 1}))
+                check('cut leak: not forced = not noted', 'cut_leak_noted' not in recs[-1] and not os.path.exists(path), str(recs[-1]))
+                s.DAEMON = D(True)
+                await s.chat(Req({'messages': first, 'max_thinking_tokens': 1}))
+                check('cut leak: forced + tool call = noted', recs[-1].get('cut_leak_noted') is True and os.path.exists(path), str(recs[-1]))
+                await s.chat(Req({'messages': hist[:3], 'max_thinking_tokens': 1}))
+                check('cut leak: next request renders it empty', seen[-1][1]['content'] == '' and recs[-1].get('cut_leaks_stripped') == 1
+                      and hist[1]['content'] == leak, str(seen[-1][1]))
+                del os.environ['HIVE_CUT_LEAK_STRIP']
+                await s.chat(Req({'messages': hist[:3], 'max_thinking_tokens': 1}))
+                check('cut leak: switched off = rendered as sent', seen[-1][1]['content'] == leak and 'cut_leaks_stripped' not in recs[-1], str(recs[-1]))
+            asyncio.run(go())
+        finally:
+            os.environ.pop('HIVE_CUT_LEAK_STRIP', None)
+            os.environ.pop('HIVE_CUT_LEAK_FILE', None)
+
+
 def main():
     server_checks()
+    cut_leak_checks()
     with tempfile.TemporaryDirectory() as td:
         exe = T.build_daemon(td, name='hived_tc')
         daemon_checks(exe, td, 'plain', {})
