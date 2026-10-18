@@ -171,6 +171,7 @@ Flags marked DeepSeek in [Model families](#model-families) do nothing in `hived_
 | `--max-sessions N` | 2 (raised to at least `--max-batch`) | — | Sessions whose KV is pre-allocated in VRAM at start |
 | `--host-session-mb MB` | 32768 | — | RAM budget for sessions evicted from the VRAM pool (oldest dropped first) |
 | `--ckpt-min-tokens N` | 256 | — | Prompts shorter than this get no prompt checkpoint |
+| `--hint-min-tokens N` | = `--ckpt-min-tokens` | — | Boundary hints (`HIVE_PREFIX_SHARE`) shorter than this are not cut into a shared snapshot |
 | `--cpu-threads N` | 16 | 16 | CPU expert workers. 8/12/24 measured: no gain |
 | `--promote N` | 4 | 8 | Experts promoted into the VRAM cache per token (side stream). 4/16 measured: no gain |
 | `--promote-misses N\|auto\|auto:N` | off | — | Instead of score-based promotion, promote up to N of this step's misses (`auto` = up to 32, at most a quarter of the unique misses). Measured: with it on, c4 −14 % (performance.md) — kept off |

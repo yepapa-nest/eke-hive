@@ -287,6 +287,11 @@ int main(int argc, char** argv) {
   int prefill_tile = 1;  // --prefill-tile N (max_chunk x N tokens per tile, experts loaded once per encoder layer)
   double host_session_mb = 32768;  // budget for session images kept outside the pool (RAM) — oldest are dropped beyond it
   int ckpt_min_tokens = 256;       // prompts shorter than this get no checkpoint (re-reading is cheaper)
+  // boundary hints (HIVE_PREFIX_SHARE) shorter than this are not cut (-1 = ckpt_min_tokens). Separate because the two pay off at different
+  //   sizes: a short shared system block (Gemma turn judgments: ~200 tokens before a one-line question, ~10 per second) is worth a shared
+  //   snapshot, while a prompt checkpoint of every such one-token request kept the image writer busy until the engine thread waited on it
+  //   (measured 2026-10-18: judgments of 252-267 tokens over the default 256 — the engine stalled 2.4 s with nothing in the log).
+  int hint_min_tokens = -1;
   double decode_share = 0.34;  // wall-clock share given to running decoders between prefill chunks (0 = one decode step per chunk)
   int prefill_threshold = -1;  // --prefill-threshold N (RuntimeOptions.prefill_threshold, default 1024 unchanged) — no rebuild needed for A/B
   int busy_chunk = 0;  // prefill chunk while others are decoding (0 = no split: max_chunk x prefill_tile as is)
@@ -326,6 +331,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-sessions") max_sessions = atoi(next().c_str());
     else if (a == "--host-session-mb") host_session_mb = atof(next().c_str());
     else if (a == "--ckpt-min-tokens") ckpt_min_tokens = atoi(next().c_str());
+    else if (a == "--hint-min-tokens") hint_min_tokens = atoi(next().c_str());
     else if (a == "--fake-head") fake_head = true;
     else if (a == "--no-vision") no_vision = true;
     else if (a == "--vision-eager") vision_eager = true;  // load the vision encoder at startup (default: lazy load on the first image, released when idle)
@@ -1862,10 +1868,12 @@ int main(int argc, char** argv) {
     //   boundary snapshot and took two new ones (~0.5 GB of sliding-window KV each) — first token 46 → 160 ms over the turns, spikes 220-
     //   280 ms. Cutting the live KV back costs nothing.
     bool rewound = false;
-    if (pick == 0 && live_ok && live_lcp > 0 && live_lcp < S->tokens.size() && ids.size() > live_lcp && images_match(S->img_sig, live_lcp) &&
-        rt_rewind(rt, *S->seq, live_lcp)) {
-      S->tokens.resize(live_lcp);
-      common = live_lcp; pick = 1; rewound = true;
+    //   An exact re-request (the whole prompt is a prefix of the live state) rewinds one token short of it, so the last row is read again
+    //   for its logits — these families take no prompt checkpoint (below).
+    const size_t rw_to = ids.empty() ? 0 : std::min(live_lcp, ids.size() - 1);
+    if (pick == 0 && live_ok && rw_to > 0 && rw_to < S->tokens.size() && images_match(S->img_sig, rw_to) && rt_rewind(rt, *S->seq, rw_to)) {
+      S->tokens.resize(rw_to);
+      common = rw_to; pick = 1; rewound = true;
     }
     // Image requests do not use the checkpoint or archived state by default — different pictures of the same size have identical placeholder ids,
         //   so token comparison cannot tell them apart (an exact re-request would return the old picture's logits). Checkpoints are also taken only for
@@ -2102,7 +2110,7 @@ int main(int argc, char** argv) {
     auto& hints = J.hints;
     if (prefix_share && !fake_head && (!has_images || image_ckpt) && q.contains("boundaries") && q["boundaries"].is_array()) {
       for (const auto& b : q["boundaries"])
-        if (b.is_number_integer() && b.get<int64_t>() > (int64_t)common && b.get<int64_t>() < (int64_t)ids.size() && b.get<int64_t>() >= ckpt_min_tokens)
+        if (b.is_number_integer() && b.get<int64_t>() > (int64_t)common && b.get<int64_t>() < (int64_t)ids.size() && b.get<int64_t>() >= (hint_min_tokens >= 0 ? hint_min_tokens : ckpt_min_tokens))
           hints.push_back((size_t)b.get<int64_t>());
       std::sort(hints.begin(), hints.end());
       hints.erase(std::unique(hints.begin(), hints.end()), hints.end());
@@ -2125,7 +2133,8 @@ int main(int argc, char** argv) {
     const bool history = q.contains("history") && q["history"].is_boolean() && q["history"].get<bool>();
     // A family that rewinds resumes a changed tail from its live state: per-turn boundary snapshots of a conversation would only cost copies
     //   (the first turn's head snapshot, shared by new conversations, is unaffected).
-    if constexpr (RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) if (history) J.extra_left = 0;
+    //   That includes the generation-suffix cut (its point is the next turn re-rendering this prompt's end, which a rewind absorbs).
+    if constexpr (RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) if (history) { J.extra_left = 0; hints.clear(); }
     if (history && J.extra_left <= 0 && !hints.empty() && !RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) {
       size_t deepest = 0;
       for (size_t h : hints) if (ids.size() - h > 16) deepest = h;  // a conversation boundary, not the generation-suffix hint
@@ -2257,7 +2266,12 @@ int main(int argc, char** argv) {
       for (const auto& r : src) if ((size_t)r.end <= S->tokens.size()) keep.push_back(r);
       S->img_sig = std::move(keep);
     }
-    if (prefill_complete && !reused_exact && (all_images.empty() || image_ckpt) && (int)ids.size() >= ckpt_min_tokens && !fake_head) {
+    // A family that rewinds keeps no prompt checkpoints: its live state is the conversation's state (cut back when the next request diverges,
+    //   moved to a host image when evicted). Measured 2026-10-18, Gemma: each turn's checkpoint copied ~0.5 GB of sliding-window KV, and when
+    //   the scratch slot did not fit under the VRAM limit the copy ran on the engine thread — the first token of a 60-turn conversation grew
+    //   from 56 to ~230 ms; one-token turn judgments over 256 tokens checkpointed too and stalled the engine 2.4 s.
+    constexpr bool kRewinds = RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>;
+    if (!kRewinds && prefill_complete && !reused_exact && (all_images.empty() || image_ckpt) && (int)ids.size() >= ckpt_min_tokens && !fake_head) {
       if (J.last_boundary_full) A->ckpt_base = J.last_boundary;  // a snapshot with skipped upper layers holds unfinished rows — never a base
       if (defer_ckpt) A->defer_ckpt = true;  // HIVE_DEFER_CKPT: after the first token (decode_step)
       else save_prompt_ckpt(*A, A->logits);
