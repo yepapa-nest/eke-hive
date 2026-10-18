@@ -308,9 +308,9 @@ struct GemmaEngine::Impl {
   }
 
   // up to gemv_rows rows: the int4 GEMV in passes of 16 rows (each pass streams the weights once, ~6.5 ms per layer stack) — cheaper
-  //   than dequantizing every matrix to bf16 for cuBLAS (~45 ms for a 20-token prompt, measured 2026-10-18), which wins only from a few
-  //   passes on. HIVE_GEMMA_GEMV_ROWS (default 64, 16 = the old cut).
-  int gemv_rows = 64;
+  //   than dequantizing every matrix to bf16 for cuBLAS (~45 ms for a 20-token prompt; 66-75 ms for the ~70-row turn tails of a long
+  //   conversation, against 7-11 ms per 16-row pass — measured 2026-10-18 in the service log). HIVE_GEMMA_GEMV_ROWS (default 128).
+  int gemv_rows = 128;
   void linear(const W4Mat& W, const bf16* x, int R, bf16* y) {
     if (R <= gemv_rows) {
       for (int r0 = 0; r0 < R; r0 += 16)
@@ -684,6 +684,20 @@ void GemmaEngine::init_seq(GemmaSeq& s, int64_t cap) {
 void GemmaEngine::reset_seq(GemmaSeq& s) {
   release_kv(s);
   s.pos = 0; s.tokens.clear(); s.h_last_valid = false; s.broken = false;
+}
+bool GemmaEngine::rewind(GemmaSeq& s, int64_t n) {
+  Impl& I = *p_;
+  if (n <= 0 || n >= s.pos || s.broken) return false;
+  if (s.swa_lo > std::max<int64_t>(0, n - I.c.window)) return false;   // a sliding page the rows after n would read is already released
+  const int keep = (int)((n + kPage - 1) / kPage);   // pages [0, keep) hold the positions below n (the last one partly — later writes overwrite it)
+  for (int i = keep; i < (int)s.pages_f.size(); ++i) I.free_page(s.pages_f[i], false);
+  for (int i = keep; i < (int)s.pages_s.size(); ++i) I.free_page(s.pages_s[i], true);
+  if ((int)s.pages_f.size() > keep) s.pages_f.resize(keep);
+  if ((int)s.pages_s.size() > keep) s.pages_s.resize(keep);
+  s.pos = n;
+  s.tokens.resize((size_t)n);
+  s.h_last_valid = false;   // the drafter's seed was the old last row
+  return true;
 }
 void GemmaEngine::release_kv(GemmaSeq& s) {
   Impl& I = *p_;

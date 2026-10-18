@@ -64,6 +64,9 @@ class GemmaEngine {
   void init_seq(GemmaSeq& s, int64_t cap);
   void reset_seq(GemmaSeq& s);
   void release_kv(GemmaSeq& s);
+  // cut the sequence back to its first n tokens (0 < n < pos) when its KV still covers them — every full-layer position is kept, and the
+  //   sliding layers need [n − window, n), which the keep margin (HIVE_GEMMA_SWA_KEEP) holds for a while. false = not possible (unchanged).
+  bool rewind(GemmaSeq& s, int64_t n);
   // load a session image's pieces (the order of save_plan) into the sequence's (new) pages
   void load_views(GemmaSeq& s, const std::vector<std::pair<const uint8_t*, size_t>>& v,
                   const std::function<void(void*, const uint8_t*, size_t)>& h2d);

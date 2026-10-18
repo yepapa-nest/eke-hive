@@ -56,6 +56,13 @@ std::unique_ptr<Seq> Runtime::new_seq() const {
   return s;
 }
 
+bool Runtime::rewind(Seq& s, size_t n) const {
+  if (!model_.eng().rewind(s, (int64_t)n)) return false;
+  s.generation = Seq::next_uid();
+  s.mtp_hidden_valid = false;
+  return true;
+}
+
 void Runtime::reset_seq(Seq& s) const {
   model_.eng().reset_seq(s);
   s.generation = Seq::next_uid();

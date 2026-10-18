@@ -149,6 +149,10 @@ template <class R> concept RtHasVerifyLogits = requires(R& r) { r.set_verify_log
 template <class R> void rt_set_verify_logits(R& r, bool on) { if constexpr (RtHasVerifyLogits<R>) r.set_verify_logits(on); }
 // The calls themselves go through these templates as well: a discarded if-constexpr branch in a non-template function is still checked.
 template <class R, class S> void rt_trim_seq(R& r, S& q) { if constexpr (RtHasTrimSeq<R, S>) r.trim_seq(q); }
+// A family whose KV can be cut back to any earlier position it still covers (Gemma: paged KV) continues the live state from the common
+//   prefix of a request that shares only part of it, instead of restoring a snapshot, and needs no per-turn boundary snapshots.
+template <class R, class S> concept RtHasRewind = requires(const R& r, S& q) { { r.rewind(q, size_t{}) } -> std::convertible_to<bool>; };
+template <class R, class S> bool rt_rewind(const R& r, S& q, size_t n) { if constexpr (RtHasRewind<R, S>) return r.rewind(q, n); else return false; }
 template <class R> void rt_set_kv_reclaim(R& r, std::function<bool()> f) { if constexpr (RtHasKvReclaim<R>) r.set_kv_reclaim(std::move(f)); }
 // false = trimming this sequence frees no device KV (it holds only what every pooled sequence keeps): evicting its session would cost a
 //   restore later for nothing. Families without the member: every idle sequence is a candidate.
@@ -1852,6 +1856,17 @@ int main(int argc, char** argv) {
         //   ring cells and compressed rows.
     const bool live_ok = S->seq && !S->seq->broken && S->seq->pos == (int64_t)S->tokens.size();  // broken = exception during a forward
     if (live_ok && live_lcp == S->tokens.size() && ids.size() > live_lcp && images_match(S->img_sig,live_lcp)) { common = live_lcp; pick = 1; }
+    // Rewind (RtHasRewind): the request shares only a prefix of the live state — typically a chat template that renders the last answer
+    //   differently from how it was generated (Gemma: the empty thought channel of the generation prompt is not in the history, so every
+    //   turn diverges where the previous answer began). Measured 2026-10-18, a 24-turn append-only conversation: each turn restored a
+    //   boundary snapshot and took two new ones (~0.5 GB of sliding-window KV each) — first token 46 → 160 ms over the turns, spikes 220-
+    //   280 ms. Cutting the live KV back costs nothing.
+    bool rewound = false;
+    if (pick == 0 && live_ok && live_lcp > 0 && live_lcp < S->tokens.size() && ids.size() > live_lcp && images_match(S->img_sig, live_lcp) &&
+        rt_rewind(rt, *S->seq, live_lcp)) {
+      S->tokens.resize(live_lcp);
+      common = live_lcp; pick = 1; rewound = true;
+    }
     // Image requests do not use the checkpoint or archived state by default — different pictures of the same size have identical placeholder ids,
         //   so token comparison cannot tell them apart (an exact re-request would return the old picture's logits). Checkpoints are also taken only for
         //   requests without images (below).
@@ -1934,7 +1949,7 @@ int main(int argc, char** argv) {
     //   as a lost session (2026-10-14 service log: a 188K conversation re-read after 7 h with no reuse line)
     if (!S->tokens.empty() || live_lcp || session_tokens)
       fprintf(stderr, "[hived] %s: reuse %zu/%zu via %s (session tokens %zu · common with live %zu · with archived %zu)\n", A->sid.c_str(), common,
-              ids.size(), pick == 1 ? "live" : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : pick == 5 ? "parent-ckpt" : "reset", session_tokens, live_lcp, archived_lcp);
+              ids.size(), pick == 1 ? (rewound ? "live (rewound)" : "live") : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : pick == 5 ? "parent-ckpt" : "reset", session_tokens, live_lcp, archived_lcp);
     S->last_used = now_ms();
     A->cancel = A->r.cancel.get();
     // Images: metadata + bin (concatenated bf16 patches). A span must fit entirely in one prefill chunk (chunk boundaries are cut before the span).
@@ -2108,7 +2123,10 @@ int main(int argc, char** argv) {
     //   Only for a conversation that already has a turn (the request's "history": true, from the API server) — a first turn keeps the
     //   server's first-turn policy (HIVE_PREFIX_FIRST_TURN: a system block nobody else sent is not cut).
     const bool history = q.contains("history") && q["history"].is_boolean() && q["history"].get<bool>();
-    if (history && J.extra_left <= 0 && !hints.empty()) {
+    // A family that rewinds resumes a changed tail from its live state: per-turn boundary snapshots of a conversation would only cost copies
+    //   (the first turn's head snapshot, shared by new conversations, is unaffected).
+    if constexpr (RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) if (history) J.extra_left = 0;
+    if (history && J.extra_left <= 0 && !hints.empty() && !RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) {
       size_t deepest = 0;
       for (size_t h : hints) if (ids.size() - h > 16) deepest = h;  // a conversation boundary, not the generation-suffix hint
       if (deepest > common && deepest - common >= J.chunk_cap) {

@@ -54,7 +54,7 @@ The math contract is the docstring of `oracle/gemma4_oracle.py` (this project's 
   launches plainly (outputs are identical).
 - **Norms**: rows are read as 16-byte vectors held in registers; each residual add is fused with the norm that reads its result (the
   pre-feedforward norm, or the next layer's input norm).
-- **Prefill**: up to `HIVE_GEMMA_GEMV_ROWS` rows (64) the decode GEMV runs in passes of 16 rows; longer forwards dequantize each matrix
+- **Prefill**: up to `HIVE_GEMMA_GEMV_ROWS` rows (128) the decode GEMV runs in passes of 16 rows; longer forwards dequantize each matrix
   into one bf16 scratch and multiply by cuBLAS.
 - **KV cache** (`engine/include/hive/gemma/gemma_kernels.h`): fp8 e4m3 pages of 64 tokens, token-major (a page's filled part is a contiguous
   prefix, so a session image copies only what grew). Page tables hold page *pointers*: when the VRAM pool is exhausted and no idle session can
@@ -95,5 +95,5 @@ Sampling fields a request leaves out default to the model's `generation_config.j
 | `HIVE_GEMMA_CHAT_TEMPLATE` | the checkpoint's | chat template file |
 | `HIVE_GEMMA_TOOL_THOUGHT` | 1 | the tool-response branch above |
 | `HIVE_GEMMA_CANDS` | ≤ 256 | sampler candidates per row |
-| `HIVE_GEMMA_GEMV_ROWS` | 64 | forwards of up to this many rows use the int4 GEMV in passes of 16 rows; longer ones dequantize for cuBLAS |
+| `HIVE_GEMMA_GEMV_ROWS` | 128 | forwards of up to this many rows use the int4 GEMV in passes of 16 rows; longer ones dequantize for cuBLAS |
 | `HIVE_GEMMA_NO_PDL` | 0 | 1 = launch the forward's kernels without programmatic dependent launch (A/B) |

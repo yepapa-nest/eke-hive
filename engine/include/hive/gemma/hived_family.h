@@ -191,6 +191,9 @@ class Runtime {
   ~Runtime();
   std::unique_ptr<Seq> new_seq() const;
   void reset_seq(Seq& s) const;
+  // continue a live sequence from its first n tokens (hived picks it when a request shares only a prefix of the live state) — a new
+  //   generation, so later checkpoints do not extend images of the longer state. false = the KV no longer covers it.
+  bool rewind(Seq& s, size_t n) const;
   void trim_seq(Seq& s) const { reset_seq(s); model_.eng().release_kv(s); }   // eviction / flush: the sequence back to empty, its KV freed
   // KV growth under VRAM pressure: hived evicts the least recently used idle session (image to host + trim_seq) and the allocation retries
   void set_kv_reclaim(std::function<bool()> f) { model_.eng().kv_reclaim = std::move(f); }
