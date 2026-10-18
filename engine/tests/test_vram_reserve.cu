@@ -5,6 +5,7 @@
 //   ② a refused allocation throws DeviceOutOfMemory instead of aborting, and the reserve is used before giving up
 //   ③ cap off (sleep): frees are not refilled
 //   ④ a refused request never makes the reserve grow past its share (first cut credited a refused 1 TiB and took the whole card)
+//   ⑥ a buffer taken while serving and freed asleep (the vision encoder at sleep) gives its room back on wake — the reserve does not shrink per sleep
 //   Run: scripts/hive-run.sh "./build-svc/test_vram_reserve"   (needs ~1 GiB of free VRAM)
 #include <cstdio>
 #include <vector>
@@ -73,6 +74,24 @@ int main() {
   const size_t h0 = vr::held();
   { DevBuf b(128ull << 20); }
   all &= check(vr::held() == h0, "cap off (sleep): a free is not refilled");
+  // ⑥ taken while serving, freed asleep, then wake: the reserve is back to what it was (2026-10-18: 2464 → 640 MiB after one sleep)
+  vr::resume();
+  const size_t h6 = vr::held();
+  DevBuf* enc = new DevBuf(8 * vr::kChunk);  // counted: out of the reserve
+  all &= check(vr::held() + tol >= h6 - 8 * vr::kChunk && vr::held() < h6, "⑥ serving: the encoder comes out of the reserve");
+  vr::set_cap(false);  // sleep
+  const size_t fs0 = dev_free();
+  delete enc;
+  all &= check(vr::held() < h6 && dev_free() >= fs0 + 8 * vr::kChunk - tol, "  asleep: its free goes to the card, not into the reserve");
+  for (int i = 0; i < 3; ++i) {  // more sleeps with the encoder loaded must not shrink it step by step
+    vr::resume();
+    DevBuf* e2 = new DevBuf(8 * vr::kChunk);
+    vr::set_cap(false);
+    delete e2;
+  }
+  vr::resume();  // wake
+  all &= check(vr::held() + tol >= h6 && vr::held() <= h6 + tol, "  wake (resume): the reserve is back to its share after 4 sleeps");
+  vr::set_cap(false);
   vr::release_all();
   all &= check(vr::held() == 0, "release_all frees every piece");
   // ⑤ ready: the ballast (outside the limit) goes back to the card, the headroom inside the limit becomes the reserve

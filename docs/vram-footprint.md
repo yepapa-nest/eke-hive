@@ -214,7 +214,8 @@ to measure every row of §3 on the 96 GB card. `HIVE_QWEN_VRAM_MB` becomes redun
 > pieces; at ready the ballast goes back to the card and the headroom left inside the limit (what is free while the ballast is held) is
 > taken as the reserve, new pieces first so nothing can take it in between. While serving, `DevBuf::alloc` and `GrowBuf::ensure` take their
 > room out of the reserve and a free refills it — never past the share it was armed with — and an allocation past the reserve is refused
-> without asking the device. A refusal throws `DeviceOutOfMemory` (the request paths fail only that request) instead of aborting. Why:
+> without asking the device. Sleep turns the cap off (what it frees goes to the card); a buffer that came out of the reserve and is freed
+> asleep (the vision encoder) still credits the reserve's share, and wake refills it. A refusal throws `DeviceOutOfMemory` (the request paths fail only that request) instead of aborting. Why:
 > with `HIVE_VRAM_BALLAST_RELEASE=1` beside another process, a 2 MiB runtime buffer found 26 MiB free on the card and the abort took every
 > open conversation down; with the ballast kept, the other process had no room to grow. DeepSeek's sizes are fixed after ready (session
 > pool, slots; wake restores at most what sleep released), so the reserve covers it; GLM, Qwen and Q27 still read the device's free

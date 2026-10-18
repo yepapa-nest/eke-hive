@@ -13,6 +13,11 @@
 //   refilled by a running credit, and a refused 1 TiB request credited 1 TiB and took every free byte of the card (GPU test, 10-18).
 //   Sleep turns the cap off (what sleep frees belongs to the media engines, and wake takes it back from the card) and a successful
 //   wake turns it back on. Without a limit, or after HIVE_VRAM_BALLAST_RELEASE, there are no pieces and nothing changes.
+// A buffer taken out of the reserve while serving (counted) gives its room back to the target even when it is freed asleep — the room
+//   itself stays with the card until wake (resume refills the pieces). Before that, sleep freed the lazily loaded vision encoder without
+//   the credit, so every sleep with it loaded shrank the reserve by the encoder for good: on 2026-10-18 one sleep with the encoder
+//   loaded left 640 of 2464 MiB, and from then on every image request was refused while the encoder loaded ("cudaMalloc(6.0 MiB) failed:
+//   over the VRAM limit · reserve 0 MiB").
 #pragma once
 #include <atomic>
 #include <cstddef>
@@ -112,12 +117,15 @@ inline size_t release_all() {
 
 // Runtime allocation of `bytes` is about to happen (cap on): its room comes out of the reserve. False = it would take the process past
 //   its limit (more than the reserve's share) — the caller refuses it without asking the device, whose free memory belongs to other processes.
-inline bool before_alloc(size_t bytes) {
+//   counted (optional) = the room came out of the reserve — pass it to after_free with the free.
+inline bool before_alloc(size_t bytes, bool* counted = nullptr) {
+  if (counted) *counted = false;
   if (!cap_on() || !bytes) return true;
   std::lock_guard<std::mutex> g(st().mu);
   if (st().target < (long long)bytes) return false;
   st().target -= (long long)bytes;
   shrink_to_locked(st().target);
+  if (counted) *counted = true;
   return true;
 }
 // The runtime allocation of `bytes` announced by before_alloc did not happen: the reserve takes its room back (never past the target).
@@ -130,11 +138,19 @@ inline void alloc_refused(size_t bytes) {
 // A runtime free of `bytes` happened (cap on): the reserve refills up to its target, so a neighbour's later allocation is not ours to take.
 //   The target bounds it — the reserve never grows past the share it was armed with, whatever the call sequence. Refills stop one piece
 //   short of the target: small buffers then come and go inside that slack instead of freeing and re-taking a piece every time.
-inline void after_free(size_t bytes) {
-  if (!cap_on() || !bytes) return;
+//   counted = the buffer's room came out of the reserve (before_alloc): with the cap off (asleep) only the target takes it back — the
+//   memory is the media engines' until resume.
+inline void after_free(size_t bytes, bool counted = false) {
+  if (!bytes || (!counted && !cap_on())) return;
   std::lock_guard<std::mutex> g(st().mu);
   st().target += (long long)bytes;
-  grow_to_locked(st().target - (long long)kChunk);
+  if (st().cap.load(std::memory_order_relaxed)) grow_to_locked(st().target - (long long)kChunk);
+}
+// Wake: serving again — the cap goes back on and the pieces refill up to the target (what counted buffers freed while asleep).
+inline size_t resume() {
+  std::lock_guard<std::mutex> g(st().mu);
+  st().cap.store(true, std::memory_order_relaxed);
+  return grow_to_locked(st().target - (long long)kChunk);
 }
 
 }  // namespace vram_reserve

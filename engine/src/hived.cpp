@@ -3472,7 +3472,9 @@ int main(int argc, char** argv) {
                  {"slots_before_sleep", store.sleep_phys_slots()}, {"warmed", warmed}, {"resident_keys", sleep_keys.size()},
                  {"vram_used_mib", vram_used_mib(tot, fr)}};
     if (vmm_restored) wake_info["vmm"] = {{"restored_mib", vmm_mib}, {"ms", vmm_ms}};
-    if (g_vram_limit_armed) vram_reserve::set_cap(true);  // serving again: runtime allocations draw from the reserve (wake itself took back what sleep gave the card)
+    // serving again: runtime allocations draw from the reserve (wake itself took back what sleep gave the card) · resume also takes back the
+    //   room of the counted buffers sleep freed (the vision encoder) — without it each sleep with the encoder loaded shrank the reserve for good
+    if (g_vram_limit_armed) vram_reserve::resume();
     fprintf(stderr, "[hived] wake: %.0f ms (alloc %.0f · warm %.0f) · slots %d (before sleep %d) · warmed %d/%zu experts · VRAM used %.0f MiB · level %d%s\n", t2 - t0,
             t1 - t0, t2 - t1, n, store.sleep_phys_slots(), warmed, sleep_keys.size(), vram_used_mib(tot, fr), level_was,
             vmm_restored ? (" · dense/work " + std::to_string((long long)vmm_mib) + " MiB back in " + std::to_string((long long)vmm_ms) + " ms").c_str() : "");

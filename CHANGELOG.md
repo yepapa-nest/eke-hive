@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The VRAM reserve survives sleep** (DeepSeek under `HIVE_VRAM_LIMIT_MB`): a buffer taken out of the reserve while serving gives its
+  room back even when it is freed asleep, and wake refills the reserve. Before, sleep freed the lazily loaded vision encoder without
+  that credit, so one sleep with it loaded shrank the reserve from 2,464 to 640 MiB for good and every later image request was refused
+  while the encoder loaded. Measured on the service after the fix: two level-3 sleep/wake cycles with the encoder loaded, and the
+  encoder (1,792 MiB) loaded again after each wake.
 - **Priority reaches prefill**: a request whose priority beats every request being prefilled is admitted at a layer yield of that
   prefill and decodes to the end before it resumes (DeepSeek: a 6K-token conversation turn 3 s into a 60K-token background prefill
   decoded at 42–45 instead of 13–16 tok/s). With `HIVE_PREFIX_FIRST_TURN=seen` the first-turn cut goes to the deepest boundary another

@@ -78,7 +78,8 @@ struct GrowBuf {
     const size_t to = devmem::round_up(std::min(bytes, n), be->gran), sz = to - mapped;
     devmem::Handle h{};
     // HIVE_VRAM_LIMIT_MB while serving: growth comes out of the process's own reserve, and past it the growth is refused (vram_reserve.h)
-    if (!vram_reserve::before_alloc(sz)) return false;
+    bool counted = false;
+    if (!vram_reserve::before_alloc(sz, &counted)) return false;
     if (!be->create(&h, sz)) {
       (void)cudaGetLastError();
       if (!vram_reserve::cap_on() || !vram_reserve::give(sz + vram_reserve::kChunk) || !be->create(&h, sz)) {
@@ -88,7 +89,7 @@ struct GrowBuf {
       }
     }
     if (!be->map((uintptr_t)p + mapped, sz, h)) { be->release(h); (void)cudaGetLastError(); vram_reserve::alloc_refused(sz); return false; }
-    steps_.push_back({h, sz});
+    steps_.push_back({h, sz, counted});
     mapped = to;
     return bytes <= n;
   }
@@ -96,7 +97,7 @@ struct GrowBuf {
   size_t trim(size_t bytes) {
     if (!vmm_) return 0;
     devmem::Backend* be = grow_backend();
-    size_t freed = 0;
+    size_t freed = 0, freed_counted = 0;
     while (!steps_.empty() && mapped - steps_.back().size >= bytes) {
       const Step s = steps_.back();
       steps_.pop_back();
@@ -104,8 +105,10 @@ struct GrowBuf {
       be->unmap((uintptr_t)p + mapped, s.size);
       be->release(s.h);
       freed += s.size;
+      if (s.counted) freed_counted += s.size;
     }
-    vram_reserve::after_free(freed);
+    vram_reserve::after_free(freed_counted, true);
+    vram_reserve::after_free(freed - freed_counted);
     return freed;
   }
   void free() {
@@ -122,7 +125,7 @@ struct GrowBuf {
   template <class T> T* as() const { return reinterpret_cast<T*>(p); }
 
  private:
-  struct Step { devmem::Handle h; size_t size; };
+  struct Step { devmem::Handle h; size_t size; bool counted; };  // counted = taken out of the reserve while serving (vram_reserve::after_free)
   bool vmm_ = false;
   std::vector<Step> steps_;
 };
