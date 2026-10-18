@@ -307,14 +307,14 @@ struct GemmaEngine::Impl {
     s.swa_lo = 0;
   }
 
-  // up to gemv_rows rows: the int4 GEMV in passes of 16 rows (each pass streams the weights once, ~6.5 ms per layer stack) — cheaper
+  // up to gemv_rows rows: the int4 GEMV in passes of kGemvRows (32) rows (each pass streams the weights once) — cheaper
   //   than dequantizing every matrix to bf16 for cuBLAS (~45 ms for a 20-token prompt; 66-75 ms for the ~70-row turn tails of a long
   //   conversation, against 7-11 ms per 16-row pass — measured 2026-10-18 in the service log). HIVE_GEMMA_GEMV_ROWS (default 128).
   int gemv_rows = 128;
   void linear(const W4Mat& W, const bf16* x, int R, bf16* y) {
     if (R <= gemv_rows) {
-      for (int r0 = 0; r0 < R; r0 += 16)
-        w4_gemv(W, x + (size_t)r0 * W.K, W.K, std::min(16, R - r0), y + (size_t)r0 * W.N, nullptr, W.N, ws.as<float>(), st);
+      for (int r0 = 0; r0 < R; r0 += kGemvRows)
+        w4_gemv(W, x + (size_t)r0 * W.K, W.K, std::min(kGemvRows, R - r0), y + (size_t)r0 * W.N, nullptr, W.N, ws.as<float>(), st);
       return;
     }
     w4_dequant(W, deq.as<bf16>(), st);
@@ -322,8 +322,8 @@ struct GemmaEngine::Impl {
   }
   void mlp_front(const LayerW& w, const bf16* h, int R) {
     if (R <= gemv_rows) {
-      for (int r0 = 0; r0 < R; r0 += 16)
-        w4_gemv_gu(w.gate, w.up, h + (size_t)r0 * c.hidden, c.hidden, std::min(16, R - r0), act.as<bf16>() + (size_t)r0 * c.inter, c.inter,
+      for (int r0 = 0; r0 < R; r0 += kGemvRows)
+        w4_gemv_gu(w.gate, w.up, h + (size_t)r0 * c.hidden, c.hidden, std::min(kGemvRows, R - r0), act.as<bf16>() + (size_t)r0 * c.inter, c.inter,
                    ws.as<float>(), st);
       return;
     }
@@ -365,13 +365,13 @@ void GemmaEngine::Impl::compute(int R, int S, int maxq, bool all_rows, const std
     const float* inv = sl ? inv_s.as<float>() : inv_f.as<float>();
     if (l == 0) rmsnorm(X, H, w.in_ln.as<bf16>(), R, H, c.eps, hbuf.as<bf16>(), H, st);   // later layers: fused into the previous add
     if (R <= gemv_rows) {   // q / k (/ v) in one GEMV launch per 16 rows
-      for (int r0 = 0; r0 < R; r0 += 16) {
+      for (int r0 = 0; r0 < R; r0 += kGemvRows) {
         W4Multi J;
         J.n = w.has_v ? 3 : 2;
         J.W[0] = w.q; J.W[1] = w.k; J.ldy[0] = w.q.N; J.ldy[1] = w.k.N;
         J.yb[0] = qraw.as<bf16>() + (size_t)r0 * w.q.N; J.yb[1] = kraw.as<bf16>() + (size_t)r0 * w.k.N;
         if (w.has_v) { J.W[2] = w.v; J.yb[2] = vraw.as<bf16>() + (size_t)r0 * w.v.N; J.ldy[2] = w.v.N; }
-        w4_gemv_multi(J, hbuf.as<bf16>() + (size_t)r0 * H, H, std::min(16, R - r0), st);
+        w4_gemv_multi(J, hbuf.as<bf16>() + (size_t)r0 * H, H, std::min(kGemvRows, R - r0), st);
       }
     } else {
       linear(w.q, hbuf.as<bf16>(), R, qraw.as<bf16>());

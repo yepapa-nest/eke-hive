@@ -37,12 +37,14 @@ void w4_repack(const uint32_t* q_ck, const bf16* s_ck, int N, int K, uint32_t* q
 // split for a matrix: enough warps in flight on narrow matrices (N small) — a function of the shape only
 int w4_split_for(int N, int K);
 
-// Decode / verify GEMV, M ≤ 16 rows: y[m, n] = Σ_g s[n, g] · Σ_{k in g} (nibble - 8) · x[m, k], fp32 accumulation, written as bf16
+// rows one decode-GEMV call serves (token tiles of 8; the engine runs longer forwards in passes of this many rows)
+constexpr int kGemvRows = 32;
+// Decode / verify GEMV, M ≤ kGemvRows rows: y[m, n] = Σ_g s[n, g] · Σ_{k in g} (nibble - 8) · x[m, k], fp32 accumulation, written as bf16
 //   (rounded) to yb or fp32 to yf (exactly one non-null). x bf16 [M, K] (row stride ldx). Each row's result does not depend on M.
 //   ws: unused (kept for the call sites).
 void w4_gemv(const W4Mat& W, const bf16* x, int ldx, int M, bf16* yb, float* yf, int ldy, float* ws, cudaStream_t st);
 void w4_gemv_multi(const W4Multi& J, const bf16* x, int ldx, int M, cudaStream_t st);
-// MLP front, M ≤ 16: act[m, n] = bf16(gelu_tanh(g) · u), g / u = rows n of G / U (fp32 sums, same as two w4_gemv calls in fp32)
+// MLP front, M ≤ kGemvRows: act[m, n] = bf16(gelu_tanh(g) · u), g / u = rows n of G / U (fp32 sums, same as two w4_gemv calls in fp32)
 void w4_gemv_gu(const W4Mat& G, const W4Mat& U, const bf16* x, int ldx, int M, bf16* act, int lda, float* ws, cudaStream_t st);
 // bytes of fp32 scratch the two calls above need for M rows (max over the model's matrices is the caller's)
 inline size_t w4_ws_bytes(const W4Mat&, int) { return 0; }   // the K split is summed inside the block now (no scratch)

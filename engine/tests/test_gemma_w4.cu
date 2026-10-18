@@ -88,7 +88,7 @@ int main() {
   cudaStream_t st = nullptr;
   // correctness on a small shape with 1, 3 (uneven K ranges) and 8 warps per tile
   for (int split : {1, 3, 8}) {
-    const int N = 256, K = 1024, M = 16;
+    const int N = 256, K = 1024, M = 32;
     HostMat h = make(N, K, rng);
     DevMat d(h);
     d.W.split = split;
@@ -108,17 +108,17 @@ int main() {
         maxrel = std::max(maxrel, std::fabs(r - yM[(size_t)m * N + n]) / (a + 1e-12));
       }
     char b[128];
-    snprintf(b, sizeof b, "w4_gemv fp32 vs fp64 reference (split %d, M 16): max |err| / sum|terms| = %.2e", split, maxrel);
+    snprintf(b, sizeof b, "w4_gemv fp32 vs fp64 reference (split %d, M 32): max |err| / sum|terms| = %.2e", split, maxrel);
     all &= check(maxrel < 1e-5, b);
     // batch invariance: row m alone == row m inside M rows
     bool inv = true;
-    for (int Mi : {1, 3, 8, 9}) {
+    for (int Mi : {1, 3, 8, 9, 16, 17, 24, 25}) {
       std::vector<float> yi((size_t)Mi * N);
       w4_gemv(d.W, x.as<bf16>(), K, Mi, nullptr, y.as<float>(), N, ws.as<float>(), st);
       cudaMemcpy(yi.data(), y.p, yi.size() * 4, cudaMemcpyDeviceToHost);
       for (size_t i = 0; i < yi.size(); ++i) inv &= yi[i] == yM[i];
     }
-    snprintf(b, sizeof b, "  … rows identical for M = 1, 3, 8, 9, 16 (split %d)", split);
+    snprintf(b, sizeof b, "  … rows identical for M = 1, 3, 8, 9, 16, 17, 24, 25, 32 (split %d)", split);
     all &= check(inv, b);
     // gu: act == bf16(gelu(g)·u) from the fp32 gemv results
     HostMat hu = make(N, K, rng);

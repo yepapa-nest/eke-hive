@@ -277,12 +277,16 @@ void launch_multi(const W4Multi& J, const bf16* x, int ldx, int M, cudaStream_t 
 }  // namespace
 
 void w4_gemv_multi(const W4Multi& J, const bf16* x, int ldx, int M, cudaStream_t st) {
-  HIVE_CHECK(M >= 1 && M <= 16 && J.n >= 1 && J.n <= 3, "w4_gemv_multi: rows / matrices");
+  HIVE_CHECK(M >= 1 && M <= kGemvRows && J.n >= 1 && J.n <= 3, "w4_gemv_multi: rows / matrices");
   for (int i = 0; i < J.n; ++i)
     HIVE_CHECK(J.W[i].N % 16 == 0 && J.W[i].K == J.W[0].K && J.W[i].split == J.W[0].split && J.W[0].K % 64 == 0 &&
                    ((J.yb[i] == nullptr) != (J.yf[i] == nullptr)), "w4_gemv_multi: shapes / outputs");
-  if (M <= 8) launch_multi<1>(J, x, ldx, M, st);
-  else launch_multi<2>(J, x, ldx, M, st);
+  switch ((M + 7) / 8) {   // token tiles of 8: up to 32 rows read each weight once (a prefill tail of a conversation turn is ~70 rows)
+    case 1: launch_multi<1>(J, x, ldx, M, st); break;
+    case 2: launch_multi<2>(J, x, ldx, M, st); break;
+    case 3: launch_multi<3>(J, x, ldx, M, st); break;
+    default: launch_multi<4>(J, x, ldx, M, st); break;
+  }
 }
 
 void w4_gemv(const W4Mat& W, const bf16* x, int ldx, int M, bf16* yb, float* yf, int ldy, float* ws, cudaStream_t st) {
@@ -294,11 +298,15 @@ void w4_gemv(const W4Mat& W, const bf16* x, int ldx, int M, bf16* yb, float* yf,
 
 void w4_gemv_gu(const W4Mat& G, const W4Mat& U, const bf16* x, int ldx, int M, bf16* act, int lda, float* ws, cudaStream_t st) {
   (void)ws;
-  HIVE_CHECK(M >= 1 && M <= 16 && G.N == U.N && G.K == U.K && G.split == U.split && G.N % 16 == 0 && G.K % 64 == 0, "w4_gemv_gu shapes");
+  HIVE_CHECK(M >= 1 && M <= kGemvRows && G.N == U.N && G.K == U.K && G.split == U.split && G.N % 16 == 0 && G.K % 64 == 0, "w4_gemv_gu shapes");
   const int KW = G.split;
   const size_t sm1 = KW > 1 ? (size_t)KW * 2 * 4 * 32 * sizeof(float) : 0;
-  if (M <= 8) launch_pdl(w4_gemv_gu_kernel<1>, dim3(G.N / 16), dim3(KW * 32), sm1, st, G, U, x, ldx, M, act, lda);
-  else launch_pdl(w4_gemv_gu_kernel<2>, dim3(G.N / 16), dim3(KW * 32), sm1 * 2, st, G, U, x, ldx, M, act, lda);
+  const int nt = (M + 7) / 8;
+  const dim3 g(G.N / 16), b(KW * 32);
+  if (nt == 1) launch_pdl(w4_gemv_gu_kernel<1>, g, b, sm1, st, G, U, x, ldx, M, act, lda);
+  else if (nt == 2) launch_pdl(w4_gemv_gu_kernel<2>, g, b, sm1 * 2, st, G, U, x, ldx, M, act, lda);
+  else if (nt == 3) launch_pdl(w4_gemv_gu_kernel<3>, g, b, sm1 * 3, st, G, U, x, ldx, M, act, lda);
+  else launch_pdl(w4_gemv_gu_kernel<4>, g, b, sm1 * 4, st, G, U, x, ldx, M, act, lda);
 }
 
 void w4_repack(const uint32_t* q_ck, const bf16* s_ck, int N, int K, uint32_t* q, uint32_t* s, cudaStream_t st) {
