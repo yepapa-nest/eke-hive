@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Eke Hive Authors
 // hived surface of the Gemma family — see hive/gemma/hived_family.h (derived from src/q27/q27_runtime.cpp, with GemmaEngine).
 #include "hive/gemma/hived_family.h"
+#include "hive/vram_reserve.h"
 #include "hive/image_reaper.h"
 
 #include <algorithm>
@@ -211,7 +212,14 @@ int Runtime::ck_slot(size_t bytes) const {
     //   pointers stored in a DevBuf: the growth bypassed the limit (the process grew 12,982 → 13,998 MiB under a 13,000 MiB limit in
     //   256 MiB steps during the live harnesses) and every regrowth's free credited the reserve with memory it never gave.
     const size_t want = ((bytes + bytes / 8) + ((size_t)256 << 20) - 1) & ~(((size_t)256 << 20) - 1), old = ck_scratch_[sl].n;
-    auto try_alloc = [](DevBuf& b, size_t n) { try { b.alloc(n); } catch (const DeviceOutOfMemory&) {} return b.p != nullptr; };
+    //   The slots may not take the reserve's last kFloor bytes: they belong to the small buffers a new conversation needs (page
+    //   tables, seeds) — with the reserve at 0 those would be refused and the request fail (measured: a 512 MiB slot left 0 MiB).
+    constexpr size_t kFloor = (size_t)128 << 20;
+    auto try_alloc = [](DevBuf& b, size_t n) {
+      if (vram_reserve::cap_on() && vram_reserve::held() < n + kFloor) return false;
+      try { b.alloc(n); } catch (const DeviceOutOfMemory&) {}
+      return b.p != nullptr;
+    };
     DevBuf nb;
     bool ok = try_alloc(nb, want);
     if (!ok) { ck_scratch_[sl] = DevBuf(); ok = try_alloc(nb, want); }
