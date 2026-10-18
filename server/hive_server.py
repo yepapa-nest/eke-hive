@@ -2049,8 +2049,12 @@ async def chat(request: Request):
                     ids, images, blob = tokenize_with_images(prompt, media)
                 t3 = time.perf_counter()
                 # H5: boundary hints are computed only with HIVE_PREFIX_SHARE (same container env as hived — off = zero cost, no field)
+                # A family whose daemon rewinds its live KV (families/<x>.REWINDS) ignores a conversation's later boundaries, so they are not
+                #   computed: the probes re-render the history and grew with it (measured 2026-10-18, Gemma: 4.7 ms at 500 prompt tokens,
+                #   61.5 ms at 3,000 — most of a 60-turn conversation's growing first-token time). First turns keep their system-block hint.
+                rewinds = adapter_family() and bool(getattr(ENC, "REWINDS", False)) and has_turns
                 hints = (boundary_hints(messages, tools, thinking_mode, effort, prompt, ids, ends, gen_cut=bool(has_turns or conv_key or body.get("hive_session_id")))
-                         if env_on("HIVE_PREFIX_SHARE") and not media else [])
+                         if env_on("HIVE_PREFIX_SHARE") and not media and not rewinds else [])
                 t4 = time.perf_counter()
             prep_ms.update(lock=round((t1 - t0) * 1000, 1), template=round((t2 - t1) * 1000, 1), tokenize=round((t3 - t2) * 1000, 1), hints=round((t4 - t3) * 1000, 1))
             return ids, images, blob, hints

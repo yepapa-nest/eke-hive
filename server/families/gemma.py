@@ -30,6 +30,8 @@ TOK = None
 FAMILY = "gemma4_unified"
 THINK_START = "<|channel>thought\n"
 THINK_END = "<channel|>"
+# the daemon cuts a conversation's live KV back to a new request's common prefix (hived RtHasRewind): no boundary hints after the first turn
+REWINDS = True
 TOOL_START = "<|tool_call>"
 TOOL_END = "<tool_call|>"
 STR_DELIM = '<|"|>'
