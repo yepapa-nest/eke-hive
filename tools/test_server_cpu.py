@@ -929,6 +929,52 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             for k in added: MARKERS.pop(k)
             s.encode_prompt=hint_encode
 
+    def test_generation_suffix_hint_for_an_added_message(self):
+        """2026-10-19: a background job sent each item twice — the second prompt was the first one up to the generation prompt plus a
+        further user message (no answer in between), so it parted from the prompt-end checkpoint before it. A hint sits at the end
+        of the last message too, and it is a prefix of that second request; a first turn without a conversation key gets it."""
+        def gen_encode(messages, tools, thinking_mode, effort):
+            text=''
+            for m in messages:
+                text+='<|'+m['role']+'|>'+(m.get('content') or '')
+                if m['role']=='assistant': text+='<|eos|>'
+            return text+'<|assistant|><think>', []
+        added={'<think>':7}
+        MARKERS.update(added); s.encode_prompt=gen_encode
+        try:
+            msgs=[{'role':'system','content':self.SYS}, {'role':'user','content':'a long document and the task'}]
+            prompt,_=gen_encode(msgs, None, 'chat', None); ids=s.TOK.encode(prompt)
+            hints=s.boundary_hints(msgs, None, 'chat', None, prompt, ids, gen_cut=True)
+            self.assertIn(len(ids)-2, hints)                                                                 # before <|assistant|>
+            p2,_=gen_encode(msgs+[{'role':'user','content':'answer again in JSON only'}], None, 'chat', None)
+            self.assertEqual(s.TOK.encode(p2)[:len(ids)-2], ids[:len(ids)-2])                                # a prefix of that request
+        finally:
+            for k in added: MARKERS.pop(k)
+            s.encode_prompt=hint_encode
+        # the same, when the template joins a further user message with "\n\n" and the last message's closing "." merges with it
+        #   (measured 2026-10-19 on DeepSeek: the request parted one token before the hint)
+        def join_encode(messages, tools, thinking_mode, effort):
+            text, prev=('', None)
+            for m in messages:
+                if m['role']=='user' and prev=='user': text+='\n\n'+(m.get('content') or '')
+                else: text+='<|'+m['role']+'|>'+(m.get('content') or '')
+                if m['role']=='assistant': text+='<|eos|>'
+                prev=m['role']
+            return text+'<|assistant|><think>', []
+        added={'<think>':7, '.\n\n':10}
+        MARKERS.update(added); s.encode_prompt=join_encode
+        try:
+            msgs=[{'role':'system','content':self.SYS}, {'role':'user','content':'a long document and the task.'}]
+            prompt,_=join_encode(msgs, None, 'chat', None); ids=s.TOK.encode(prompt)
+            hints=s.boundary_hints(msgs, None, 'chat', None, prompt, ids, gen_cut=True)
+            p2,_=join_encode(msgs+[{'role':'user','content':'again in JSON only'}], None, 'chat', None); ids2=s.TOK.encode(p2)
+            k=next(i for i,(a,b) in enumerate(zip(ids, ids2)) if a!=b)
+            self.assertEqual(k, len(ids)-3)                                                                  # the "." token differs
+            self.assertIn(k, hints)                                                                          # the hint is a prefix of it
+        finally:
+            for k in added: MARKERS.pop(k)
+            s.encode_prompt=hint_encode
+
     def test_turn_prerender_plan_matches_next_request(self):
         """HIVE_TURN_PRERENDER (2026-10-15): the planned ids are the next request's tokens up to where its user message starts — that
         request drops this turn's reasoning (templates that keep reasoning only after the last user message; clients that send it back
@@ -1189,10 +1235,11 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             await s.chat(Request({'messages':room('room A context '*20, 'question about room A '*8), 'reasoning_effort':'none'}))
             self.assertIsNone(extra(), 'first room: no cut')
             hints_a=s.DAEMON.kw[-1].get('boundaries') or []
-            self.assertEqual(len(hints_a), 2, hints_a)
+            self.assertEqual(len(hints_a), 3, hints_a)  # system block, room block, end of the last message (generation suffix)
             await s.chat(Request({'messages':room('room B context, other words '*20, 'question about room B '*8), 'reasoning_effort':'none'}))
             self.assertEqual(extra(), 1, 'second room: cut')
-            self.assertEqual(s.DAEMON.kw[-1].get('boundaries'), [hints_a[0]], 'only the shared system-block boundary is sent')
+            self.assertEqual(s.DAEMON.kw[-1].get('boundaries')[:1], [hints_a[0]], 'only the shared system-block boundary is sent')
+            self.assertTrue(all(h > hints_a[1] for h in s.DAEMON.kw[-1].get('boundaries')[1:]), 'besides it, only suffix hints')
             later=first('q2')+[{'role':'assistant','content':'a'}, {'role':'user','content':'q2b'}]
             await s.chat(Request({'messages':later, 'reasoning_effort':'none'}))
             self.assertIsNone(extra(), 'not a first turn')
@@ -1205,6 +1252,23 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop('HIVE_PREFIX_FIRST_TURN', None)
             s.SEEN=s.SeenPrefixes()
 
+    def test_rewinding_family_gets_no_suffix_hints(self):
+        """2026-10-19: a family that rewinds its live KV (Gemma) continues a repeated prompt from its live state — the suffix hints of a
+        first turn only left snapshots (two per short request, the copies that stalled the engine on 10-18). The server asks for them
+        only from families that cannot rewind (gen_cut=False: no suffix hint, test_generation_suffix_hint_is_where_the_next_turn_continues)."""
+        fam, had, rw=s.FAMILY, hasattr(s.ENC, 'REWINDS'), getattr(s.ENC, 'REWINDS', None)
+        try:
+            s.FAMILY=None
+            self.assertFalse(s.rewinding_family(), 'DeepSeek: suffix hints')
+            s.FAMILY=next(iter(s.ADAPTER_FAMILIES)); s.ENC.REWINDS=False
+            self.assertFalse(s.rewinding_family(), 'an adapter family without rewind: suffix hints')
+            s.ENC.REWINDS=True
+            self.assertTrue(s.rewinding_family(), 'Gemma: none')
+        finally:
+            s.FAMILY=fam
+            if had: s.ENC.REWINDS=rw
+            elif hasattr(s.ENC, 'REWINDS'): del s.ENC.REWINDS
+
     async def test_sent_only_when_enabled(self):
         await s.chat(Request({'messages':self.conv(), 'reasoning_effort':'none'}))
         self.assertNotIn('boundaries', s.DAEMON.kw[-1], 'default: no field, no hint cost')
@@ -1213,7 +1277,8 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('boundaries', s.DAEMON.kw[-1])
         os.environ['HIVE_PREFIX_SHARE']='1'
         await s.chat(Request({'messages':self.conv(), 'reasoning_effort':'none'}))
-        _, _, want=self.hints_for(self.conv())
+        prompt, ids, _=self.hints_for(self.conv())
+        want=s.boundary_hints(self.conv(), None, 'chat', None, prompt, ids, gen_cut=True)  # every text request gets the suffix hints (2026-10-19)
         self.assertEqual(s.DAEMON.kw[-1].get('boundaries'), want)
         s.tokenize_with_images=lambda prompt, media: (s.TOK.encode(prompt), [{'start':0}], b'x')  # image request: no text offsets
         s.encode_prompt=lambda *a: (hint_encode(*a)[0], [{'image':1}])
@@ -1299,8 +1364,8 @@ class HintCacheTests(unittest.TestCase):
             for k in range(1, 12):
                 hints=self.both(self.agent(k), self.TOOLS, mode, effort)
                 self.assertTrue(hints)
-                if k>=2:  # system block and older turn ends come from the cache: the newest turn end + the suffix pair only
-                    self.assertEqual(self.last_renders, 4, (mode, k))
+                if k>=2:  # system block and older turn ends come from the cache: the newest turn end + the suffix probes (pair + added message) only
+                    self.assertEqual(self.last_renders, 5, (mode, k))
             self.assertGreater(s.HINT_CACHE.hits, 0)
 
     def test_edited_history_misses(self):

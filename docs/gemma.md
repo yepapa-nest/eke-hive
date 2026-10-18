@@ -74,11 +74,23 @@ The math contract is the docstring of `oracle/gemma4_oracle.py` (this project's 
   16-row tile, and that read bounded it above ~16 rows. Per layer (q + k + v, o, gate + up, down; cold L2): 70 rows 788 → 305 µs,
   128 rows 1,382 → 477 µs. A conversation turn's tail of 70 rows after 3,000 tokens: 42.7 → 28.9 ms; 128 rows: 70.4 → 36.6 ms (`tests/gemma_tail.cpp`).
   Served (60-turn voice conversation, server-side first token while it is the only conversation): p50 64 → 31 ms.
+  That kernel was bound by L2 → SM bytes (each 16-token block re-read the weights, each 64-row block the activations: ~1.2 GB a layer at
+  70 rows; this card's L2 gives ~4–5.6 TB/s). The default now moves the K split from the warps of a block to the 8 blocks of a
+  thread-block cluster: every block's warps share one K range, so one staged activation tile feeds 128 rows and a block covers up to 80
+  tokens (the weights are read once); the ranks' fp32 partials are summed through distributed shared memory in rank order, which keeps
+  the GEMV's bits. Per sliding layer (cold L2, 2026-10-19, medians beside the served models): 17 rows 209 → 125 µs, 40 rows 258 → 174,
+  70 rows 385 → 250, 128 rows 520 → 387, 192 rows 711 → 553 (full layer 70 rows 414 → 264, 128 rows 551 → 412). The rank sum is now the
+  largest remaining cost (~70–95 µs of a 70-row layer: distributed shared memory moves ~2.4 B a clock per SM on this card).
   Longer forwards dequantize each matrix into one bf16 scratch and multiply by cuBLAS (faster from ~256 rows).
 - **KV cache** (`engine/include/hive/gemma/gemma_kernels.h`): fp8 e4m3 pages of 64 tokens, token-major (a page's filled part is a contiguous
   prefix, so a session image copies only what grew). Page tables hold page *pointers*: when the VRAM pool is exhausted and no idle session can
   be evicted, new pages come from mapped pinned host memory (`HIVE_GEMMA_HOST_KV_MB`) — slower, never an out-of-memory. Sliding-window layers
-  release pages behind `window + HIVE_GEMMA_SWA_KEEP` positions.
+  release pages behind `window + HIVE_GEMMA_SWA_KEEP` positions. The sliding pool holds the windows of `HIVE_GEMMA_SWA_SEQS` sequences
+  (a sliding page is 20× a full one: 40 sliding layers against 8 full), as far as the full pool keeps `HIVE_GEMMA_FULL_MIN_TOKENS`
+  positions; the full pool takes the rest. Sizing both for one max-length context instead left room for about one voice conversation in
+  the sliding pool, so two conversations taking turns evicted each other (first token 260–500 ms against 30–70). The keep margin covers
+  how far a next turn rewinds: over 2,339 served follow-ups the rewind was 44 tokens at the median, 215 at p95 and 600 at p99.5.
+  A session moved to a host image by the KV reclaim is resumed and rewound the same way when it returns.
 - **MTP** (Frozen-KV assistant): the seed is the target's sampled next token (embedded with the target embedding × √3840) together with the
   final-normed hidden of the last processed row; every chain step runs at the rope position of the last written KV slot, reads the target's
   last sliding and last full layer KV (keys 0 … that slot), and feeds back `post_projection(norm(z))`.
@@ -121,13 +133,17 @@ Sampling fields a request leaves out default to the model's `generation_config.j
 | `HIVE_GEMMA_ASSISTANT` | unset | directory of the MTP assistant checkpoint (inside the container); unset = no drafter |
 | `HIVE_GEMMA_MTP_K` | 3 | drafts per step (0 = off) |
 | `HIVE_GEMMA_CHUNK` | 1024 | prefill rows per forward |
-| `HIVE_GEMMA_SWA_KEEP` | 2048 | sliding-layer positions kept behind the window |
+| `HIVE_GEMMA_SWA_KEEP` | 768 | sliding-layer positions kept behind the window (how far a next turn can rewind the live state) |
+| `HIVE_GEMMA_SWA_SEQS` | 4 | sequences whose sliding window the KV pool holds |
+| `HIVE_GEMMA_FULL_MIN_TOKENS` | 65536 | full-layer positions the pool keeps at least (capped at the context length) |
 | `HIVE_GEMMA_KV_MB` | from the limit | KV page pool size (overrides the limit-based size) |
 | `HIVE_GEMMA_HOST_KV_MB` | 8192 | mapped host memory for KV pages when the pool is full |
 | `HIVE_GEMMA_CHAT_TEMPLATE` | the checkpoint's | chat template file |
 | `HIVE_GEMMA_TOOL_THOUGHT` | 1 | the tool-response branch above |
 | `HIVE_GEMMA_CANDS` | ≤ 256 | sampler candidates per row |
 | `HIVE_GEMMA_GEMV_ROWS` | 192 | forwards of up to this many rows use the int4 kernels (the GEMV up to 16 rows, the prefill GEMM above); longer ones dequantize for cuBLAS |
-| `HIVE_GEMMA_GEMM_V` | unset | force one prefill GEMM variant (0 … 5, `src/gemma/gemma_w4.cu`); unset = by row count. Every variant gives the same bits |
+| `HIVE_GEMMA_GEMM_V` | unset | force one prefill GEMM variant (0 … 8, `src/gemma/gemma_w4.cu`); unset = 6 (the cluster kernel; 0 … 5 the former kernel, 7 / 8 the single-block form). Every variant gives the same bits |
 | `HIVE_GEMMA_VISION` | 1 | 0 = do not load the vision embedder (image requests are then refused); it takes ~102 MiB under a VRAM limit |
+| `HIVE_GEMMA_ATTN_SPLIT_Q` | 48 | sliding-layer sequences of up to this many query rows use the key-split attention (16 = decode / verify only) |
+| `HIVE_GEMMA_ATTN_SMALL_M` | 128 | sequences of up to this many query rows get 16-row attention tiles (0 = the wide tiles) — a 70-row turn tail: sliding 49.6 → 24.2 µs, full 156.5 → 95.5 µs per layer |
 | `HIVE_GEMMA_NO_PDL` | 0 | 1 = launch the forward's kernels without programmatic dependent launch (A/B) |

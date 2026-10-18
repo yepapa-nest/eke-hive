@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Gemma prefill GEMM, K split across a thread-block cluster**: the 17–192-row int4 GEMM was bound by L2 traffic (weights re-read per
+  16-token block, activations per 64-row block); the default kernel now gives each of the 8 K-split ranks its own block of a cluster, so
+  one staged activation tile feeds 128 rows and the weights are read once, and sums the ranks' partials in rank order — outputs
+  unchanged, bit for bit (every variant tested against the decode GEMV at 1–200 rows and the model's shapes). Per sliding layer, cold
+  L2: 70 rows 385 → 250 µs, 128 rows 520 → 387, 17 rows 209 → 125, 192 rows 711 → 553 (`tests/test_gemma_w4.cu`, 2026-10-19). The
+  former kernel stays selectable (`HIVE_GEMMA_GEMM_V=0 … 5`). On the model (`tests/gemma_tail.cpp`, a conversation turn's tail after
+  3,000 tokens, medians of 20): 70 rows 26.7 → 19.4 ms, 128 rows 34.9 → 29.4 ms; with the attention change above, the 70-row tail went
+  from 28.9 to 19.4 ms. Two served conversations taking turns: first token 27 → 20 ms.
+
+- **Fewer conversations read again** (measured on the DeepSeek service's request log, 2026-10-16 … 19):
+  - The session store outlives rebuilds: its layout key no longer names the build; a canary state checked at start-up decides whether
+    a new build reads the stored images (five rebuilds in one day had each dropped every stored conversation). Runs of one build are
+    not bit-identical (CPU-computed experts), so the canary is prefilled twice and the stored one must agree within four times that
+    run's own KL noise — measured across two builds: KL 1.35e-6 against a 1e-3 floor, stored conversations kept.
+  - Every text request of a family that cannot rewind (DeepSeek) gets a generation-suffix hint at the end of its last message — one
+    token earlier when the further message's separator merges with that token — and the daemon cuts every such hint: a request that
+    repeats a prompt with a further message (no answer in between) continues there. A background job's second requests re-read
+    23–44K tokens each before (1.63M tokens in three days); measured after: 26,120 of 26,138 tokens reused, 8.0 → 0.8 s. Gemma
+    rewinds its live state instead and gets no suffix hints (they only left snapshots).
+  - Gemma: the KV pool holds four conversations' sliding windows (it was sized for one max-length context, so two voice conversations
+    taking turns evicted each other) and the keep margin follows the measured rewind depth (768; p99.5 600 tokens). A session brought
+    back from a host image is rewound like a live one. Short prefills (≤ 128 rows) take the split or 16-row-tile attention: a 70-row
+    turn tail 49.6 → 24.2 µs per sliding layer, 156.5 → 95.5 µs per full layer.
+  - `/health` reads the device again on the publish that ends a sleep or wake (it showed the mid-wake reserve until the idle sweep).
+
 - **The VRAM reserve survives sleep** (DeepSeek under `HIVE_VRAM_LIMIT_MB`): a buffer taken out of the reserve while serving gives its
   room back even when it is freed asleep, and wake refills the reserve. Before, sleep freed the lazily loaded vision encoder without
   that credit, so one sleep with it loaded shrank the reserve from 2,464 to 640 MiB for good and every later image request was refused

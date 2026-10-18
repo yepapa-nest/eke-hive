@@ -8,11 +8,16 @@
 //   machine's NVMe writes 3.6 GB/s and reads 6.5 GB/s. The engine is stopped with `docker rm -f` (no time to save at stop), so images are
 //   written when they are made (write-through, on a writer thread) and read back only when a request needs them (lazy).
 //
-// Format (one directory per layout key = family + build id + checkpoint config + image shape; anything else is ignored):
+// Format (one directory per layout key = family + store format + checkpoint config + image shape; anything else is ignored):
 //   packs/<id>.pack   the bytes written by one image save — only segments not already on disk (images share the unchanged prefix of the
 //                     previous image: HostImageBuffer segments, HIVE_CKPT_DELTA), so a follow-up turn writes its increment only
 //   metas/<name>.json one image: kind (ckpt | snap), session id or prefix key, position, recency, image signatures, upper_skipped, the
 //                     image's fields in SeqImage::fields order — numbers inline, byte ranges as [pack, offset, length, hash]
+//   metas/canary-*.json + its pack: the canary (put_canary) — the state of a fixed token sequence and its logits, written by the build that
+//                     created the directory, never evicted. The layout key has no build id (measured 2026-10-18/19: five DeepSeek rebuilds in
+//                     a day each dropped every stored conversation, so every room read its whole prompt once more after each deploy — up to
+//                     224K tokens, 40-50 s); a new build instead resumes the canary and compares its logits with its own (hived store_canary)
+//                     and drops the directory when they differ.
 //   Every file is written to a temporary name, fsync'ed and renamed; a range is read back only if its length and hash match.
 // Images are immutable once saved (segments are never rewritten), so the writer holds references and copies nothing.
 #pragma once
@@ -225,12 +230,13 @@ template <class Image>
 class SessionStore {
  public:
   struct Stats { long writes = 0, write_fail = 0, loads = 0, load_fail = 0, evicted = 0; double write_ms = 0; size_t written = 0; };
-  // dir = HIVE_SESSION_STORE · key = layout key (family, build, checkpoint config, image shape) · budget in bytes
+  // dir = HIVE_SESSION_STORE · key = layout key (family, store format, checkpoint config, image shape) · budget in bytes
   SessionStore(std::string dir, std::string key, size_t budget) : root_(std::move(dir)), budget_(budget) {
     dir_ = root_ + "/" + key;
     ::mkdir(root_.c_str(), 0755);
-    // the same daemon's directories of other builds can never be read again (the layout key changed) — drop them, or every rebuild would
-    //   leave its store behind (measured 2026-10-15: 19 GB after one rebuild); other daemons' directories are left alone
+    // the same daemon's directories of another layout (store format, checkpoint, image shape — or the build-keyed directories before the
+    //   canary) can never be read again — drop them, or every change would leave its store behind (measured 2026-10-15: 19 GB after one
+    //   rebuild); other daemons' directories are left alone
     if (const size_t dash = key.rfind('-'); dash != std::string::npos)
       for (const auto& d : list_dir(root_))
         if (d != key && d.compare(0, dash + 1, key, 0, dash + 1) == 0 && d.size() == key.size()) remove_tree(root_ + "/" + d);
@@ -254,6 +260,14 @@ class SessionStore {
     Job j; j.kind = "snap"; j.name = hex16(key); j.key = key; j.image = std::move(img); j.sig = std::move(sig); j.upper_skipped = upper_skipped;
     enqueue(std::move(j));
   }
+  // the canary (hived store_canary): kept outside the session index — no session id can name it, the budget never drops it
+  void put_canary(std::shared_ptr<Image> img, const std::vector<float>& logits) {
+    Job j; j.kind = "canary"; j.name = "canary"; j.image = std::move(img); j.logits = logits;
+    enqueue(std::move(j));
+  }
+  bool has_canary() { std::lock_guard<std::mutex> lk(im_); return !canary_.file.empty(); }
+  std::unique_ptr<Loaded<Image>> load_canary() { std::string f; { std::lock_guard<std::mutex> lk(im_); f = canary_.file; } return load(f); }
+  size_t entries() { std::lock_guard<std::mutex> lk(im_); return ckpt_.size() + snaps_.size(); }
   bool has_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); return ckpt_.count(sid) > 0; }
   // position and last token of a session's checkpoint on disk (-1 = none) — the caller checks the token before reading GBs
   std::pair<int64_t, int32_t> ckpt_at(const std::string& sid) {
@@ -275,12 +289,13 @@ class SessionStore {
     std::lock_guard<std::mutex> lk(im_);
     return {{"dir", dir_}, {"ckpts", ckpt_.size()}, {"snaps", snaps_.size()}, {"bytes", disk_bytes_}, {"budget", budget_},
             {"writes", st_.writes}, {"write_fail", st_.write_fail}, {"loads", st_.loads}, {"load_fail", st_.load_fail},
-            {"evicted", st_.evicted}, {"written", st_.written}, {"queue", queued_.load()}};
+            {"evicted", st_.evicted}, {"written", st_.written}, {"queue", queued_.load()}, {"canary", !canary_.file.empty()}};
   }
   // Waits until the writer is idle (tests and the flush op).
   void drain() { std::unique_lock<std::mutex> lk(qm_); idle_cv_.wait(lk, [&] { return q_.empty() && !busy_; }); }
-  // The flush op ("drop every reusable prompt state"): the disk copies go too. Returns the number of entries dropped.
-  size_t clear() {
+  // The flush op ("drop every reusable prompt state"): the disk copies go too (the canary stays — it is no prompt state; with_canary drops
+  //   it as well, for a directory a new build cannot read). Returns the number of entries dropped.
+  size_t clear(bool with_canary = false) {
     { std::lock_guard<std::mutex> lk(qm_); queued_ -= (long)q_.size(); q_.clear(); }
     drain();
     for (auto& [id, fd] : fds_) ::close(fd);
@@ -289,6 +304,7 @@ class SessionStore {
     const size_t n = ckpt_.size() + snaps_.size();
     for (auto& [k, m] : ckpt_) ::unlink(m.file.c_str());
     for (auto& [k, m] : snaps_) ::unlink(m.file.c_str());
+    if (with_canary && !canary_.file.empty()) { ::unlink(canary_.file.c_str()); canary_ = Meta{}; }
     ckpt_.clear(); snaps_.clear(); known_.clear();
     gc_packs();
     return n;
@@ -305,6 +321,7 @@ class SessionStore {
   std::mutex im_;  // index + stats + known
   std::map<std::string, Meta> ckpt_;            // session id -> its latest checkpoint
   std::map<uint64_t, Meta> snaps_;              // prefix key -> boundary snapshot
+  Meta canary_;                                 // the canary (file empty = none)
   std::map<uint64_t, long long> pack_bytes_;    // pack id -> size
   size_t disk_bytes_ = 0;
   std::map<const uint8_t*, typename WriteAr::Known> known_;
@@ -348,6 +365,7 @@ class SessionStore {
       const std::string kind = m.value("kind", "");
       if (kind == "ckpt") ckpt_[m.value("sid", "")] = e;
       else if (kind == "snap") snaps_[std::stoull(m.value("key", "0"), nullptr, 16)] = e;
+      else if (kind == "canary") canary_ = e;
     }
     gc_packs();
     for (auto& [id, n] : pack_bytes_) disk_bytes_ += (size_t)std::max(0LL, n);
@@ -356,6 +374,7 @@ class SessionStore {
     std::set<uint64_t> used;
     for (auto& [k, m] : ckpt_) used.insert(m.packs.begin(), m.packs.end());
     for (auto& [k, m] : snaps_) used.insert(m.packs.begin(), m.packs.end());
+    used.insert(canary_.packs.begin(), canary_.packs.end());
     for (auto it = pack_bytes_.begin(); it != pack_bytes_.end();) {
       if (used.count(it->first)) { ++it; continue; }
       ::unlink(pack_path(it->first).c_str());
@@ -411,7 +430,7 @@ class SessionStore {
     }
     json m = {{"v", 1}, {"kind", j.kind}, {"pos", j.image->pos}, {"last_used", wall_ms()},
               {"last_tok", j.image->tokens.empty() ? -1 : j.image->tokens.back()}, {"fields", ar.out}};
-    if (j.kind == "ckpt") m["sid"] = j.name; else { m["key"] = j.name; m["upper_skipped"] = j.upper_skipped; }
+    if (j.kind == "ckpt") m["sid"] = j.name; else if (j.kind == "snap") { m["key"] = j.name; m["upper_skipped"] = j.upper_skipped; }
     json sg = json::array(); for (const auto& s : j.sig) sg.push_back(json::array({s.start, s.end, hex16(s.hash)})); m["sig"] = sg;
     if (!logit_ref.empty()) m["logits"] = ref_json(logit_ref[0]);
     const std::string mpath = meta_path(j.kind, j.name);
@@ -421,9 +440,9 @@ class SessionStore {
     for (auto& [owner, r] : ar.made) known_[owner.get()] = {owner, r};
     Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"];
     collect_packs(ar.out, e.packs); if (!logit_ref.empty()) e.packs.insert(pack);
-    if (j.kind == "ckpt") ckpt_[j.name] = e; else snaps_[j.key] = e;
+    if (j.kind == "ckpt") ckpt_[j.name] = e; else if (j.kind == "snap") snaps_[j.key] = e; else canary_ = e;
     gc_packs();  // a replaced checkpoint's packs that no entry refers to any more
-    ++st_.writes; st_.written += ar.fresh; st_.write_ms += wall_ms() - t0;
+    if (j.kind != "canary") { ++st_.writes; st_.written += ar.fresh; st_.write_ms += wall_ms() - t0; }  // the counters are conversation state
     evict();
     fprintf(stderr, "[store] %s %.16s pos %lld · %.1f MB new · %.0f ms · disk %.2f GB / %.0f GB\n", j.kind.c_str(), j.name.c_str(),
             (long long)j.image->pos, ar.fresh / 1048576.0, wall_ms() - t0, disk_bytes_ / 1073741824.0, budget_ / 1073741824.0);
@@ -502,7 +521,7 @@ class SessionStore {
     out->bytes = ar.bytes_read; out->ms = wall_ms() - t0;
     std::lock_guard<std::mutex> lk(im_);
     for (auto& [p, r] : ar.loaded) known_[p.get()] = {p, r};
-    ++st_.loads;
+    if (m.value("kind", "") != "canary") ++st_.loads;
     return out;
   }
 };

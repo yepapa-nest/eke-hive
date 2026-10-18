@@ -115,7 +115,8 @@ static bool run_case(const Case& cs, std::mt19937& rng) {
   const int D = cs.D, Hkv = cs.Hkv, H = cs.H;
   // sequences: {n_q, q_pos0, image span rows [a, b)}; the last two share one KV (decode at p vs. verify ending at p)
   struct Spec { int n_q, q_pos0, a = 0, b = 0; };
-  std::vector<Spec> specs = {{1, 0}, {1, 1500}, {4, 1101}, {16, 2047, 3, 12}, {300, 900, 18, 298}, {37, 0, 5, 14}, {2048, 2048}, {1, 1234}, {4, 1231}};
+  std::vector<Spec> specs = {{1, 0}, {1, 1500}, {4, 1101}, {16, 2047, 3, 12}, {300, 900, 18, 298}, {37, 0, 5, 14}, {2048, 2048}, {70, 2930, 10, 30},
+                             {1, 1234}, {4, 1231}};
   const int n = (int)specs.size();
   size_t need = 0;
   for (auto& sp : specs) need += (sp.q_pos0 + sp.n_q + kPage - 1) / kPage;
@@ -495,6 +496,9 @@ int main() {
     for (int ctx : {2048, 8192})
       for (int nq : {1, 4}) timing(*cs, 2, nq, ctx, 500);
   for (const Case* cs : {&sliding, &full}) timing(*cs, 1, 2048, 4096, 20);
+  // a conversation turn's tail (2026-10-19: HIVE_GEMMA_ATTN_SPLIT_Q / HIVE_GEMMA_ATTN_SMALL_M)
+  for (const Case* cs : {&sliding, &full})
+    for (int nq : {40, 70, 128, 256, 512}) timing(*cs, 1, nq, 3000, 200);
   printf("%s\n", all ? "ALL PASS" : "FAIL");
   return all ? 0 : 1;
 }

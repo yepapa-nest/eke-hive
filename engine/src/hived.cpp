@@ -133,6 +133,9 @@ constexpr bool kVramReserve = kVramFamily == hive::vram_limit::Family::DeepSeek;
 #ifndef HIVE_BUILD_ID
 #define HIVE_BUILD_ID "unknown"
 #endif
+// Session store format (HIVE_SESSION_STORE layout key): raise it when the bytes of a saved image change meaning (SeqImage fields, buffer
+//   layouts, KV numerics a canary would not catch). Rebuilds keep the store otherwise — the canary check at start-up decides (store_canary).
+constexpr int kStoreFormat = 1;
 
 namespace {
 
@@ -900,8 +903,9 @@ int main(int argc, char** argv) {
             max_sessions ? (double)(fr0 - fr1) / 1048576.0 / max_sessions : 0.0, fr1 / 1048576.0);
   }
   // HIVE_SESSION_STORE=<dir> (unset or empty = off: nothing is written or read, responses and logs unchanged) · HIVE_SESSION_STORE_GB (default
-  //   64) = disk budget, oldest entries dropped first. The layout key = this daemon + its build + the checkpoint's config.json + the shape of
-  //   an image (buffer counts, layer keys) of a fresh sequence: a store written by another build or model is never read (it ages out instead).
+  //   64) = disk budget, oldest entries dropped first. The layout key = this daemon + kStoreFormat + the checkpoint's config.json + the shape
+  //   of an image (buffer counts, layer keys) of a fresh sequence: a store written for another model or layout is never read. The build is
+  //   not in the key — a rebuild resumes the store once its canary agrees (store_canary, before ready).
   //   Set up here and, when the daemon starts asleep, at the first wake (the shape needs a sequence from the pool).
   const std::string store_root = getenv("HIVE_SESSION_STORE") && strcmp(getenv("HIVE_SESSION_STORE"), "0") != 0 ? getenv("HIVE_SESSION_STORE") : "";  // "" / "0" = off
   const double store_gb = getenv("HIVE_SESSION_STORE_GB") && *getenv("HIVE_SESSION_STORE_GB") ? std::max(0.000001, atof(getenv("HIVE_SESSION_STORE_GB"))) : 64.0;
@@ -914,14 +918,9 @@ int main(int argc, char** argv) {
     probe.fields(shape);
     std::string cfg;
     if (FILE* f = fopen((ckpt + "/config.json").c_str(), "rb")) { char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) cfg.append(b, n); fclose(f); }
-#ifdef HIVE_BUILD_ID
-    const std::string build = HIVE_BUILD_ID;
-#else
-    const std::string build = "unversioned";
-#endif
     std::string daemon = argv[0];
     if (auto sl = daemon.rfind('/'); sl != std::string::npos) daemon = daemon.substr(sl + 1);
-    const std::string id = build + "\n" + cfg + "\n" + shape.s;
+    const std::string id = "store-format " + std::to_string(kStoreFormat) + "\n" + cfg + "\n" + shape.s;
     const std::string key = daemon + "-" + hive::store::hex16(hive::store::hash_bytes(reinterpret_cast<const uint8_t*>(id.data()), id.size()));
     try {
       sstore = std::make_unique<hive::store::SessionStore<SeqImage>>(store_root, key, (size_t)(store_gb * 1073741824.0));
@@ -935,6 +934,101 @@ int main(int argc, char** argv) {
             st["ckpts"].get<size_t>(), st["snaps"].get<size_t>(), st["bytes"].get<size_t>() / 1073741824.0, store_gb);
   };
   store_init();
+  // The store's canary — whether this build reads the images in the store the way the build that wrote them meant (the layout key no longer
+  //   names the build). Once per process, on a pooled sequence, before the first request (before ready; at the first wake when started
+  //   asleep): a fixed token sequence (a block of 64 ordinary tokens repeated — its continuation is predictable, so the logits are peaked)
+  //   of HIVE_STORE_CANARY_TOKENS (default 2048, at most half the context) and HIVE_STORE_CANARY_TAIL (16) more. Runs of one build are not
+  //   bit-identical (CPU-computed experts are fp32, the DMA/CPU split follows timing): measured 2026-10-19 on DeepSeek, two starts of the same
+  //   build differed by relative L2 0.18 on random-token logits, so a fixed tolerance dropped a compatible store. The noise is therefore
+  //   measured here: the prompt is prefilled twice, and the stored canary must agree with this run as closely as the two runs agree with
+  //   each other — the same argmax and KL(this run || stored) ≤ HIVE_STORE_CANARY_TOL (default 4) × this run's KL between its two
+  //   prefills (clamped to 1e-3 … 0.25 nats), for the prompt logits and for the tail run from the resumed stored image (a changed image layout breaks the
+  //   resumed tail, changed numerics the prompt logits). A failure drops the whole directory (and writes this build's canary), as does a
+  //   directory with entries but no canary; without a canary the directory is new and this build's canary is written. HIVE_STORE_CANARY=0
+  //   = no check (the store is trusted as is). A fake head has no logits: only the resume itself is checked.
+  bool canary_done = false;
+  auto store_canary = [&] {
+    if (canary_done || !sstore || seq_pool.empty()) return;
+    canary_done = true;
+    if (getenv("HIVE_STORE_CANARY") && strcmp(getenv("HIVE_STORE_CANARY"), "0") == 0) return;
+    const double t0 = now_ms();
+    const int64_t P = std::max<int64_t>(16, std::min<int64_t>(getenv("HIVE_STORE_CANARY_TOKENS") ? atoll(getenv("HIVE_STORE_CANARY_TOKENS")) : 2048, max_ctx / 2));
+    const int64_t Q = std::max<int64_t>(1, std::min<int64_t>(getenv("HIVE_STORE_CANARY_TAIL") ? atoll(getenv("HIVE_STORE_CANARY_TAIL")) : 16, max_chunk));
+    const double scale = getenv("HIVE_STORE_CANARY_TOL") ? atof(getenv("HIVE_STORE_CANARY_TOL")) : 4.0;
+    std::vector<int32_t> ids((size_t)(P + Q));
+    const int64_t lo = std::min<int64_t>(1000, c.vocab / 4), span = std::max<int64_t>(1, c.vocab / 2);  // ordinary tokens, no specials
+    uint64_t x = 0x243F6A8885A308D3ull;
+    for (size_t k = 0; k < ids.size(); ++k) {
+      if (k < 64) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ids[k] = (int32_t)(lo + (int64_t)(x % (uint64_t)span)); }
+      else ids[k] = ids[k - 64];
+    }
+    Seq& sq = *seq_pool.back();
+    ForwardStats fs{};
+    auto run = [&](int64_t from, int64_t to, std::vector<float>& lg) {
+      for (int64_t i = from; i < to;) {
+        const int m = (int)std::min<int64_t>(to - i, max_chunk);
+        rt.forward(sq, ids.data() + i, m, nullptr, &lg, &fs, true);
+        i += m;
+      }
+    };
+    // KL(a || b) of the two softmax distributions (nats); INFINITY when the argmax differs or the sizes do — 0 for two empty vectors
+    auto kl = [](const std::vector<float>& a, const std::vector<float>& b) -> double {
+      if (a.size() != b.size()) return INFINITY;
+      if (a.empty()) return 0.0;
+      if (std::max_element(a.begin(), a.end()) - a.begin() != std::max_element(b.begin(), b.end()) - b.begin()) return INFINITY;
+      const double ma = *std::max_element(a.begin(), a.end()), mb = *std::max_element(b.begin(), b.end());
+      double za = 0, zb = 0;
+      for (size_t k = 0; k < a.size(); ++k) { za += std::exp((double)a[k] - ma); zb += std::exp((double)b[k] - mb); }
+      const double la = std::log(za) + ma, lb = std::log(zb) + mb;
+      double d = 0;
+      for (size_t k = 0; k < a.size(); ++k) { const double pa = std::exp((double)a[k] - la); if (pa > 0) d += pa * (((double)a[k] - la) - ((double)b[k] - lb)); }
+      return std::max(0.0, d);
+    };
+    std::vector<float> lg_prompt, lg_tail, lg_prompt2, lg_tail2, lg_tail_old;
+    rt.reset_seq(sq);
+    run(0, P, lg_prompt);
+    auto img = std::make_shared<SeqImage>();
+    rt.save_image(sq, *img);
+    img->wait_ready();
+    run(P, P + Q, lg_tail);
+    rt.reset_seq(sq);  // the second run: this build's own noise
+    run(0, P, lg_prompt2);
+    run(P, P + Q, lg_tail2);
+    // this run's noise, between 1e-3 and 0.25 nats (two prefills that disagree on the argmax would otherwise make the check vacuous)
+    const double n_prompt = std::clamp(kl(lg_prompt, lg_prompt2), 1e-3, 0.25), n_tail = std::clamp(kl(lg_tail, lg_tail2), 1e-3, 0.25);
+    const size_t had = sstore->entries();
+    std::string verdict;
+    double k_prompt = -1, k_tail = -1;
+    if (sstore->has_canary()) {
+      auto L = sstore->load_canary();
+      const bool same_tokens = L && L->image && L->image->pos == P && L->image->tokens.size() == (size_t)P && std::equal(L->image->tokens.begin(), L->image->tokens.end(), ids.begin());
+      if (same_tokens) {
+        rt.reset_seq(sq);
+        rt.load_image(sq, *L->image);
+        run(P, P + Q, lg_tail_old);
+        k_prompt = kl(lg_prompt, L->logits);
+        k_tail = kl(lg_tail, lg_tail_old);
+      }
+      if (same_tokens && k_prompt <= scale * n_prompt && k_tail <= scale * n_tail) verdict = "kept";
+      else {
+        const size_t n = sstore->clear(true);
+        sstore->put_canary(img, lg_prompt);
+        verdict = same_tokens ? "differs — " + std::to_string(n) + " entries of an incompatible build dropped"
+                              : "unreadable or another canary — " + std::to_string(n) + " entries dropped";
+      }
+    } else if (had) {
+      const size_t n = sstore->clear(true);
+      sstore->put_canary(img, lg_prompt);
+      verdict = "missing — " + std::to_string(n) + " unverifiable entries dropped";
+    } else {
+      sstore->put_canary(img, lg_prompt);
+      verdict = "written (new store)";
+    }
+    if constexpr (RtHasTrimSeq<std::remove_reference_t<decltype(rt)>, Seq>) rt_trim_seq(rt, sq);
+    rt.reset_seq(sq);
+    fprintf(stderr, "[hived] session store canary: %lld+%lld tokens · KL vs stored: prompt %.2e · resumed tail %.2e · this run's noise %.2e / %.2e "
+            "(keep ≤ %.3g×) · %s · %.0f ms\n", (long long)P, (long long)Q, k_prompt, k_tail, n_prompt, n_tail, scale, verdict.c_str(), now_ms() - t0);
+  };
   if (cache_fit && !start_asleep) {  // HIVE_CACHE_FIT: slot region (one contiguous block) from the headroom after the session pool -> warm start
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
@@ -984,6 +1078,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[hived] VRAM limit: ballast %.0f MiB returned to the card · headroom %.0f MiB inside the limit kept as the reserve for runtime allocations "
             "(held for the process lifetime) — device VRAM free %.0f MiB\n", ballast / 1048576.0, kept / 1048576.0, fr2 / 1048576.0);
   }
+  if (!start_asleep) store_canary();  // before ready: no request may resume a stored image this build has not checked
   // ready only after the session pool is reserved — launchers treat this line as startup complete (a pool OOM must not happen after ready)
   fprintf(stderr, "[hived] ready in %.1fs · layers %d · ctx %lld · chunk %d · dspark %s(block %d · conf ≥ %.2f · max %d)\n", (now_ms() - t_load) / 1000.0, nl,
           (long long)max_ctx, max_chunk, rt.mtp_enabled() ? "on" : "off", mtp_B, mtp_conf, mtp_max);
@@ -1011,6 +1106,7 @@ int main(int argc, char** argv) {
   json vmm_info = json::object();  // level 3 (VMM release) report — released bytes, shadow copies, time, errors
   json vram_json = json::object(), host_mem_json = json::object();
   double vram_ms = -1e18;
+  int vram_power = -1;  // the power state of the last device query — a new state queries again (publish_stats)
   auto power_name = [](int p) { return p == kPowerDraining ? "draining" : p == kPowerSleeping ? "sleeping" : p == kPowerWaking ? "waking" : "ready"; };
   // Mutable engine state never crosses threads. Stats readers only copy this snapshot.
   std::mutex stats_mu;
@@ -1042,7 +1138,10 @@ int main(int argc, char** argv) {
     if (sstore) s["session_store"] = sstore->stats();
     s["state"] = power_name(power.load());  // sleep/wake state
     s["max_ctx"] = max_ctx;  // the server uses it to reject over-window requests with 400 before the stream starts
-    if (power.load() != kPowerReady || last_stats - vram_ms >= 1000.0) {  // even on forced publishes (request end, every chunk) query the device at most once per second (every time during transitions)
+    // even on forced publishes (request end, every chunk) query the device at most once per second (every time during transitions, and once
+    //   more on the publish that ends one: measured 2026-10-19, a wake's last publish came < 1 s after its previous query, so /health showed
+    //   the mid-wake reserve (672 MiB, really 2,432) until the idle loop's next sweep — seconds to minutes)
+    if (power.load() != kPowerReady || last_stats - vram_ms >= 1000.0 || vram_power != power.load()) {
       size_t fr = 0, tot = 0;
       cudaMemGetInfo(&fr, &tot);
       const size_t held = vram_reserve::held();
@@ -1058,6 +1157,7 @@ int main(int argc, char** argv) {
       host_mem_json["experts_pinned_mib"] = store.experts_host_bytes() / 1048576.0;
       host_mem_json["engram_mib"] = store.engram_host_bytes() / 1048576.0;
       vram_ms = last_stats;
+      vram_power = power.load();
     }
     s["vram"] = vram_json;
     s["host_memory"] = host_mem_json;
@@ -1634,7 +1734,8 @@ int main(int argc, char** argv) {
       //   its tail mode with the upper layers on (the next chunk is not a tail-mode chunk), so the snapshot there is complete. It is
       //   where the next turn of the conversation continues (that turn renders this answer without its reasoning) — cut it for free.
       //   Taken only when no other boundary is cut in this chunk; a conversation boundary cut first leaves this one to the next chunk.
-      if (ids.size() - h <= 16) { gen_cut = h; continue; }
+      //   With several (the end of the last message and the reasoning-marker point), the earliest is cut here and the next chunk cuts the next.
+      if (ids.size() - h <= 16) { if (!gen_cut) gen_cut = h; continue; }
       if (!have_nat) { nat = plan_cost((size_t)M, i + (size_t)M, cap); have_nat = true; }
       const auto cut = plan_cost(h - i, h, cap);
       if (cut[0] <= nat[0] && cut[1] <= nat[1] && cut[2] >= nat[2]) free_cut = h;
@@ -1904,6 +2005,16 @@ int main(int argc, char** argv) {
       const size_t k = lcp(S->live->tokens);
       if (k == (size_t)S->live->pos && ids.size() > k) { common = k; pick = 3; }
     }
+    // A rewinding family resumes an archived last state the request shares only a prefix of, and cuts it back after the load (as the live
+    //   state above). Measured 2026-10-19 (Gemma, two voice conversations taking turns): a session moved to a host image by the KV reclaim
+    //   came back with 1,468 of its 1,488 tokens shared (the previous answer re-rendered) and was read from the shared head instead (684).
+    size_t archived_rw = 0;
+    if constexpr (RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) {
+      if (pick == 0 && (!has_images || image_ckpt) && S->live && !ids.empty()) {
+        const size_t k = std::min(lcp(S->live->tokens), ids.size() - 1);
+        if (k > common && k < (size_t)S->live->pos && images_match(S->live_sig, k)) { common = k; pick = 3; archived_rw = k; }
+      }
+    }
     // An auxiliary session of a conversation ("<sid>~next" = the server's read-ahead of the next turn, "<sid>~k" = a concurrent request slot)
     //   also continues from the conversation's own prompt checkpoints. Measured 2026-10-16 (DeepSeek, a chat client): a turn's first prompt ends
     //   "<｜Assistant｜><think>" and the next turn renders that step as "<｜Assistant｜><think></think>…" (GLM the same), so the prompt checkpoint
@@ -1946,6 +2057,7 @@ int main(int argc, char** argv) {
     if (pick == 0 || pick == 2 || pick == 3) {
       if (pick == 0) { rt.reset_seq(*S->seq); S->img_sig.clear(); }
       else { rt.load_image(*S->seq, pick == 2 ? *S->ckpt : *S->live); S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig; }
+      if (archived_rw && !rt_rewind(rt, *S->seq, archived_rw)) { rt.reset_seq(*S->seq); S->img_sig.clear(); common = 0; pick = 0; }  // its window is gone
       S->tokens.assign(ids.begin(), ids.begin() + common);
     }
     if (pick == 5) {  // the parent conversation's prompt checkpoint (above) — a complete prompt-end state, so also this request's delta base
@@ -1960,7 +2072,7 @@ int main(int argc, char** argv) {
     //   as a lost session (2026-10-14 service log: a 188K conversation re-read after 7 h with no reuse line)
     if (!S->tokens.empty() || live_lcp || session_tokens)
       fprintf(stderr, "[hived] %s: reuse %zu/%zu via %s (session tokens %zu · common with live %zu · with archived %zu)\n", A->sid.c_str(), common,
-              ids.size(), pick == 1 ? (rewound ? "live (rewound)" : "live") : pick == 2 ? "prompt-ckpt" : pick == 3 ? "archived" : pick == 5 ? "parent-ckpt" : "reset", session_tokens, live_lcp, archived_lcp);
+              ids.size(), pick == 1 ? (rewound ? "live (rewound)" : "live") : pick == 2 ? "prompt-ckpt" : pick == 3 ? (archived_rw ? "archived (rewound)" : "archived") : pick == 5 ? "parent-ckpt" : "reset", session_tokens, live_lcp, archived_lcp);
     S->last_used = now_ms();
     A->cancel = A->r.cancel.get();
     // Images: metadata + bin (concatenated bf16 patches). A span must fit entirely in one prefill chunk (chunk boundaries are cut before the span).
@@ -3475,6 +3587,7 @@ int main(int argc, char** argv) {
     // serving again: runtime allocations draw from the reserve (wake itself took back what sleep gave the card) · resume also takes back the
     //   room of the counted buffers sleep freed (the vision encoder) — without it each sleep with the encoder loaded shrank the reserve for good
     if (g_vram_limit_armed) vram_reserve::resume();
+    store_canary();  // started asleep: the first wake checks the store before the first request (later wakes: done already)
     fprintf(stderr, "[hived] wake: %.0f ms (alloc %.0f · warm %.0f) · slots %d (before sleep %d) · warmed %d/%zu experts · VRAM used %.0f MiB · level %d%s\n", t2 - t0,
             t1 - t0, t2 - t1, n, store.sleep_phys_slots(), warmed, sleep_keys.size(), vram_used_mib(tot, fr), level_was,
             vmm_restored ? (" · dense/work " + std::to_string((long long)vmm_mib) + " MiB back in " + std::to_string((long long)vmm_ms) + " ms").c_str() : "");

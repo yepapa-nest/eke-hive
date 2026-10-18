@@ -140,7 +140,7 @@ struct GemmaEngine::Impl {
   size_t host_limit = 0, host_used = 0;
   int n_pages_s = 0, n_pages_f = 0;
   int64_t max_ctx = 0;
-  int swa_keep = 2048;
+  int swa_keep = 768;
   // work
   int max_rows = 0, max_batch = 0;
   DevBuf x, hbuf, qraw, kraw, vraw, qb, kb, vb, ob, yb, gb, ub, act, deq, ws, hn;
@@ -369,8 +369,10 @@ struct GemmaEngine::Impl {
   //   for bit (gemma_kernels.h), so a row's result does not depend on which one ran. Dequantizing every matrix to bf16 for cuBLAS cost
   //   ~45 ms for a 20-token prompt and 66-75 ms for the ~70-row turn tails of a long conversation (measured 2026-10-18 in the service
   //   log); the GEMV in passes of 32 rows was bounded by re-reading the activations (92 µs for q + k + v + o + down of a layer at 32 rows,
-  //   ~15 µs of weight bytes). HIVE_GEMMA_GEMV_ROWS (default 192): longer forwards dequantize for cuBLAS (the GEMM is faster up to ~200
+  //   ~15 µs of weight bytes). HIVE_GEMMA_GEMV_ROWS (default 192): longer forwards dequantize for cuBLAS (the GEMM was faster up to ~200
   //   rows — 192 rows 659 µs a layer against 716 — and slower at 256: 895 against 759, cold L2, tests/test_gemma_w4.cu 2026-10-18).
+  //   The cluster GEMM (variant 6) is faster up to ~512 rows (256: 702 against 891, 512: 1,350 against 1,407, 2026-10-19); the default
+  //   stays 192 until a served A/B of the 193–512-row forwards (which would then match the GEMV's bits instead of cuBLAS's).
   int gemv_rows = 192;
   void linear(const W4Mat& W, const bf16* x, int R, bf16* y) {
     if (R <= gemv_rows) {
@@ -714,13 +716,18 @@ GemmaEngine::GemmaEngine(const std::string& ckpt_dir, const std::string& assista
   }
   if (const char* m = getenv("HIVE_GEMMA_KV_MB")) kv = (size_t)(atof(m) * 1048576);
   HIVE_CHECK(kv >= ((size_t)64 << 20), "gemma: no VRAM left for the KV pool under the limit");
-  // full pages: every position of every sequence · sliding pages: at most window + keep per sequence — size the two pools so a context of
-  //   max_ctx fits with its sliding window (the rest of the budget goes to more sequences in the same proportion)
+  // full pages: every position of every sequence · sliding pages: at most window + keep per sequence. The sliding pool holds the windows of
+  //   HIVE_GEMMA_SWA_SEQS (default 4) sequences, as far as the full pool keeps HIVE_GEMMA_FULL_MIN_TOKENS (default 65536) positions; the
+  //   full pool gets the rest. Measured 2026-10-18/19 (13,200 MiB limit): the earlier split sized both for one max_ctx (131,072) context —
+  //   63 sliding pages (10 MiB each: 40 sliding layers) against 2,611 full ones (0.5 MiB) — so the sliding pool held about one voice
+  //   conversation (2-3K tokens take 32-48 sliding pages), two conversations taking turns evicted each other (first token 260-500 ms
+  //   against 30-70) while the full pool stayed mostly empty. Contexts beyond the full pool take host pages (slower, never an OOM).
   const double ps = (double)I.Ls.page_bytes(), pf = (double)I.Lf.page_bytes();
-  const double per_seq_s = std::ceil((double)(c.window + I.swa_keep + kPage) / kPage) + 1, per_seq_f = std::ceil((double)max_ctx / kPage);
-  const double unit = per_seq_s * ps + per_seq_f * pf;
-  const double seqs = kv / unit;   // may be below one sequence's full need: the pool then holds what the budget allows
-  I.n_pages_s = (int)std::max(4.0, std::floor(seqs * per_seq_s));
+  const double per_seq_s = std::ceil((double)(c.window + I.swa_keep + kPage) / kPage) + 1;
+  const double swa_seqs = getenv("HIVE_GEMMA_SWA_SEQS") ? std::max(1.0, atof(getenv("HIVE_GEMMA_SWA_SEQS"))) : 4.0;
+  const double full_min = std::ceil((double)std::min<int64_t>(max_ctx, getenv("HIVE_GEMMA_FULL_MIN_TOKENS") ? std::max(0ll, atoll(getenv("HIVE_GEMMA_FULL_MIN_TOKENS"))) : 65536) / kPage);
+  const double room_s = std::max(0.0, (double)kv - full_min * pf);   // what the sliding pool may take
+  I.n_pages_s = (int)std::max(4.0, std::floor(std::min(swa_seqs * per_seq_s, room_s / ps)));
   I.n_pages_f = (int)std::max(4.0, std::floor((kv - I.n_pages_s * ps) / pf));
   I.pool_s.alloc((size_t)I.n_pages_s * I.Ls.page_bytes());
   I.pool_f.alloc((size_t)I.n_pages_f * I.Lf.page_bytes());

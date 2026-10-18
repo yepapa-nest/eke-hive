@@ -51,10 +51,13 @@ inline size_t w4_ws_bytes(const W4Mat&, int) { return 0; }   // the K split is s
 
 // Prefill GEMM, any M ≥ 1 (used above 16 rows): the GEMV's math row for row and bit for bit (same K split, same order) with the tokens'
 //   activations staged in shared memory — a row's result equals w4_gemv / w4_gemv_multi / w4_gemv_gu at any M. Needs N a multiple of
-//   64 (w4_gemm_fits; gate / up: N a multiple of 32).
+//   64 (w4_gemm_fits; gate / up: N a multiple of 32). The default runs a thread-block cluster per 128 rows (the K split across its
+//   blocks) when every N is a multiple of 128 (gate / up: 64), else the former kernel.
 bool w4_gemm_fits(const W4Mat& W);
 void w4_gemm_multi(const W4Multi& J, const bf16* x, int ldx, int M, cudaStream_t st);
 void w4_gemm_gu(const W4Mat& G, const W4Mat& U, const bf16* x, int ldx, int M, bf16* act, int lda, cudaStream_t st);
+// tests / benchmarks: force prefill GEMM variant v (0 … 8, as HIVE_GEMMA_GEMM_V), -1 = the default, other = back to HIVE_GEMMA_GEMM_V
+void w4_gemm_set_variant(int v);
 
 // Prefill: the weight as bf16 [N, K] (bf16((nibble - 8) · s) — rounded once), for a cuBLAS GEMM with fp32 accumulation.
 void w4_dequant(const W4Mat& W, bf16* out, cudaStream_t st);

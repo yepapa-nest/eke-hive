@@ -62,9 +62,16 @@ __global__ void flush_read(const uint4* p, size_t n, unsigned* sink) {
   if (a == 0x12345678u) *sink = a;
 }
 
+// one flush buffer for every cold_us instantiation (a static inside the template was one 512 MiB buffer per lambda type, never freed)
+static DevBuf& flush_buf() {
+  static DevBuf flush((size_t)(getenv("HIVE_W4_FLUSH_MB") ? atoi(getenv("HIVE_W4_FLUSH_MB")) : 512) << 20);
+  return flush;
+}
+
 template <class F>
 static double cold_us(F&& fn, int R = 30) {
-  static DevBuf flush((size_t)(getenv("HIVE_W4_FLUSH_MB") ? atoi(getenv("HIVE_W4_FLUSH_MB")) : 512) << 20), sink(64);
+  static DevBuf sink(64);
+  DevBuf& flush = flush_buf();
   cudaEvent_t a, b;
   cudaEventCreate(&a); cudaEventCreate(&b);
   std::vector<float> t;
@@ -177,48 +184,60 @@ int main() {
     all &= check(memcmp(a.data(), b.data(), a.size() * 4) == 0, "w4_gemv_multi (3 matrices) == 3 w4_gemv calls (bit exact)");
   }
   // prefill GEMM == GEMV bit for bit (rows of any count; the GEMV runs in passes of kGemvRows), plain / three matrices / gate + up
+  //   for every variant (HIVE_GEMMA_GEMM_V 0 … 6, and the default); N multiples of 256 so the cluster variants run themselves
+  const int kVariants = 9;
   for (int split : {1, 3, 8}) {
-    const int K = 1024, MM = 70;
-    HostMat ha = make(256, K, rng), hb = make(128, K, rng), hc = make(128, K, rng);
-    DevMat da(ha), db(hb), dc(hc);
-    da.W.split = db.W.split = dc.W.split = split;
+    const int K = 1024, MM = 200, NA = 512, NB = 256, NC = 256, NY = NA + NB + NC;
+    HostMat ha = make(NA, K, rng), hb = make(NB, K, rng), hc = make(NC, K, rng), hu = make(NA, K, rng);
+    DevMat da(ha), db(hb), dc(hc), du(hu);
+    da.W.split = db.W.split = dc.W.split = du.W.split = split;
     std::vector<uint16_t> xh((size_t)MM * K);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : xh) v = tf2bf(nd(rng));
-    DevBuf x((size_t)MM * K * 2), y1((size_t)MM * 512 * 4), y2((size_t)MM * 512 * 4), a1((size_t)MM * 256 * 2), a2((size_t)MM * 256 * 2);
+    DevBuf x((size_t)MM * K * 2), y1((size_t)MM * NY * 4), y2((size_t)MM * NY * 4), a1((size_t)MM * NA * 2), a2((size_t)MM * NA * 2);
     cudaMemcpy(x.p, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice);
-    bool same = true, same_gu = true;
-    for (int M : {1, 5, 16, 17, 31, 32, 33, 48, 70}) {
-      W4Multi J;
-      J.n = 3; J.W[0] = da.W; J.W[1] = db.W; J.W[2] = dc.W;
-      J.yf[0] = y1.as<float>(); J.yf[1] = y1.as<float>() + 256; J.yf[2] = y1.as<float>() + 384;
-      J.ldy[0] = J.ldy[1] = J.ldy[2] = 512;
-      cudaMemset(y1.p, 0, y1.n); cudaMemset(y2.p, 0xFF, y2.n);
-      for (int r0 = 0; r0 < M; r0 += kGemvRows) {
-        W4Multi P = J;
-        for (int i = 0; i < 3; ++i) P.yf[i] = J.yf[i] + (size_t)r0 * 512;
-        w4_gemv_multi(P, x.as<bf16>() + (size_t)r0 * K, K, std::min(kGemvRows, M - r0), st);
+    std::string bad, bad_gu;
+    for (int v = -1; v < kVariants; ++v) {
+      w4_gemm_set_variant(v);
+      bool same = true, same_gu = true;
+      for (int M : {1, 5, 16, 17, 31, 32, 33, 48, 70, 79, 80, 81, 128, 150, 192, 200}) {
+        W4Multi J;
+        J.n = 3; J.W[0] = da.W; J.W[1] = db.W; J.W[2] = dc.W;
+        J.yf[0] = y1.as<float>(); J.yf[1] = y1.as<float>() + NA; J.yf[2] = y1.as<float>() + NA + NB;
+        J.ldy[0] = J.ldy[1] = J.ldy[2] = NY;
+        cudaMemset(y1.p, 0, y1.n); cudaMemset(y2.p, 0xFF, y2.n);
+        for (int r0 = 0; r0 < M; r0 += kGemvRows) {
+          W4Multi P = J;
+          for (int i = 0; i < 3; ++i) P.yf[i] = J.yf[i] + (size_t)r0 * NY;
+          w4_gemv_multi(P, x.as<bf16>() + (size_t)r0 * K, K, std::min(kGemvRows, M - r0), st);
+        }
+        W4Multi Q = J;
+        for (int i = 0; i < 3; ++i) Q.yf[i] = J.yf[i] - y1.as<float>() + y2.as<float>();
+        w4_gemm_multi(Q, x.as<bf16>(), K, M, st);
+        std::vector<float> ra((size_t)M * NY), rb((size_t)M * NY);
+        cudaMemcpy(ra.data(), y1.p, ra.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(rb.data(), y2.p, rb.size() * 4, cudaMemcpyDeviceToHost);
+        same &= memcmp(ra.data(), rb.data(), ra.size() * 4) == 0;
+        cudaMemset(a2.p, 0xFF, a2.n);
+        for (int r0 = 0; r0 < M; r0 += kGemvRows)
+          w4_gemv_gu(da.W, du.W, x.as<bf16>() + (size_t)r0 * K, K, std::min(kGemvRows, M - r0), a1.as<bf16>() + (size_t)r0 * NA, NA, nullptr, st);
+        w4_gemm_gu(da.W, du.W, x.as<bf16>(), K, M, a2.as<bf16>(), NA, st);
+        std::vector<uint16_t> ga((size_t)M * NA), gb((size_t)M * NA);
+        cudaMemcpy(ga.data(), a1.p, ga.size() * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(gb.data(), a2.p, gb.size() * 2, cudaMemcpyDeviceToHost);
+        same_gu &= memcmp(ga.data(), gb.data(), ga.size() * 2) == 0;
       }
-      W4Multi Q = J;
-      for (int i = 0; i < 3; ++i) Q.yf[i] = J.yf[i] - y1.as<float>() + y2.as<float>();
-      w4_gemm_multi(Q, x.as<bf16>(), K, M, st);
-      std::vector<float> ra((size_t)M * 512), rb((size_t)M * 512);
-      cudaMemcpy(ra.data(), y1.p, ra.size() * 4, cudaMemcpyDeviceToHost);
-      cudaMemcpy(rb.data(), y2.p, rb.size() * 4, cudaMemcpyDeviceToHost);
-      same &= memcmp(ra.data(), rb.data(), ra.size() * 4) == 0;
-      for (int r0 = 0; r0 < M; r0 += kGemvRows)
-        w4_gemv_gu(da.W, da.W, x.as<bf16>() + (size_t)r0 * K, K, std::min(kGemvRows, M - r0), a1.as<bf16>() + (size_t)r0 * 256, 256, nullptr, st);
-      w4_gemm_gu(da.W, da.W, x.as<bf16>(), K, M, a2.as<bf16>(), 256, st);
-      std::vector<uint16_t> ga((size_t)M * 256), gb((size_t)M * 256);
-      cudaMemcpy(ga.data(), a1.p, ga.size() * 2, cudaMemcpyDeviceToHost);
-      cudaMemcpy(gb.data(), a2.p, gb.size() * 2, cudaMemcpyDeviceToHost);
-      same_gu &= memcmp(ga.data(), gb.data(), ga.size() * 2) == 0;
+      if (!same) bad += " " + std::to_string(v);
+      if (!same_gu) bad_gu += " " + std::to_string(v);
     }
-    char b[160];
-    snprintf(b, sizeof b, "w4_gemm_multi (3 matrices) == w4_gemv_multi passes, bit for bit, M = 1 … 70 (split %d)", split);
-    all &= check(same, b);
-    snprintf(b, sizeof b, "w4_gemm_gu == w4_gemv_gu passes, bit for bit, M = 1 … 70 (split %d)", split);
-    all &= check(same_gu, b);
+    w4_gemm_set_variant(-2);
+    char b[200];
+    snprintf(b, sizeof b, "w4_gemm_multi (3 matrices) == w4_gemv_multi passes, bit for bit, M = 1 … 200, variants -1 … 8 (split %d)%s%s", split,
+             bad.empty() ? "" : " — differ:", bad.c_str());
+    all &= check(bad.empty(), b);
+    snprintf(b, sizeof b, "w4_gemm_gu == w4_gemv_gu passes, bit for bit, M = 1 … 200, variants -1 … 8 (split %d)%s%s", split,
+             bad_gu.empty() ? "" : " — differ:", bad_gu.c_str());
+    all &= check(bad_gu.empty(), b);
   }
   // the same at the model's shapes (K 3840 / 4096 / 15360, the engine's splits) and row counts of a turn tail
   {
@@ -235,21 +254,27 @@ int main() {
       cudaMemcpy(x.p, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice);
       bool same = true;
       for (int M : {17, 21, 70, 81, 150}) {
-        cudaMemset(y1.p, 0, y1.n); cudaMemset(y2.p, 0xFF, y2.n);
+        cudaMemset(y1.p, 0, y1.n);
         for (int r0 = 0; r0 < M; r0 += kGemvRows)
           w4_gemv(d.W, x.as<bf16>() + (size_t)r0 * sh.K, sh.K, std::min(kGemvRows, M - r0), y1.as<bf16>() + (size_t)r0 * sh.N, nullptr, sh.N, nullptr, st);
-        W4Multi J; J.n = 1; J.W[0] = d.W; J.yb[0] = y2.as<bf16>(); J.ldy[0] = sh.N;
-        w4_gemm_multi(J, x.as<bf16>(), sh.K, M, st);
         std::vector<uint16_t> a((size_t)M * sh.N), bb((size_t)M * sh.N);
         cudaMemcpy(a.data(), y1.p, a.size() * 2, cudaMemcpyDeviceToHost);
-        cudaMemcpy(bb.data(), y2.p, bb.size() * 2, cudaMemcpyDeviceToHost);
-        long diff = 0;
-        for (size_t i = 0; i < a.size(); ++i) diff += a[i] != bb[i];
-        if (diff) printf("    %s M %d: %ld of %zu outputs differ\n", sh.name, M, diff, a.size());
-        same &= diff == 0;
+        for (int v = -1; v < kVariants; ++v) {
+          w4_gemm_set_variant(v);
+          cudaMemset(y2.p, 0xFF, y2.n);
+          W4Multi J; J.n = 1; J.W[0] = d.W; J.yb[0] = y2.as<bf16>(); J.ldy[0] = sh.N;
+          w4_gemm_multi(J, x.as<bf16>(), sh.K, M, st);
+          cudaMemcpy(bb.data(), y2.p, bb.size() * 2, cudaMemcpyDeviceToHost);
+          long diff = 0;
+          for (size_t i = 0; i < a.size(); ++i) diff += a[i] != bb[i];
+          if (diff) printf("    %s M %d variant %d: %ld of %zu outputs differ\n", sh.name, M, v, diff, a.size());
+          same &= diff == 0;
+        }
+        w4_gemm_set_variant(-2);
       }
       char b[160];
-      snprintf(b, sizeof b, "w4_gemm == w4_gemv passes at %s (N %d K %d split %d), M = 17, 21, 70, 81, 150", sh.name, sh.N, sh.K, d.W.split);
+      snprintf(b, sizeof b, "w4_gemm == w4_gemv passes at %s (N %d K %d split %d), M = 17, 21, 70, 81, 150, variants -1 … 8", sh.name, sh.N, sh.K,
+               d.W.split);
       all &= check(same, b);
     }
     HostMat hg = make(15360, 3840, rng), hu = make(15360, 3840, rng);
@@ -264,16 +289,109 @@ int main() {
     for (int M : {17, 21, 70, 81, 150}) {
       for (int r0 = 0; r0 < M; r0 += kGemvRows)
         w4_gemv_gu(dg.W, du.W, x.as<bf16>() + (size_t)r0 * 3840, 3840, std::min(kGemvRows, M - r0), a1.as<bf16>() + (size_t)r0 * 15360, 15360, nullptr, st);
-      w4_gemm_gu(dg.W, du.W, x.as<bf16>(), 3840, M, a2.as<bf16>(), 15360, st);
       std::vector<uint16_t> a((size_t)M * 15360), bb((size_t)M * 15360);
       cudaMemcpy(a.data(), a1.p, a.size() * 2, cudaMemcpyDeviceToHost);
-      cudaMemcpy(bb.data(), a2.p, bb.size() * 2, cudaMemcpyDeviceToHost);
-      long diff = 0;
-      for (size_t i = 0; i < a.size(); ++i) diff += a[i] != bb[i];
-      if (diff) printf("    gate+up M %d: %ld of %zu outputs differ\n", M, diff, a.size());
-      same &= diff == 0;
+      for (int v = -1; v < kVariants; ++v) {
+        w4_gemm_set_variant(v);
+        cudaMemset(a2.p, 0xFF, a2.n);
+        w4_gemm_gu(dg.W, du.W, x.as<bf16>(), 3840, M, a2.as<bf16>(), 15360, st);
+        cudaMemcpy(bb.data(), a2.p, bb.size() * 2, cudaMemcpyDeviceToHost);
+        long diff = 0;
+        for (size_t i = 0; i < a.size(); ++i) diff += a[i] != bb[i];
+        if (diff) printf("    gate+up M %d variant %d: %ld of %zu outputs differ\n", M, v, diff, a.size());
+        same &= diff == 0;
+      }
+      w4_gemm_set_variant(-2);
     }
-    all &= check(same, "w4_gemm_gu == w4_gemv_gu passes at gate / up (N 15360 K 3840), M = 17, 21, 70, 81, 150");
+    all &= check(same, "w4_gemm_gu == w4_gemv_gu passes at gate / up (N 15360 K 3840), M = 17, 21, 70, 81, 150, variants -1 … 8");
+  }
+  // prefill GEMM time of a whole layer (cold L2 before the layer; its matrices in the engine's order, each cold when its turn comes):
+  //   sliding layer q + k + v (one launch), o, gate + up, down; full layer q + k, o (K 8192), gate + up, down. Variants interleaved per
+  //   repetition (the card is shared with served models: back to back, medians). HIVE_W4_LAYER_V: variants to time (default "2 1 6 -1";
+  //   100 = dequant + cuBLAS), HIVE_W4_PARTS=1: the sliding layer's matrices one by one as well.
+  {
+    const char* ve = getenv("HIVE_W4_LAYER_V");
+    std::vector<int> vs;
+    for (const char* q = ve ? ve : "2 1 6 -1"; *q;) { char* e; const long v = strtol(q, &e, 10); if (e == q) break; vs.push_back((int)v); q = e; }
+    const int reps = getenv("HIVE_W4_LAYER_REPS") ? atoi(getenv("HIVE_W4_LAYER_REPS")) : 15;
+    std::vector<int> lms;   // HIVE_W4_LAYER_M: row counts (default "17 40 70 128 192")
+    {
+      const char* me = getenv("HIVE_W4_LAYER_M");
+      for (const char* q = me ? me : "17 40 70 128 192"; *q;) { char* e; const long v = strtol(q, &e, 10); if (e == q) break; lms.push_back((int)v); q = e; }
+    }
+    const int maxm = *std::max_element(lms.begin(), lms.end());
+    HostMat hq = make(4096, 3840, rng), hk = make(2048, 3840, rng), hv = make(2048, 3840, rng), ho = make(3840, 4096, rng);
+    HostMat hqf = make(8192, 3840, rng), hkf = make(512, 3840, rng), hof = make(3840, 8192, rng);
+    HostMat hg = make(15360, 3840, rng), hu = make(15360, 3840, rng), hd = make(3840, 15360, rng);
+    DevMat dq(hq), dk(hk), dv(hv), dO(ho), dqf(hqf), dkf(hkf), dof(hof), dg(hg), du(hu), dd(hd);
+    DevBuf x((size_t)maxm * 15360 * 2), y((size_t)maxm * 15360 * 2);
+    cudaMemset(x.p, 0, x.n);
+    int cur_m = 0;
+    Blas blas(st);
+    DevBuf deq((size_t)15360 * 3840 * 2), y2((size_t)maxm * 15360 * 2);
+    int cur_v = 0;
+    auto lin = [&](const W4Mat& W, bf16* out) {   // the engine's long-forward path: dequantize, cuBLAS
+      w4_dequant(W, deq.as<bf16>(), st);
+      blas.gemm_bf16(x.as<bf16>(), deq.as<bf16>(), out, cur_m, W.N, W.K);
+    };
+    auto layer = [&](bool full, int M, int part = -1) {   // part 0 … 3: that matrix alone
+      cur_m = M;
+      if (cur_v == 100) {   // "variant" 100: dequant + cuBLAS per matrix (gate and up separately; without the engine's gelu_mul pass)
+        if (part < 0 || part == 0) { lin(full ? dqf.W : dq.W, y.as<bf16>()); lin(full ? dkf.W : dk.W, y.as<bf16>()); if (!full) lin(dv.W, y.as<bf16>()); }
+        if (part < 0 || part == 1) lin(full ? dof.W : dO.W, y.as<bf16>());
+        if (part < 0 || part == 2) { lin(dg.W, y.as<bf16>()); lin(du.W, y2.as<bf16>()); }
+        if (part < 0 || part == 3) lin(dd.W, y.as<bf16>());
+        return;
+      }
+      W4Multi J;
+      J.n = full ? 2 : 3;
+      J.W[0] = full ? dqf.W : dq.W; J.W[1] = full ? dkf.W : dk.W; J.W[2] = dv.W;
+      for (int i = 0; i < 3; ++i) { J.yb[i] = y.as<bf16>(); J.ldy[i] = 8192; }
+      if (part < 0 || part == 0) w4_gemm_multi(J, x.as<bf16>(), 3840, M, st);
+      W4Multi O; O.n = 1; O.W[0] = full ? dof.W : dO.W; O.yb[0] = y.as<bf16>(); O.ldy[0] = 3840;
+      if (part < 0 || part == 1) w4_gemm_multi(O, x.as<bf16>(), O.W[0].K, M, st);
+      if (part < 0 || part == 2) w4_gemm_gu(dg.W, du.W, x.as<bf16>(), 3840, M, y.as<bf16>(), 15360, st);
+      W4Multi D; D.n = 1; D.W[0] = dd.W; D.yb[0] = y.as<bf16>(); D.ldy[0] = 3840;
+      if (part < 0 || part == 3) w4_gemm_multi(D, x.as<bf16>(), 15360, M, st);
+    };
+    printf("  prefill GEMM per layer (cold L2, µs, median of %d)    variant:", reps);
+    for (int v : vs) printf(" %7d", v);
+    printf("\n");
+    for (int full = 0; full < 2; ++full)
+      for (int M : lms) {
+        std::vector<std::vector<double>> t(vs.size());
+        for (int r = 0; r < reps; ++r)
+          for (size_t i = 0; i < vs.size(); ++i) {
+            w4_gemm_set_variant(vs[i]);
+            cur_v = vs[i];
+            t[i].push_back(cold_us([&] { layer(full, M); }, 1));
+          }
+        w4_gemm_set_variant(-2);
+        printf("  %-7s layer M %3d %40s", full ? "full" : "sliding", M, "");
+        for (auto& ti : t) { std::sort(ti.begin(), ti.end()); printf(" %7.1f", ti[ti.size() / 2]); }
+        printf("\n");
+        if (!getenv("HIVE_W4_PARTS") || full) continue;   // HIVE_W4_PARTS=1: the sliding layer's matrices one by one too
+        const char* pn[4] = {"q+k+v", "o", "gate+up", "down"};
+        for (int part = 0; part < 4; ++part) {
+          std::vector<std::vector<double>> tp(vs.size());
+          for (int r = 0; r < reps; ++r)
+            for (size_t i = 0; i < vs.size(); ++i) {
+              w4_gemm_set_variant(vs[i]);
+              cur_v = vs[i];
+              tp[i].push_back(cold_us([&] { layer(false, M, part); }, 1));
+            }
+          w4_gemm_set_variant(-2);
+          printf("    %-10s M %3d %41s", pn[part], M, "");
+          for (auto& ti : tp) { std::sort(ti.begin(), ti.end()); printf(" %7.1f", ti[ti.size() / 2]); }
+          printf("\n");
+        }
+      }
+  }
+  if (getenv("HIVE_W4_QUICK")) {   // the layer times only (skips the per-matrix table and the decode bandwidth lines)
+    const cudaError_t e = cudaGetLastError();
+    all &= check(e == cudaSuccess, cudaGetErrorString(e));
+    printf("%s\n", all ? "ALL PASS" : "FAIL");
+    return all ? 0 : 1;
   }
   // prefill time per call at the model's shapes: GEMV passes of kGemvRows / GEMM / dequant + cuBLAS (the engine's three paths)
   {

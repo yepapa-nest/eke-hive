@@ -140,6 +140,12 @@ ADAPTER_FAMILIES = {"glm5_next": "glm", "qwen4_exp": "qwen", "qwen3_5": "q27", "
 def adapter_family() -> bool:
     """True for a family served through a server/families adapter (GLM, Qwen) rather than DeepSeek's reference encoding."""
     return FAMILY in ADAPTER_FAMILIES
+
+
+def rewinding_family() -> bool:
+    """A family whose daemon rewinds its live KV (families/<x>.REWINDS — Gemma): it continues a request that shares only a prefix of the
+    live state from that state, so it needs no generation-suffix hints (their cuts would only leave snapshots)."""
+    return adapter_family() and bool(getattr(ENC, "REWINDS", False))
 EOS_TEXTS: list = []     # their text forms (stripped from completions)
 
 
@@ -954,6 +960,33 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
                     enc = TOK(done[s0:s0 + 64], return_offsets_mapping=True)
                     first = next((i for i, (a, b) in zip(enc["input_ids"], enc["offset_mapping"]) if b > a), None)  # skip a zero-width BOS
                     if first != ids[-1]:
+                        t -= 1
+                except Exception:
+                    pass
+            if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
+                out.add(t)
+        # Where a request that adds a message without this answer leaves this one: the end of the last message, before the generation
+        #   prompt. Measured 2026-10-18/19 (DeepSeek, chat mode): a background job sent each item twice — the second prompt was the first
+        #   one up to "<｜Assistant｜></think>" plus ~52 tokens of a further user message. The prompt-end checkpoint sat 2 tokens past the
+        #   divergence and a rewind of the live state is impossible (window ring, compressor state), so 54 second requests re-read
+        #   23-44K tokens each (1.63M tokens over three days, 6-10 s apiece). The daemon cuts every generation-suffix hint (each piece
+        #   after one is about one decode step).
+        try:
+            more, media2 = encode_prompt(list(messages) + [{"role": "user", "content": "\x02"}], tools, thinking_mode, effort)
+        except Exception:
+            more, media2 = None, None
+        if more is not None and not media2:
+            c = _common_prefix_len(more, prompt)
+            t = bisect.bisect_right(ends, c)
+            # The last token before that point can merge with what the further message brings (measured 2026-10-19, DeepSeek: a second
+            #   user message is joined to the first with "\n\n", the first one's closing "." merged with it, and the request parted one
+            #   token before the hint) — cut one token earlier when the further rendering tokenizes that place differently.
+            if 2 <= t < len(ids):
+                try:
+                    s0 = ends[t - 2]
+                    enc = TOK(more[s0:s0 + 64], return_offsets_mapping=True)
+                    first = next((i for i, (a, b) in zip(enc["input_ids"], enc["offset_mapping"]) if b > a), None)  # skip a zero-width BOS
+                    if first != ids[t - 1]:
                         t -= 1
                 except Exception:
                     pass
@@ -2058,8 +2091,13 @@ async def chat(request: Request):
                 # A family whose daemon rewinds its live KV (families/<x>.REWINDS) ignores a conversation's later boundaries, so they are not
                 #   computed: the probes re-render the history and grew with it (measured 2026-10-18, Gemma: 4.7 ms at 500 prompt tokens,
                 #   61.5 ms at 3,000 — most of a 60-turn conversation's growing first-token time). First turns keep their system-block hint.
-                rewinds = adapter_family() and bool(getattr(ENC, "REWINDS", False)) and has_turns
-                hints = (boundary_hints(messages, tools, thinking_mode, effort, prompt, ids, ends, gen_cut=bool(has_turns or conv_key or body.get("hive_session_id")))
+                rewinds = rewinding_family() and has_turns
+                # generation-suffix hints for every text request of a family that cannot rewind: a first turn without a conversation key is
+                #   followed by a request of the same session too (the 2026-10-18 background job above — its second prompt continued at the
+                #   end of the last message). A rewinding family continues such a request from its live state, so a first turn keeps only its
+                #   system-block hint (measured 2026-10-19, Gemma 19b: the suffix hints left two snapshots per short first turn — 76 in 20
+                #   minutes, the copies that stalled the engine 2.4 s on 10-18)
+                hints = (boundary_hints(messages, tools, thinking_mode, effort, prompt, ids, ends, gen_cut=not rewinding_family())
                          if env_on("HIVE_PREFIX_SHARE") and not media and not rewinds else [])
                 t4 = time.perf_counter()
             prep_ms.update(lock=round((t1 - t0) * 1000, 1), template=round((t2 - t1) * 1000, 1), tokenize=round((t3 - t2) * 1000, 1), hints=round((t4 - t3) * 1000, 1))

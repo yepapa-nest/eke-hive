@@ -143,6 +143,42 @@ def run(exe, td):
     ck.true('a stale build directory of this daemon is dropped', not stale.exists(), str(list(Path(store).iterdir())))
     ck.true("another daemon's directory stays", foreign.exists(), '')
     kill(h)
+    # 6c. a rebuild (another build id, the same daemon) resumes the store once its canary agrees — 2026-10-18/19: five rebuilds in a day
+    #     each dropped every stored conversation
+    h = t.Hived(exe, td, env, name='st6c')
+    R = t.tokens(600, 1630)
+    h.generate('R', R, 3); wait_writes(h, 1)
+    ck.true('the canary is on disk', store_stats(h).get('canary') is True, json.dumps(store_stats(h)))
+    kill(h)
+    td2 = Path(td) / 'rebuild'; td2.mkdir()
+    src = (t.harness.ROOT / 'engine/src/hived.cpp').read_text()
+    rebuilt = t.build_daemon(str(td2), hived_source='#undef HIVE_BUILD_ID\n#define HIVE_BUILD_ID "rebuilt-for-the-test"\n' + src)
+    h = t.Hived(rebuilt, td, env, name='st6d', build_id='rebuilt-for-the-test')
+    R2 = R + t.tokens(30, 1631)
+    r = h.generate('R', R2, 3)
+    t.done_ok(ck, 'a rebuild resumes the stored conversation', r, R2, 3, len(R))
+    ck.true('canary kept by the rebuild', 'session store canary:' in h.tail(100000) and '· kept ·' in h.tail(100000), h.tail(3000))
+    kill(h)
+    # 6d. a store whose canary is gone cannot be checked: its entries are dropped, a new canary is written
+    for m in Path(store).glob('hived-*/metas/canary-*.json'):
+        m.unlink()
+    h = t.Hived(exe, td, env, name='st6e')
+    ck.true('no canary: the entries are dropped', 'unverifiable entries dropped' in h.tail(100000), h.tail(3000))
+    r = h.generate('R', R2 + t.tokens(20, 1632), 3)
+    t.done_ok(ck, 'after the drop the turn prefills from the start', r, R2 + t.tokens(20, 1632), 3, 0)
+    kill(h)
+    # 6e. a canary this build reads differently (its image damaged: unreadable) drops the store too
+    h = t.Hived(exe, td, env, name='st6f')
+    h.generate('R3', R, 3); wait_writes(h, 1); kill(h)
+    for m in Path(store).glob('hived-*/metas/canary-*.json'):
+        meta = json.loads(m.read_text()); meta['fields'][0] = meta['fields'][0] + 1 if isinstance(meta['fields'][0], int) else meta['fields'][0]
+        m.write_text(json.dumps(meta))
+    h = t.Hived(exe, td, env, name='st6g')
+    log = h.tail(100000)
+    ck.true('a canary that does not match drops the store', 'entries dropped' in log and '· kept ·' not in log, log[-3000:])
+    r = h.generate('R3', R + t.tokens(10, 1633), 3)
+    t.done_ok(ck, 'after a canary mismatch the turn prefills from the start', r, R + t.tokens(10, 1633), 3, 0)
+    kill(h)
     # 7. budget: a tiny budget keeps only the newest entry
     small = {**env, 'HIVE_SESSION_STORE': str(Path(td) / 'store-small'), 'HIVE_SESSION_STORE_GB': '0.000004'}  # ~4 KB
     h = t.Hived(exe, td, small, name='st7')

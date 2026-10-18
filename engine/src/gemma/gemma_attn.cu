@@ -38,10 +38,14 @@
 //     The scratch is a static device array (no allocation per call); a call needing more slots than it holds runs as several launches
 //     over disjoint sequence ranges (the launch count depends only on n_seqs, max_q_per_seq and the layer type, so it is fixed under
 //     CUDA graph capture; nothing in either path reads device data on the host).
-//   · prefill chunks (n_q > 16): no key split; D 256: M = 64, DS = 2, KT = 64; D 512: M = 32, DS = 4, KT = 32 (dynamic smem ≤ 99 KB per
-//     block on sm_120). Row tiles are scheduled latest-first (they have the most keys).
+//   · prefill chunks: sliding sequences of ≤ 48 rows take the split path too; up to 128 rows 16-row tiles (D 256: DS = 8, KT = 64, two
+//     stages; D 512: DS = 8, KT = 64); longer ones no key split; D 256: M = 64, DS = 2, KT = 64; D 512: M = 32, DS = 4, KT = 32 (dynamic
+//     smem ≤ 99 KB per block on sm_120). Each sequence's path follows its own row count (attn_paged). Row tiles are scheduled latest-first.
 //   Q·K^T with one 8-key n-tile per warp accumulates over D / 16 dependent mmas; it is split into NA interleaved accumulators (added
 //   in fixed order) so the tensor pipe is not latency-bound.
+#include <algorithm>
+#include <cstdlib>
+
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -59,7 +63,7 @@ namespace cg = cooperative_groups;
 // decode / verify key split = cluster size, fixed per layer type (never chosen from the batch): sliding layers (8 kv heads) already give
 //   batch × 8 units, full layers (1 kv head) need the wider split (16 = the non-portable cluster maximum on sm_120) to fill the GPU.
 constexpr int kSplitSliding = 8, kSplitFull = 16;
-constexpr int kDecodeMaxQ = 16;   // sequences with n_q ≤ this take the split path
+constexpr int kDecodeMaxQ = 16;   // sequences with n_q ≤ this take the split path (sliding layers: up to HIVE_GEMMA_ATTN_SPLIT_Q, attn_paged)
 constexpr float kLog2e = 1.4426950408889634f;
 
 // Split-K scratch for the decode / verify path: one slot per cluster in flight, statically allocated (no allocation per call, safe under
@@ -76,6 +80,8 @@ struct Args {
   size_t tok;    // bytes between consecutive tokens of a page
   size_t koff;   // byte offset of this layer's K (head 0) inside a token
   size_t voff;   // same for V
+  int q_lo, q_hi;   // this launch serves the sequences with q_lo < n_q ≤ q_hi — chosen from each sequence's own n_q, never from the
+                    //   call, so a sequence's result does not depend on the others in the call
 };
 
 // D head dim · M rows per block · DS warps per row group (P·V column split) · QDS of them compute Q·K^T (key split) · KT keys per tile ·
@@ -151,7 +157,7 @@ __global__ void __launch_bounds__(Cfg<D, M, DS, QDS, KT, ST, SPLIT>::NT, 1) attn
   }
   const AttnSeq sq = a.seqs[seq_i];
   // every block of a cluster shares (sequence, kv head, row tile), so these exits are cluster-uniform
-  if (SPLIT > 1 ? (sq.n_q <= 0 || sq.n_q > kDecodeMaxQ) : sq.n_q <= kDecodeMaxQ) return;
+  if (sq.n_q <= a.q_lo || sq.n_q > a.q_hi) return;
   const int ratio = a.ratio, rows = sq.n_q * ratio, r0 = mtile * M;
   if (r0 >= rows) return;
   const int rlast = min(rows, r0 + M) - 1;
@@ -510,8 +516,26 @@ void attn_paged(const bf16* q, bf16* out, int H, const KvLayout& L, int layer, c
   a.tok = L.token_bytes();
   a.koff = L.k_off(0, layer);
   a.voff = L.v_off(0, layer);
-  const int dq = max_q_per_seq < kDecodeMaxQ ? max_q_per_seq : kDecodeMaxQ;
+  // A short prefill (a conversation turn's tail: ~70 rows) had 24 blocks on the sliding layers and 35 on the full ones — 13-19 % of the
+  //   GPU (nsys, 2026-10-18: 5.1 of a 28.9 ms tail). HIVE_GEMMA_ATTN_SPLIT_Q (default 48) sends sliding-layer sequences of up to that
+  //   many query rows down the key-split path as well (bounded by the split scratch); HIVE_GEMMA_ATTN_SMALL_M (default 128) gives
+  //   sequences of up to that many rows 16-row tiles instead of 64 / 32 (the full layers' split scratch is too small for their 16 query
+  //   heads per kv head). Measured 2026-10-19 (tests/test_gemma_attn.cu, ctx 3000, graph replay): sliding 40 / 70 / 128 rows 46.9 / 49.6 /
+  //   49.6 → 15.8 / 24.2 / 27.6 µs, full 156.5 → 95.4 / 95.5 / 96.4 µs; at 256 rows the wide tiles win again (sliding 49.8 vs 51.2, full
+  //   157.8 vs 214.8). 16 / 0 = the earlier paths.
+  static const int split_q_env = getenv("HIVE_GEMMA_ATTN_SPLIT_Q") ? std::max(kDecodeMaxQ, atoi(getenv("HIVE_GEMMA_ATTN_SPLIT_Q"))) : 48;
+  static const int small_m = getenv("HIVE_GEMMA_ATTN_SMALL_M") ? std::max(0, atoi(getenv("HIVE_GEMMA_ATTN_SMALL_M"))) : 128;
+  int split_q = kDecodeMaxQ;   // the layout's bound alone (one sequence of split_q rows must fit the scratch) — never the call's
+  if (L.D == 256)
+    while (split_q < split_q_env &&
+           (size_t)(((split_q + 1) * a.ratio + 15) / 16) * L.Hkv * Cfg<256, 16, 8, 8, 64, 2, kSplitSliding>::SLOT <= kWsFloats) ++split_q;
+  const int small_q = std::max(small_m, split_q);   // row-tile launches: 16-row tiles for split_q < n_q ≤ small_q, the wide tiles above
+  const int dq = max_q_per_seq < split_q ? max_q_per_seq : split_q;
   const int mt = (dq * a.ratio + 15) / 16;
+  a.q_lo = 0; a.q_hi = split_q;
+  Args sm = a, wide = a;
+  sm.q_lo = split_q; sm.q_hi = small_q;
+  wide.q_lo = small_q; wide.q_hi = 1 << 30;
   // decode / verify path in waves of whole sequences whose scratch slots fit
   auto split_waves = [&](auto launch_fn, size_t slot) {
     const int per_wave = (int)(kWsFloats / slot / ((size_t)mt * L.Hkv));
@@ -526,11 +550,15 @@ void attn_paged(const bf16* q, bf16* out, int H, const KvLayout& L, int layer, c
   if (L.D == 256) {
     split_waves([&](const Args& w, int ns) { launch<256, 16, 8, 8, 64, 2, kSplitSliding>(w, dim3(kSplitSliding, mt, ns * L.Hkv), st); },
                 Cfg<256, 16, 8, 8, 64, 2, kSplitSliding>::SLOT);
-    if (max_q_per_seq > kDecodeMaxQ) launch<256, 64, 2, 2, 64, 1, 1>(a, dim3((max_q_per_seq * a.ratio + 63) / 64, L.Hkv, n_seqs), st);
+    if (max_q_per_seq > split_q && small_q > split_q)
+      launch<256, 16, 8, 8, 64, 2, 1>(sm, dim3((std::min(max_q_per_seq, small_q) * a.ratio + 15) / 16, L.Hkv, n_seqs), st);
+    if (max_q_per_seq > small_q) launch<256, 64, 2, 2, 64, 1, 1>(wide, dim3((max_q_per_seq * a.ratio + 63) / 64, L.Hkv, n_seqs), st);
   } else {
     split_waves([&](const Args& w, int ns) { launch<512, 16, 8, 8, 64, 1, kSplitFull>(w, dim3(kSplitFull, mt, ns * L.Hkv), st); },
                 Cfg<512, 16, 8, 8, 64, 1, kSplitFull>::SLOT);
-    if (max_q_per_seq > kDecodeMaxQ) launch<512, 32, 4, 4, 32, 1, 1>(a, dim3((max_q_per_seq * a.ratio + 31) / 32, L.Hkv, n_seqs), st);
+    if (max_q_per_seq > split_q && small_q > split_q)
+      launch<512, 16, 8, 8, 64, 1, 1>(sm, dim3((std::min(max_q_per_seq, small_q) * a.ratio + 15) / 16, L.Hkv, n_seqs), st);
+    if (max_q_per_seq > small_q) launch<512, 32, 4, 4, 32, 1, 1>(wide, dim3((max_q_per_seq * a.ratio + 31) / 32, L.Hkv, n_seqs), st);
   }
 }
 

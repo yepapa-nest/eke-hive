@@ -107,7 +107,7 @@ def build_daemon(td, name='hived', hived_source=None):
 class Hived:
     count = 0
 
-    def __init__(self, exe, td, env=None, args=(), name='hived'):
+    def __init__(self, exe, td, env=None, args=(), name='hived', build_id='cpu-fake'):
         Hived.count += 1
         self.sock = str(Path(td) / f'{name}{Hived.count}.sock')
         self.log_path = Path(td) / f'{name}{Hived.count}.log'
@@ -123,7 +123,7 @@ class Hived:
         while True:
             self.alive()
             try:
-                if self.stats().get('build_id') == 'cpu-fake':
+                if self.stats().get('build_id') == build_id:
                     break
             except OSError:
                 pass

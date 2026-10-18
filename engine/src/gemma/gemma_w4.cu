@@ -19,7 +19,8 @@
 //   independent of how many rows share the call, and equals the decode / verify GEMV's. What changes is reuse: the GEMV re-reads every
 //   token's activations from L1 / L2 for each 16-row tile (at 32 rows that read, not the weight stream, bounds it: q + k + v + o + down
 //   of a layer took 92 µs against ~15 µs of weight bytes); here a warp owns GM_TN tiles (64 rows) × GM_BM tokens and stages the tokens'
-//   activations of its K range in shared memory (cp.async), feeding the mma B operands with ldmatrix.
+//   activations of its K range in shared memory (cp.async), feeding the mma B operands with ldmatrix. The default (w4_gemm_cl_kernel)
+//   moves the K split to the blocks of a thread-block cluster so that one staged tile feeds 128 rows and the weights are read once.
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -384,6 +385,247 @@ __global__ void __launch_bounds__(KW_MAX * 32, MB) w4_gemm_kernel(W4Multi J, con
       }
 }
 
+// Cluster variant (6). The block-per-K-split kernel above is bound by L2 → SM bytes, not by the weight stream or the tensor cores: each
+//   16- or 32-token block re-reads the weights from L2, and each 64-row block re-reads the tokens' activations, because a block's warps
+//   own different K ranges and so cannot share a staged tile — at 70 rows (variant 2) ~1.2 GB a layer against ~126 MB of weight bytes.
+//   This card's L2 delivers ~4–5.6 TB/s (a 48 MB / 16 MB L2-resident read; DRAM 1.6 TB/s; mma.sync bf16 ~500 TFLOPS, 4 clocks an mma per
+//   SM — measured 2026-10-19 on the RTX PRO 6000 beside the served models), which is the ~380 µs a layer took. Here the K split moves
+//   from the warps of a block to the blocks of a thread-block cluster: cluster rank r computes exactly what warp r of the GEMV block
+//   computes (the same K range, the same per-group integer tiles and fp32 scaling), all 8 warps of a block share that K range, so one
+//   staged activation tile feeds 128 rows, and a block covers up to 80 tokens (70 rows: all of them), so the weights are read once. The
+//   ranks' partial tiles are summed through distributed shared memory in rank order — the GEMV's warp-order sum — so the bits are the
+//   GEMV's (per-layer times: gm_variant).
+//   That sum is the price: each rank's fp32 partial (40 KB a block at 70 rows) crosses SMs, and distributed shared memory moves only
+//   ~2.4 B a clock per SM here (8 blocks reading their slice of 8 × 40 KB: 6.7 µs, 2026-10-19), so it takes ~70–95 µs of a 70-row layer
+//   (blocks leaving after the first cluster barrier instead: 168 against 264 µs). Tried and not kept (70 / 128 rows, µs a layer, same
+//   run as variant 6 at ~258 / 412): 256 rows a block (two tiles a warp, 179 registers, one block per SM) 291 / 469; four stages (65 KB,
+//   one block per SM) 330 / 539; 16 warps a block 311 / 500; the remote reads as generic pointers or the last barrier with
+//   release semantics: no difference.
+//   SEQ (variants 7, 8, opt-in): no cluster — one block walks all KW ranges, restarting acc at each range and folding it into v in rank
+//   order, so nothing crosses SMs; it needs a whole row block's K per block (fewer, longer blocks) and a second register tile. Gate + up
+//   alone, 70 / 128 / 192 rows: 137 / 195 / 252 µs (80 tokens a block, 189 registers, one block per SM) and 135 / 170 / 248 (48
+//   tokens, two blocks per SM) against 117 / 213 / 309 for variant 6; the narrow matrices (o, down: 30 row blocks) lose 2–3×, so a
+//   whole layer is slower at every row count (70 / 128 / 192: 387 / 498 / 559 against 219 / 369 / 553, 2026-10-19).
+//   Block = WR warps × TN tiles (R = 16 · TN · WR rows) × up to 8 · NTT tokens; weights, scales and activations of one group pair per
+//   stage (ST stages, cp.async). GU: the first R / 2 rows of a block are gate rows, the rest the same rows of up.
+__device__ __forceinline__ void cp_async16z(void* s, const void* g, bool valid) {   // zero-fills when !valid
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"((uint32_t)__cvta_generic_to_shared(s)), "l"(g), "r"(valid ? 16 : 0));
+}
+// pair() with the mask-or in one lop3 (the compiler keeps two: one 32-bit immediate per LOP3) — the same bits
+__device__ __forceinline__ uint32_t pair3(uint32_t w, int p, uint32_t mask, uint32_t bias) {
+  uint32_t biased;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(biased) : "r"(w >> (4 * p)), "r"(mask), "r"(bias));   // (a & b) | c
+  __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&biased);
+  v = __hsub2(v, __floats2bfloat162_rn(136.f, 136.f));
+  return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+// rank r's shared-memory word at (this block's) shared address a, through the cluster's shared window
+__device__ __forceinline__ float ld_dsmem(uint32_t a, int r) {
+  uint32_t ra;
+  float v;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(a), "r"(r));
+  asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(ra) : "memory");
+  return v;
+}
+
+template <int TN, int WR, int NTT, int ST>
+struct ClGeom {
+  static constexpr int NTILE = TN * WR, R = 16 * NTILE, BM = 8 * NTT;
+  static constexpr int SW = NTILE * 512, SS = NTILE * 64, SX = BM * GM_LDS * 2, STB = SW + SS + SX;
+  static constexpr int RED = NTILE * NTT * 128 * 4;   // the block's partial tile, fp32 in fragment order
+  static constexpr int SMEM = ST * STB > RED ? ST * STB : RED;
+  // the same for blocks of nub token tiles (the launch's tokens per block / 8): what a launch allocates
+  static __host__ __device__ constexpr int stb(int nub) { return SW + SS + nub * 8 * GM_LDS * 2; }
+  static __host__ __device__ constexpr int smem(int nub) { return ST * stb(nub) > NTILE * nub * 512 ? ST * stb(nub) : NTILE * nub * 512; }
+};
+
+template <bool GU, bool SEQ, int TN, int WR, int NTT, int ST>
+__global__ void __launch_bounds__(WR * 32, SEQ && NTT <= 6 ? 2 : 1) w4_gemm_cl_kernel(W4Multi J, const bf16* __restrict__ x, int ldx, int M, int bm, bf16* act, int lda,
+                                                                int kw) {
+  using Gm = ClGeom<TN, WR, NTT, ST>;
+  constexpr int NT = WR * 32, NTILE = Gm::NTILE;
+  extern __shared__ __align__(16) uint8_t csm[];
+  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, g = lane >> 2;
+  // cluster (KW, 1, 1) along x: rank = the GEMV warp whose K range this block computes. SEQ: no cluster, the block walks the KW ranges
+  //   one after the other (acc restarts at each range's first pair) and folds them into v in rank order — the same sum, in registers
+  const int rank = SEQ ? 0 : blockIdx.x, KW = SEQ ? kw : gridDim.x;
+  int nb = blockIdx.z, m = 0;   // grid (KW, token blocks, row blocks): a row block's token blocks run side by side, sharing its weights in L2
+  if (!GU) while (m + 1 < J.n && nb >= J.W[m].N / Gm::R) { nb -= J.W[m].N / Gm::R; ++m; }
+  const int G = J.W[0].K / 32, P = J.W[0].K / 64, per = (P + KW - 1) / KW;
+  const int p0 = SEQ ? 0 : min(P, rank * per), p1 = SEQ ? P : min(P, p0 + per), np = p1 - p0;   // warp_range of the GEMV's warp `rank`
+  const int t0 = blockIdx.y * bm, ntok = min(bm, M - t0), nu = (ntok + 7) / 8, nub = bm / 8, STB = Gm::stb(nub);
+  auto tile_of = [&](int T, const W4Mat*& W) {   // block tile T → its matrix and tile index there
+    if (GU) { W = &J.W[T < NTILE / 2 ? 0 : 1]; return (int)blockIdx.z * (NTILE / 2) + T % (NTILE / 2); }
+    W = &J.W[m];
+    return nb * NTILE + T;
+  };
+  // this thread's copies: weight tiles wid + k · WR (lane's 16 bytes), scale chunk tid (< NTILE · 4), activation chunks tid + k · NT
+  const uint4* qsrc[TN];
+#pragma unroll
+  for (int k2 = 0; k2 < TN; ++k2) {
+    const W4Mat* W;
+    const int tg = tile_of(wid + k2 * WR, W);
+    qsrc[k2] = reinterpret_cast<const uint4*>(W->q) + ((size_t)tg * (G / 2) + p0) * 32 + lane;
+    if (lane == 0 && np > 0) {   // the block's weight / scale bytes into L2 ahead (independent of the chain: before pdl_wait)
+      prefetch_l2(qsrc[k2], (uint32_t)np * 512u);
+      prefetch_l2(W->s + ((size_t)tg * G + 2 * p0) * 8, (uint32_t)np * 64u);
+    }
+  }
+  const uint4* ssrc = nullptr;
+  if (tid < NTILE * 4) {
+    const W4Mat* W;
+    const int tg = tile_of(tid >> 2, W);
+    ssrc = reinterpret_cast<const uint4*>(W->s + ((size_t)tg * G + 2 * p0) * 8) + (tid & 3);
+  }
+  auto stage_w = [&](int i, int s) {
+    uint8_t* sb = csm + (size_t)s * STB;
+#pragma unroll
+    for (int k2 = 0; k2 < TN; ++k2) cp_async16(sb + ((wid + k2 * WR) * 32 + lane) * 16, qsrc[k2] + (size_t)i * 32);
+    if (tid < NTILE * 4) cp_async16(sb + Gm::SW + tid * 16, ssrc + (size_t)i * 4);
+  };
+  auto stage_x = [&](int i, int s) {
+    bf16* xs = reinterpret_cast<bf16*>(csm + (size_t)s * STB + Gm::SW + Gm::SS);
+    for (int idx = tid; idx < nu * 64; idx += NT) {
+      const int row = idx >> 3, ch = idx & 7;
+      cp_async16z(xs + row * GM_LDS + ch * 8, x + (size_t)(t0 + (row < ntok ? row : 0)) * ldx + (size_t)(p0 + i) * 64 + ch * 8, row < ntok);
+    }
+  };
+#pragma unroll
+  for (int s = 0; s < ST - 1; ++s) if (s < np) stage_w(s, s);
+  pdl_wait();
+  pdl_trigger();
+#pragma unroll
+  for (int s = 0; s < ST - 1; ++s) { if (s < np) stage_x(s, s); cp_async_commit(); }
+  float acc[TN][NTT][4];
+#pragma unroll
+  for (int t = 0; t < TN; ++t)
+#pragma unroll
+    for (int u = 0; u < NTT; ++u) acc[t][u][0] = acc[t][u][1] = acc[t][u][2] = acc[t][u][3] = 0.f;
+  const uint32_t mask = 0x000F000Fu, bias = 0x43004300u;
+  float v[SEQ ? TN : 1][SEQ ? NTT : 1][4];
+  int nfold = 0;
+  auto fold = [&] {   // SEQ: v = p_0, then v += p_r (block_reduce's order); acc restarts
+    if constexpr (SEQ) {
+#pragma unroll
+      for (int t = 0; t < TN; ++t)
+#pragma unroll
+        for (int u = 0; u < NTT; ++u)
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            v[t][u][e] = nfold ? v[t][u][e] + acc[t][u][e] : acc[t][u][e];
+            acc[t][u][e] = 0.f;
+          }
+      ++nfold;
+    }
+  };
+  for (int i = 0; i < np; ++i) {
+    if (SEQ && i > 0 && i % per == 0) fold();
+    cp_async_wait<ST - 2>();
+    __syncthreads();   // stage i landed for every thread; every warp is done with stage i - 1, which the next copy refills
+    if (i + ST - 1 < np) { stage_w(i + ST - 1, (i + ST - 1) % ST); stage_x(i + ST - 1, (i + ST - 1) % ST); }
+    cp_async_commit();
+    const uint8_t* sb = csm + (size_t)(i % ST) * STB;
+    const bf16* xst = reinterpret_cast<const bf16*>(sb + Gm::SW + Gm::SS);
+    uint4 w[TN];
+    uint32_t sp[TN][2];
+#pragma unroll
+    for (int t = 0; t < TN; ++t) {
+      const int T = wid * TN + t;
+      w[t] = *reinterpret_cast<const uint4*>(sb + (T * 32 + lane) * 16);
+      sp[t][0] = *reinterpret_cast<const uint32_t*>(sb + Gm::SW + T * 64 + g * 4);
+      sp[t][1] = *reinterpret_cast<const uint32_t*>(sb + Gm::SW + T * 64 + 32 + g * 4);
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      uint32_t a[TN][2][4];
+      float sc0[TN], sc1[TN];
+#pragma unroll
+      for (int t = 0; t < TN; ++t) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t wd = j ? (h ? w[t].w : w[t].z) : (h ? w[t].y : w[t].x);
+#pragma unroll
+          for (int q = 0; q < 4; ++q) a[t][h][q] = pair3(wd, q, mask, bias);
+        }
+        const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(&sp[t][j]);
+        sc0[t] = __low2float(s2); sc1[t] = __high2float(s2);
+      }
+#pragma unroll
+      for (int up = 0; up < NTT / 2; ++up) {
+        if (2 * up >= nu) break;
+        uint32_t b[2][4];   // [h]: (token tile 2up, k lo), (2up, k hi), (2up + 1, k lo), (2up + 1, k hi)
+        const bool two = 2 * up + 1 < nu;   // else the last tile alone (no mma on a padded tile)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const bf16* bp = xst + (size_t)(up * 16 + ((lane >> 4) << 3) + (lane & 7)) * GM_LDS + (2 * j + h) * 16 + ((lane >> 3) & 1) * 8;
+          if (two) ldmatrix_x4(b[h], bp);
+          else { uint32_t r2[2]; ldmatrix_x2(r2, bp); b[h][0] = r2[0]; b[h][1] = r2[1]; b[h][2] = b[h][3] = 0u; }
+        }
+#pragma unroll
+        for (int t = 0; t < TN; ++t)
+#pragma unroll
+          for (int uu = 0; uu < 2; ++uu) {
+            if (uu && !two) break;
+            float tmp[4] = {0.f, 0.f, 0.f, 0.f};
+            mma_bf16(tmp, a[t][0][0], a[t][0][1], a[t][0][2], a[t][0][3], b[0][2 * uu], b[0][2 * uu + 1]);
+            mma_bf16(tmp, a[t][1][0], a[t][1][1], a[t][1][2], a[t][1][3], b[1][2 * uu], b[1][2 * uu + 1]);
+            float (&ac)[4] = acc[t][2 * up + uu];
+            ac[0] += tmp[0] * sc0[t]; ac[1] += tmp[1] * sc0[t];
+            ac[2] += tmp[2] * sc1[t]; ac[3] += tmp[3] * sc1[t];
+          }
+      }
+    }
+  }
+  if constexpr (SEQ) {
+    fold();
+    while (nfold < KW) fold();   // ranks past the last pair (empty: + 0, as the GEMV's idle warps)
+  }
+  cp_async_wait<0>();
+  __syncthreads();   // the staging memory becomes the partial tile
+  float* red = reinterpret_cast<float*>(csm);
+#pragma unroll
+  for (int t = 0; t < TN; ++t)
+#pragma unroll
+    for (int u = 0; u < NTT; ++u)
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        if (u < nub) red[(((wid * TN + t) * nub + u) * 4 + e) * 32 + lane] = SEQ ? v[SEQ ? t : 0][SEQ ? u : 0][e] : acc[t][u][e];
+  if (SEQ) __syncthreads();
+  else asm volatile("barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;\n" ::: "memory");   // the partials are visible
+  // rank r sums slice r of the elements over the ranks in rank order (the GEMV's block_reduce) and stores it
+  const int E = (GU ? NTILE / 2 : NTILE) * nub * 128, UP = (NTILE / 2) * nub * 128;
+  const uint32_t red_s = (uint32_t)__cvta_generic_to_shared(red);
+  const int KR = SEQ ? 1 : KW, eper = (E + KR - 1) / KR, e1 = min(E, (rank + 1) * eper);   // SEQ: one rank, the block's own tile
+  for (int L = rank * eper + tid; L < e1; L += NT) {
+    const int ln = L & 31, e = (L >> 5) & 3, T = (L >> 7) / nub, u = (L >> 7) - T * nub;
+    const int tok = t0 + u * 8 + 2 * (ln & 3) + (e & 1);
+    if (u >= nu || tok >= M) continue;
+    float pv[KW_MAX], pu[KW_MAX];   // every rank's value loaded before the first add (one remote round trip, not KW in a row)
+#pragma unroll
+    for (int r = 0; r < KW_MAX; ++r)
+      if (r < KR) {
+        pv[r] = SEQ ? red[L] : ld_dsmem(red_s + L * 4, r);
+        if (GU) pu[r] = SEQ ? red[L + UP] : ld_dsmem(red_s + (L + UP) * 4, r);
+      }
+    float vs = pv[0], vu = GU ? pu[0] : 0.f;
+#pragma unroll
+    for (int r = 1; r < KW_MAX; ++r)
+      if (r < KR) { vs += pv[r]; if (GU) vu += pu[r]; }
+    const int nr = (ln >> 2) + (e >> 1) * 8;
+    if (GU) {
+      act[(size_t)tok * lda + ((int)blockIdx.z * (NTILE / 2) + T) * 16 + nr] = __float2bfloat16(gelu_tanh(vs) * vu);
+    } else {
+      const int n = (nb * NTILE + T) * 16 + nr;
+      if (J.yf[m]) J.yf[m][(size_t)tok * J.ldy[m] + n] = vs;
+      else J.yb[m][(size_t)tok * J.ldy[m] + n] = __float2bfloat16(vs);
+    }
+  }
+  // no block leaves while another reads its partial. Relaxed: the reads are complete (their values are summed and stored above), and
+  //   cluster.sync() here (release / acquire) is a MEMBAR.ALL.GPU that waits for those global stores, + an L1 invalidate
+  if (!SEQ) asm volatile("barrier.cluster.arrive.relaxed.aligned;\nbarrier.cluster.wait.aligned;\n" ::: "memory");
+}
+
 // one fragment word per thread: (tile, group, lane, half) → its 8 values at their [n, k]
 __global__ void w4_dequant_kernel(W4Mat W, bf16* out) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -471,14 +713,57 @@ void w4_gemv_multi(const W4Multi& J, const bf16* x, int ldx, int M, cudaStream_t
 }
 
 namespace {
-// the variants (TN, BM, ST, PF, MB) timed by tests/test_gemma_w4.cu (cold L2, 2026-10-18, sum of q+k+v, o, gate+up, down of a layer):
-//   up to ~80 rows variant 2 (16 tokens per block, two blocks per SM: 70 rows 305 µs against 422 for variant 0 and 788 for the GEMV
-//   passes), above it variant 1 (32 tokens per block, the next pair's weights loaded ahead: 128 rows 477 µs, variant 2 489, 192 rows 659
-//   against 716 for dequant + cuBLAS). HIVE_GEMMA_GEMM_V forces one (0 … 5). Every variant gives the same bits.
-constexpr int kGemmVariants = 6;
+// the variants timed by tests/test_gemma_w4.cu (cold L2, sum of q+k+v, o, gate+up, down of a layer). 0 … 5 (TN, BM, ST, PF, MB of
+//   w4_gemm_kernel; 2026-10-18): up to ~80 rows variant 2 (16 tokens per block, two blocks per SM: 70 rows 305 µs against 422 for
+//   variant 0 and 788 for the GEMV passes), above it variant 1 (32 tokens per block, the next pair's weights loaded ahead: 128 rows 477
+//   µs, variant 2 489, 192 rows 659 against 716 for dequant + cuBLAS) — the choice until 2026-10-19. 6: the cluster kernel
+//   (w4_gemm_cl_kernel, 128 rows × ≤ 80 tokens a block, 3 stages, two blocks per SM), the default at every row count. Sliding layer,
+//   2026-10-19, medians of 15 beside the served models, variant 2 or 1 (the former choice) → 6: 17 rows 208.9 → 124.9 µs, 40 rows
+//   258.0 → 174.1, 70 rows 385.1 → 249.9, 128 rows 520.2 → 387.1, 192 rows 710.7 → 553.0; full layer 251.9 → 145.4, 297.0 → 190.5,
+//   413.7 → 264.2, 550.9 → 411.7, 749.6 → 583.7. It stays ahead of dequant + cuBLAS up to ~512 rows (256: 702 against 891, 512: 1,350
+//   against 1,407). 7, 8: the SEQ form (opt-in). HIVE_GEMMA_GEMM_V forces one (0 … 8). Every variant gives the same bits.
+constexpr int kGemmVariants = 9;
+int g_set_variant = -2;   // w4_gemm_set_variant: -2 = not set (HIVE_GEMMA_GEMM_V, else the default), -1 = the default
 int gm_variant(int M) {
-  static const int forced = [] { const char* e = getenv("HIVE_GEMMA_GEMM_V"); const int x = e ? atoi(e) : -1; return x >= 0 && x < kGemmVariants ? x : -1; }();
-  return forced >= 0 ? forced : M <= 80 ? 2 : 1;
+  static const int env = [] { const char* e = getenv("HIVE_GEMMA_GEMM_V"); const int x = e ? atoi(e) : -1; return x >= 0 && x < kGemmVariants ? x : -1; }();
+  const int forced = g_set_variant >= -1 ? g_set_variant : env;
+  (void)M;
+  return forced >= 0 ? forced : 6;
+}
+int gm_old_default(int M) { return M <= 80 ? 2 : 1; }   // the by-row-count choice before variant 6
+
+template <class... KArgs, class... Args>
+void launch_cluster(void (*kern)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Args&&... args) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid; cfg.blockDim = block; cfg.dynamicSmemBytes = smem; cfg.stream = st;
+  cudaLaunchAttribute at[2];
+  at[0].id = cudaLaunchAttributeClusterDimension;
+  at[0].val.clusterDim.x = grid.x; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+  at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  at[1].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = at; cfg.numAttrs = pdl_off() ? 1 : 2;
+  CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, std::forward<Args>(args)...));
+}
+// the cluster variant; false (nothing launched) when a matrix's N is not a multiple of the block's rows or the split exceeds a cluster
+template <bool GU, bool SEQ, int TN, int WR, int NTT, int ST>
+bool launch_cl(const W4Multi& J, const bf16* x, int ldx, int M, bf16* act, int lda, cudaStream_t st) {
+  using Gm = ClGeom<TN, WR, NTT, ST>;
+  const int rows = GU ? Gm::R / 2 : Gm::R, KW = J.W[0].split;
+  int ty = 0;
+  for (int i = 0; i < (GU ? 1 : J.n); ++i) {
+    if (J.W[i].N % rows) return false;
+    ty += J.W[i].N / rows;
+  }
+  if (KW < 1 || KW > KW_MAX) return false;
+  static const bool attr = [] {
+    CUDA_CHECK(cudaFuncSetAttribute(w4_gemm_cl_kernel<GU, SEQ, TN, WR, NTT, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, Gm::SMEM));
+    return true;
+  }();
+  (void)attr;
+  const int tb = (M + Gm::BM - 1) / Gm::BM, bm = ((M + tb - 1) / tb + 7) / 8 * 8;   // token blocks of equal size (≤ 8 · NTT)
+  if (SEQ) launch_pdl(w4_gemm_cl_kernel<GU, SEQ, TN, WR, NTT, ST>, dim3(1, tb, ty), dim3(WR * 32), Gm::smem(bm / 8), st, J, x, ldx, M, bm, act, lda, KW);
+  else launch_cluster(w4_gemm_cl_kernel<GU, SEQ, TN, WR, NTT, ST>, dim3(KW, tb, ty), dim3(WR * 32), Gm::smem(bm / 8), st, J, x, ldx, M, bm, act, lda, KW);
+  return true;
 }
 template <bool GU, int TN, int BM, int ST, bool PF, int MB>
 void launch_v(const W4Multi& J, int rows_per_y, const bf16* x, int ldx, int M, bf16* act, int lda, cudaStream_t st) {
@@ -496,6 +781,11 @@ void launch_v(const W4Multi& J, int rows_per_y, const bf16* x, int ldx, int M, b
              act, lda);
 }
 template <bool GU>
+void old_gemm(const W4Multi& J, const bf16* x, int ldx, int M, bf16* act, int lda, cudaStream_t st) {
+  if (gm_old_default(M) == 2) launch_v<GU, 4, 16, 2, true, 2>(J, 64, x, ldx, M, act, lda, st);
+  else launch_v<GU, 4, 32, 2, true, 1>(J, 64, x, ldx, M, act, lda, st);
+}
+template <bool GU>
 void launch_gemm(const W4Multi& J, const bf16* x, int ldx, int M, bf16* act, int lda, cudaStream_t st) {
   switch (gm_variant(M)) {
     case 0: launch_v<GU, 4, 32, 2, false, 1>(J, 64, x, ldx, M, act, lda, st); break;
@@ -503,15 +793,21 @@ void launch_gemm(const W4Multi& J, const bf16* x, int ldx, int M, bf16* act, int
     case 2: launch_v<GU, 4, 16, 2, true, 2>(J, 64, x, ldx, M, act, lda, st); break;
     case 3: launch_v<GU, 2, 32, 2, true, 2>(J, 32, x, ldx, M, act, lda, st); break;
     case 4: launch_v<GU, 2, 16, 2, true, 2>(J, 32, x, ldx, M, act, lda, st); break;
-    default: launch_v<GU, 8, 16, 2, true, 1>(J, 128, x, ldx, M, act, lda, st); break;
+    case 5: launch_v<GU, 8, 16, 2, true, 1>(J, 128, x, ldx, M, act, lda, st); break;
+    case 6: if (!launch_cl<GU, false, 1, 8, 10, 3>(J, x, ldx, M, act, lda, st)) old_gemm<GU>(J, x, ldx, M, act, lda, st); break;
+    case 7: if (!launch_cl<GU, true, 1, 8, 10, 3>(J, x, ldx, M, act, lda, st)) old_gemm<GU>(J, x, ldx, M, act, lda, st); break;
+    default: if (!launch_cl<GU, true, 1, 8, 6, 3>(J, x, ldx, M, act, lda, st)) old_gemm<GU>(J, x, ldx, M, act, lda, st); break;
   }
 }
-// rows (N) one block covers, for the shape check: the largest over the variants a row count can pick (64 unless one is forced)
+// rows (N) one block covers, for the shape check: the largest over the variants a row count can pick (64 unless one is forced; 6 … 8
+//   fall back to the former choice when a matrix's N is not a multiple of their 128 rows, gate / up 64)
 int gm_rows_per_block() {
   const int v = gm_variant(1) == gm_variant(1 << 20) ? gm_variant(1) : 0;
   return v == 3 || v == 4 ? 32 : v == 5 ? 128 : 64;
 }
 }  // namespace
+
+void w4_gemm_set_variant(int v) { g_set_variant = v >= -1 && v < kGemmVariants ? v : -2; }
 
 bool w4_gemm_fits(const W4Mat& W) { return W.N % gm_rows_per_block() == 0 && W.K % 64 == 0 && W.split >= 1 && W.split <= KW_MAX; }
 
