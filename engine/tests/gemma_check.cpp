@@ -4,16 +4,19 @@
 //   decode N tokens (one row per step), and the drafts the MTP assistant proposes at every step. Writes OUT/logits.f32 (last prompt row),
 //   OUT/decode.json {"tokens": [...], "drafts": [[...], ...]} and timings to stdout.
 //   gemma_check CKPT ASSISTANT_DIR|- PROMPT.json OUT N [chunk]
+//   HIVE_CHECK_IMAGES=images.json: the prompt's images (the oracle's --images format: start, gh, gw, raw bf16 patch file)
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
 #include <vector>
 
+#include "hive/common.h"
 #include "hive/gemma/gemma_engine.h"
 #include "nlohmann/json.hpp"
 
 using namespace hive::gemma;
+using hive::DevBuf;
 
 static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -29,8 +32,28 @@ int main(int argc, char** argv) {
   e.init_seq(s, 32768);
   const int V = e.cfg().vocab;
   std::vector<float> lg(V);
+  std::vector<GemmaImage> images;
+  std::vector<DevBuf> patch_bufs;
+  if (const char* ip = getenv("HIVE_CHECK_IMAGES")) {
+    const std::string p = ip, base = p.find('/') == std::string::npos ? "." : p.substr(0, p.rfind('/'));
+    for (const auto& im : nlohmann::json::parse(std::ifstream(p))) {
+      std::ifstream f(base + "/" + im["file"].get<std::string>(), std::ios::binary);
+      std::vector<char> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      DevBuf d(raw.size());
+      CUDA_CHECK(cudaMemcpy(d.p, raw.data(), raw.size(), cudaMemcpyHostToDevice));
+      images.push_back({im["start"].get<int>(), im["gh"].get<int>(), im["gw"].get<int>(), d.as<__nv_bfloat16>()});
+      patch_bufs.push_back(std::move(d));
+    }
+  }
   const double t2 = now_ms();
-  e.prefill(s, ids.data(), (int)ids.size(), lg.data());
+  // HIVE_CHECK_SPLIT=N: prefill the first N tokens, then the rest (a server request that continues a shared prefix)
+  const int split = getenv("HIVE_CHECK_SPLIT") ? atoi(getenv("HIVE_CHECK_SPLIT")) : 0;
+  if (split > 0 && split < (int)ids.size() && images.empty()) {
+    e.prefill(s, ids.data(), split, nullptr);
+    e.prefill(s, ids.data() + split, (int)ids.size() - split, lg.data());
+  } else {
+    e.prefill(s, ids.data(), (int)ids.size(), lg.data(), images.empty() ? nullptr : &images);
+  }
   const double t3 = now_ms();
   { std::ofstream f(out + "/logits.f32", std::ios::binary); f.write((const char*)lg.data(), (size_t)V * 4); }
   auto argmax = [&](const float* r) { int a = 0; for (int i = 1; i < V; ++i) if (r[i] > r[a]) a = i; return a; };

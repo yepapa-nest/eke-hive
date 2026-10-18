@@ -5,6 +5,7 @@
 
 API (one request per WebSocket connection):
   WS  /ws/speak   client text frame {"type": "speak", "text": "...", "voice": "sohee", "instruct": "", "language": "Korean"}
+                  (optional "temperature" 0.05-2.0, "top_k" 1-2048 and "seed" ≥ 0 override the server's sampling for this request)
                   -> binary frames: raw PCM16 little-endian mono 24 kHz, 7680 samples (4 codec frames, 320 ms) each, the last one shorter
                   -> text frame {"type": "done", "audio_ms": N, "first_ms": N, "total_ms": N}
                   errors: {"type": "error", "message": "..."} then done. Empty text: done with audio_ms 0 only.
@@ -413,6 +414,16 @@ class Server:
                 seed = self.a.seed if self.a.seed >= 0 else secrets.randbits(63)
                 cap = self.frame_cap(len(ids) - 8)
                 sampling = Sampling(*[getattr(self.sampling, f) for f, _ in Sampling._fields_[:-1]], cap)
+                # per-request sampling (optional): a client that wants an even, calm delivery lowers the temperature for its voice;
+                #   out-of-range or non-numeric values keep the server's
+                t = req.get("temperature")
+                if isinstance(t, (int, float)) and not isinstance(t, bool) and 0.05 <= t <= 2.0:
+                    sampling.temperature = sampling.sub_temperature = float(t)
+                k = req.get("top_k")
+                if isinstance(k, int) and not isinstance(k, bool) and 1 <= k <= 2048:
+                    sampling.top_k = sampling.sub_top_k = k
+                if isinstance(req.get("seed"), int) and not isinstance(req.get("seed"), bool) and req["seed"] >= 0:
+                    seed = req["seed"]
                 await loop.run_in_executor(self.worker, self.engine.start, ids, ins, sid, lid, seed, sampling)
                 fut = loop.run_in_executor(self.worker, self.engine.next_chunk, cancel)
                 while True:

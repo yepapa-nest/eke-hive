@@ -740,26 +740,32 @@ class SeenPrefixes:
     128 s of prefill), while shared snapshots of 2,000+ tokens were resumed 8 times — most first-turn system blocks never repeat (a
     per-document date at the end of the system prompt, per-conversation memory). This keeps, per boundary, a hash of the prefix and the conversation that
     first sent it (LRU, `cap` prefixes): the first conversation with a block pays nothing, the second pays the cut and saves the
-    snapshot, the third and later resume from it."""
+    snapshot, the third and later resume from it.
+    The cut goes to the deepest boundary another conversation sent — not to the request's deepest boundary. Measured 2026-10-18 (live
+    DeepSeek, a chat client's rooms): a first turn has two boundaries, the end of the system/tools block (~4.5K tokens, the same in every room)
+    and the end of the client's leading per-room context block (~19-24K, different in every room). The daemon spends its one extra cut on
+    the deepest boundary, so every room saved a snapshot nobody could use and the shared block was never saved — "shared-prefix not used
+    — snapshot at 33212 shares 4524 tokens", every new room cached 0."""
 
     def __init__(self, cap: int = 4096):
         self.cap = cap
         self.entries: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
 
-    def observe(self, key: str, ids: list[int], hints: list[int]) -> bool:
-        """Record this request's boundary prefixes (call off the event loop). True = another conversation sent one of them."""
+    def observe(self, key: str, ids: list[int], hints: list[int]) -> int:
+        """Record this request's boundary prefixes (call off the event loop). Returns the deepest boundary another conversation already
+        sent (0 = none)."""
         view = memoryview(array("i", ids)).cast("B")
         w = array("i").itemsize
-        hashes = [hashlib.blake2b(view[: h * w], digest_size=16).digest() for h in hints if 0 < h <= len(ids)]
-        seen = False
+        hashes = [(h, hashlib.blake2b(view[: h * w], digest_size=16).digest()) for h in hints if 0 < h <= len(ids)]
+        seen = 0
         with self.lock:
-            for d in hashes:
+            for h, d in hashes:
                 owner = self.entries.get(d)
                 if owner is None:
                     self.entries[d] = key
                 elif owner != key:
-                    seen = True
+                    seen = max(seen, h)
                 self.entries.move_to_end(d)
             while len(self.entries) > self.cap:
                 self.entries.popitem(last=False)
@@ -2083,7 +2089,13 @@ async def chat(request: Request):
     #   that never repeats (per-document dates, per-conversation memory) pays no cut.
     first_turn = os.environ.get("HIVE_PREFIX_FIRST_TURN", "")
     if hints and not prefix_extra and env_on("HIVE_PREFIX_FIRST_TURN") and not any(m.get("role") == "assistant" for m in messages if isinstance(m, dict)):
-        prefix_extra = True if first_turn != "seen" else await asyncio.to_thread(SEEN.observe, session, ids, hints)
+        if first_turn != "seen":
+            prefix_extra = True
+        elif seen_at := await asyncio.to_thread(SEEN.observe, session, ids, hints):
+            # the daemon spends the extra cut on the deepest boundary it gets — leave out the deeper ones nobody else sent (SeenPrefixes);
+            #   a generation-suffix hint stays (a free cut)
+            prefix_extra = True
+            hints = [h for h in hints if h <= seen_at or len(ids) - h <= GEN_TAIL_MAX]
     if INFLIGHT.get(session, 0) > 0:  # concurrent request in the same conversation (regenerate, two tabs, parallel bench) — separate session
         # B8: a per-request "~<uuid>" session would fill the daemon session pool and archived budget with single-use
         #   sessions and push real conversations out of the LRU. Use fixed per-conversation auxiliary slots (~1, ~2, ...,

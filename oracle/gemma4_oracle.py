@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Eke Hive Authors
-"""Gemma 4 12B Unified (text path) + its MTP assistant: an independent fp32 reference for the hive `gemma` family.
+"""Gemma 4 12B Unified (text and images) + its MTP assistant: an independent fp32 reference for the hive `gemma` family.
 
 Math contract (what the engine must reproduce):
   embed      h = E[tok] * bf16(sqrt(3840))                         E = model.language_model.embed_tokens (bf16)
@@ -18,6 +18,13 @@ Math contract (what the engine must reproduce):
   weights    compressed-tensors pack-quantized int4, symmetric, group 32 along the input: int32 holds 8 values, low nibble
              first, value = nibble - 8; W[o, i] = value * weight_scale[o, i // 32] (bf16 scale). Norms, embeddings, lm_head bf16.
   kv cache   the engine stores K and V as fp8 e4m3 (scale 1.0); --fp8-kv here rounds them the same way.
+  suppress   generation_config suppress_tokens (end-of-image / end-of-audio markers) get logit -inf.
+  images     (config use_bidirectional_attention "vision") an image's gh·gw soft tokens replace the placeholder rows' embeddings (no
+             embedding scale) with the encoder-free vision embedder of its merged patches P [n, 48·48·3] (pixel / 255, rows (y, x, c), raster
+             order — patch m at grid (m % gw, m / gw)):
+               v = LN1(P) @ patch_dense^T + b;  v = LN2(v);  v = LN3(v + pos[x, 0] + pos[y, 1]);  e = rms(v) @ embedding_projection^T
+             LN = LayerNorm with weight and bias, eps 1e-5; rms without scale, eps vision_config.rms_norm_eps. In attention every soft
+             token of an image also sees the image's later soft tokens (both ways inside the span; causal everywhere else, window kept).
   assistant  (MTP drafter, bf16) pairs the target's hidden at the last processed position t with the embedding of the token that
              hidden predicted (sampled, not yet in the KV): z = pre_projection([E[tok_{t+1}]*sqrt(3840), h_t]) at rope position t (the last
              written slot — not advanced)
@@ -26,10 +33,12 @@ Math contract (what the engine must reproduce):
              softcap) and h = post_projection(z). The chain repeats with (draft, h) at the same position t. h_t is the target's final-normed hidden (--mtp-hidden raw = before the final norm, for comparison).
 
 Usage (CPU, fp32; ~50 GB RAM for the dequantized target):
-  python3 oracle/gemma4_oracle.py --ckpt DIR --tok DIR --prompt-ids ids.json --out OUTDIR [--decode 16] [--fp8-kv]
+  python3 oracle/gemma4_oracle.py --ckpt DIR --tok DIR --prompt-ids ids.json --out OUTDIR [--decode 16] [--fp8-kv] [--images images.json]
       [--assistant DIR --mtp-k 3 --mtp-hidden normed|raw] [--dump-layers 0,5,23,47]
 Writes OUTDIR/meta.json, h_LNN.npy (hidden after layer NN for the last prompt row), logits.npy (last prompt row),
 decode.json (greedy continuation, and for --assistant the drafts proposed at each step and how many the target accepts).
+--images: [{"start": row of the first soft token in the prompt ids, "gh": .., "gw": .., "file": raw bf16 patches [gh·gw, 6912]
+(relative to the JSON's directory)}] — what tools/gemma_vision_case.py writes from a chat request through the server's preprocessing.
 """
 import argparse, json, math, os, struct, sys, time
 import numpy as np
@@ -154,6 +163,32 @@ class Gemma4Text:
         self.head = self.ck.tensor(head_name)
         self.softcap = c.get("final_logit_softcapping")
         self.layers = [None] * self.L
+        try:
+            self.suppress = json.load(open(os.path.join(ckpt_dir, "generation_config.json"))).get("suppress_tokens") or []
+        except OSError:
+            self.suppress = []
+        self.vcfg = cfg.get("vision_config")
+        self.vis = None
+
+    def vision(self):
+        if self.vis is None:
+            g = lambda n: self.ck.tensor(n)
+            V = "model.vision_embedder."
+            self.vis = {n: g(V + n) for n in ("patch_ln1.weight", "patch_ln1.bias", "patch_dense.weight", "patch_dense.bias", "patch_ln2.weight",
+                                               "patch_ln2.bias", "pos_embedding", "pos_norm.weight", "pos_norm.bias")}
+            self.vis["proj"] = g("model.embed_vision.embedding_projection.weight")
+        return self.vis
+
+    def vision_embed(self, patches, gh, gw):
+        """merged patches [gh·gw, 6912] (fp32 of the bf16 input) → soft-token embeddings [gh·gw, hidden] (fp32)."""
+        w = self.vision()
+        ln = lambda x, n: torch.nn.functional.layer_norm(x, (x.shape[-1],), w[n + ".weight"], w[n + ".bias"], 1e-5)
+        v = ln(patches, "patch_ln1") @ w["patch_dense.weight"].T + w["patch_dense.bias"]
+        v = ln(v, "patch_ln2")
+        m = torch.arange(gh * gw)
+        v = v + w["pos_embedding"][m % gw, 0] + w["pos_embedding"][m // gw, 1]
+        v = ln(v, "pos_norm")
+        return rms(v, eps=self.vcfg.get("rms_norm_eps", 1e-6)) @ w["proj"].T
 
     def layer(self, i):
         if self.layers[i] is None:
@@ -174,13 +209,18 @@ class Gemma4Text:
     def new_cache(self):
         return {"k": [None] * self.L, "v": [None] * self.L, "pos": 0}
 
-    def forward(self, ids, cache, dump=None):
-        """ids: list[int] appended after cache['pos']. Returns (hidden after the final norm for every new row, raw last-layer
-        hidden for every new row, logits of the last row)."""
+    def forward(self, ids, cache, dump=None, images=None):
+        """ids: list[int] appended after cache['pos']; images: [(row in ids, gh, gw, patches fp32 [gh·gw, 6912])]. Returns (hidden after
+        the final norm for every new row, raw last-layer hidden for every new row, logits of the last row)."""
         T = len(ids)
         p0 = cache["pos"]
         pos = torch.arange(p0, p0 + T)
         x = self.embed[torch.tensor(ids)] * self.embed_scale
+        lim = pos.clone()   # last key each row sees: its own position, or the end of its image span
+        for row, gh, gw, patches in images or []:
+            n = gh * gw
+            x[row:row + n] = self.vision_embed(patches, gh, gw)
+            lim[row:row + n] = p0 + row + n - 1
         x = bf16(x)
         for i in range(self.L):
             w = self.layer(i)
@@ -205,7 +245,7 @@ class Gemma4Text:
             Vr = V.repeat_interleave(rep, dim=1)
             s = torch.einsum("thd,shd->hts", q, Kr)  # scaling 1.0
             kpos = torch.arange(K.shape[0])
-            mask = kpos[None, :] <= pos[:, None]
+            mask = kpos[None, :] <= lim[:, None]
             if t == "sliding_attention":
                 mask &= kpos[None, :] > pos[:, None] - self.win
             s = s.masked_fill(~mask[None], float("-inf"))
@@ -224,6 +264,8 @@ class Gemma4Text:
         logits = normed[-1] @ self.head.T
         if self.softcap:
             logits = self.softcap * torch.tanh(logits / self.softcap)
+        if self.suppress:
+            logits[torch.tensor(self.suppress)] = float("-inf")
         return normed, raw, logits
 
     def last_kv(self, cache, ltype, upto):
@@ -309,6 +351,7 @@ def main():
     ap.add_argument("--mtp-k", type=int, default=3)
     ap.add_argument("--mtp-hidden", choices=["normed", "raw"], default="normed")
     ap.add_argument("--eos", default="1,106,50")
+    ap.add_argument("--images", help="JSON list of images (see the module docstring)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     ids = json.load(open(a.prompt_ids))
@@ -317,7 +360,13 @@ def main():
     asst = Gemma4Assistant(a.assistant, m) if a.assistant else None
     cache = m.new_cache()
     dump = {"layers": {int(x) for x in a.dump_layers.split(",") if x}, "dir": a.out}
-    normed, raw, logits = m.forward(ids, cache, dump)
+    images = []
+    if a.images:
+        base = os.path.dirname(os.path.abspath(a.images))
+        for im in json.load(open(a.images)):
+            u = np.fromfile(os.path.join(base, im["file"]), dtype=np.uint16).astype(np.uint32) << 16
+            images.append((im["start"], im["gh"], im["gw"], torch.from_numpy(u.view(np.float32).reshape(im["gh"] * im["gw"], -1).copy())))
+    normed, raw, logits = m.forward(ids, cache, dump, images)
     np.save(os.path.join(a.out, "logits.npy"), logits.numpy())
     np.save(os.path.join(a.out, "h_final.npy"), normed[-1].numpy())
     eos = {int(x) for x in a.eos.split(",")}
@@ -338,7 +387,7 @@ def main():
                 d.append(prev)
             drafts.append(d)
         tok = nxt
-    meta = {"prompt_tokens": len(ids), "fp8_kv": a.fp8_kv, "seconds": round(time.time() - t0, 1), "mtp_hidden": a.mtp_hidden}
+    meta = {"prompt_tokens": len(ids), "images": len(images), "fp8_kv": a.fp8_kv, "seconds": round(time.time() - t0, 1), "mtp_hidden": a.mtp_hidden}
     if asst is not None:
         # acceptance: drafts made after step s predict out[s+2 .. s+1+k] (out[s+1] is the target's own token)
         acc = []

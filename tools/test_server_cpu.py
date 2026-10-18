@@ -1183,6 +1183,16 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('boundaries', s.DAEMON.kw[-1])
             await s.chat(Request({'messages':first('q3', self.SYS+' (dated 2026-10-07)'), 'reasoning_effort':'none'}))
             self.assertIsNone(extra(), 'a block that differs at its end is a new block')
+            # 2026-10-18: a room's own context block after the shared system block — the cut goes to the shared boundary
+            def room(ctx, q): return [{'role':'system','content':self.SYS}, {'role':'user','content':ctx}, {'role':'user','content':q}]
+            s.SEEN=s.SeenPrefixes()
+            await s.chat(Request({'messages':room('room A context '*20, 'question about room A '*8), 'reasoning_effort':'none'}))
+            self.assertIsNone(extra(), 'first room: no cut')
+            hints_a=s.DAEMON.kw[-1].get('boundaries') or []
+            self.assertEqual(len(hints_a), 2, hints_a)
+            await s.chat(Request({'messages':room('room B context, other words '*20, 'question about room B '*8), 'reasoning_effort':'none'}))
+            self.assertEqual(extra(), 1, 'second room: cut')
+            self.assertEqual(s.DAEMON.kw[-1].get('boundaries'), [hints_a[0]], 'only the shared system-block boundary is sent')
             later=first('q2')+[{'role':'assistant','content':'a'}, {'role':'user','content':'q2b'}]
             await s.chat(Request({'messages':later, 'reasoning_effort':'none'}))
             self.assertIsNone(extra(), 'not a first turn')

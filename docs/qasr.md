@@ -1,7 +1,7 @@
 # Qwen3-ASR in Eke Hive
 
 > **Status (2026-10-18):** validated end to end on an RTX PRO 6000 Blackwell — greedy output identical to the fp32 reference on the 30-clip
-> test set, the same HTTP answers as the SGLang server it replaces, about half its latency, 5,040 MiB of VRAM (numbers:
+> test set, the same HTTP answers as the SGLang server it replaces, about half its latency, 4,828 MiB of VRAM (numbers:
 > [qasr-validation-20261018.md](qasr-validation-20261018.md)).
 
 Eke Hive serves **Qwen3-ASR 1.7B** (config.json `model_type` `qwen3_asr`, bf16 safetensors) as a speech-recognition service: an audio
@@ -48,16 +48,17 @@ description and checked against the reference implementation).
 - **Memory:** everything is allocated in `qasr_create` (weights, KV for `max_seqs` × `max_ctx`, one union work arena for the encoder and
   decoder phases, cuBLAS workspace, graphs), followed by a warm-up. No device allocation happens per request. The start-up plan (context
   measured as NVML free before minus CUDA free after creation) is checked against `HIVE_VRAM_LIMIT_MB` and against the free VRAM; if it
-  does not fit, `qasr_create` fails with the reason.
+  does not fit, `qasr_create` fails with the reason. The per-thread stack limit is lowered to 256 B right after the context is created (the
+  qasr kernels use no stack frame; the default 1 KiB reservation on every resident thread cost 212 MiB — measured 2026-10-18).
 
 | VRAM (2 slots × 2048 positions) | MiB |
 |---|---|
-| CUDA context (measured) | 555 |
+| CUDA context (measured, stack limit 256 B) | 343 |
 | weights (one embedding copy) | 3,888 |
 | KV cache | 448 |
 | work buffers | 104 |
 | cuBLAS workspace | 32 |
-| **process total, measured under load** | **5,040** |
+| **process total, measured under load** | **4,828** (5,040 with the default stack limit) |
 
 ## HTTP API (`server/speech/asr_server.py`)
 

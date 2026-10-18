@@ -190,6 +190,72 @@ __global__ void softcap_kernel(float* l, size_t n, float cap) {
   if (i < n) l[i] = cap * tanhf(l[i] / cap);
 }
 
+struct Ids4 { int v[4]; };
+__global__ void suppress_kernel(float* l, int V, Ids4 ids, int n) {
+  pdl_trigger();
+  pdl_wait();
+  if ((int)threadIdx.x < n) l[(size_t)blockIdx.x * V + ids.v[threadIdx.x]] = -INFINITY;
+}
+
+// LayerNorm (w, b) of one row per block, the row held in registers (hive/gemma/gemma_kernels.h layernorm)
+__global__ void layernorm_kernel(const bf16* x, int ldx, const bf16* w, const bf16* b, int K, float eps, const bf16* pos, int gw, bf16* out,
+                                 int ldo) {
+  pdl_trigger();
+  pdl_wait();
+  const int m = blockIdx.x, nv = K / 8;
+  const uint4* r = reinterpret_cast<const uint4*>(x + (size_t)m * ldx);
+  const uint4* p0 = pos ? reinterpret_cast<const uint4*>(pos + ((size_t)(m % gw) * 2 + 0) * K) : nullptr;
+  const uint4* p1 = pos ? reinterpret_cast<const uint4*>(pos + ((size_t)(m / gw) * 2 + 1) * K) : nullptr;
+  float v[VPT][8];
+  float s = 0.f;
+#pragma unroll
+  for (int j = 0; j < VPT; ++j) {
+    const int i = threadIdx.x + j * NT;
+    if (i >= nv) continue;
+    unpack8(r[i], v[j]);
+    if (pos) {
+      float a[8], c[8];
+      unpack8(p0[i], a);
+      unpack8(p1[i], c);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) v[j][e] = rnd(v[j][e] + rnd(a[e] + c[e]));
+    }
+#pragma unroll
+    for (int e = 0; e < 8; ++e) s += v[j][e];
+  }
+  const float mean = block_sum(s) / K;
+  float ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < VPT; ++j) {
+    if (threadIdx.x + j * NT >= nv) continue;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) { const float d = v[j][e] - mean; ss += d * d; }
+  }
+  const float inv = rsqrtf(block_sum(ss) / K + eps);
+  const uint4* wv = reinterpret_cast<const uint4*>(w);
+  const uint4* bv = reinterpret_cast<const uint4*>(b);
+  uint4* o = reinterpret_cast<uint4*>(out + (size_t)m * ldo);
+#pragma unroll
+  for (int j = 0; j < VPT; ++j) {
+    const int i = threadIdx.x + j * NT;
+    if (i >= nv) continue;
+    float ww[8], bb[8], f[8];
+    unpack8(wv[i], ww);
+    unpack8(bv[i], bb);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) f[e] = (v[j][e] - mean) * inv * ww[e] + bb[e];
+    o[i] = pack8(f);
+  }
+}
+
+__global__ void bias_rows_kernel(const bf16* b, int N, bf16* out) {
+  pdl_trigger();
+  pdl_wait();
+  const uint4* bv = reinterpret_cast<const uint4*>(b);
+  uint4* o = reinterpret_cast<uint4*>(out + (size_t)blockIdx.x * N);
+  for (int i = threadIdx.x; i < N / 8; i += blockDim.x) o[i] = bv[i];
+}
+
 // argmax (ties → the smaller id) and Σ exp(l - max) of each row, in two passes over AS_NB column blocks (fixed order: deterministic)
 constexpr int AS_NB = 64;
 __global__ void argmax_sumexp_part(const float* __restrict__ l, int V, float* __restrict__ part) {
@@ -291,6 +357,22 @@ void argmax_sumexp(const float* logits, int M, int V, float* part, int32_t* arg,
 }
 void softcap(float* l, size_t n, float cap, cudaStream_t st) {
   if (n) launch_pdl(softcap_kernel, dim3((unsigned)((n + 255) / 256)), dim3(256), 0, st, l, n, cap);
+}
+void suppress_cols(float* l, int M, int V, const int (&ids)[4], int n, cudaStream_t st) {
+  if (M <= 0 || n <= 0) return;
+  HIVE_CHECK(n <= 4, "suppress_cols: at most 4 ids");
+  Ids4 v;
+  for (int i = 0; i < 4; ++i) v.v[i] = ids[i];
+  launch_pdl(suppress_kernel, dim3(M), dim3(32), 0, st, l, V, v, n);
+}
+void layernorm(const bf16* x, int ldx, const bf16* w, const bf16* b, int M, int K, float eps, const bf16* pos, int gw, bf16* out, int ldo,
+               cudaStream_t st) {
+  HIVE_CHECK(K % 8 == 0 && K <= 8 * NT * VPT && ldx % 8 == 0 && ldo % 8 == 0 && (!pos || gw > 0), "layernorm: row size / alignment");
+  if (M > 0) launch_pdl(layernorm_kernel, dim3(M), dim3(NT), 0, st, x, ldx, w, b, K, eps, pos, gw, out, ldo);
+}
+void bias_rows(const bf16* b, int M, int N, bf16* out, cudaStream_t st) {
+  HIVE_CHECK(N % 8 == 0, "bias_rows: row size");
+  if (M > 0) launch_pdl(bias_rows_kernel, dim3(M), dim3(NT), 0, st, b, N, out);
 }
 
 }  // namespace hive::gemma::k

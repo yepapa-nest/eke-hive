@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
 // Gemma 4 engine (hive/gemma/gemma_engine.h): loading, the paged KV pool, the forward over rows of several sequences (prefill chunks, decode,
-//   verify), the Frozen-KV MTP assistant. Rows ≤ 16 take the int4 decode GEMV; larger chunks dequantize each matrix into one bf16 scratch
+//   verify), the Frozen-KV MTP assistant, the vision embedder of prefill images. Rows ≤ 16 take the int4 decode GEMV; larger chunks dequantize each matrix into one bf16 scratch
 //   and run a cuBLAS GEMM. Activations are bf16 between ops (the points the reference keeps in bf16), arithmetic fp32.
 #include "hive/gemma/gemma_engine.h"
 
@@ -64,8 +64,22 @@ GemmaConfig GemmaConfig::load(const std::string& dir) {
       if (gj["eos_token_id"].is_array()) for (auto& e : gj["eos_token_id"]) c.eos.push_back(e);
       else c.eos.push_back(gj["eos_token_id"]);
     }
+    // suppress_tokens: the end-of-image / end-of-audio markers — input-only; the reference generation masks them out of every next-token row
+    if (gj.contains("suppress_tokens") && gj["suppress_tokens"].is_array())
+      for (auto& e : gj["suppress_tokens"]) if (e.is_number_integer() && e.get<int>() >= 0 && e.get<int>() < c.vocab) c.suppress.push_back(e);
   }
   if (c.eos.empty()) c.eos = {1, 106};
+  HIVE_CHECK(c.suppress.size() <= 4, "gemma: more than 4 suppress_tokens");
+  if (j.contains("vision_config") && j["vision_config"].is_object()) {
+    const json& v = j["vision_config"];
+    const int mp = v.value("model_patch_size", v.value("patch_size", 16) * v.value("pooling_kernel_size", 3));
+    c.v_patch = mp * mp * 3;
+    c.v_dim = v.value("mm_embed_dim", 0);
+    c.v_posemb = v.value("mm_posemb_size", 0);
+    c.v_max_tokens = v.value("num_soft_tokens", 280);
+    c.v_eps = v.value("rms_norm_eps", 1e-6);
+    c.image_token = j.value("image_token_id", -1);
+  }
   return c;
 }
 
@@ -103,6 +117,14 @@ struct GemmaEngine::Impl {
   bf16* embed_host = nullptr;   // HIVE_GEMMA_EMBED_HOST=1: the embedding / lm_head in mapped pinned host memory (read over the bus)
   const bf16* E() const { return embed_host ? embed_host : embed.as<bf16>(); }
   DevBuf inv_s, inv_f;
+  // vision embedder (load_vision): patch LayerNorm, Dense (+ bias), LayerNorm, position table + LayerNorm, the projection's RMSNorm (no
+  //   scale) and Linear; work rows for one image (vin [v_max_tokens, v_patch], va / vb [v_max_tokens, v_dim])
+  bool vision = false;
+  DevBuf v_ln1_w, v_ln1_b, v_dense_w, v_dense_b, v_ln2_w, v_ln2_b, v_pos, v_pn_w, v_pn_b, v_proj;
+  DevBuf vin, va, vbw;
+  // per-row last visible key of a prefill with images (AttnSeq::qlim)
+  DevBuf lim_d;
+  int32_t* lim_h = nullptr;
   // assistant
   bool mtp = false;
   int mtp_k = 3;
@@ -205,7 +227,43 @@ struct GemmaEngine::Impl {
       w.k_norm = vec(p + "self_attn.k_norm.weight");
       w.scalar = vec(p + "layer_scalar");
     }
+    load_vision();
     files.clear();
+  }
+
+  // the encoder-free vision embedder (HIVE_GEMMA_VISION=0: not loaded — image requests are then refused by the daemon). ~95 MiB bf16.
+  void load_vision() {
+    const char* e = getenv("HIVE_GEMMA_VISION");
+    if ((e && strcmp(e, "0") == 0) || c.v_patch == 0 || c.v_dim == 0 || c.image_token < 0) return;
+    const std::string V = "model.vision_embedder.";
+    if (!find(V + "patch_dense.weight") || !find("model.embed_vision.embedding_projection.weight")) return;
+    const TensorInfo* d = find(V + "patch_dense.weight");
+    const TensorInfo* pe = find(V + "pos_embedding");
+    const TensorInfo* pj = find("model.embed_vision.embedding_projection.weight");
+    HIVE_CHECK(d->shape.size() == 2 && (int)d->shape[0] == c.v_dim && (int)d->shape[1] == c.v_patch, "gemma: vision patch_dense shape");
+    HIVE_CHECK(pe && pe->shape.size() == 3 && (int)pe->shape[1] == 2 && (int)pe->shape[2] == c.v_dim, "gemma: vision pos_embedding shape");
+    HIVE_CHECK(pj->shape.size() == 2 && (int)pj->shape[0] == c.hidden && (int)pj->shape[1] == c.v_dim, "gemma: vision projection shape");
+    for (const auto* t : {d, pe, pj}) HIVE_CHECK(t->dtype == "BF16", "gemma: vision weights must be bf16");
+    if (c.v_posemb <= 0) c.v_posemb = (int)pe->shape[0];
+    v_ln1_w = vec(V + "patch_ln1.weight"); v_ln1_b = vec(V + "patch_ln1.bias");
+    v_dense_w = vec(V + "patch_dense.weight"); v_dense_b = vec(V + "patch_dense.bias");
+    v_ln2_w = vec(V + "patch_ln2.weight"); v_ln2_b = vec(V + "patch_ln2.bias");
+    v_pos = vec(V + "pos_embedding");
+    v_pn_w = vec(V + "pos_norm.weight"); v_pn_b = vec(V + "pos_norm.bias");
+    v_proj = vec("model.embed_vision.embedding_projection.weight");
+    vision = true;
+  }
+  // one image's soft tokens → rows dst (bf16 [gh · gw, hidden], row stride hidden) — the math of oracle/gemma4_oracle.py vision_embed
+  void vision_embed(const GemmaImage& im, bf16* dst) {
+    const int n = im.gh * im.gw, P = c.v_patch, Dv = c.v_dim;
+    constexpr float kLnEps = 1e-5f;   // the embedder's LayerNorms use the framework default
+    layernorm(im.patches, P, v_ln1_w.as<bf16>(), v_ln1_b.as<bf16>(), n, P, kLnEps, nullptr, 0, vin.as<bf16>(), P, st);
+    bias_rows(v_dense_b.as<bf16>(), n, Dv, va.as<bf16>(), st);
+    blasp->gemm_bf16_acc(vin.as<bf16>(), v_dense_w.as<bf16>(), va.as<bf16>(), n, Dv, P);
+    layernorm(va.as<bf16>(), Dv, v_ln2_w.as<bf16>(), v_ln2_b.as<bf16>(), n, Dv, kLnEps, nullptr, 0, vbw.as<bf16>(), Dv, st);
+    layernorm(vbw.as<bf16>(), Dv, v_pn_w.as<bf16>(), v_pn_b.as<bf16>(), n, Dv, kLnEps, v_pos.as<bf16>(), im.gw, va.as<bf16>(), Dv, st);
+    rmsnorm(va.as<bf16>(), Dv, nullptr, n, Dv, c.v_eps, vbw.as<bf16>(), Dv, st);
+    blasp->gemm_bf16(vbw.as<bf16>(), v_proj.as<bf16>(), dst, n, c.hidden, Dv);
   }
 
   void load_assistant(const std::string& dir) {
@@ -307,12 +365,21 @@ struct GemmaEngine::Impl {
     s.swa_lo = 0;
   }
 
-  // up to gemv_rows rows: the int4 GEMV in passes of kGemvRows (32) rows (each pass streams the weights once) — cheaper
-  //   than dequantizing every matrix to bf16 for cuBLAS (~45 ms for a 20-token prompt; 66-75 ms for the ~70-row turn tails of a long
-  //   conversation, against 7-11 ms per 16-row pass — measured 2026-10-18 in the service log). HIVE_GEMMA_GEMV_ROWS (default 128).
-  int gemv_rows = 128;
+  // up to gemv_rows rows the int4 kernels: the decode GEMV for ≤ 16 rows (decode / verify), the prefill GEMM above — the same math bit
+  //   for bit (gemma_kernels.h), so a row's result does not depend on which one ran. Dequantizing every matrix to bf16 for cuBLAS cost
+  //   ~45 ms for a 20-token prompt and 66-75 ms for the ~70-row turn tails of a long conversation (measured 2026-10-18 in the service
+  //   log); the GEMV in passes of 32 rows was bounded by re-reading the activations (92 µs for q + k + v + o + down of a layer at 32 rows,
+  //   ~15 µs of weight bytes). HIVE_GEMMA_GEMV_ROWS (default 192): longer forwards dequantize for cuBLAS (the GEMM is faster up to ~200
+  //   rows — 192 rows 659 µs a layer against 716 — and slower at 256: 895 against 759, cold L2, tests/test_gemma_w4.cu 2026-10-18).
+  int gemv_rows = 192;
   void linear(const W4Mat& W, const bf16* x, int R, bf16* y) {
     if (R <= gemv_rows) {
+      if (R > 16 && w4_gemm_fits(W)) {
+        W4Multi J;
+        J.n = 1; J.W[0] = W; J.yb[0] = y; J.ldy[0] = W.N;
+        w4_gemm_multi(J, x, W.K, R, st);
+        return;
+      }
       for (int r0 = 0; r0 < R; r0 += kGemvRows)
         w4_gemv(W, x + (size_t)r0 * W.K, W.K, std::min(kGemvRows, R - r0), y + (size_t)r0 * W.N, nullptr, W.N, ws.as<float>(), st);
       return;
@@ -322,6 +389,10 @@ struct GemmaEngine::Impl {
   }
   void mlp_front(const LayerW& w, const bf16* h, int R) {
     if (R <= gemv_rows) {
+      if (R > 16 && w.gate.N % 32 == 0) {
+        w4_gemm_gu(w.gate, w.up, h, c.hidden, R, act.as<bf16>(), c.inter, st);
+        return;
+      }
       for (int r0 = 0; r0 < R; r0 += kGemvRows)
         w4_gemv_gu(w.gate, w.up, h + (size_t)r0 * c.hidden, c.hidden, std::min(kGemvRows, R - r0), act.as<bf16>() + (size_t)r0 * c.inter, c.inter,
                    ws.as<float>(), st);
@@ -332,7 +403,8 @@ struct GemmaEngine::Impl {
     gelu_mul(gb.as<bf16>(), c.inter, ub.as<bf16>(), c.inter, R, c.inter, act.as<bf16>(), c.inter, st);
   }
 
-  struct Part { GemmaSeq* s; const int32_t* ids; int n; };
+  struct Part { GemmaSeq* s; const int32_t* ids; int n; const GemmaImage* img = nullptr; int n_img = 0; };   // img rows: relative to ids
+  std::vector<std::pair<int, const GemmaImage*>> cur_imgs;   // this forward's images (first row in the forward) — compute() embeds them
   void compute(int R, int S, int maxq, bool all_rows, const std::vector<int>& rows_last, bool want_logits, bool prefill);
   void draft_chain(int S, int k);
   DevBuf dsum, dmax, dones, dpart;
@@ -358,20 +430,23 @@ void GemmaEngine::Impl::compute(int R, int S, int maxq, bool all_rows, const std
   const int H = c.hidden;
   bf16* X = x.as<bf16>();
   k::embed(E(), ids_d.as<int32_t>(), R, H, c.embed_scale, X, H, st);
+  if (prefill) for (const auto& [r0, im] : cur_imgs) vision_embed(*im, X + (size_t)r0 * H);
   for (int l = 0; l < (int)L.size(); ++l) {
     const LayerW& w = L[l];
     const bool sl = c.sliding[l];
     const int D = sl ? c.head_dim : c.g_head_dim, Hkv = sl ? c.kv_heads : c.g_kv_heads;
     const float* inv = sl ? inv_s.as<float>() : inv_f.as<float>();
     if (l == 0) rmsnorm(X, H, w.in_ln.as<bf16>(), R, H, c.eps, hbuf.as<bf16>(), H, st);   // later layers: fused into the previous add
-    if (R <= gemv_rows) {   // q / k (/ v) in one GEMV launch per 16 rows
-      for (int r0 = 0; r0 < R; r0 += kGemvRows) {
+    if (R <= gemv_rows) {   // q / k (/ v) in one launch: the GEMV up to 16 rows, the GEMM above
+      const bool gemm = R > 16 && w4_gemm_fits(w.q) && w4_gemm_fits(w.k) && (!w.has_v || w4_gemm_fits(w.v));
+      for (int r0 = 0; r0 < R; r0 += gemm ? R : kGemvRows) {
         W4Multi J;
         J.n = w.has_v ? 3 : 2;
         J.W[0] = w.q; J.W[1] = w.k; J.ldy[0] = w.q.N; J.ldy[1] = w.k.N;
         J.yb[0] = qraw.as<bf16>() + (size_t)r0 * w.q.N; J.yb[1] = kraw.as<bf16>() + (size_t)r0 * w.k.N;
         if (w.has_v) { J.W[2] = w.v; J.yb[2] = vraw.as<bf16>() + (size_t)r0 * w.v.N; J.ldy[2] = w.v.N; }
-        w4_gemv_multi(J, hbuf.as<bf16>() + (size_t)r0 * H, H, std::min(kGemvRows, R - r0), st);
+        if (gemm) w4_gemm_multi(J, hbuf.as<bf16>(), H, R, st);
+        else w4_gemv_multi(J, hbuf.as<bf16>() + (size_t)r0 * H, H, std::min(kGemvRows, R - r0), st);
       }
     } else {
       linear(w.q, hbuf.as<bf16>(), R, qraw.as<bf16>());
@@ -407,6 +482,11 @@ void GemmaEngine::Impl::compute(int R, int S, int maxq, bool all_rows, const std
   if (want_logits) {
     blasp->gemm_bf16_f32out(HN, E(), logits_d.as<float>(), NR, c.vocab, H);
     if (c.softcap > 0) softcap(logits_d.as<float>(), (size_t)NR * c.vocab, c.softcap, st);
+    if (!c.suppress.empty()) {
+      int ids[4] = {0, 0, 0, 0};
+      for (size_t i = 0; i < c.suppress.size(); ++i) ids[i] = c.suppress[i];
+      suppress_cols(logits_d.as<float>(), NR, c.vocab, ids, (int)c.suppress.size(), st);
+    }
   }
 }
 
@@ -424,13 +504,33 @@ void GemmaEngine::Impl::run(const std::vector<Part>& parts, bool all_rows, float
   AttnSeq* af = as + S;
   int r = 0;
   std::vector<int> rows_last;
+  cur_imgs.clear();
+  bool any_img = false;
   for (int i = 0; i < S; ++i) {
     const Part& p = parts[i];
     as[i].pages = p.s->tab_s.as<const uint8_t*>(); af[i].pages = p.s->tab_f.as<const uint8_t*>();
     as[i].q_row0 = af[i].q_row0 = r; as[i].n_q = af[i].n_q = p.n; as[i].q_pos0 = af[i].q_pos0 = (int)p.s->pos;
+    as[i].qlim = af[i].qlim = nullptr; as[i].kmax = af[i].kmax = 0;
+    if (p.n_img > 0) {   // an image's rows see each other: their last visible key is the span's last position
+      HIVE_CHECK(vision && !all_rows, "gemma: image rows outside a vision prefill");
+      for (int j = 0; j < p.n; ++j) lim_h[r + j] = (int32_t)(p.s->pos + j);
+      int kmax = (int)p.s->pos + p.n - 1;
+      for (int k = 0; k < p.n_img; ++k) {
+        const GemmaImage& im = p.img[k];
+        const int n = im.gh * im.gw;
+        HIVE_CHECK(im.row >= 0 && n >= 1 && n <= c.v_max_tokens && im.row + n <= p.n && im.gw <= c.v_posemb && im.gh <= c.v_posemb,
+                   "gemma: image span outside the forward");
+        for (int j = 0; j < n; ++j) lim_h[r + im.row + j] = (int32_t)(p.s->pos + im.row + n - 1);
+        cur_imgs.push_back({r + im.row, &im});
+      }
+      as[i].qlim = af[i].qlim = lim_d.as<int32_t>() + r;
+      as[i].kmax = af[i].kmax = kmax;
+      any_img = true;
+    }
     for (int j = 0; j < p.n; ++j, ++r) { ids[r] = p.ids[j]; pos[r] = (int32_t)(p.s->pos + j); seqof[r] = i; }
     rows_last.push_back(r - 1);
   }
+  if (any_img) CUDA_CHECK(cudaMemcpyAsync(lim_d.p, lim_h, (size_t)R * 4, cudaMemcpyHostToDevice, st));
   CUDA_CHECK(cudaMemcpyAsync(ids_d.p, ids, (size_t)R * 4, cudaMemcpyHostToDevice, st));
   CUDA_CHECK(cudaMemcpyAsync(pos_d.p, pos, (size_t)R * 4, cudaMemcpyHostToDevice, st));
   CUDA_CHECK(cudaMemcpyAsync(seqof_d.p, seqof, (size_t)R * 4, cudaMemcpyHostToDevice, st));
@@ -443,6 +543,7 @@ void GemmaEngine::Impl::run(const std::vector<Part>& parts, bool all_rows, float
   } else {
     compute(R, S, maxq, all_rows, rows_last, want_logits, !all_rows);
   }
+  cur_imgs.clear();
   if (const char* dump = getenv("HIVE_GEMMA_DUMP"); dump) {   // validation: the residual of the forward's last row (fp32)
     std::vector<uint16_t> b(H);
     CUDA_CHECK(cudaMemcpyAsync(b.data(), x.as<bf16>() + (size_t)(R - 1) * H, (size_t)H * 2, cudaMemcpyDeviceToHost, st));
@@ -583,6 +684,12 @@ GemmaEngine::GemmaEngine(const std::string& ckpt_dir, const std::string& assista
   CUDA_CHECK(cudaMallocHost(&I.logits_h, (size_t)32 * c.vocab * 4));
   CUDA_CHECK(cudaMallocHost(&I.stage_i.p, (size_t)3 * I.max_rows * 4));
   CUDA_CHECK(cudaMallocHost(&I.stage_seq, (size_t)2 * 64 * sizeof(AttnSeq)));
+  if (I.vision) {
+    HIVE_CHECK(c.v_max_tokens >= 1 && c.v_max_tokens <= R, "gemma: an image's soft tokens exceed the prefill chunk (HIVE_GEMMA_CHUNK)");
+    A(I.vin, (size_t)c.v_max_tokens * c.v_patch * 2); A(I.va, (size_t)c.v_max_tokens * c.v_dim * 2); A(I.vbw, (size_t)c.v_max_tokens * c.v_dim * 2);
+    A(I.lim_d, (size_t)R * 4);
+    CUDA_CHECK(cudaMallocHost(&I.lim_h, (size_t)R * 4));
+  }
   I.use_graphs = !(getenv("HIVE_GEMMA_GRAPHS") && strcmp(getenv("HIVE_GEMMA_GRAPHS"), "0") == 0);
   if (I.mtp) {
     const int DH = I.d_hidden, S = 16;
@@ -621,9 +728,10 @@ GemmaEngine::GemmaEngine(const std::string& ckpt_dir, const std::string& assista
   for (int i = I.n_pages_f - 1; i >= 0; --i) I.free_f.push_back(I.pool_f.as<uint8_t>() + (size_t)i * I.Lf.page_bytes());
   I.host_limit = (size_t)(getenv("HIVE_GEMMA_HOST_KV_MB") ? atof(getenv("HIVE_GEMMA_HOST_KV_MB")) : 16384.0) * 1048576;
   fprintf(stderr, "[gemma] %d layers (%d sliding / %d full) · weights %.0f MiB · work %.0f MiB · KV pool %d sliding pages (%.1f MiB each) + %d full "
-          "pages (%.2f MiB each) = %.0f MiB · chunk %d · MTP %s (k %d)\n", c.n_layers, c.n_sliding, c.n_full, I.weights_bytes / 1048576.0,
+          "pages (%.2f MiB each) = %.0f MiB · chunk %d · MTP %s (k %d) · vision %s\n", c.n_layers, c.n_sliding, c.n_full, I.weights_bytes / 1048576.0,
           I.work_bytes / 1048576.0, I.n_pages_s, I.Ls.page_bytes() / 1048576.0, I.n_pages_f, I.Lf.page_bytes() / 1048576.0,
-          (I.pool_s.n + I.pool_f.n) / 1048576.0, I.max_rows, I.mtp ? "on" : "off", I.mtp_k);
+          (I.pool_s.n + I.pool_f.n) / 1048576.0, I.max_rows, I.mtp ? "on" : "off", I.mtp_k,
+          I.vision ? ("on (" + std::to_string(c.v_max_tokens) + " tokens per image)").c_str() : "off");
 }
 
 GemmaEngine::~GemmaEngine() {
@@ -631,6 +739,7 @@ GemmaEngine::~GemmaEngine() {
   if (p_ && p_->embed_host) cudaFreeHost(p_->embed_host);
   if (p_ && p_->stage_i.p) cudaFreeHost(p_->stage_i.p);
   if (p_ && p_->stage_seq) cudaFreeHost(p_->stage_seq);
+  if (p_ && p_->lim_h) cudaFreeHost(p_->lim_h);
   if (p_) for (auto& [k, g] : p_->graphs) cudaGraphExecDestroy(g);
   if (p_) for (uint8_t* h : p_->host_pages) cudaFreeHost(h);
 }
@@ -643,6 +752,8 @@ float* GemmaEngine::logits_host() { return p_->logits_h; }
 void GemmaEngine::set_host_logits(bool on) { p_->host_logits = on; }
 long GemmaEngine::graph_captures() const { return p_->n_captures; }
 bool GemmaEngine::mtp_on() const { return p_->mtp; }
+bool GemmaEngine::has_vision() const { return p_->vision; }
+int GemmaEngine::vision_max_tokens() const { return p_->vision ? p_->c.v_max_tokens : 0; }
 int GemmaEngine::mtp_k() const { return p_->mtp ? p_->mtp_k : 0; }
 // Every decode / verify / draft graph the daemon can ask for, captured and uploaded before serving: the start-up VRAM plan (and the
 //   daemon's limit reserve, rebased at ready) then already contains their memory. Captured lazily they appeared while serving, outside
@@ -707,14 +818,34 @@ void GemmaEngine::release_kv(GemmaSeq& s) {
   s.pos = 0; s.tokens.clear(); s.h_last_valid = false;
 }
 
-void GemmaEngine::prefill(GemmaSeq& s, const int32_t* ids, int T, float* logits) {
+void GemmaEngine::prefill(GemmaSeq& s, const int32_t* ids, int T, float* logits, const std::vector<GemmaImage>* images) {
   Impl& I = *p_;
   I.kv_reclaim_ = kv_reclaim;
   I.layer_boundary = layer_boundary; I.layer_boundary_due = layer_boundary_due;
-  for (int off = 0; off < T; off += I.max_rows) {
-    const int n = std::min(I.max_rows, T - off);
+  std::vector<GemmaImage> im;   // in row order
+  if (images) im = *images;
+  std::sort(im.begin(), im.end(), [](const GemmaImage& a, const GemmaImage& b) { return a.row < b.row; });
+  HIVE_CHECK(im.empty() || I.vision, "gemma: image inputs without the vision embedder");
+  for (size_t k = 0; k < im.size(); ++k)
+    HIVE_CHECK(im[k].row >= 0 && im[k].row + im[k].gh * im[k].gw <= T && (k == 0 || im[k].row >= im[k - 1].row + im[k - 1].gh * im[k - 1].gw),
+               "gemma: image spans out of range or overlapping");
+  size_t k = 0;
+  for (int off = 0; off < T;) {
+    int n = std::min(I.max_rows, T - off);
+    // a chunk never ends inside an image span: it ends before the span instead (a span fits one chunk — checked at load)
+    for (size_t j = k; j < im.size(); ++j) {
+      const int a = im[j].row, b = a + im[j].gh * im[j].gw;
+      if (a >= off + n) break;
+      if (b > off + n) { n = a - off; break; }
+    }
+    HIVE_CHECK(n >= 1, "gemma: an image span longer than the prefill chunk");
+    std::vector<GemmaImage> mine;
+    while (k < im.size() && im[k].row < off + n) { GemmaImage x = im[k++]; x.row -= off; mine.push_back(x); }
     const bool last = off + n >= T;
-    I.run({{&s, ids + off, n}}, false, last ? logits : nullptr, false);
+    Impl::Part p{&s, ids + off, n};
+    if (!mine.empty()) { p.img = mine.data(); p.n_img = (int)mine.size(); }
+    I.run({p}, false, last ? logits : nullptr, false);
+    off += n;
   }
 }
 void GemmaEngine::decode(GemmaSeq* const* seqs, const int32_t* ids, int M, float* logits) {
@@ -771,6 +902,7 @@ void GemmaEngine::mtp_draft_batch(GemmaSeq* const* seqs, const int32_t* toks, in
     HIVE_CHECK(seqs[i]->h_last_valid && seqs[i]->pos >= 1, "gemma: draft without a seed");
     as[i].pages = seqs[i]->tab_s.as<const uint8_t*>(); af[i].pages = seqs[i]->tab_f.as<const uint8_t*>();
     as[i].q_row0 = af[i].q_row0 = i; as[i].n_q = af[i].n_q = 1; as[i].q_pos0 = af[i].q_pos0 = (int)(seqs[i]->pos - 1);
+    as[i].qlim = af[i].qlim = nullptr; as[i].kmax = af[i].kmax = 0;
     pos[i] = (int32_t)(seqs[i]->pos - 1);
     ids[i] = toks[i];
     CUDA_CHECK(cudaMemcpyAsync(I.dcat.as<uint8_t>() + ((size_t)i * 2 * H + H) * 2, seqs[i]->h_last.p, (size_t)H * 2, cudaMemcpyDeviceToDevice, st));

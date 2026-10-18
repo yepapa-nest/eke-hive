@@ -28,6 +28,7 @@ Model::Model(const std::string& ckpt, int, int64_t max_ctx) {
   const GemmaConfig& q = e_->cfg();
   cfg_.vocab = q.vocab; cfg_.n_layers = q.n_layers; cfg_.eng = e_.get();
   cfg_.window = q.window;
+  cfg_.vision_max_tokens = e_->vision_max_tokens(); cfg_.vision_downsample = 1;   // hived's patch budget per image (one patch = one soft token)
 }
 
 Runtime::Runtime(Model& model, ExpertStore& store, const void*, const RuntimeOptions& opt) : model_(model), store_(store), opt_(opt) {
@@ -447,8 +448,13 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
                          bool) {
   HIVE_CHECK(M >= 1, "gemma forward: no tokens");
   GemmaEngine& e = model_.eng();
-  HIVE_CHECK(!images || images->empty(), "gemma: image inputs are not served");
-  if (M == 1) {
+  std::vector<GemmaImage> gi;
+  if (images) for (const ImageInput& x : *images) {
+    HIVE_CHECK(has_vision(), "gemma: image inputs without the vision embedder");
+    HIVE_CHECK((int)x.types.size() == x.n_vit_h * x.n_vit_w, "gemma: an image span is one soft token per patch");
+    gi.push_back({x.start, x.n_vit_h, x.n_vit_w, x.patches_dev});
+  }
+  if (M == 1 && gi.empty()) {
     std::vector<Seq*> s{&seq};
     std::vector<int32_t> next;
     std::vector<std::vector<float>> lg;
@@ -473,7 +479,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   }
   const int V = e.cfg().vocab;
   std::vector<float> lg(V);
-  try { e.prefill(seq, ids, M, lg.data()); } catch (...) { seq.broken = true; throw; }
+  try { e.prefill(seq, ids, M, lg.data(), gi.empty() ? nullptr : &gi); } catch (...) { seq.broken = true; throw; }
   inv_temp_[0] = 1.f;
   cands(lg.data(), 1);
   if (logits_out) *logits_out = std::move(lg);

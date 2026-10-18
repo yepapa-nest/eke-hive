@@ -873,6 +873,10 @@ qasr_engine* qasr_create(const char* ckpt_dir, const qasr_options* opt_in, char*
     const bool nvml = hive::vram_limit::nvml_free(pci, &f0);
     CUDA_CHECK(cudaSetDevice(e->dev));
     CUDA_CHECK(cudaFree(0));
+    // The context reserves local memory for the per-thread stack limit (default 1 KiB) on every resident thread — ~210 MiB on a 188-SM
+    //   card (measured for qtts, 2026-10-18). The qasr kernels use no stack frame (ptxas -v: 0 bytes for all 61) and the driver raises the
+    //   limit by itself for a launch that needs more (cuBLAS), so lowering it only costs a reallocation if ever needed.
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 256));
     CUDA_CHECK(cudaMemGetInfo(&f1, &tot));
     const bool ctx_measured = nvml && f0 > f1 && f0 - f1 >= (64ull << 20);
     const size_t ctx = ctx_measured ? f0 - f1 : hive::vram_limit::kCtxFallback;

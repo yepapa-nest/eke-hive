@@ -1511,10 +1511,13 @@ int main(int argc, char** argv) {
   // HIVE_LAYER_YIELD: prompt id count of sessions being prefilled (the "sid:rows" layer-yield header line — lets a monitor tell >= 16K prefill
     // gaps apart). Only when enabled; entries no longer prefilling are swept on insert.
   std::map<std::string, size_t> ly_rows;
-  auto ly_mark = [&](const std::string& sid, size_t rows) {
+  std::map<std::string, int> ly_prio;  // priority of the request being prefilled per session (the layer-yield priority rule below)
+  auto ly_mark = [&](const std::string& sid, size_t rows, int prio) {
     if (ly_period <= 0) return;
     for (auto it = ly_rows.begin(); it != ly_rows.end();) it = prefilling_sids.count(it->first) ? std::next(it) : ly_rows.erase(it);
+    for (auto it = ly_prio.begin(); it != ly_prio.end();) it = prefilling_sids.count(it->first) ? std::next(it) : ly_prio.erase(it);
     ly_rows[sid] = rows;
+    ly_prio[sid] = prio;
   };
   int prefill_pending_n = 0;               // the multi-chunk marker means "at least one request is prefilling" — 0/1 on the single path
   // Tell the runtime while a multi-chunk prefill runs (before the first chunk until after the last). RAII — cleared on error, cancel, exception
@@ -2318,7 +2321,7 @@ int main(int argc, char** argv) {
         //   (the forward is paused between layers).
     struct YieldSid { std::set<std::string>* s; std::string sid; ~YieldSid() { if (s) s->erase(sid); } } yield_sid{prefill_yield || layer_yield ? &prefilling_sids : nullptr, J.A->sid};
     if (prefill_yield || layer_yield) prefilling_sids.insert(J.A->sid);
-    ly_mark(J.A->sid, J.ids.size());
+    ly_mark(J.A->sid, J.ids.size(), J.A->prio);
     while (J.i < J.ids.size()) {
       if (!chunk_begin(J, SIZE_MAX, false)) return;
       const double tc0 = now_ms();
@@ -2419,7 +2422,7 @@ int main(int argc, char** argv) {
       const Tag tag{r.cancel, r.req.value("session", "default")};
       try {
         auto Jp = admit_setup(std::move(r), true);
-        if (Jp && Jp->i < Jp->ids.size()) { prefilling_sids.insert(Jp->A->sid); ly_mark(Jp->A->sid, Jp->ids.size()); jobs.push_back(std::move(Jp)); return; }
+        if (Jp && Jp->i < Jp->ids.size()) { prefilling_sids.insert(Jp->A->sid); ly_mark(Jp->A->sid, Jp->ids.size(), Jp->A->prio); jobs.push_back(std::move(Jp)); return; }
         if (Jp) admit_finish(*Jp);  // nothing to prefill (regenerating the same prompt)
       } catch (const std::exception& e) {
         admit_error(fd, e, tag.sid);
@@ -3127,7 +3130,31 @@ int main(int argc, char** argv) {
     //   Warming (warm_after_prefill) is skipped.
     //   Logs: header line "[hived] layer yield: <prefilling sid> · prefill X ms since resume ..." (counted as a gap by monitors) -> admit line
     //   (same format as HIVE_PREFILL_YIELD + " · layer") -> done line.
+  // A queued request's priority — same reading as the Active's prio (a number clamped to ±1000, anything else 0)
+  auto req_prio = [](const Request& x) {
+    const auto it = x.req.find("priority");
+    if (it == x.req.end() || !it->is_number()) return 0;
+    const double v = it->get<double>();
+    return std::isfinite(v) ? (int)std::max(-1000.0, std::min(1000.0, v)) : 0;
+  };
+  // HIVE_LAYER_YIELD priority rule: a queued request whose priority beats every request being prefilled ("urgent") is admitted at a layer
+    //   yield up to the rows the runtime can lend (<= max(HIVE_LAYER_YIELD_MAX, HIVE_LAYER_YIELD_MID) and <= R) without the mid rule's
+    //   "much smaller than what is left" test, best priority first; and while such a request decodes, the yield keeps stepping it (no
+    //   share/step budget) — the paused prefill resumes when it finishes. Measured 2026-10-18 (DeepSeek, a background-prefill probe — numbers in docs/performance.md step 34):
+    //   decode was held by priority since 10-08 but prefill was not — a conversation turn queued behind a background prefill waited for the
+    //   paused forward unless it passed the mid rule, and once admitted it decoded only a few steps per 150 ms yield. Requests without the
+    //   field are all 0: no request is urgent and nothing changes.
   if (layer_yield) {
+    auto paused_prio = [&] {
+      int p = INT_MAX;
+      for (const auto& sid : prefilling_sids) { const auto it = ly_prio.find(sid); p = std::min(p, it != ly_prio.end() ? it->second : 0); }
+      return p;
+    };
+    auto urgent_active = [&, paused_prio] {  // paused_prio by value: this block ends before the hooks run
+      const int pp = paused_prio();
+      for (auto& A : active) if (A->prio < pp && A->client_ok && !A->cancel->load() && A->n < A->max_tokens) return true;
+      return false;
+    };
     auto h_nested_ok = [&] { return ly_mid > ly_max && rt.in_layer_yield(); };  // in_yield from a layer yield (not HIVE_PREFILL_YIELD) with level 2 on
     auto ly_mid_ok = [&](size_t rows) {  // HIVE_LAYER_YIELD_MID (see its comment): much smaller than the paused forward's remaining rows
       if (ly_mid <= ly_max || rows <= ly_max || rows > ly_mid) return false;
@@ -3135,14 +3162,14 @@ int main(int argc, char** argv) {
       const double rem = (double)ly_fwd_rows * (1.0 - p) + (double)ly_rest_rows;
       return 2.0 * (double)rows <= rem && ly_mid_used + rows <= ly_fwd_rows;
     };
-    auto ly_rows_of = [&, ly_mid_ok](const Request& r, size_t cap) -> size_t {
+    auto ly_rows_of = [&, ly_mid_ok, paused_prio](const Request& r, size_t cap) -> size_t {
       const json& q = r.req;
       if (q.contains("images") && q["images"].is_array() && !q["images"].empty()) return 0;  // do not lazily load the vision encoder (VRAM) in the middle of a long prefill
       const std::string sid = q.value("session", "default");
       if (active_sids.count(sid) || prefilling_sids.count(sid)) return 0;
       const size_t rows = rows_to_prefill(sid, q);  // ids minus the reusable prefix (lower bound): what the forward will really hold
       if (rows == 0 || rows > cap) return 0;
-      if (rows > ly_max && !ly_mid_ok(rows)) return 0;
+      if (rows > ly_max && !ly_mid_ok(rows) && !(req_prio(r) < paused_prio())) return 0;
       return rows;
     };
     auto ly_seat = [&] { return (int)(active.size() + prefilling_sids.size()) + 1 <= rt.max_batch(); };
@@ -3164,7 +3191,7 @@ int main(int argc, char** argv) {
       }
       return need;
     };
-    h.run = [&, ly_rows_of, ly_seat](int R, double gap_ms) {
+    h.run = [&, ly_rows_of, ly_seat, paused_prio, urgent_active](int R, double gap_ms) {
       const bool nested = in_yield;  // level 2 (inside a forward admitted by a yield): decode steps only
       const int kind = rt.layer_yield_kind();  // HIVE_LAYER_YIELD_INTRA: ≠ kLayer = a point inside a layer — decode steps only (no admission)
       struct InYield { bool& f; bool was; ~InYield() { f = was; } } in_yield_guard{in_yield, in_yield};
@@ -3180,29 +3207,52 @@ int main(int argc, char** argv) {
       fprintf(stderr, "[hived] layer yield: %s · prefill %.0f ms since resume · rows %d · active %zu%s%s%s\n", who.empty() ? "-" : who.c_str(), gap_ms, R, active.size(),
               nested ? " · level 2 (decode only)" : "", kind != ly::kLayer ? " · intra " : "", kind != ly::kLayer ? ly::kind_name(kind) : "");
       const size_t cap = nested || kind != ly::kLayer ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));
-      int n = 0, n_mid = 0;
-      while (cap > 0 && ly_seat()) {
-        Request r;
-        bool got = false;
-        size_t rows = 0;
-        {
-          std::lock_guard<std::mutex> lk(mu);
-          if (stop_state.load() != 0 || sleep_asked.load()) break;
-          for (auto it = queue.begin(); it != queue.end(); ++it)
-            if ((rows = ly_rows_of(*it, cap)) > 0) { r = std::move(*it); queue.erase(it); got = true; break; }
+      int n = 0, n_mid = 0, n_urgent = 0;
+      // Admit the best-priority admissible request first (FIFO among equals) — with no priorities this is the queue order as before
+      auto admit_some = [&] {
+        while (cap > 0 && ly_seat()) {
+          Request r;
+          bool got = false;
+          size_t rows = 0;
+          int prio = 0;
+          {
+            std::lock_guard<std::mutex> lk(mu);
+            if (stop_state.load() != 0 || sleep_asked.load()) break;
+            auto pick = queue.end();
+            for (auto it = queue.begin(); it != queue.end(); ++it) {
+              const size_t x = ly_rows_of(*it, cap);
+              if (x > 0 && (pick == queue.end() || req_prio(*it) < prio)) { pick = it; rows = x; prio = req_prio(*it); }
+            }
+            if (pick != queue.end()) { r = std::move(*pick); queue.erase(pick); got = true; }
+          }
+          if (!got) break;
+          if (prio < paused_prio()) ++n_urgent;
+          else if (rows > ly_max) { ly_mid_used += rows; ++n_mid; }  // HIVE_LAYER_YIELD_MID
+          admit(std::move(r));
+          ++n;
         }
-        if (!got) break;
-        if (rows > ly_max) { ly_mid_used += rows; ++n_mid; }  // HIVE_LAYER_YIELD_MID
-        admit(std::move(r));
-        ++n;
-      }
+      };
+      admit_some();
       const double ta = now_ms();
-      if (n) fprintf(stderr, "[hived] prefill yield: %d short request%s admitted in %.0f ms (active %zu · prefilling %zu) · layer%s\n", n, n > 1 ? "s" : "", ta - t0,
-                     active.size(), prefilling_sids.size(), n_mid ? (" · " + std::to_string(n_mid) + " by the mid rule").c_str() : "");
+      if (n) fprintf(stderr, "[hived] prefill yield: %d short request%s admitted in %.0f ms (active %zu · prefilling %zu) · layer%s%s\n", n, n > 1 ? "s" : "", ta - t0,
+                     active.size(), prefilling_sids.size(), n_mid ? (" · " + std::to_string(n_mid) + " by the mid rule").c_str() : "",
+                     n_urgent ? (" · " + std::to_string(n_urgent) + " by priority").c_str() : "");
       int steps = 0;
       if (!active.empty()) {
         const double budget = ly::decode_budget_ms(gap_ms, ly_share);
         do { decode_step(); ++steps; } while (!active.empty() && steps < ly_steps && now_ms() - ta < budget);
+      }
+      // Priority hold: while a better-priority request decodes, the yield keeps stepping it until it finishes (more urgent arrivals are
+      //   admitted between steps at a layer point); a stop or sleep request ends the hold
+      if (!nested && urgent_active()) {
+        const double th = now_ms();
+        const int s0 = steps;
+        while (urgent_active() && stop_state.load() == 0 && !sleep_asked.load()) {
+          if (kind == ly::kLayer) admit_some();
+          decode_step();
+          ++steps;
+        }
+        fprintf(stderr, "[hived] layer yield: priority hold %d steps · %.0f ms (prefilling priority %d)\n", steps - s0, now_ms() - th, paused_prio());
       }
       last_prefill_tc = saved_tc;
       fprintf(stderr, "[hived] layer yield done: admitted %d · decode steps %d · %.0f ms\n", n, steps, now_ms() - t0);
@@ -3594,17 +3644,11 @@ int main(int argc, char** argv) {
       if (!queue.empty() && (int)active.size() < max_batch && !sleep_asked.load()) {
         // Priority: the best-priority queued request first (FIFO among equals), and none below a running request's priority — its
         //   prefill would interrupt that request's decode (the decode_step rule holds it anyway). Without the field everything is 0: FIFO as before.
-        auto prio_of = [](const Request& x) {
-          const auto it = x.req.find("priority");
-          if (it == x.req.end() || !it->is_number()) return 0;
-          const double v = it->get<double>();
-          return std::isfinite(v) ? (int)std::max(-1000.0, std::min(1000.0, v)) : 0;
-        };
         int best_active = INT_MAX;
         for (auto& A : active) best_active = std::min(best_active, A->prio);
         auto pick = queue.begin();
-        int pick_prio = prio_of(*pick);
-        for (auto it = std::next(queue.begin()); it != queue.end(); ++it) { const int p = prio_of(*it); if (p < pick_prio) { pick = it; pick_prio = p; } }
+        int pick_prio = req_prio(*pick);
+        for (auto it = std::next(queue.begin()); it != queue.end(); ++it) { const int p = req_prio(*it); if (p < pick_prio) { pick = it; pick_prio = p; } }
         if (pick_prio <= best_active) { r = std::move(*pick); queue.erase(pick); got = true; }
       }
       lk.unlock();

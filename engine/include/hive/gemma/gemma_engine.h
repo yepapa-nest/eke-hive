@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
-// Gemma 4 (Unified, text path) engine: int4 group-32 weights (compressed-tensors pack-quantized, repacked for the decode GEMV), bf16
+// Gemma 4 (Unified) engine: int4 group-32 weights (compressed-tensors pack-quantized, repacked for the decode GEMV), bf16
 //   embedding shared with the lm_head, a paged fp8 KV cache (sliding-window layers release pages behind the window), and the Frozen-KV MTP
-//   assistant (it reads the target's last sliding / full layer KV). The math contract is oracle/gemma4_oracle.py.
-//   The vision / audio towers of the checkpoint are not loaded (text serving).
+//   assistant (it reads the target's last sliding / full layer KV), and the encoder-free vision embedder (merged pixel patches → LayerNorm →
+//   Dense → LayerNorm → + 2-D position → LayerNorm → RMSNorm → Linear into the text space; an image's soft tokens attend to each other both
+//   ways). The math contract is oracle/gemma4_oracle.py. The audio projection of the checkpoint is not loaded.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "hive/devbuf.h"
@@ -31,6 +33,11 @@ struct GemmaConfig {
   std::vector<int> type_index;                    // per layer: index among the layers of its type
   int n_sliding = 0, n_full = 0;
   std::vector<int> eos;
+  std::vector<int> suppress;                      // generation_config suppress_tokens (input-only image / audio end markers)
+  // vision (config.json vision_config): merged patch = model_patch_size² · 3 values, mm_embed_dim, position table rows, soft tokens per image
+  int v_patch = 0, v_dim = 0, v_posemb = 0, v_max_tokens = 0;
+  float v_eps = 1e-6f;
+  int image_token = -1;
   static GemmaConfig load(const std::string& ckpt_dir);
 };
 
@@ -55,6 +62,13 @@ struct GemmaSeq {
 
 struct Placement { bool head_gpu = true; };
 
+// One image of a prefill: its gh × gw soft tokens are the rows [row, row + gh · gw) of the ids handed to prefill (placeholders), in raster
+//   order; patches = bf16 [gh · gw, v_patch] merged pixel patches (values / 255, rows of (y, x, channel)), device memory.
+struct GemmaImage {
+  int row = 0, gh = 0, gw = 0;
+  const __nv_bfloat16* patches = nullptr;
+};
+
 class GemmaEngine {
  public:
   GemmaEngine(const std::string& ckpt_dir, const std::string& assistant_dir, int64_t max_ctx, int max_batch);
@@ -74,8 +88,11 @@ class GemmaEngine {
   std::function<void(int layer)> layer_boundary;
   std::function<bool()> layer_boundary_due;
   void warmup(int max_batch, int max_k);
-  // prefill T tokens of one sequence (chunked internally); logits of the last row → logits (fp32 [vocab], host or null)
-  void prefill(GemmaSeq& s, const int32_t* ids, int T, float* logits);
+  // prefill T tokens of one sequence (chunked internally, never inside an image); logits of the last row → logits (fp32 [vocab], host or
+  //   null); images (or null): their rows take the vision embedding instead of the placeholder token's
+  void prefill(GemmaSeq& s, const int32_t* ids, int T, float* logits, const std::vector<GemmaImage>* images = nullptr);
+  bool has_vision() const;                        // the checkpoint has the vision embedder and HIVE_GEMMA_VISION is not 0
+  int vision_max_tokens() const;                  // soft tokens of one image at most (0 = no vision)
   // one token for each of M sequences; logits [M, vocab] (host, or null with set_host_logits(false))
   void decode(GemmaSeq* const* seqs, const int32_t* ids, int M, float* logits);
   // verify rows: M[s] rows of sequence s (ids concatenated); logits [Σ M, vocab]

@@ -15,11 +15,23 @@
 
 One difference: `tool_choice: "required"` is not enforced (the request is served as `auto`).
 
-Eke Hive's fifth model family is **Gemma 4 12B Unified** (config.json `model_type` `gemma4_unified`), served on its **text path** from the
+**Images (2026-10-18):** image parts are served through the checkpoint's encoder-free vision embedder (below). Measured on the GPU
+against the fp32 oracle (`oracle/gemma4_oracle.py --images`, whose embedder matches the Hugging Face module to a relative 2e-7) on three
+images through the server's own preprocessing: teacher-forced argmax agrees at 58 of 59 steps (the miss is a near-tie of 0.16 logits).
+The server's preprocessing gives the same token ids, soft-token counts and positions as the checkpoint's Hugging Face processor; pixels
+differ by at most 1.5 levels of 255 (bicubic resampler). Text requests are unchanged: on a text prompt every logit (except the two
+suppressed markers) and 64 decoded tokens with their drafts are bit-identical to the build without vision. Under the voice set's
+13,000 MiB limit the embedder costs 102 MiB of the KV pool (1,838 → 1,736 MiB); the process stays at 12,992 MiB while serving images.
+Image requests on the served model (stream, 10 different pictures of 300 × 200 … 1920 × 1080, ~290 prompt tokens, preprocessing
+included): first token p50 90 ms (max 169, the first request), decode 276 tok/s; the next text turn of the same conversation 71 ms; two
+images in one request (559 tokens) 128 ms. The chat harness above with the embedder loaded: first token 45 / 61 ms, first sentence
+93 / 150 ms, 320 tok/s, tool battery unchanged.
+
+Eke Hive's fifth model family is **Gemma 4 12B Unified** (config.json `model_type` `gemma4_unified`), served for **text and images** from the
 quantization-aware-trained checkpoint `gemma-4-12B-it-qat-w4a16-ct` (compressed-tensors int4, ~9.6 GB), with the Frozen-KV MTP assistant
 `gemma-4-12B-it-qat-q4_0-unquantized-assistant` (bf16, 0.84 GB) as the drafter. It is a small real-time chat model: short prompts, a few
-conversations at once, first-token latency matters more than long-context throughput. The vision and audio towers in the checkpoint are not
-loaded.
+conversations at once, first-token latency matters more than long-context throughput. The checkpoint has no vision tower: its encoder-free
+vision embedder (~95 MiB) is loaded; the audio projection is not.
 
 ## Model and checkpoint
 
@@ -31,6 +43,7 @@ loaded.
 | norms | input, post-attention, pre-FF, post-FF (RMSNorm `x · w`), q / k norms per head, v norm without scale, a per-layer scalar | BF16 |
 | embedding = lm_head (tied, the same bytes in the file) | 262144 × 3840, embedding scaled by bf16(√3840) | BF16 |
 | logits | final RMSNorm, then `30 · tanh(l / 30)` | — |
+| vision embedder | merged 48 × 48 patch (6912 values) → LayerNorm → Dense 6912 → 3840 (+ bias) → LayerNorm → + position rows (x, axis 0) and (y, axis 1) of a [1120, 2, 3840] table → LayerNorm → RMSNorm (no scale) → Linear 3840 → 3840 | BF16 |
 | MTP assistant | `pre_projection` 7680 → 1024, 4 KV-shared layers (3 sliding + 1 full, hidden 1024, 16 heads), final norm, `post_projection` 1024 → 3840, own tied head 262144 × 1024 | BF16 |
 
 int4 group 32 (compressed-tensors `pack-quantized`, symmetric): `weight_packed` int32 [N, K / 8] holds 8 values per word, low nibble first,
@@ -54,8 +67,14 @@ The math contract is the docstring of `oracle/gemma4_oracle.py` (this project's 
   launches plainly (outputs are identical).
 - **Norms**: rows are read as 16-byte vectors held in registers; each residual add is fused with the norm that reads its result (the
   pre-feedforward norm, or the next layer's input norm).
-- **Prefill**: up to `HIVE_GEMMA_GEMV_ROWS` rows (128) the decode GEMV runs in passes of 16 rows; longer forwards dequantize each matrix
-  into one bf16 scratch and multiply by cuBLAS.
+- **Prefill GEMM** (`w4_gemm_multi` / `w4_gemm_gu`, 17 … `HIVE_GEMMA_GEMV_ROWS` rows, default 192): the GEMV's math bit for bit — the
+  same K split over the block's warps, the same per-group integer tile and fp32 scaling, the same warp-order sum — so a row's result does
+  not depend on the row count and equals the decode GEMV's. A warp owns 64 output rows × 16 or 32 tokens and stages the tokens'
+  activations of its K range in shared memory (cp.async, ldmatrix); the GEMV it replaces re-read every token's activations for each
+  16-row tile, and that read bounded it above ~16 rows. Per layer (q + k + v, o, gate + up, down; cold L2): 70 rows 788 → 305 µs,
+  128 rows 1,382 → 477 µs. A conversation turn's tail of 70 rows after 3,000 tokens: 42.7 → 28.9 ms; 128 rows: 70.4 → 36.6 ms (`tests/gemma_tail.cpp`).
+  Served (60-turn voice conversation, server-side first token while it is the only conversation): p50 64 → 31 ms.
+  Longer forwards dequantize each matrix into one bf16 scratch and multiply by cuBLAS (faster from ~256 rows).
 - **KV cache** (`engine/include/hive/gemma/gemma_kernels.h`): fp8 e4m3 pages of 64 tokens, token-major (a page's filled part is a contiguous
   prefix, so a session image copies only what grew). Page tables hold page *pointers*: when the VRAM pool is exhausted and no idle session can
   be evicted, new pages come from mapped pinned host memory (`HIVE_GEMMA_HOST_KV_MB`) — slower, never an out-of-memory. Sliding-window layers
@@ -69,12 +88,25 @@ The math contract is the docstring of `oracle/gemma4_oracle.py` (this project's 
   default gate's fixed table belongs to DeepSeek and never let a 6.5 ms Gemma step draft.
 - **No layer yield**: the engine has one set of forward buffers, so a decode inside a prefill's layer boundary would overwrite the
   prefill's residual; prompts are prefilled in chunks between decode steps instead.
+- **Images** (`GemmaImage`, `prefill(…, images)`): an image's soft tokens are prefill rows whose embedding is the vision embedder's output
+  (no embedding scale) instead of the placeholder token's. The embedder runs per image on the rows of its chunk (two cuBLAS GEMMs, three
+  LayerNorms and an RMSNorm). The checkpoint's `use_bidirectional_attention: "vision"` means an image's soft tokens see each other both
+  ways: every attention row carries the last key it may see (`AttnSeq::qlim` — the span's last position for an image row, its own
+  position otherwise), on the prefill and the decode / verify kernel alike; a prefill chunk never ends inside an image span. The daemon's
+  image rules (session signatures of the patch bytes, no prefix reuse across a different picture) are the shared ones of `hived`.
+- **Suppressed tokens**: the end-of-image / end-of-audio markers (generation_config `suppress_tokens`) get logit −inf in every next-token
+  row, as the reference generation does. They are input-only; on a plain text prompt the end-of-audio marker still scored 16.3.
 - **VRAM limit**: the engine sizes its KV pool from `HIVE_VRAM_LIMIT_MB` (limit − weights − work buffers − context and cuBLAS estimate −
   `HIVE_CACHE_RESERVE_MB`), and the daemon keeps the reserve for the process lifetime (like DeepSeek, see `docs/configuration.md`).
 
 ## API
 
-The usual `/v1/chat/completions` (streaming, tools, `chat_template_kwargs.enable_thinking`, `top_k`). The prompt is the checkpoint's chat
+The usual `/v1/chat/completions` (streaming, tools, `chat_template_kwargs.enable_thinking`, `top_k`, image parts — `image_url` data: or
+http(s) URLs, Anthropic-style `image` sources, also inside tool results).
+Images are preprocessed by the server (`server/families/gemma.py`, from `processor_config.json`): aspect ratio kept, the largest height and
+width that are multiples of 48 with at most 280 · 48² pixels (bicubic), cut into 48 × 48 blocks in raster order (values / 255, no
+normalization); the prompt's `<|image|>` becomes `<|image>` + one `<|image|>` per block (at most 280) + `<image|>`. Audio and video
+parts are refused. The prompt is the checkpoint's chat
 template (or `HIVE_GEMMA_CHAT_TEMPLATE`) with one added branch (`HIVE_GEMMA_TOOL_THOUGHT`, default on): after a tool response with thinking
 off, the generation prompt closes an empty thought channel, as it does after a user turn. Tool calls are parsed from the model's own syntax
 (`<|tool_call>call:NAME{key:value,…}<tool_call|>`, strings delimited by `<|"|>`), thinking from the `<|channel>thought … <channel|>` channel.
@@ -95,5 +127,7 @@ Sampling fields a request leaves out default to the model's `generation_config.j
 | `HIVE_GEMMA_CHAT_TEMPLATE` | the checkpoint's | chat template file |
 | `HIVE_GEMMA_TOOL_THOUGHT` | 1 | the tool-response branch above |
 | `HIVE_GEMMA_CANDS` | ≤ 256 | sampler candidates per row |
-| `HIVE_GEMMA_GEMV_ROWS` | 128 | forwards of up to this many rows use the int4 GEMV in passes of 16 rows; longer ones dequantize for cuBLAS |
+| `HIVE_GEMMA_GEMV_ROWS` | 192 | forwards of up to this many rows use the int4 kernels (the GEMV up to 16 rows, the prefill GEMM above); longer ones dequantize for cuBLAS |
+| `HIVE_GEMMA_GEMM_V` | unset | force one prefill GEMM variant (0 … 5, `src/gemma/gemma_w4.cu`); unset = by row count. Every variant gives the same bits |
+| `HIVE_GEMMA_VISION` | 1 | 0 = do not load the vision embedder (image requests are then refused); it takes ~102 MiB under a VRAM limit |
 | `HIVE_GEMMA_NO_PDL` | 0 | 1 = launch the forward's kernels without programmatic dependent launch (A/B) |

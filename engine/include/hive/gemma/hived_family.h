@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
-// Gemma 4 (Unified, text path) for hived (built as hived_gemma with -DHIVE_FAMILY_GEMMA). The surface hived sees is the one of every family
+// Gemma 4 (Unified: text and images) for hived (built as hived_gemma with -DHIVE_FAMILY_GEMMA). The surface hived sees is the one of every family
 //   (derived from hive/q27/hived_family.h); here it wraps GemmaEngine (hive/gemma/gemma_engine.h). The model is dense — there is no expert
 //   cache, so the ExpertStore below only answers hived's bookkeeping questions. Sleep levels release nothing yet (asleep() stays false).
 #pragma once
@@ -129,10 +129,12 @@ struct ForwardStats {
   std::vector<int> row_hit, row_cpu, row_dma;
 };
 
+// one image: n_vit_h × n_vit_w soft tokens (rows of the merged-patch grid) at token start, patches = bf16 [n_vit_h · n_vit_w, v_patch]
+//   on the device (GemmaImage)
 struct ImageInput {
   int start = 0, n_vit_h = 0, n_vit_w = 0;
   std::vector<int8_t> types;
-  const bf16* patches_dev = nullptr;   // device memory (copied to the host: the vision encoder runs on the CPU engine)
+  const bf16* patches_dev = nullptr;
 };
 
 struct Seq;
@@ -208,7 +210,7 @@ class Runtime {
   void forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::vector<int32_t>& next, std::vector<std::vector<float>>* logits_out,
                      ForwardStats* stats);
   bool tail_mode_for(int) const { return false; }
-  bool has_vision() const { return false; }
+  bool has_vision() const { return opt_.vision && model_.eng().has_vision(); }
   void ensure_vision() {}
   void release_vision_if_idle() {}
   int max_batch() const { return opt_.max_batch; }
@@ -231,7 +233,7 @@ class Runtime {
   void set_warm_cap(int n) { opt_.warm_cap = n; }
   void warm_defer(int) {}
   int warm_left() const { return 0; }
-  int image_patch_bytes() const { return 16 * 16 * 3 * 2; }   // images are not served (text path)
+  int image_patch_bytes() const { return model_.eng().has_vision() ? model_.eng().cfg().v_patch * 2 : 16 * 16 * 3 * 2; }   // one merged patch, bf16
   int promote_after_step() { return 0; }
   int warm_from_keys(const std::vector<int32_t>&) { return 0; }
   size_t sleep_release() { return 0; }

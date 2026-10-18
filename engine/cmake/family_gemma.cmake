@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Eke Hive Authors
-# Gemma 4 family (config model_type "gemma4_unified", text path): int4 group-32 weights, paged fp8 KV with sliding-window layers, Frozen-KV
+# Gemma 4 family (config model_type "gemma4_unified", text and images): int4 group-32 weights, paged fp8 KV with sliding-window layers, Frozen-KV
 #   MTP assistant — hive/gemma/*. hive_gemma: the engine · hived_gemma: the daemon · gemma_check: engine end to end against the oracle.
 # Every target is guarded by the existence of its sources: this file is included by every configure of the tree.
 set(_gm ${CMAKE_CURRENT_SOURCE_DIR})

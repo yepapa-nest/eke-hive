@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(Cfg<D, M, DS, QDS, KT, ST, SPLIT>::NT, 1) attn
   if (r0 >= rows) return;
   const int rlast = min(rows, r0 + M) - 1;
   const int pmin = sq.q_pos0 + r0 / ratio, pmax = sq.q_pos0 + rlast / ratio;
-  const int lo = a.window > 0 ? max(0, pmin - a.window + 1) : 0, hi = pmax;
+  const int lo = a.window > 0 ? max(0, pmin - a.window + 1) : 0, hi = sq.qlim ? max(pmax, sq.kmax) : pmax;
   const int tlo = lo / KT, thi = hi / KT;
   int t_first, t_step, n_t;
   if constexpr (SPLIT > 1) {
@@ -204,6 +204,12 @@ __global__ void __launch_bounds__(Cfg<D, M, DS, QDS, KT, ST, SPLIT>::NT, 1) attn
 
   const int rowA = rg * 16 + gq;   // this lane's rows: rowA, rowA + 8
   const int posA = sq.q_pos0 + (r0 + rowA) / ratio, posB = sq.q_pos0 + (r0 + rowA + 8) / ratio;
+  // last visible key of each row: its position, or the end of its image span (qlim)
+  int limA = posA, limB = posB;
+  if (sq.qlim) {
+    if (r0 + rowA < rows) limA = sq.qlim[(r0 + rowA) / ratio];
+    if (r0 + rowA + 8 < rows) limB = sq.qlim[(r0 + rowA + 8) / ratio];
+  }
   float mA = -INFINITY, mB = -INFINITY, lA = 0.f, lB = 0.f;
   float o[C::NG][4][4];
 #pragma unroll
@@ -271,7 +277,7 @@ __global__ void __launch_bounds__(Cfg<D, M, DS, QDS, KT, ST, SPLIT>::NT, 1) attn
         float v = s[nt][e] * kLog2e;
         if (!full) {
           const int j = jt + kq0 + nt * 8 + 2 * c + (e & 1), p = e < 2 ? posA : posB;
-          if (j > p || (a.window > 0 && j <= p - a.window)) v = -INFINITY;
+          if (j > (e < 2 ? limA : limB) || (a.window > 0 && j <= p - a.window)) v = -INFINITY;
         }
         s[nt][e] = v;
         if (e < 2) xA = fmaxf(xA, v); else xB = fmaxf(xB, v);

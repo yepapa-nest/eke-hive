@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
-// Gemma 4 12B (text path) GPU kernels (sm_120a). The math contract is oracle/gemma4_oracle.py; the arithmetic is fp32 between the
+// Gemma 4 12B GPU kernels (sm_120a). The math contract is oracle/gemma4_oracle.py; the arithmetic is fp32 between the
 //   points where the engine rounds to bf16 (activations between ops, the KV cache in fp8 e4m3).
 #pragma once
 #include <cstddef>
@@ -49,6 +49,13 @@ void w4_gemv_gu(const W4Mat& G, const W4Mat& U, const bf16* x, int ldx, int M, b
 // bytes of fp32 scratch the two calls above need for M rows (max over the model's matrices is the caller's)
 inline size_t w4_ws_bytes(const W4Mat&, int) { return 0; }   // the K split is summed inside the block now (no scratch)
 
+// Prefill GEMM, any M ≥ 1 (used above 16 rows): the GEMV's math row for row and bit for bit (same K split, same order) with the tokens'
+//   activations staged in shared memory — a row's result equals w4_gemv / w4_gemv_multi / w4_gemv_gu at any M. Needs N a multiple of
+//   64 (w4_gemm_fits; gate / up: N a multiple of 32).
+bool w4_gemm_fits(const W4Mat& W);
+void w4_gemm_multi(const W4Multi& J, const bf16* x, int ldx, int M, cudaStream_t st);
+void w4_gemm_gu(const W4Mat& G, const W4Mat& U, const bf16* x, int ldx, int M, bf16* act, int lda, cudaStream_t st);
+
 // Prefill: the weight as bf16 [N, K] (bf16((nibble - 8) · s) — rounded once), for a cuBLAS GEMM with fp32 accumulation.
 void w4_dequant(const W4Mat& W, bf16* out, cudaStream_t st);
 
@@ -77,6 +84,17 @@ inline size_t argmax_sumexp_part_floats(int M) { return (size_t)M * 64 * 3; }
 void argmax_sumexp(const float* logits, int M, int V, float* part, int32_t* arg, float* sumexp, cudaStream_t st);
 // logits in place: l = cap · tanh(l / cap) over n values (cap > 0)
 void softcap(float* l, size_t n, float cap, cudaStream_t st);
+// logits in place: column ids[i] (i < n ≤ 4) of each of M rows of V set to -inf (generation_config suppress_tokens — never sampled)
+void suppress_cols(float* l, int M, int V, const int (&ids)[4], int n, cudaStream_t st);
+
+// ---- Vision embedder (encoder-free: merged pixel patches straight into the text space) -------------------------------------------------
+// LayerNorm with weight and bias over rows of K: out = bf16((v − mean) · (var + eps)^-0.5 · w + b) (biased variance, fp32), v = the row.
+//   pos (the factorized 2-D position table, bf16 [P, 2, K]): v = bf16(x + bf16(pos[gx, 0] + pos[gy, 1])) first, for row m at grid
+//   (gx, gy) = (m % gw, m / gw) — the patch order of an image (raster, row-major). (K % 8 == 0, K ≤ 8192)
+void layernorm(const bf16* x, int ldx, const bf16* w, const bf16* b, int M, int K, float eps, const bf16* pos, int gw, bf16* out, int ldo,
+               cudaStream_t st);
+// out[m, :] = b for M rows of N (the bias a following gemm_bf16_acc adds the product to)
+void bias_rows(const bf16* b, int M, int N, bf16* out, cudaStream_t st);
 
 
 // ---- Paged fp8 KV cache and attention ------------------------------------------------------------------------------------------------
@@ -98,9 +116,13 @@ struct KvLayout {
 };
 // One sequence's slice of an attention call: query rows [q_row0, q_row0 + n_q) at positions q_pos0 .. q_pos0 + n_q - 1, keys 0 ..
 //   q_pos0 + n_q - 1 (causal; the new rows' K/V are already written), window > 0: key j visible to query position i iff i - window < j ≤ i.
+//   qlim (device, n_q entries, or null): the last key query row i sees is qlim[i] instead of its own position — the soft tokens of one
+//   image attend to each other both ways (use_bidirectional_attention "vision"); kmax = the largest qlim entry. The window bound stays.
 struct AttnSeq {
   const uint8_t* const* pages = nullptr;   // device array of page pointers
   int q_row0 = 0, n_q = 0, q_pos0 = 0;
+  const int32_t* qlim = nullptr;
+  int kmax = 0;
 };
 // out[r, h, :] = softmax_j(q[r, h, :] · K[j, h / (H / Hkv), :]) · V[j, h / (H / Hkv), :]  (scaling 1.0 — q / k are RMS-normalized),
 //   fp32 softmax and accumulation, K / V read as fp8 → fp32. q / out bf16 [rows, H, D]. seqs: device array of n_seqs AttnSeq.

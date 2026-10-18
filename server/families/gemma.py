@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Eke Hive Authors
-"""Gemma 4 Unified family adapter (config.json model_type "gemma4_unified", text path) for hive_server.py — the same surface as
+"""Gemma 4 Unified family adapter (config.json model_type "gemma4_unified", text and images) for hive_server.py — the same surface as
 server/families/qwen.py (encode_messages, parse_message_from_completion_text, prepare_inputs, effort_from_request) plus the family facts.
 
 Prompt: the checkpoint's chat_template.jinja through the tokenizer (apply_chat_template), or the file HIVE_GEMMA_CHAT_TEMPLATE. With
@@ -17,9 +17,20 @@ Tool calls (the template's own rendering of history tool calls, parsed back):
   Arguments are returned as a JSON object string. A string arrives without JSON escaping, so it is taken verbatim between the delimiters.
 Sampling defaults when a request omits them come from generation_config.json (temperature 1.0 · top_p 0.95 · top_k 64), as the model card
   recommends; `defaults()` hands them to the server.
+Images (image / image_url parts, also inside tool results): the template writes one <|image|> per part; prepare_inputs expands it to
+  <|image> + N × <|image|> + <image|> and sends the N merged patches to the daemon (the vision embedder runs there). Preprocessing follows
+  processor_config.json image_processor (patch 16, pooling 3, 280 soft tokens, /255, no normalization); the code is this project's own:
+  1. size: keep the aspect ratio and take the largest height / width, multiples of 48 (patch × pooling), whose area is at most
+     280 · 48² — an image is shrunk or enlarged to it (bicubic); a side that rounds to zero becomes 48 and the other side gets the
+     aspect ratio (at most 280 · 48);
+  2. merged patches: the 48 × 48 blocks in raster order (row of blocks, then column), each the flattened (y, x, channel) values / 255 —
+     the order of the embedder's patch_dense weights; N = (height / 48) · (width / 48), the block at grid (x, y) takes the position
+     embedding rows x (axis 0) and y (axis 1).
+  Audio and video parts are not served (the audio projection is not loaded; video would need frame sampling and timestamps).
 """
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -36,6 +47,28 @@ TOOL_START = "<|tool_call>"
 TOOL_END = "<tool_call|>"
 STR_DELIM = '<|"|>'
 MEDIA_TYPES = ("image", "image_url", "video", "video_url", "audio", "input_audio", "audio_url")
+IMAGE_TYPES = ("image", "image_url")
+IMAGE_TOKEN, BOI, EOI = "<|image|>", "<|image>", "<image|>"
+_PATCH, _POOL, _MAX_TOKENS = 16, 3, 280   # processor_config.json image_processor (read in init)
+# Text that itself contains the placeholder string (code, documentation about this model): it is set aside before the template runs, so
+#   the placeholders left in the prompt are exactly the template's one per image part, and put back before tokenization (the tokenizer reads
+#   it as before). Measured 2026-10-18: a 64K-token documentation prompt without images was refused with "the template rendered 2 image
+#   placeholders for 0 image parts".
+_LITERAL = "\ue000gemma-image-literal\ue000"
+
+
+def _hide_literal(x):
+    if isinstance(x, str):
+        return x.replace(IMAGE_TOKEN, _LITERAL)
+    if isinstance(x, list):
+        return [_hide_literal(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _hide_literal(v) for k, v in x.items()}
+    return x
+
+
+def _restore_literal(text: str) -> str:
+    return text.replace(_LITERAL, IMAGE_TOKEN)
 
 STOP_IDS: list[int] = []
 EOS_TEXTS: list[str] = []
@@ -79,6 +112,13 @@ def init(tok, cfg: dict, ckpt: str | None = None) -> None:
         elif _PATCHED not in tpl:
             print("[gemma] chat template: the tool-response branch was not found — template used unchanged")
     _TEMPLATE = tpl
+    global _PATCH, _POOL, _MAX_TOKENS
+    try:
+        with open(os.path.join(ckpt or "", "processor_config.json")) as f:
+            ip = json.load(f).get("image_processor", {})
+        _PATCH, _POOL, _MAX_TOKENS = int(ip.get("patch_size", _PATCH)), int(ip.get("pooling_kernel_size", _POOL)), int(ip.get("max_soft_tokens", _MAX_TOKENS))
+    except (OSError, ValueError):
+        pass
 
 
 def nothink_mode() -> str:
@@ -112,9 +152,27 @@ def _content_text(c) -> str:
     return "" if c is None else str(c)
 
 
+def _keep_images(parts: list, media: list) -> list:
+    """A content list with media: image parts are collected (in order — the template writes one <|image|> for each) and reduced to their
+    type; text parts stay; audio / video parts are refused."""
+    out = []
+    for p in parts:
+        if isinstance(p, dict) and p.get("type") in IMAGE_TYPES:
+            media.append(p)
+            out.append({"type": "image"})
+        elif isinstance(p, dict) and p.get("type") in MEDIA_TYPES:
+            raise ValueError("audio / video parts are not served by this model (images only)")
+        elif isinstance(p, dict) and p.get("type") in ("text", "input_text"):
+            out.append({"type": "text", "text": p.get("text", "")})
+        elif isinstance(p, str):
+            out.append({"type": "text", "text": p})
+    return out
+
+
 def encode_messages(messages: list[dict], thinking_mode: str = "chat", reasoning_effort=None, return_multi_modal_data: bool = False, **_):
     msgs = []
     tools = None
+    media: list[dict] = []
     for m in messages:
         m = dict(m)
         if "tools" in m:
@@ -123,8 +181,9 @@ def encode_messages(messages: list[dict], thinking_mode: str = "chat", reasoning
             continue  # the server's tool carrier (empty system message) — the template takes tools as an argument
         if isinstance(m.get("content"), list):
             if any(isinstance(p, dict) and p.get("type") in MEDIA_TYPES for p in m["content"]):
-                raise ValueError("image / audio parts are not served by this model (text path)")
-            m["content"] = _content_text(m["content"])
+                m["content"] = _keep_images(m["content"], media)   # the template renders text and <|image|> parts in order
+            else:
+                m["content"] = _content_text(m["content"])
         tcs = []
         for tc in m.get("tool_calls") or []:
             tc = dict(tc)
@@ -140,15 +199,23 @@ def encode_messages(messages: list[dict], thinking_mode: str = "chat", reasoning
         if tcs:
             m["tool_calls"] = tcs
         msgs.append(m)
+    msgs = _hide_literal(msgs)
     kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking_mode == "thinking"}
     if tools:
-        kwargs["tools"] = tools
+        kwargs["tools"] = _hide_literal(tools)
     if _TEMPLATE is not None:
         kwargs["chat_template"] = _TEMPLATE
     prompt = TOK.apply_chat_template(msgs, **kwargs)
     if thinking_mode == "thinking" and not prompt.endswith(THINK_START):
         prompt += THINK_START   # the answer starts inside the thought channel (the stream's reasoning part)
-    return (prompt, {"images": []}) if return_multi_modal_data else prompt
+    if not media:   # text only: the prompt as the template wrote it (literal placeholder text back in place)
+        prompt = _restore_literal(prompt)
+        return (prompt, {"images": []}) if return_multi_modal_data else prompt
+    if prompt.count(IMAGE_TOKEN) != len(media):
+        raise ValueError(f"the template rendered {prompt.count(IMAGE_TOKEN)} image placeholders for {len(media)} image parts")
+    if not return_multi_modal_data:
+        raise ValueError("image parts need the multimodal path")
+    return prompt, {"images": media}   # literal placeholder text stays set aside until prepare_inputs
 
 
 # ---- Tool-call parsing -----------------------------------------------------------------------------------------------------------------
@@ -351,7 +418,68 @@ def parse_message_from_completion_text(text: str, thinking_mode: str = "chat", t
     return out
 
 
+# ---- Images ---------------------------------------------------------------------------------------------------------------------
+def _target_size(h: int, w: int) -> tuple[int, int]:
+    """(height, width): multiples of patch · pooling, aspect ratio kept, at most max_soft_tokens · pooling² patches (module docstring)."""
+    side = _PATCH * _POOL
+    budget = _MAX_TOKENS * _POOL * _POOL * _PATCH * _PATCH
+    k = math.sqrt(budget / (h * w))
+    th, tw = int(math.floor(k * h / side)) * side, int(math.floor(k * w / side)) * side
+    if th == 0 and tw == 0:
+        raise ValueError(f"image {w}x{h} is too small to resize")
+    if th == 0:
+        th, tw = side, min(int(math.floor(w / h)) * side, _MAX_TOKENS * side)
+    elif tw == 0:
+        tw, th = side, min(int(math.floor(h / w)) * side, _MAX_TOKENS * side)
+    return th, tw
+
+
+def _image_patches(data: bytes):
+    """Image bytes → (bf16 merged patches as bytes, grid height, grid width)."""
+    import numpy as np
+    import torch
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except UnidentifiedImageError as e:
+        raise ValueError(f"cannot identify image: {len(data)} bytes, starting {data[:16].hex() or '(empty)'}") from e
+    img = img.convert("RGB")
+    th, tw = _target_size(img.height, img.width)
+    if (th, tw) != (img.height, img.width):
+        img = img.resize((tw, th), Image.BICUBIC)
+    side = _PATCH * _POOL
+    gh, gw = th // side, tw // side
+    x = np.asarray(img, dtype=np.float32) / 255.0                       # [th, tw, 3]
+    x = x.reshape(gh, side, gw, side, 3).transpose(0, 2, 1, 3, 4)       # [gh, gw, y, x, c]
+    x = np.ascontiguousarray(x.reshape(gh * gw, side * side * 3))
+    raw = torch.from_numpy(x).to(torch.bfloat16).contiguous().view(torch.int16).numpy().tobytes()
+    return raw, gh, gw
+
+
 def prepare_inputs(prompt: str, media: list[dict], tok):
-    if media:
-        raise ValueError("image / audio parts are not served by this model (text path)")
-    return tok.encode(prompt, add_special_tokens=False), [], b""
+    """Prompt with one <|image|> per image part → (token ids, hived image metas, bf16 patch bytes) — the server's tokenize_with_images."""
+    if not media:
+        return tok.encode(_restore_literal(prompt), add_special_tokens=False), [], b""
+    from families.glm import _fetch, _part_url   # the shared data: / http(s) URL reader
+
+    pieces = [_image_patches(_fetch(_part_url(p))) for p in media]
+    parts = prompt.split(IMAGE_TOKEN)
+    if len(parts) != len(pieces) + 1:
+        raise ValueError("image parts and placeholders do not match")
+    text = _restore_literal(parts[0] + "".join(BOI + IMAGE_TOKEN * (gh * gw) + EOI + after for (_, gh, gw), after in zip(pieces, parts[1:])))
+    ids = tok.encode(text, add_special_tokens=False)
+    img_id, boi_id, eoi_id = (tok.convert_tokens_to_ids(t) for t in (IMAGE_TOKEN, BOI, EOI))
+    metas, blobs, i = [], [], 0
+    for raw, gh, gw in pieces:
+        n = gh * gw
+        # the span is <|image> + n × <|image|> + <image|> (a placeholder string inside the text is a lone token, never this shape)
+        while i + n + 1 < len(ids) and not (ids[i] == boi_id and ids[i + n + 1] == eoi_id and all(ids[j] == img_id for j in range(i + 1, i + n + 1))):
+            i += 1
+        if i + n + 1 >= len(ids):
+            raise ValueError("image token span not found in the encoded prompt")
+        metas.append({"start": i + 1, "n_vit_h": gh, "n_vit_w": gw, "types": [1] * n, "nbytes": len(raw)})
+        blobs.append(raw)
+        i += n + 2
+    return ids, metas, b"".join(blobs)

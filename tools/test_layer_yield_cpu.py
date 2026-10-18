@@ -37,7 +37,7 @@ BASE = {'FAKE_LAYERS': str(LAYERS), 'FAKE_PREFILL_MS': str(FWD_MS * SLOW), 'FAKE
 ON = {**BASE, 'HIVE_LAYER_YIELD': str(PERIOD)}
 LY_RE = re.compile(r'^\[hived\] layer yield: (\S+) · prefill ([\d.]+) ms since resume · rows (\d+) · active (\d+)$')
 LYDONE_RE = re.compile(r'^\[hived\] layer yield done: admitted (\d+) · decode steps (\d+) · ([\d.]+) ms$')
-ADMIT_RE = re.compile(r'^\[hived\] prefill yield: (\d+) short requests? admitted in ([\d.]+) ms \(active \d+ · prefilling \d+\) · layer(?: · (\d+) by the mid rule)?$')
+ADMIT_RE = re.compile(r'^\[hived\] prefill yield: (\d+) short requests? admitted in ([\d.]+) ms \(active \d+ · prefilling \d+\) · layer(?: · (\d+) by the mid rule)?(?: · (\d+) by priority)?$')
 CHUNK_RE = re.compile(r'^\[hived\] (\S+): prefill chunk (\d+) M (\d+) · .* · ([\d.]+) ms(?: · layer yields (\d+) last ([\d.]+) ms)?$')
 
 
@@ -164,6 +164,34 @@ def sc_mid(h, ck, tag, nested=True):
     ck.true(f'{tag}: decoder ok', res['D']['error'] is None, repr(res['D']['error']))
     ck.eq(f'{tag}: decoder tokens follow its oracle', res['D']['tokens'], t.oracle(D, len(res['D']['tokens'])))
     return gmax
+
+
+def sc_prio(h, ck, tag):
+    """Priority rule (2026-10-18): a 250-row request at priority -1 arriving 0.25 s into a 400-row forward at priority 1 is admitted at a yield
+    although the mid rule refuses it (2 x 250 > 400), and the yield holds until it has decoded all its tokens — they all come out before the
+    long prompt's first token. Controls: the same pair with equal priorities waits for the forward (mid rule as before)."""
+    def pair(lp, sp, seed):
+        L, S = t.tokens(400, seed), t.tokens(250, seed + 1)
+        res, first, last = {}, {}, {}
+        def on(sid):
+            return lambda k: (first.setdefault(sid, time.monotonic()), last.__setitem__(sid, time.monotonic()))
+        a = t.launch(h, 'PL' + str(seed), L, 3, res, 'L', on_token=on('L'), priority=lp)
+        time.sleep(.25 * SLOW)
+        b = t.launch(h, 'PS' + str(seed), S, 12, res, 'S', on_token=on('S'), priority=sp)
+        a.join(60 * SLOW); b.join(60 * SLOW)
+        t.done_ok(ck, f'{tag} {lp}/{sp} long', res['L'], L, 3, 0)
+        t.done_ok(ck, f'{tag} {lp}/{sp} request', res['S'], S, 12, 0)
+        return first, last
+    def by_prio():
+        return sum(int(m[4] or 0) for m in (ADMIT_RE.match(l) for l in lines(h)) if m)
+    p0 = by_prio()
+    first, last = pair(1, -1, 1180)
+    ck.eq(f'{tag}: one admission by priority', by_prio() - p0, 1)
+    ck.true(f'{tag}: all 12 tokens of the better-priority request before the long one\'s first', last.get('S', 1e9) < first.get('L', 0), repr((first, last)))
+    ck.true(f'{tag}: priority hold line', any('priority hold' in l for l in lines(h)), '')
+    first, last = pair(None, None, 1190)
+    ck.eq(f'{tag} control: equal priorities — not admitted (mid rule)', by_prio() - p0, 1)
+    ck.true(f'{tag} control: request waits for the long forward', first.get('S', 1e9) > first.get('L', 0), repr(first))
 
 
 def sc_reuse(h, ck, tag):
@@ -380,6 +408,7 @@ def run(exe, td):
         ('single-off', BASE, TILE3, lambda h: (sc_short(h, ck, False, 'single-off'), sc_decoder(h, ck, False, 'single-off'))),
         ('max300', {**ON, 'HIVE_LAYER_YIELD_MAX': '300'}, TILE3, lambda h: sc_limits(h, ck, 'max300', True)),
         ('mid300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: (sc_mid(h, ck, 'mid'), sc_short(h, ck, True, 'mid+short'))),
+        ('prio300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: sc_prio(h, ck, 'prio')),
         ('batch-on', {**ON, **batch}, TILE3, lambda h: (sc_short(h, ck, True, 'batch'), sc_batch(h, ck, 'batch'), sc_decoder(h, ck, True, 'batch'))),
         ('mtp-on', {**ON, 'FAKE_MTP': '3', 'FAKE_MTP_DRAFT_MS': '1'}, TILE3, lambda h: sc_decoder(h, ck, True, 'mtp', mtp=True)),
         ('t3+t11', {**ON, 'HIVE_PREFILL_YIELD': '1'}, TILE3, lambda h: (sc_short(h, ck, True, 't3+t11'), sc_decoder(h, ck, True, 't3+t11'))),

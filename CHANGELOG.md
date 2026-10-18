@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Priority reaches prefill**: a request whose priority beats every request being prefilled is admitted at a layer yield of that
+  prefill and decodes to the end before it resumes (DeepSeek: a 6K-token conversation turn 3 s into a 60K-token background prefill
+  decoded at 42–45 instead of 13–16 tok/s). With `HIVE_PREFIX_FIRST_TURN=seen` the first-turn cut goes to the deepest boundary another
+  conversation already sent, so rooms that share a system block but differ after it share that block.
+- **Gemma prefill GEMM**: forwards of 17 to 192 rows (a conversation turn's tail, short prompts) run an int4 tensor-core GEMM that keeps
+  the decode GEMV's arithmetic bit for bit but stages the activations in shared memory: a 70-row turn tail after 3,000 tokens 42.7 →
+  28.9 ms, 128 rows 70.4 → 36.6 ms; outputs unchanged. Qwen3-ASR lowers the per-thread stack limit after its context is created, as
+  Qwen3-TTS does (its kernels use no stack; ~210 MiB of VRAM).
+
+- **Gemma 4 12B reads images** ([docs/gemma.md](docs/gemma.md)): the checkpoint's encoder-free vision embedder (~95 MiB) turns 48 × 48
+  pixel blocks straight into soft tokens, and the soft tokens of one image attend to each other both ways (`use_bidirectional_attention:
+  "vision"`). The server's preprocessing gives the Hugging Face processor's token ids and positions; teacher-forced against the fp32
+  oracle on three images 58 / 59 (one near-tie). Text output is bit-identical to before, apart from the end-of-image / end-of-audio
+  markers, which are now suppressed as the reference generation does (`suppress_tokens`). `HIVE_GEMMA_VISION=0` leaves the embedder out.
+
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
@@ -12,7 +27,7 @@ smaller cards reproduced with the engine's VRAM limit) — the table is in the [
     tool calls streamed as they are generated. First token p50 42 ms, first sentence 96 ms, 303 tok/s (the reference server: 69 ms,
     179 ms, 181 tok/s), same tool-call and delegation accuracy.
   - **Qwen3-ASR 1.7B** (`libhive_qasr.so` + `server/speech/asr_server.py`, [docs/qasr.md](docs/qasr.md)) — `/generate` with forced or
-    auto-detected language: p50 72 ms, CER 0.0054 (the reference server: 152 ms, 0.0067), 5.0 GB.
+    auto-detected language: p50 72 ms, CER 0.0054 (the reference server: 152 ms, 0.0067), 4.8 GB.
   - **Qwen3-TTS 12 Hz 1.7B CustomVoice** (`libhive_qtts.so` + `server/speech/tts_server.py`, [docs/qtts.md](docs/qtts.md)) — streaming
     WebSocket speech: first audio chunk p50 25 ms, real-time factor 0.069 (the reference server: 163 ms, 0.33), 4.0 GB.
   The three run beside DeepSeek at 72 GB on one 96 GB card, each under its own `HIVE_VRAM_LIMIT_MB`.

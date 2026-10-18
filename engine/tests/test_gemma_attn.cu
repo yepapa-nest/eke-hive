@@ -3,7 +3,8 @@
 // Gemma paged fp8 attention (hive/gemma/gemma_kernels.h): kv_write against a host e4m3 encoder, attn_paged against an fp64 host
 //   reference over the same fp8 K / V, on page tables with shuffled pages, some pages in mapped pinned host memory, NaN-filled unwritten
 //   slots and null (released) sliding pages; decode / verify / prefill rows mixed in one call; determinism (a sequence alone vs. inside the
-//   mixed call, and a decode row vs. the same position inside a verify call → bitwise identical); and timings at the model's shapes.
+//   mixed call, and a decode row vs. the same position inside a verify call → bitwise identical); image spans (AttnSeq::qlim: the rows of
+//   a span see each other both ways) on the prefill and the split path; and timings at the model's shapes.
 //   Run: scripts/hive-run.sh "./build-svc/test_gemma_attn"
 #include <algorithm>
 #include <cmath>
@@ -66,6 +67,8 @@ struct Pool {
 
 struct HostSeq {
   int n_q, q_pos0, q_row0 = 0;
+  std::vector<int32_t> lim;       // last visible key per row (empty = causal)
+  DevBuf dlim;
   std::vector<uint8_t*> table;    // page pointers (nullptr = released)
   DevBuf dtable;
   std::vector<uint8_t> kc, vc;    // fp8 codes [pos][Hkv][D]
@@ -80,13 +83,13 @@ struct Case {
 // out = Σ p v, mass = Σ p |v| (the scale of the rounding errors: P is rounded relative to the row max, the output to bf16)
 static void reference(const Case& cs, const HostSeq& s, const std::vector<uint16_t>& q, int qi, int h, std::vector<double>& out,
                       std::vector<double>& mass) {
-  const int D = cs.D, g = h / (cs.H / cs.Hkv), pos = s.q_pos0 + qi;
+  const int D = cs.D, g = h / (cs.H / cs.Hkv), pos = s.q_pos0 + qi, hi = s.lim.empty() ? pos : s.lim[qi];
   const int j0 = cs.window > 0 ? std::max(0, pos - cs.window + 1) : 0;
   const uint16_t* qr = q.data() + ((size_t)(s.q_row0 + qi) * cs.H + h) * D;
-  std::vector<double> qd(D), sc(pos - j0 + 1);
+  std::vector<double> qd(D), sc(hi - j0 + 1);
   for (int d = 0; d < D; ++d) qd[d] = h_bf2f(qr[d]);
   double mx = -1e300;
-  for (int j = j0; j <= pos; ++j) {
+  for (int j = j0; j <= hi; ++j) {
     const uint8_t* kr = s.kc.data() + ((size_t)j * cs.Hkv + g) * D;
     double a = 0;
     for (int d = 0; d < D; ++d) a += qd[d] * e4m3_val(kr[d]);
@@ -97,7 +100,7 @@ static void reference(const Case& cs, const HostSeq& s, const std::vector<uint16
   for (auto& v : sc) { v = std::exp(v - mx); L += v; }
   out.assign(D, 0.0);
   mass.assign(D, 0.0);
-  for (int j = j0; j <= pos; ++j) {
+  for (int j = j0; j <= hi; ++j) {
     const uint8_t* vr = s.vc.data() + ((size_t)j * cs.Hkv + g) * D;
     const double p = sc[j - j0] / L;
     for (int d = 0; d < D; ++d) { const double v = e4m3_val(vr[d]); out[d] += p * v; mass[d] += p * std::fabs(v); }
@@ -110,9 +113,9 @@ static bool run_case(const Case& cs, std::mt19937& rng) {
   KvLayout L;
   L.n_layers = cs.n_layers; L.Hkv = cs.Hkv; L.D = cs.D;
   const int D = cs.D, Hkv = cs.Hkv, H = cs.H;
-  // sequences: {n_q, q_pos0}; the last two share one KV (decode at p vs. verify ending at p)
-  struct Spec { int n_q, q_pos0; };
-  std::vector<Spec> specs = {{1, 0}, {1, 1500}, {4, 1101}, {16, 2047}, {300, 900}, {37, 0}, {2048, 2048}, {1, 1234}, {4, 1231}};
+  // sequences: {n_q, q_pos0, image span rows [a, b)}; the last two share one KV (decode at p vs. verify ending at p)
+  struct Spec { int n_q, q_pos0, a = 0, b = 0; };
+  std::vector<Spec> specs = {{1, 0}, {1, 1500}, {4, 1101}, {16, 2047, 3, 12}, {300, 900, 18, 298}, {37, 0, 5, 14}, {2048, 2048}, {1, 1234}, {4, 1231}};
   const int n = (int)specs.size();
   size_t need = 0;
   for (auto& sp : specs) need += (sp.q_pos0 + sp.n_q + kPage - 1) / kPage;
@@ -123,6 +126,11 @@ static bool run_case(const Case& cs, std::mt19937& rng) {
   for (int i = 0; i < n; ++i) {
     HostSeq& s = seqs[i];
     s.n_q = specs[i].n_q; s.q_pos0 = specs[i].q_pos0; s.q_row0 = rows; rows += s.n_q;
+    if (specs[i].b > specs[i].a) {
+      for (int t = 0; t < s.n_q; ++t) s.lim.push_back(s.q_pos0 + (t >= specs[i].a && t < specs[i].b ? specs[i].b - 1 : t));
+      s.dlim.alloc(s.lim.size() * 4);
+      CUDA_CHECK(cudaMemcpy(s.dlim.p, s.lim.data(), s.lim.size() * 4, cudaMemcpyHostToDevice));
+    }
     const bool shared = i == n - 1;   // shares the previous sequence's pages and KV
     const int kv_len = s.q_pos0 + s.n_q;
     if (shared) { s.table = seqs[i - 1].table; s.kc = seqs[i - 1].kc; s.vc = seqs[i - 1].vc; }
@@ -153,7 +161,10 @@ static bool run_case(const Case& cs, std::mt19937& rng) {
     CUDA_CHECK(cudaMemcpy(s.dtable.p, s.table.data(), s.table.size() * sizeof(uint8_t*), cudaMemcpyHostToDevice));
   }
   std::vector<AttnSeq> as(n);
-  for (int i = 0; i < n; ++i) { as[i].pages = seqs[i].dtable.as<const uint8_t*>(); as[i].q_row0 = seqs[i].q_row0; as[i].n_q = seqs[i].n_q; as[i].q_pos0 = seqs[i].q_pos0; }
+  for (int i = 0; i < n; ++i) {
+    as[i].pages = seqs[i].dtable.as<const uint8_t*>(); as[i].q_row0 = seqs[i].q_row0; as[i].n_q = seqs[i].n_q; as[i].q_pos0 = seqs[i].q_pos0;
+    if (!seqs[i].lim.empty()) { as[i].qlim = seqs[i].dlim.as<int32_t>(); as[i].kmax = *std::max_element(seqs[i].lim.begin(), seqs[i].lim.end()); }
+  }
   DevBuf das(n * sizeof(AttnSeq));
   CUDA_CHECK(cudaMemcpy(das.p, as.data(), n * sizeof(AttnSeq), cudaMemcpyHostToDevice));
 
@@ -241,8 +252,8 @@ static bool run_case(const Case& cs, std::mt19937& rng) {
         }
       }
     }
-    snprintf(b, sizeof b, "%s: seq %d (n_q %4d, q_pos0 %4d): vs fp64 reference, max |err| %.2e, max err / tol %.2f, %ld / %ld out",
-             cs.name, i, s.n_q, s.q_pos0, maxerr, maxrel, bad, checked);
+    snprintf(b, sizeof b, "%s: seq %d (n_q %4d, q_pos0 %4d%s): vs fp64 reference, max |err| %.2e, max err / tol %.2f, %ld / %ld out",
+             cs.name, i, s.n_q, s.q_pos0, s.lim.empty() ? "" : ", image span", maxerr, maxrel, bad, checked);
     all &= check(bad == 0, b);
   }
   // ---- determinism: each sequence alone (rows at the same place) → bitwise identical rows

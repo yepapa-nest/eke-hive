@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory() as d:
         gemma.encode_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}], "chat")
         ok(False, "image part rejected")
     except ValueError:
-        ok(True, "image part rejected (text path)")
+        ok(True, "image part outside the multimodal path rejected")
     os.environ["HIVE_GEMMA_TOOL_THOUGHT"] = "0"
     gemma.init(tok, {}, d)
     ok(gemma._TEMPLATE is not None and gemma._PATCHED not in gemma._TEMPLATE, "HIVE_GEMMA_TOOL_THOUGHT=0 keeps the template unchanged")
@@ -146,6 +146,12 @@ if real:
     ok(p.endswith("<|channel>thought\n<channel|>"), "real template: empty thought channel after a tool response (patched branch)")
     ids = gemma.prepare_inputs(p, [], tok)[0]
     ok(isinstance(ids, list) and len(ids) > 10, f"prepare_inputs: {len(ids)} ids")
+    # text that itself contains the image placeholder string (documentation, code) is a text request — never an image-count error
+    lit = [{"role": "user", "content": "the token <|image|> marks an image; what does <|image|> do?"}]
+    p3, m3 = gemma.encode_messages(lit, "chat", return_multi_modal_data=True)
+    ok(m3["images"] == [] and p3.count(gemma.IMAGE_TOKEN) == 2, "literal placeholder text: no image parts, text kept as written")
+    ids3 = gemma.prepare_inputs(p3, m3["images"], tok)[0]
+    ok(ids3 == tok.encode(p3, add_special_tokens=False), "literal placeholder text: tokenized as before")
 
 print(f"gemma family CPU: {'ok' if not fails else f'{fails} FAIL'}")
 sys.exit(1 if fails else 0)
