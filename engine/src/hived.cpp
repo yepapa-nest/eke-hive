@@ -61,7 +61,8 @@
 #include "hive/session_store.h"
 // Model family: the DeepSeek build (default), the GLM build (-DHIVE_FAMILY_GLM, target hived_glm) and the Qwen3.8-Flash-Next build
 //   (-DHIVE_FAMILY_QWEN, target hived_qwen; -DHIVE_FAMILY_QWEN_CPU, target hived_qwen_cpu: CPU only, built against engine/cpu_shim), the CPU-only
-//   GLM / DeepSeek builds (-DHIVE_FAMILY_GLM_CPU / -DHIVE_FAMILY_DS_CPU) and the Qwen3.8-27B builds (-DHIVE_FAMILY_Q27 / -DHIVE_FAMILY_Q27_CPU) share
+//   GLM / DeepSeek builds (-DHIVE_FAMILY_GLM_CPU / -DHIVE_FAMILY_DS_CPU), the Qwen3.8-27B builds (-DHIVE_FAMILY_Q27 / -DHIVE_FAMILY_Q27_CPU) and
+//   the Gemma 4 build (-DHIVE_FAMILY_GEMMA, target hived_gemma) share
 //   this file; the family header
 //   provides Config, Model, ExpertStore, RuntimeOptions, ForwardStats, ImageInput, PrefillPart, Seq, SeqImage, Runtime and the load helpers.
 #if defined(HIVE_FAMILY_GLM)
@@ -78,6 +79,8 @@
 #include "hive/q27/hived_family.h"
 #elif defined(HIVE_FAMILY_Q27_CPU)
 #include "hive/q27/hived_family_cpu.h"
+#elif defined(HIVE_FAMILY_GEMMA)
+#include "hive/gemma/hived_family.h"
 #else
 #include "hive/bulk_load.h"
 #include "hive/expert_store.h"
@@ -102,20 +105,29 @@ using namespace hive::ds::cpufam;
 using namespace hive::q27::fam;
 #elif defined(HIVE_FAMILY_Q27_CPU)
 using namespace hive::q27::cpufam;
+#elif defined(HIVE_FAMILY_GEMMA)
+using namespace hive::gemma::fam;
 #endif
 // HIVE_VRAM_LIMIT_MB (hive/vram_limit.h): only the GPU families take part; the CPU-only families have no device memory to limit.
 #if defined(HIVE_FAMILY_QWEN_CPU) || defined(HIVE_FAMILY_GLM_CPU) || defined(HIVE_FAMILY_DS_CPU) || defined(HIVE_FAMILY_Q27_CPU) || defined(HIVE_CPU_ONLY)
 #define HIVE_VRAM_LIMIT_ON 0
+constexpr bool kVramReserve = false;
 #else
 #define HIVE_VRAM_LIMIT_ON 1
 #if defined(HIVE_FAMILY_GLM)
 constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::Glm;
 #elif defined(HIVE_FAMILY_QWEN)
 constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::Qwen;
-#elif defined(HIVE_FAMILY_Q27)
+#elif defined(HIVE_FAMILY_Q27) || defined(HIVE_FAMILY_GEMMA)
 constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::None;  // no cost table yet: ballast only, no startup plan
 #else
 constexpr hive::vram_limit::Family kVramFamily = hive::vram_limit::Family::DeepSeek;
+#endif
+// The ballast is swapped for a runtime reserve at ready only where runtime sizing does not read the device's free memory (see the ready block).
+#if defined(HIVE_FAMILY_GEMMA)
+constexpr bool kVramReserve = true;   // Gemma sizes everything at load (KV page pool from the limit; a full pool spills pages to host memory)
+#else
+constexpr bool kVramReserve = kVramFamily == hive::vram_limit::Family::DeepSeek;
 #endif
 #endif
 #ifndef HIVE_BUILD_ID
@@ -151,9 +163,10 @@ double now_ms() { return hive::mono_ms(); }
 bool env_on(const char* name) { const char* v = getenv(name); return v && *v && strcmp(v, "0") != 0; }
 // HIVE_VRAM_LIMIT_MB ballast held for the life of the process (0 = no limit). Subtracted from the "used" values hived publishes, so they read
 //   like the smaller card.
-size_t g_vram_ballast = 0;
+size_t g_vram_ballast = 0;  // the reserve at startup (vram_reserve pieces); stats use vram_reserve::held() — runtime allocations draw from it
+size_t g_vram_limit_armed = 0;  // HIVE_VRAM_LIMIT_MB held for the process lifetime (vram_reserve armed at ready): the process occupies exactly this
 void* g_vram_ballast_ptr = nullptr;  // kept so HIVE_VRAM_BALLAST_RELEASE can free it before ready
-double vram_used_mib(size_t tot, size_t fr) { const size_t u = tot > fr ? tot - fr : 0; return (double)(u > g_vram_ballast ? u - g_vram_ballast : 0) / 1048576.0; }
+double vram_used_mib(size_t tot, size_t fr) { const size_t u = tot > fr ? tot - fr : 0, b = vram_reserve::held(); return (double)(u > b ? u - b : 0) / 1048576.0; }
 
 // Graceful shutdown (installed only when HIVE_GRACEFUL_STOP_S>0 — by default SIGTERM keeps its default action = immediate exit).
 //   The handler only writes one byte to a self-pipe (async-signal-safe). A second signal restores the default action and dies at once (forced exit while draining).
@@ -428,7 +441,7 @@ int main(int argc, char** argv) {
 #elif defined(HIVE_FAMILY_GLM)
       // GLM places layers on the CPU itself (GlmModel, HIVE_GLM_GPU_LAYERS / the limit)
       const char* placement = " — set a lower HIVE_GLM_GPU_LAYERS (or unset it to let the family choose from the limit)";
-#elif !defined(HIVE_FAMILY_Q27)
+#elif !defined(HIVE_FAMILY_Q27) && !defined(HIVE_FAMILY_GEMMA)
       // DeepSeek places layers on the CPU itself (Model::plan_gpu_layers: HIVE_DS_GPU_LAYERS / the limit)
       const char* placement = " — set a lower HIVE_DS_GPU_LAYERS (or unset it to let the model choose from the limit; docs/vram-footprint.md §3.2)";
 #else
@@ -487,14 +500,14 @@ int main(int argc, char** argv) {
     // ballast: the process keeps exactly (limit − context − weights) free from here on
     const size_t target = (size_t)after_weights;
     if (fr > target) {
-      size_t b = fr - target;
-      void* p = nullptr;
-      while (b >= (64ull << 20) && cudaMalloc(&p, b) != cudaSuccess) { (void)cudaGetLastError(); p = nullptr; b -= std::max<size_t>(64ull << 20, b / 64); }
-      if (p) { g_vram_ballast = b; g_vram_ballast_ptr = p; }
+      // In vram_reserve pieces (hive/vram_reserve.h), so that after ready a runtime allocation can take its room from this reserve
+      //   instead of from memory another process on the card freed (2026-10-18 OOM beside a 25.6 GB neighbour).
+      g_vram_ballast = vram_reserve::fill(fr - target);
+      g_vram_ballast_ptr = g_vram_ballast ? (void*)1 : nullptr;  // marker only: the pieces live in vram_reserve
       size_t fr2 = 0;
       cudaMemGetInfo(&fr2, &tot);
       fprintf(stderr, "[hived] VRAM limit %.0f MiB: ballast %.0f MiB%s — VRAM free %.0f MiB (the process now sees a %.0f MiB card)\n", vram_limit_bytes / MiB,
-              g_vram_ballast / MiB, g_vram_ballast + (64ull << 20) < fr - target ? " (⚠️less than wanted: allocation refused)" : "", fr2 / MiB,
+              g_vram_ballast / MiB, g_vram_ballast + vram_reserve::kChunk < fr - target ? " (⚠️less than wanted: allocation refused)" : "", fr2 / MiB,
               (double)(vram_ctx_bytes + weights + fr2) / MiB);
     } else {
       fprintf(stderr, "[hived] VRAM limit %.0f MiB: no ballast — free VRAM %.0f MiB is already below what the limit leaves (%.0f MiB)\n", vram_limit_bytes / MiB,
@@ -936,13 +949,31 @@ int main(int argc, char** argv) {
   //   solo start; the ballast is freed here, just before ready, so a second daemon can start beside this one. Runtime growth (KV, MTP lend,
   //   image buffers) then reads the device-wide free memory instead of the emulated card.
   if (g_vram_ballast_ptr && env_on("HIVE_VRAM_BALLAST_RELEASE")) {
-    const size_t b = g_vram_ballast;
-    CUDA_CHECK(cudaFree(g_vram_ballast_ptr));
+    const size_t b = vram_reserve::release_all();
     g_vram_ballast_ptr = nullptr; g_vram_ballast = 0;
     size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
     fprintf(stderr, "[hived] VRAM limit: ballast %.0f MiB released before ready (HIVE_VRAM_BALLAST_RELEASE) — device VRAM free %.0f MiB\n", b / 1048576.0, fr / 1048576.0);
   }
 #endif
+  // HIVE_VRAM_LIMIT_MB kept (ballast not released): the ballast (outside the limit) goes back to the card and the headroom inside the limit
+  //   becomes the reserve — from here on runtime allocations take their room from it, so the process stays at the limit (vram_reserve.h).
+  //   DeepSeek only: after ready its sizes are fixed (session pool, slots; wake restores at most what sleep released) and runtime buffers
+  //   are DevBuf / GrowBuf. GLM, Qwen and Q27 size KV and cache growth at runtime from the device's free memory (kv_reserve, make_room,
+  //   regrow_cache, vram_avail) — with the ballast returned they would read the rest of the card as theirs, so they keep the ballast
+  //   (the limit as before; a refused allocation still fails only the request).
+  if (vram_reserve::held() && kVramReserve) {
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);  // the ballast is still held: what is free is this process's headroom inside the limit
+    const size_t ballast = vram_reserve::held();
+    const size_t kept = vram_reserve::rebase(fr);
+    g_vram_ballast = kept;
+    vram_reserve::arm();
+    g_vram_limit_armed = vram_limit_bytes;
+    size_t fr2 = 0;
+    cudaMemGetInfo(&fr2, &tot);
+    fprintf(stderr, "[hived] VRAM limit: ballast %.0f MiB returned to the card · headroom %.0f MiB inside the limit kept as the reserve for runtime allocations "
+            "(held for the process lifetime) — device VRAM free %.0f MiB\n", ballast / 1048576.0, kept / 1048576.0, fr2 / 1048576.0);
+  }
   // ready only after the session pool is reserved — launchers treat this line as startup complete (a pool OOM must not happen after ready)
   fprintf(stderr, "[hived] ready in %.1fs · layers %d · ctx %lld · chunk %d · dspark %s(block %d · conf ≥ %.2f · max %d)\n", (now_ms() - t_load) / 1000.0, nl,
           (long long)max_ctx, max_chunk, rt.mtp_enabled() ? "on" : "off", mtp_B, mtp_conf, mtp_max);
@@ -1004,8 +1035,15 @@ int main(int argc, char** argv) {
     if (power.load() != kPowerReady || last_stats - vram_ms >= 1000.0) {  // even on forced publishes (request end, every chunk) query the device at most once per second (every time during transitions)
       size_t fr = 0, tot = 0;
       cudaMemGetInfo(&fr, &tot);
-      vram_json = {{"free_mib", fr / 1048576.0}, {"used_mib", vram_used_mib(tot, fr)}, {"total_mib", (double)(tot - g_vram_ballast) / 1048576.0}};
-      if (g_vram_ballast) vram_json["limit_ballast_mib"] = g_vram_ballast / 1048576.0;  // HIVE_VRAM_LIMIT_MB: used / total exclude it
+      const size_t held = vram_reserve::held();
+      if (g_vram_limit_armed) {  // the process is the limit: its reserve is its free part (the device-wide numbers include other processes on the card)
+        vram_json = {{"free_mib", held / 1048576.0}, {"used_mib", (double)(g_vram_limit_armed - std::min(held, g_vram_limit_armed)) / 1048576.0},
+                     {"total_mib", g_vram_limit_armed / 1048576.0}, {"device_free_mib", fr / 1048576.0}};
+        vram_json["limit_reserve_mib"] = held / 1048576.0;
+      } else {
+        vram_json = {{"free_mib", fr / 1048576.0}, {"used_mib", vram_used_mib(tot, fr)}, {"total_mib", (double)(tot - held) / 1048576.0}};
+        if (held) vram_json["limit_ballast_mib"] = held / 1048576.0;  // HIVE_VRAM_LIMIT_MB: used / total exclude it
+      }
       host_mem_json = proc_memory_mib();
       host_mem_json["experts_pinned_mib"] = store.experts_host_bytes() / 1048576.0;
       host_mem_json["engram_mib"] = store.engram_host_bytes() / 1048576.0;
@@ -3246,6 +3284,7 @@ int main(int argc, char** argv) {
   };
   auto do_sleep = [&] {
     const double t0 = now_ms();
+    vram_reserve::set_cap(false);  // what sleep frees is for the media engines — not refilled into the reserve
     size_t fr0 = 0, tot = 0;
     cudaMemGetInfo(&fr0, &tot);
     int level = 1;
@@ -3351,6 +3390,7 @@ int main(int argc, char** argv) {
                  {"slots_before_sleep", store.sleep_phys_slots()}, {"warmed", warmed}, {"resident_keys", sleep_keys.size()},
                  {"vram_used_mib", vram_used_mib(tot, fr)}};
     if (vmm_restored) wake_info["vmm"] = {{"restored_mib", vmm_mib}, {"ms", vmm_ms}};
+    if (g_vram_limit_armed) vram_reserve::set_cap(true);  // serving again: runtime allocations draw from the reserve (wake itself took back what sleep gave the card)
     fprintf(stderr, "[hived] wake: %.0f ms (alloc %.0f · warm %.0f) · slots %d (before sleep %d) · warmed %d/%zu experts · VRAM used %.0f MiB · level %d%s\n", t2 - t0,
             t1 - t0, t2 - t1, n, store.sleep_phys_slots(), warmed, sleep_keys.size(), vram_used_mib(tot, fr), level_was,
             vmm_restored ? (" · dense/work " + std::to_string((long long)vmm_mib) + " MiB back in " + std::to_string((long long)vmm_ms) + " ms").c_str() : "");

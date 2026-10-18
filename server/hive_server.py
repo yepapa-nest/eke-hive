@@ -134,7 +134,7 @@ class ClosingStreamingResponse(StreamingResponse):
 FAMILY = "deepseek_v4"   # model family of the checkpoint (config.json model_type); adapter families: ADAPTER_FAMILIES
 STOP_IDS: list = []      # stop token ids (DeepSeek: the tokenizer's eos; GLM: config eos_token_id list; Qwen: generation_config eos list)
 # model_type → adapter module in server/families (the checkpoint's chat template through transformers + the module's parsing / media)
-ADAPTER_FAMILIES = {"glm5_next": "glm", "qwen4_exp": "qwen", "qwen3_5": "q27"}
+ADAPTER_FAMILIES = {"glm5_next": "glm", "qwen4_exp": "qwen", "qwen3_5": "q27", "gemma4_unified": "gemma"}
 
 
 def adapter_family() -> bool:
@@ -159,7 +159,7 @@ def load_modules(ckpt: str):
         fam = importlib.import_module("families." + ADAPTER_FAMILIES[cfg["model_type"]])
 
         TOK = AutoTokenizer.from_pretrained(ckpt)
-        if fam.FAMILY in ("qwen4_exp", "qwen3_5"):
+        if fam.FAMILY in ("qwen4_exp", "qwen3_5", "gemma4_unified"):
             fam.init(TOK, cfg, ckpt)  # stop ids from generation_config.json
         else:
             fam.init(TOK, cfg)
@@ -181,6 +181,17 @@ def load_modules(ckpt: str):
 
     TOK = AutoTokenizer.from_pretrained(ckpt)
     STOP_IDS, EOS_TEXTS = [TOK.eos_token_id], [TOK.eos_token]
+
+
+def family_default(key: str, fallback):
+    """A sampling default of the adapter family's model (families/*.py defaults()), else the server's fallback."""
+    d = ENC.defaults() if adapter_family() and hasattr(ENC, "defaults") else {}
+    return d.get(key, fallback)
+
+
+def think_end() -> str:
+    """The text that closes the reasoning of a thinking response (adapter families: their THINK_END)."""
+    return getattr(ENC, "THINK_END", "</think>") if adapter_family() else "</think>"
 
 
 def eos_texts() -> list:
@@ -453,6 +464,18 @@ def encode_prompt(messages: list[dict], tools, thinking_mode: str, effort) -> tu
     """Reference encoding.encode_messages: the tool list is attached to the first message as `tools`. Images come back in media["images"]."""
     check_image_parts(messages)
     messages = [dict(m) for m in messages]
+    if adapter_family():
+        # Tools a client announces in a later system message ({"role": "system", "tools": [...]}, e.g. a tool added after the
+        #   conversation's first turn, so the head of the prompt stays byte-stable): DeepSeek's reference encoding declares them in
+        #   place (render_message: any system message renders its tools). The GLM / Qwen templates declare tools only in the head, so
+        #   for them the announced tools join the request's list (the prompt a client listing every tool up front would give).
+        announced = []
+        for m in messages[1:]:
+            if m.get("role") == "system" and isinstance(m.get("tools"), list):
+                announced.extend(t for t in m.pop("tools") if isinstance(t, dict))
+        if announced:
+            have = {((t.get("function") or {}).get("name")) for t in tools or []}
+            tools = list(tools or []) + [t for t in announced if (t.get("function") or {}).get("name") not in have]
     if tools and messages:
         # The reference encoding only calls render_tools for role=system — requests that start with a user message (e.g.
         #   BFCL function calling) got no tool list in the prompt at all (measured: weather question + get_weather, 0/4
@@ -2071,9 +2094,10 @@ async def chat(request: Request):
         # Unset = the full context: 0 lets the daemon use max_ctx - prompt
         "max_tokens": max(0, int(_num(body.get("max_tokens") or body.get("max_completion_tokens"), 0))) if abs(_num(body.get("max_tokens") or body.get("max_completion_tokens"), 0)) < 2 ** 62 else 0,
         # Normalize: null, bool, non-numeric and non-finite values become the default (a raw null would make hived's json value() throw -> request error)
-        "temperature": _num(body.get("temperature"), 1.0),
-        "top_p": _num(body.get("top_p"), 0.95),
-        "top_k": int(_num(body.get("top_k"), 0)),
+        # unset fields: the family's model defaults when its adapter has them (Gemma: generation_config.json), else 1.0 / 0.95 / off
+        "temperature": _num(body.get("temperature"), family_default("temperature", 1.0)),
+        "top_p": _num(body.get("top_p"), family_default("top_p", 0.95)),
+        "top_k": int(_num(body.get("top_k"), family_default("top_k", 0))),
         "min_p": _num(body.get("min_p"), 0.0),
         "seed": int(_num(body.get("seed"), 0)) if abs(_num(body.get("seed"), 0)) < 2 ** 62 else 0,
         # ignore_eos (benchmark harnesses measure throughput at a fixed output length): no stop token, run to max_tokens
@@ -2324,9 +2348,12 @@ async def chat(request: Request):
         #   while they are generated (DsmlToolStream; HIVE_TOOL_STREAM=0 = parse at the end and send them in one piece).
         buf = ""
         in_think = thinking_mode == "thinking"
+        te = think_end()
         tool_buf = ""
         in_tool = False
-        tstream = DsmlToolStream(ENC) if os.environ.get("HIVE_TOOL_STREAM", "1") != "0" and not adapter_family() else None
+        tstream = None
+        if os.environ.get("HIVE_TOOL_STREAM", "1") != "0":   # an adapter family streams its calls if it has a ToolStream (Gemma)
+            tstream = DsmlToolStream(ENC) if not adapter_family() else (ENC.ToolStream(ENC) if hasattr(ENC, "ToolStream") else None)
         done = {}
         gen_text = ""  # the generated text as one string (HIVE_TURN_PRERENDER parses it like the non-streaming path)
 
@@ -2344,17 +2371,17 @@ async def chat(request: Request):
                     buf += val
                     while buf:
                         if in_think:
-                            j = buf.find("</think>")
+                            j = buf.find(te)
                             if j < 0:
                                 # protect a partial tag
-                                safe = buf if not any(buf.endswith("</think>"[:k]) for k in range(1, 8)) else buf[: len(buf) - max(k for k in range(1, 8) if buf.endswith("</think>"[:k]))]
+                                safe = buf if not any(buf.endswith(te[:k]) for k in range(1, len(te))) else buf[: len(buf) - max(k for k in range(1, len(te)) if buf.endswith(te[:k]))]
                                 if safe:
                                     yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'reasoning_content': safe}, 'finish_reason': None}]})}\n\n"
                                     buf = buf[len(safe):]
                                 break
                             if j > 0:
                                 yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'reasoning_content': buf[:j]}, 'finish_reason': None}]})}\n\n"
-                            buf = buf[j + len("</think>"):]
+                            buf = buf[j + len(te):]
                             in_think = False
                             continue
                         if in_tool:

@@ -210,6 +210,16 @@ Every existing sizing path then sees the small card with no family change: `HIVE
 cuBLAS internals, CUDA graph growth and VMM granularity — all are counted because they come out of the same physical pool. This is also how
 to measure every row of §3 on the 96 GB card. `HIVE_QWEN_VRAM_MB` becomes redundant (keep it as an alias: L = its value + C).
 
+> **Implemented 2026-10-18 for DeepSeek (a narrower form of step 2):** `engine/include/hive/vram_reserve.h`. The ballast is held in 32 MiB
+> pieces; at ready the ballast goes back to the card and the headroom left inside the limit (what is free while the ballast is held) is
+> taken as the reserve, new pieces first so nothing can take it in between. While serving, `DevBuf::alloc` and `GrowBuf::ensure` take their
+> room out of the reserve and a free refills it — never past the share it was armed with — and an allocation past the reserve is refused
+> without asking the device. A refusal throws `DeviceOutOfMemory` (the request paths fail only that request) instead of aborting. Why:
+> with `HIVE_VRAM_BALLAST_RELEASE=1` beside another process, a 2 MiB runtime buffer found 26 MiB free on the card and the abort took every
+> open conversation down; with the ballast kept, the other process had no room to grow. DeepSeek's sizes are fixed after ready (session
+> pool, slots; wake restores at most what sleep released), so the reserve covers it; GLM, Qwen and Q27 still read the device's free
+> memory at runtime (the table below) and keep the ballast until they read `avail()` instead. GPU test: `engine/tests/test_vram_reserve.cu`.
+
 **Step 2 — accounting cap (for a card shared by several processes; optional).** A header `hive/vram_budget.h` with
 `avail() = min(cudaMemGetInfo free, L − used_self)`, where `used_self` = C + bytes counted at the allocation points — `DevBuf::alloc/free`,
 `devmem::alloc/free`, `GrowBuf::ensure/trim`, `ExpertStore::alloc_cache` / `elastic_reserve` / staging, `GlmExperts` slots (`slot_buf_`) and

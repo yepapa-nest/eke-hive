@@ -82,6 +82,8 @@ void mtp_attention(DsCpuEngine::Impl& I, const LayerW& L, const CpuSeq& s, const
   });
   for (int m = 0; m < B; ++m) I.rope_win.apply(o.data() + (size_t)m * QW, H, HDm, rd, f.pos[m], true);
   const int G = c.o_groups, OR = c.o_lora_rank, sub = QW / G;
+  round_rows(o.data(), B, QW, QW);  // reference act_quant(o) before wo_a (see ds_cpu_engine.cpp)
+  act_quant_fp8(o.data(), B, QW, QW, o.data(), QW);
   std::vector<float> og((size_t)B * G * OR);
   jobs.clear();
   for (int g = 0; g < G; ++g) jobs.push_back(MatJob{MatView{&A.wo_a, g * OR, (g + 1) * OR}, og.data() + (size_t)g * OR, G * OR, o.data() + (size_t)g * sub, B, QW});

@@ -23,6 +23,9 @@ python3 tools/test_validation_cpu.py
 python3 tools/test_server_cpu.py
 python3 tools/test_glm_family_cpu.py  # GLM family: effort mapping, unset = high, HIVE_GLM_NOTHINK
 python3 tools/test_qwen_family_cpu.py  # Qwen3.8-Flash-Next family: effort mapping, tool-call parsing, stop ids, image/video preprocessing and spans
+python3 tools/test_gemma_family_cpu.py  # Gemma 4 family: thinking mapping, template (tool-response branch), tool-call / thought-channel parsing, stop ids, defaults
+python3 tools/test_qasr_frontend_cpu.py  # Qwen3-ASR front end: audio token count, WAV decoding, log-mel vs the reference extractor (when transformers is installed)
+python3 tools/test_qtts_server_cpu.py  # Qwen3-TTS server: /ws/speak protocol, barge-in, queueing, /health, voice / language resolution (fake engine)
 T=$(mktemp -d)/qwen_ple; g++ -std=c++20 -O1 -Itools/cpu_fake/include -Iengine/include -Iengine/third_party engine/tests/test_qwen_ple_cpu.cpp -DHIVE_SOURCE_DIR_HINT="\"$ROOT/engine\"" -o "$T" && "$T"  # PLE n-gram hash == oracle vectors, split == whole
 T=$(mktemp -d)/qwen_simd; g++ -std=gnu++20 -O3 -mavx2 -mfma -mf16c engine/tests/test_qwen_cpu_simd.cpp -o "$T" && "$T"  # Qwen CPU engine AVX2 element-wise kernels == scalar twins (bit for bit)
 python3 tools/test_hive_monitor_cpu.py  # hived.log monitor, daily report, lossless concurrent writes with an external log-rotate script (if present)

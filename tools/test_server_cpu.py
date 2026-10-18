@@ -1627,4 +1627,39 @@ class TokenCacheTests(unittest.TestCase):
             threading.Thread = real_thread
 
 
+class AnnouncedToolsTests(unittest.TestCase):
+    """Tools announced in a later system message: DeepSeek keeps them in place, the adapter families merge them into the head."""
+
+    def _run(self, family):
+        seen = {}
+
+        class Enc:
+            def encode_messages(self, messages, **kw):
+                seen['messages'] = messages
+                return 'p', {}
+
+        old = (s.FAMILY, s.ENC)
+        s.FAMILY, s.ENC = family, Enc()
+        try:
+            tool = lambda n: {'type': 'function', 'function': {'name': n}}
+            msgs = [{'role': 'system', 'content': 'head'}, {'role': 'user', 'content': 'q'},
+                    {'role': 'system', 'content': 'new', 'tools': [tool('later'), tool('a')]}, {'role': 'user', 'content': 'q2'}]
+            ORIG_ENCODE_PROMPT(msgs, [tool('a')], 'chat', None)
+            return seen['messages'], msgs
+        finally:
+            s.FAMILY, s.ENC = old
+
+    def test_deepseek_keeps_announced_tools_in_place(self):
+        out, given = self._run('deepseek')
+        self.assertEqual([t['function']['name'] for t in out[0]['tools']], ['a'])
+        self.assertEqual([t['function']['name'] for t in out[2]['tools']], ['later', 'a'])
+
+    def test_adapter_family_merges_them_into_the_head(self):
+        family = next(iter(s.ADAPTER_FAMILIES))
+        out, given = self._run(family)
+        self.assertEqual([t['function']['name'] for t in out[0]['tools']], ['a', 'later'])
+        self.assertNotIn('tools', out[2])
+        self.assertIn('tools', given[2])   # the caller's messages are not mutated
+
+
 if __name__=='__main__': unittest.main()

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The Eke Hive Authors
+# Gemma 4 family (config model_type "gemma4_unified", text path): int4 group-32 weights, paged fp8 KV with sliding-window layers, Frozen-KV
+#   MTP assistant — hive/gemma/*. hive_gemma: the engine · hived_gemma: the daemon · gemma_check: engine end to end against the oracle.
+# Every target is guarded by the existence of its sources: this file is included by every configure of the tree.
+set(_gm ${CMAKE_CURRENT_SOURCE_DIR})
+set(HIVE_GEMMA_SRC ${_gm}/src/gemma/gemma_w4.cu ${_gm}/src/gemma/gemma_attn.cu ${_gm}/src/gemma/gemma_ops.cu ${_gm}/src/gemma/gemma_engine.cu)
+set(_gm_ok TRUE)
+foreach(f IN LISTS HIVE_GEMMA_SRC)
+  if(NOT EXISTS ${f})
+    set(_gm_ok FALSE)
+  endif()
+endforeach()
+if(_gm_ok)
+  add_library(hive_gemma STATIC ${HIVE_GEMMA_SRC})
+  target_link_libraries(hive_gemma PUBLIC hive_core)
+  if(EXISTS ${_gm}/tests/gemma_consistency.cpp)
+    add_executable(gemma_consistency tests/gemma_consistency.cpp)
+    target_link_libraries(gemma_consistency hive_gemma)
+  endif()
+  if(EXISTS ${_gm}/tests/gemma_check.cpp)
+    add_executable(gemma_check tests/gemma_check.cpp)
+    target_link_libraries(gemma_check hive_gemma)
+  endif()
+  if(EXISTS ${_gm}/include/hive/gemma/hived_family.h AND EXISTS ${_gm}/src/gemma/gemma_runtime.cpp)
+    add_executable(hived_gemma src/hived.cpp src/gemma/gemma_runtime.cpp)
+    target_link_libraries(hived_gemma hive_gemma)
+    target_compile_definitions(hived_gemma PRIVATE HIVE_FAMILY_GEMMA HIVE_BUILD_ID="${HIVE_SOURCE_SHA}")
+  endif()
+endif()

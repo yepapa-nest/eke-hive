@@ -523,6 +523,50 @@ __global__ void rope_last_kernel(bf16* __restrict__ x, int M, int H, int D, int 
   base[1] = f2bf(a * f.y + b * f.x);
 }
 
+// rope_last(inverse) followed by act_quant(x, 32, ue8m0) round trip over each row [H*D], in one pass (prefill wo_a input).
+//   Four threads per 32-element block, 8 elements (16 bytes) each, so a warp reads and writes 512 contiguous bytes; the block's
+//   amax is reduced over its 4 lanes with shuffles. A block never straddles a head (D % 32 == 0) and the rotated tail starts on a
+//   block boundary (rd % 32 == 0), so every 8-element slice holds whole (2i, 2i+1) pairs. Same arithmetic as rope_last_kernel
+//   (rounded to bf16), then the act_quant_fp8_kernel<true> formula — bit-identical to the two launches (tests/test_rope_quant.cu).
+//   The one-thread-per-block layout of those kernels reads 2 bytes per load: 16K rows took 5.7 ms (~350 GB/s).
+__global__ void rope_last_quant_kernel(bf16* __restrict__ x, int M, int H, int D, int rd, const float2* __restrict__ freqs,
+                                       const int32_t* __restrict__ pos, bool inverse) {
+  const int K = H * D, nq = K / 8;              // 8-element slices per row
+  const size_t t = hive::cu::global_tid();
+  const bool live = t < (size_t)M * nq;         // dead lanes still take part in the shuffles (whole warps)
+  const int m = live ? (int)(t / nq) : 0, s = live ? (int)(t % nq) : 0;
+  const int off = (s * 8) % D, half = rd / 2;
+  uint4 raw = live ? *reinterpret_cast<const uint4*>(x + (size_t)m * K + (size_t)s * 8) : make_uint4(0, 0, 0, 0);
+  const bf16* rb = reinterpret_cast<const bf16*>(&raw);
+  float v[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) v[i] = bf2f(rb[i]);
+  if (live && off >= D - rd) {
+    const int p0 = (off - (D - rd)) / 2;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float2 f = freqs[(size_t)pos[m] * half + p0 + j];
+      if (inverse) f.y = -f.y;
+      const float a = v[2 * j], c = v[2 * j + 1];
+      v[2 * j] = bf2f(f2bf(a * f.x - c * f.y));
+      v[2 * j + 1] = bf2f(f2bf(a * f.y + c * f.x));
+    }
+  }
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  if (!live) return;
+  amax = fmaxf(amax, 1e-4f);
+  const float sc = e8m0_to_f32(f32_ceil_pow2_e8m0(amax * (1.0f / 448.0f)));
+  uint4 out;
+  bf16* ob = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) ob[i] = f2bf(e4m3_to_f32(f32_to_e4m3(fminf(fmaxf(v[i] / sc, -448.f), 448.f))) * sc);
+  *reinterpret_cast<uint4*>(x + (size_t)m * K + (size_t)s * 8) = out;
+}
+
 // ---- sparse attention: block = (1 query, head group ATT_HG=8), 256 threads → per thread (1 head, a 128-dim range… → 8 heads × 512 = 4096 outputs / 256 = 16)
 //   Reference kernel semantics: score = bf16 q · bf16 kv (fp32 accumulation) × scale; P is cast to bf16 and multiplied with V (fp32 accumulation); denominator fp32 (+sink).
 constexpr int ATT_D = 512;
@@ -1321,6 +1365,10 @@ void hc_post(const bf16* x, const float* post, const float* comb, int M, int hc,
 }
 void rope_last(bf16* x, int M, int H, int D, int rd, const float2* freqs, const int32_t* pos, bool inverse, cudaStream_t st) {
   rope_last_kernel<<<grid1d((size_t)M * H * (rd / 2)), 256, 0, st>>>(x, M, H, D, rd, freqs, pos, inverse);
+}
+void rope_last_quant(bf16* x, int M, int H, int D, int rd, const float2* freqs, const int32_t* pos, bool inverse, cudaStream_t st) {
+  HIVE_CHECK(D % 32 == 0 && rd % 32 == 0 && rd <= D, "rope_last_quant shape");
+  rope_last_quant_kernel<<<grid1d((size_t)M * (H * D / 8)), 256, 0, st>>>(x, M, H, D, rd, freqs, pos, inverse);
 }
 void sparse_attn(const bf16* q, int M, int H, int D, const KvSources& kv, const int32_t* idx, int idx_stride, int topk,
                  const float* sink, float scale, bf16* o, cudaStream_t st) {

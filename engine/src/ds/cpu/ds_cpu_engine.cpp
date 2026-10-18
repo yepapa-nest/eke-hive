@@ -609,6 +609,9 @@ void DsCpuEngine::Impl::attention(LayerW& L, Fwd& f, const float* xn, float* out
   {
     Timer tm(st.ms_attn_out);
     const int G = c.o_groups, OR = c.o_lora_rank, sub = QW / G;
+    // reference act_quant(o, 32, ue8m0) in place before wo_a (model.py since deepseek-ai/DeepSeek-V4.1-Flash 4dd75a8, 2026-10-12) — o is bf16 there
+    round_rows(o.data(), M, QW, QW);
+    act_quant_fp8(o.data(), M, QW, QW, o.data(), QW);
     std::vector<float> og((size_t)M * G * OR);
     std::vector<MatJob> jobs;
     for (int g = 0; g < G; ++g) jobs.push_back(MatJob{MatView{&A.wo_a, g * OR, (g + 1) * OR}, og.data() + (size_t)g * OR, G * OR, o.data() + (size_t)g * sub, M, QW});

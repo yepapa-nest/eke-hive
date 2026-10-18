@@ -70,6 +70,9 @@ void route_to_host(const int32_t* ids, const float* rw, const uint8_t* xq, const
 // freqs_cis: [max_pos, rd/2] complex (cos,sin pairs) fp32. x: rotates the last rd dims of [M, H, D]. pos[m] = position.
 // inverse = conjugate. Reference apply_rotary_emb: computes in fp32 and writes back bf16.
 void rope_last(bf16* x, int M, int H, int D, int rd, const float2* freqs, const int32_t* pos, bool inverse, cudaStream_t st);
+// rope_last followed by act_quant_fp8_roundtrip over each row [H*D] in one pass (bit-identical; the wo_a input). D, rd multiples of 32;
+//   rd = 0 quantizes only (freqs/pos unused) — coalesced 16-byte slices, ~4x the bandwidth of act_quant_fp8_roundtrip.
+void rope_last_quant(bf16* x, int M, int H, int D, int rd, const float2* freqs, const int32_t* pos, bool inverse, cudaStream_t st);
 // For group positions of the compressed latents: also passed as pos[m] as above, even when it is not a plain position array.
 
 // ---- attention ---------------------------------------------------------------------------------------------------------

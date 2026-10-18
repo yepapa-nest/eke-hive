@@ -590,6 +590,10 @@ class Attention:
             apply_rotary_emb(k[..., -rd:], freqs)
             fp4_act_quant_inplace(k, 32, False)
             self.idx_k_cache[start_pos // ratio : start_pos // ratio + k.size(0)] = k
+        if self.idx_owns_k:
+            # Republish even when no group completed this step — reference "Restore each indexer's K cache on incomplete
+            # compression steps" (deepseek-ai/DeepSeek-V4.1-Flash 8b3cec7, 2026-10-12). Otherwise this layer reads the cache of
+            # the last owner that did publish (the engine always republished: runtime.cpp shared_index_k_).
             self.shared.index_k = self.idx_k_cache
 
         q = self.idx_wq_b(qr).unflatten(-1, (self.idx_n_heads, self.idx_head_dim))  # [s,h,d] bf16
@@ -677,6 +681,7 @@ class Attention:
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
         o = o.view(seqlen, self.o_groups, -1)
+        act_quant_fp8_inplace(o)  # reference model.py since deepseek-ai/DeepSeek-V4.1-Flash 4dd75a8 (2026-10-12)
         wo_a = self.wo_a.view(self.o_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
         return self.wo_b(o.flatten(1))
@@ -845,6 +850,7 @@ class DSparkAttention(Attention):
         o = sparse_attn(q, kv_all, self.attn_sink, idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
         o = o.view(B, self.o_groups, -1)
+        act_quant_fp8_inplace(o)  # reference model.py since deepseek-ai/DeepSeek-V4.1-Flash 4dd75a8 (2026-10-12)
         wo_a = self.wo_a.view(self.o_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
         log.setdefault("dspark_idxs", {})[f"L{self.layer_id}"] = idxs[0].tolist()

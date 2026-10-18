@@ -37,7 +37,7 @@ hive_mem_gb() {  # $1 = MemTotal | MemAvailable, in GiB (HIVE_TEST_MEMTOTAL_GB /
 
 hive_apply_profile() {
   [ -n "${HIVE_MODEL:-}" ] || return 0
-  case "$HIVE_MODEL" in ds|glm|fn|27b) ;; *) echo "HIVE_MODEL must be ds, glm, fn or 27b (got '$HIVE_MODEL')" >&2; exit 1 ;; esac
+  case "$HIVE_MODEL" in ds|glm|fn|27b|gemma|asr|tts) ;; *) echo "HIVE_MODEL must be ds, glm, fn, 27b, gemma, asr or tts (got '$HIVE_MODEL')" >&2; exit 1 ;; esac
   : "${HIVE_VRAM_GB:=96}"
   case "$HIVE_VRAM_GB" in 96|72|48|32|24|16|12|8|0) ;; *) echo "HIVE_VRAM_GB must be one of 96 72 48 32 24 16 12 8 0 (got '$HIVE_VRAM_GB')" >&2; exit 1 ;; esac
   export HIVE_MODEL HIVE_VRAM_GB
@@ -146,6 +146,15 @@ hive_load_config() {
     elif [ "${HIVE_MODEL_FAMILY:-}" = q27 ] || { [ -z "${HIVE_MODEL_FAMILY:-}" ] && [ -n "${HIVE_CKPT:-}" ] &&
         grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen3_5"' "$HIVE_CKPT/config.json" 2>/dev/null; }; then
       cfg=$HIVE_ROOT/config/q27.env
+    elif [ "${HIVE_MODEL_FAMILY:-}" = gemma ] || { [ -z "${HIVE_MODEL_FAMILY:-}" ] && [ -n "${HIVE_CKPT:-}" ] &&
+        grep -q '"model_type"[[:space:]]*:[[:space:]]*"gemma4_unified"' "$HIVE_CKPT/config.json" 2>/dev/null; }; then
+      cfg=$HIVE_ROOT/config/gemma.env
+    elif [ "${HIVE_MODEL_FAMILY:-}" = qasr ] || { [ -z "${HIVE_MODEL_FAMILY:-}" ] && [ -n "${HIVE_CKPT:-}" ] &&
+        grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen3_asr"' "$HIVE_CKPT/config.json" 2>/dev/null; }; then
+      cfg=$HIVE_ROOT/config/qasr.env
+    elif [ "${HIVE_MODEL_FAMILY:-}" = qtts ] || { [ -z "${HIVE_MODEL_FAMILY:-}" ] && [ -n "${HIVE_CKPT:-}" ] &&
+        grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen3_tts"' "$HIVE_CKPT/config.json" 2>/dev/null; }; then
+      cfg=$HIVE_ROOT/config/qtts.env
     fi
   fi
   case "$cfg" in /*) ;; *) [ -f "$cfg" ] || cfg=$HIVE_ROOT/$cfg ;; esac
@@ -180,14 +189,20 @@ hive_detect_family() {
     if grep -q '"model_type"[[:space:]]*:[[:space:]]*"glm5_next"' "$HIVE_CKPT/config.json" 2>/dev/null; then HIVE_MODEL_FAMILY=glm
     elif grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen4_exp"' "$HIVE_CKPT/config.json" 2>/dev/null; then HIVE_MODEL_FAMILY=qwen
     elif grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen3_5"' "$HIVE_CKPT/config.json" 2>/dev/null; then HIVE_MODEL_FAMILY=q27
+    elif grep -q '"model_type"[[:space:]]*:[[:space:]]*"gemma4_unified"' "$HIVE_CKPT/config.json" 2>/dev/null; then HIVE_MODEL_FAMILY=gemma
+    elif grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen3_asr"' "$HIVE_CKPT/config.json" 2>/dev/null; then HIVE_MODEL_FAMILY=qasr
+    elif grep -q '"model_type"[[:space:]]*:[[:space:]]*"qwen3_tts"' "$HIVE_CKPT/config.json" 2>/dev/null; then HIVE_MODEL_FAMILY=qtts
     else HIVE_MODEL_FAMILY=deepseek; fi
   fi
   case "$HIVE_MODEL_FAMILY" in
     glm) HIVE_DAEMON_BIN=hived_glm ;;
     qwen) HIVE_DAEMON_BIN=hived_qwen ;;
     q27) HIVE_DAEMON_BIN=hived_q27 ;;
+    gemma) HIVE_DAEMON_BIN=hived_gemma ;;
+    qasr) HIVE_DAEMON_BIN=libhive_qasr.so ;;  # speech recognition: a library behind server/speech/asr_server.py (scripts/qasr-start.sh)
+    qtts) HIVE_DAEMON_BIN=libhive_qtts.so ;;  # text-to-speech: a library behind server/speech/tts_server.py (scripts/qtts-start.sh)
     deepseek) HIVE_DAEMON_BIN=hived ;;
-    *) echo "HIVE_MODEL_FAMILY must be deepseek, glm, qwen or q27 (got '$HIVE_MODEL_FAMILY')" >&2; exit 1 ;;
+    *) echo "HIVE_MODEL_FAMILY must be deepseek, glm, qwen, q27, gemma, qasr or qtts (got '$HIVE_MODEL_FAMILY')" >&2; exit 1 ;;
   esac
   export HIVE_MODEL_FAMILY HIVE_DAEMON_BIN
 }

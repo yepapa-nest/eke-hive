@@ -16,6 +16,10 @@ set -u
 . "$(dirname "$0")/lib.sh"
 shell_build=${HIVE_BUILD:-}; unset HIVE_BUILD
 hive_load_config; hive_need_ckpt; hive_detect_family
+# Qwen3-ASR (qwen3_asr) is not a hived family: its own container runs server/speech/asr_server.py on libhive_qasr.so (docs/qasr.md)
+[ "$HIVE_MODEL_FAMILY" = qasr ] && exec "$(dirname "$0")/qasr-start.sh" "$@"
+# Qwen3-TTS (qwen3_tts) likewise: server/speech/tts_server.py on libhive_qtts.so in its own container (docs/qtts.md)
+[ "$HIVE_MODEL_FAMILY" = qtts ] && exec "$(dirname "$0")/qtts-start.sh" "$@"
 BUILD=build
 read -r -a EXTRA <<< "${HIVE_DAEMON_ARGS:-}"
 while [ $# -gt 0 ]; do
@@ -35,6 +39,24 @@ if [ -n "$shell_build" ] && [ "$shell_build" != "$BUILD" ]; then
   echo "note: HIVE_BUILD=$shell_build in the shell is ignored; starting engine/$BUILD (use --build $shell_build to change)" >&2
 fi
 hive_profile_preflight
+GEMMA_MOUNTS=()
+# Gemma: the MTP assistant checkpoint (HIVE_GEMMA_ASSISTANT; unset = a known assistant directory next to HIVE_CKPT, 0 = no drafter),
+#   mounted read-only at the same path
+if [ "${HIVE_MODEL_FAMILY:-}" = gemma ]; then
+  if [ -z "${HIVE_GEMMA_ASSISTANT:-}" ]; then
+    for n in google-gemma-4-12B-it-qat-q4_0-unquantized-assistant gemma-4-12B-it-qat-q4_0-unquantized-assistant; do
+      [ -f "$(dirname "$HIVE_CKPT")/$n/config.json" ] && { HIVE_GEMMA_ASSISTANT=$(dirname "$HIVE_CKPT")/$n; break; }
+    done
+  fi
+  if [ -n "${HIVE_GEMMA_ASSISTANT:-}" ] && [ "$HIVE_GEMMA_ASSISTANT" != 0 ]; then
+    [ -f "$HIVE_GEMMA_ASSISTANT/config.json" ] || { echo "HIVE_GEMMA_ASSISTANT=$HIVE_GEMMA_ASSISTANT has no config.json" >&2; exit 1; }
+    export HIVE_GEMMA_ASSISTANT
+    GEMMA_MOUNTS=(-v "$HIVE_GEMMA_ASSISTANT":"$HIVE_GEMMA_ASSISTANT":ro)
+  else
+    unset HIVE_GEMMA_ASSISTANT
+  fi
+fi
+
 dry_run=0
 case "${HIVE_DRY_RUN:-}" in ""|0) ;; *) dry_run=1 ;; esac
 if [ "$dry_run" = 1 ]; then  # resolved settings and the command line only (HIVE_DRY_RUN — tools/test_profiles_cpu.sh)
@@ -51,7 +73,7 @@ fi
 [ "${HIVE_GPU:-0}" = none ] || [ -x "$HIVE_ROOT/engine/$BUILD/$HIVE_DAEMON_BIN" ] || { echo "engine/$BUILD/$HIVE_DAEMON_BIN not found — run scripts/build.sh first" >&2; exit 1; }
 # GLM: no engram tables; the expert cache is sized after the session pool (HIVE_CACHE_FIT) unless set explicitly; the optional
 #   Z.ai FP8 tensors (HIVE_GLM_FP8_DIR, docs/glm.md) are mounted read-only at the same path.
-FAMILY_MOUNTS=()
+FAMILY_MOUNTS=("${GEMMA_MOUNTS[@]}")
 if [ "$HIVE_MODEL_FAMILY" = glm ]; then
   : "${HIVE_CACHE_FIT:=1}"; export HIVE_CACHE_FIT
   if [ -n "${HIVE_GLM_FP8_DIR:-}" ] && [ "$HIVE_GLM_FP8_DIR" != 0 ]; then
@@ -97,6 +119,7 @@ mkdir -p "$HIVE_STATE_DIR/logs"
 docker rm -f "$HIVE_CONTAINER" >/dev/null 2>&1
 # HIVE_START_WAIT_OTHERS=0: other families' daemons may stay alive beside this one (e.g. one asleep, or two models sharing the card
 #   under VRAM caps) — then wait only for the RAM, not for every other hived process to exit (default 1 = unchanged).
+# hived_gemma is not waited for: the live chat model runs beside a large model under VRAM caps (its pinned RAM is small).
 # Wait until a previous daemon has exited and released its pinned RAM: starting a new one while the old
 # pinned memory (~480 GB for DeepSeek, ~385 GB for GLM) is still being freed gets the new process OOM-killed. MemAvailable alone is not
 # enough (it counts the page cache holding the checkpoint), so the old process must also be gone.

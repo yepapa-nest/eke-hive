@@ -20,6 +20,7 @@
 #include "hive/common.h"
 #include "hive/cache_reserve.h"
 #include "hive/devmem.h"
+#include "hive/vram_reserve.h"
 
 namespace hive {
 
@@ -76,8 +77,17 @@ struct GrowBuf {
     devmem::Backend* be = grow_backend();
     const size_t to = devmem::round_up(std::min(bytes, n), be->gran), sz = to - mapped;
     devmem::Handle h{};
-    if (!be->create(&h, sz)) { (void)cudaGetLastError(); return false; }
-    if (!be->map((uintptr_t)p + mapped, sz, h)) { be->release(h); (void)cudaGetLastError(); return false; }
+    // HIVE_VRAM_LIMIT_MB while serving: growth comes out of the process's own reserve, and past it the growth is refused (vram_reserve.h)
+    if (!vram_reserve::before_alloc(sz)) return false;
+    if (!be->create(&h, sz)) {
+      (void)cudaGetLastError();
+      if (!vram_reserve::cap_on() || !vram_reserve::give(sz + vram_reserve::kChunk) || !be->create(&h, sz)) {
+        (void)cudaGetLastError();
+        vram_reserve::alloc_refused(sz);
+        return false;
+      }
+    }
+    if (!be->map((uintptr_t)p + mapped, sz, h)) { be->release(h); (void)cudaGetLastError(); vram_reserve::alloc_refused(sz); return false; }
     steps_.push_back({h, sz});
     mapped = to;
     return bytes <= n;
@@ -95,6 +105,7 @@ struct GrowBuf {
       be->release(s.h);
       freed += s.size;
     }
+    vram_reserve::after_free(freed);
     return freed;
   }
   void free() {

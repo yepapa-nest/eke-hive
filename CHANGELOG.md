@@ -5,6 +5,23 @@
 Four models at four VRAM sizes. Every family is measured with the same harness at 96 / 72 / 48 / 32 GB (`HIVE_MODEL`, `HIVE_VRAM_GB`;
 smaller cards reproduced with the engine's VRAM limit) — the table is in the [README](README.md#performance-by-vram-size).
 
+- **Three new families for a real-time voice assistant**, all measured against the servers they replace with those servers' own client
+  harnesses on the same card:
+  - **Gemma 4 12B** (`hived_gemma`, [docs/gemma.md](docs/gemma.md)) — int4 QAT weights, paged fp8 KV whose sliding-window pages are
+    released behind the window (and moved to mapped host memory when the pool is full), the Frozen-KV MTP assistant as the drafter,
+    tool calls streamed as they are generated. First token p50 42 ms, first sentence 96 ms, 303 tok/s (the reference server: 69 ms,
+    179 ms, 181 tok/s), same tool-call and delegation accuracy.
+  - **Qwen3-ASR 1.7B** (`libhive_qasr.so` + `server/speech/asr_server.py`, [docs/qasr.md](docs/qasr.md)) — `/generate` with forced or
+    auto-detected language: p50 72 ms, CER 0.0054 (the reference server: 152 ms, 0.0067), 5.0 GB.
+  - **Qwen3-TTS 12 Hz 1.7B CustomVoice** (`libhive_qtts.so` + `server/speech/tts_server.py`, [docs/qtts.md](docs/qtts.md)) — streaming
+    WebSocket speech: first audio chunk p50 25 ms, real-time factor 0.069 (the reference server: 163 ms, 0.33), 4.0 GB.
+  The three run beside DeepSeek at 72 GB on one 96 GB card, each under its own `HIVE_VRAM_LIMIT_MB`.
+- **The VRAM limit holds while serving (DeepSeek)**: with `HIVE_VRAM_LIMIT_MB`, the ballast that emulates the smaller card goes back
+  to the card at ready and the headroom left inside the limit becomes a reserve; runtime allocations come out of it and are refused past
+  it, so the daemon stays at its limit beside another process instead of taking the memory that process frees, and the other process
+  keeps room to grow. GLM, Qwen and Q27 keep the ballast as before (they size growth from the device's free memory).
+- Fixed: a refused device allocation aborted the daemon and every open conversation with it; it now fails only its request
+  (`DeviceOutOfMemory`), for all four families.
 - **A thinking cut no longer spreads** (`HIVE_CUT_LEAK_STRIP`, off by default): when the thinking cap cuts a response, the model often
   writes its unfinished reasoning as text in front of the tool call, and once that text is in the history the next answers copy it.
   How the thinking is closed made no difference (exit phrase or none, other phrases, closing at a newline or sentence end, a wrap-up

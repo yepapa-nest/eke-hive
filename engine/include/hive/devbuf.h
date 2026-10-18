@@ -4,12 +4,19 @@
 #pragma once
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 #include <cuda_runtime.h>
 
 #include "hive/devmem.h"
+#include "hive/vram_reserve.h"
 
 namespace hive {
+
+// A device allocation the driver refused. Thrown instead of abort() (2026-10-18: one 2 MiB buffer refused at 26 MiB free took the whole
+//   daemon and every open conversation down); the request paths catch std::exception and fail only that request.
+struct DeviceOutOfMemory : std::runtime_error { using std::runtime_error::runtime_error; };
 
 // RAII device memory
 struct DevBuf {
@@ -30,24 +37,45 @@ struct DevBuf {
   void alloc(size_t bytes) {
     free();
     if (bytes) {
-      cudaError_t e = cudaSuccess;
-      if (devmem::on()) { p = devmem::alloc(bytes); if (!p) e = cudaErrorMemoryAllocation; }
-      else e = cudaMalloc(&p, bytes);
+      // HIVE_VRAM_LIMIT_MB while serving: the room comes out of the process's own reserve, and past it the allocation is refused
+      const bool within = vram_reserve::before_alloc(bytes);
+      cudaError_t e = within ? try_alloc(bytes) : cudaErrorMemoryAllocation;
+      // Serving only: the reserve is ours, so use it before failing (during startup a refusal must stay a refusal — the limit decides what fits).
+      if (within && e != cudaSuccess && vram_reserve::cap_on() && vram_reserve::give(bytes + vram_reserve::kChunk) > 0) e = try_alloc(bytes);
       if (e != cudaSuccess) {
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
-        fprintf(stderr, "cudaMalloc(%.1f MiB) failed: %s (free %.1f MiB / %.1f MiB)\n", bytes / 1048576.0, cudaGetErrorString(e),
-                fr / 1048576.0, tot / 1048576.0);
-        abort();
+        char msg[200];
+        snprintf(msg, sizeof msg, "cudaMalloc(%.1f MiB) failed: %s (free %.1f MiB / %.1f MiB%s)", bytes / 1048576.0,
+                 within ? cudaGetErrorString(e) : "over the VRAM limit", fr / 1048576.0, tot / 1048576.0,
+                 within ? "" : (" · reserve " + std::to_string(vram_reserve::held() >> 20) + " MiB").c_str());
+        fprintf(stderr, "%s\n", msg);
+        p = nullptr;
+        if (within) vram_reserve::alloc_refused(bytes);  // the room given for it goes back to the reserve (cap on, up to its target), not to the neighbour
+        throw DeviceOutOfMemory(msg);
       }
     }
     n = bytes;
   }
   void free() {
-    if (p && !devmem::free_if_owned(p)) cudaFree(p);
+    // Only a real free refills the reserve: an aliased view (p into another buffer) makes cudaFree fail quietly and must not count as room.
+    if (p) {
+      bool freed = devmem::free_if_owned(p);
+      if (!freed) { freed = cudaFree(p) == cudaSuccess; if (!freed) (void)cudaGetLastError(); }
+      if (freed) vram_reserve::after_free(n);
+    }
     p = nullptr; n = 0;
   }
   template <class T> T* as() const { return reinterpret_cast<T*>(p); }
+
+ private:
+  cudaError_t try_alloc(size_t bytes) {
+    p = nullptr;
+    if (devmem::on()) { p = devmem::alloc(bytes); return p ? cudaSuccess : cudaErrorMemoryAllocation; }
+    const cudaError_t e = cudaMalloc(&p, bytes);
+    if (e != cudaSuccess) { (void)cudaGetLastError(); p = nullptr; }
+    return e;
+  }
 };
 
 }  // namespace hive

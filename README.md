@@ -17,7 +17,9 @@ GLM-5.3-Flash — that runs them on whatever GPU memory you give it, with the CP
    engine for it (Qwen3.8-Flash-Next: SGLang · Qwen3.8-27B: NInfer) — see the benchmark docs for where each axis stands.
 4. **Eke out every byte.** Down to 3- and 2-bit quantized builds, each configuration is tuned for the best speed it can reach.
 5. **Four models, not all models.** Eke Hive supports the most popular and useful open models only — Qwen3.8-27B,
-   Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash and GLM-5.3-Flash — and follows new versions of these families.
+   Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash and GLM-5.3-Flash — and follows new versions of these families. Beside them, a
+   real-time voice set that shares the card: Gemma 4 12B (chat), Qwen3-ASR 1.7B (speech recognition) and Qwen3-TTS 1.7B
+   (speech synthesis).
 6. **We pick and optimize; we do not fine-tune.** Model quality scores are the model authors'; we run a quality suite only to
    prove a quantization or optimization did not regress. Performance is measured the same way, with one harness, at every
    VRAM size (96 / 72 / 48 / 32 GB on sm_120 cards).
@@ -228,7 +230,7 @@ scales down: on a box with less RAM, keep only the engines you use most resident
 
 GLM-5.3-Flash with a 48 GB budget and Qwen3.8-27B with a 32 GB budget, both running at the same time on the one
 RTX PRO 6000 (96 GB). Each daemon sizes itself at start exactly as it does alone; after start they share the card's free
-memory (`HIVE_VRAM_BALLAST_RELEASE=1` frees the VRAM-limit ballast just before ready, `HIVE_START_WAIT_OTHERS=0` lets the second
+memory (`HIVE_VRAM_BALLAST_RELEASE=1` frees the VRAM-limit ballast just before ready and leaves growth after start uncapped, `HIVE_START_WAIT_OTHERS=0` lets the second
 start beside the first — [docs/configuration.md](docs/configuration.md)). Same harness as above (`tools/bench_chat.py`, warm pass discarded); total tok/s, long prompts as time to first
 token.
 
@@ -325,6 +327,10 @@ yourself; they are not part of this repository. Licenses as stated in each relea
 | Qwen3.8-Flash-Next | Qwen ([`Qwen`](https://huggingface.co/Qwen)) | [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVIDIA ModelOpt quantization of [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)) | NVFP4 | NVIDIA Open Model License; the base model's Qwen Community License 1.0 (both named on the model card) |
 | Qwen3.8-27B | Qwen ([`Qwen`](https://huggingface.co/Qwen)) | [`unsloth/Qwen3.8-27B-NVFP4`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) (base [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B)) + the DFlash2 drafter [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | NVFP4 (compressed-tensors; FP8 `lm_head`) · drafter BF16 | Apache-2.0 (NVFP4 release, base model and drafter) |
 
+| Gemma 4 12B (voice chat) | Google ([`google`](https://huggingface.co/google)) | `google/gemma-4-12B-it-qat-w4a16-ct` + the MTP assistant `google/gemma-4-12B-it-qat-q4_0-unquantized-assistant` (text path; the vision and audio towers are not loaded) | int4 group 32 (compressed-tensors, quantization-aware trained) · assistant BF16 | Apache-2.0 |
+| Qwen3-ASR 1.7B | Qwen ([`Qwen`](https://huggingface.co/Qwen)) | `Qwen/Qwen3-ASR-1.7B` | BF16 | Apache-2.0 |
+| Qwen3-TTS 12 Hz 1.7B CustomVoice | Qwen ([`Qwen`](https://huggingface.co/Qwen)) | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` (speech tokenizer included) | BF16 | Apache-2.0 |
+
 ## Requirements (short version)
 
 - NVIDIA Blackwell GPU with `sm_120a` (RTX PRO 6000 Blackwell, RTX 50 series); 96 GB was used for development.
@@ -406,10 +412,14 @@ Details: [docs/configuration.md](docs/configuration.md#http-request-fields). GLM
 | [docs/qwen.md](docs/qwen.md) | The Qwen3.8-Flash-Next family: model layout, routing with a partial expert cache, PLE in RAM or on the SSD, its switches |
 | [docs/q27.md](docs/q27.md) | The Qwen3.8-27B family: CPU and GPU daemons, DFlash2 speculation, placement and the KV tier under a VRAM budget, its switches |
 | [docs/vram-footprint.md](docs/vram-footprint.md) | Where the VRAM goes per family and card size |
+| [docs/gemma.md](docs/gemma.md) | Gemma 4 12B for voice chat: int4 GEMV, paged fp8 KV with sliding-window release, Frozen-KV MTP, measurements |
+| [docs/qasr.md](docs/qasr.md) · [validation](docs/qasr-validation-20261018.md) | Qwen3-ASR 1.7B: `/generate` server, engine library, accuracy and latency against the reference server |
+| [docs/qtts.md](docs/qtts.md) · [validation](docs/qtts-validation-20261018.md) | Qwen3-TTS 1.7B: streaming `/ws/speak` server, engine library, first-chunk latency and quality |
 
 ## Status
 
-Eke Hive is a dedicated engine for four models (DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B) on one machine type that we own, put
+Eke Hive is a dedicated engine for four models (DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B) and a voice set (Gemma 4 12B,
+Qwen3-ASR, Qwen3-TTS) on one machine type that we own, put
 together from the parts we had. It is shared as-is: it works for us every day, and the documentation says exactly what was
 and was not measured. Other models and other GPUs are not planned; faster memory and PCIe would help most.
 

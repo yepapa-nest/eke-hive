@@ -4078,7 +4078,10 @@ void Runtime::attention(Seq& seq, const LayerWeights& L, int l, int M, int64_t s
   else
     k::sparse_attn_tc(w.q.as<bf16>(), M, H, D, kvs, w.idx.as<int32_t>(), idx_stride, topk_total, A.attn_sink.as<float>(),
                       1.0f / sqrtf((float)D), w.attn_S.as<float>(), w.attn_mx.as<float>(), w.attn_sum.as<float>(), w.o.as<bf16>(), st_);
-  k::rope_last(w.o.as<bf16>(), M, H, D, rd, freqs, w.pos_d, true, st_);
+  // inverse RoPE on o, then act_quant(o, 32, ue8m0) in place — reference model.py since deepseek-ai/DeepSeek-V4.1-Flash 4dd75a8
+  //   (2026-10-12), also in DeepSeek-V4.1-Flash-1017; every wo_a site below (decode, DSpark draft, verify) quantizes o the same way.
+  //   One pass here: a separate quantize pass re-read and re-wrote o (M x 32768 bf16 per layer) — 64K prefill +0.25 s (cell 2026-10-18).
+  k::rope_last_quant(w.o.as<bf16>(), M, H, D, rd, freqs, w.pos_d, true, st_);
   pmark("attn.sparse");
   // wo_a: per group og[:, g, :] = o[:, g, :] · wo_a[g]ᵀ  (A row stride = HD, batch stride = sub; B batch stride = R·sub; C row stride = G·R)
   {  // wo_a: for each group g, og[:, g·R + r] = o[:, g·sub + k] · wo_a[g·R + r, k] — bf16 activations × fp8 original (no bf16 copy, same values)
@@ -6288,6 +6291,7 @@ void Runtime::attention_decode_dev(const LayerWeights& L, int l, int M, int Tmax
   pmark("attn.sparse");
   }  // !front_done (D2)
   {
+    k::rope_last_quant(w.o.as<bf16>(), M, H, D, 0, nullptr, nullptr, false, st_);  // reference act_quant(o) before wo_a (see attention()) — rd 0 = quantize only
     const int G = c.o_groups, sub = H * D / G, R = c.o_lora_rank;
     // decode: bf16 activations × original fp8 wo_a (same values, half the bytes). Prefill (M>8) uses cuBLAS bf16.
     if (M <= 8) (k::decode_gemv2_on() ? k::gemv2_bf16_fp8_grouped : k::gemv_bf16_fp8_grouped)(w.o.as<bf16>(), H * D, A.wo_a_q.w.as<uint8_t>(), A.wo_a_q.s.as<uint8_t>(), M, G, R, sub, w.og.as<bf16>(), st_);
@@ -6424,6 +6428,7 @@ void Runtime::mtp_attention(Seq& seq, int s, int B, int64_t pos0, int filled) {
                              A.attn_sink.as<float>(), 1.0f / sqrtf((float)D), w.o.as<bf16>(), 1, w.attn_pacc.as<float>(), w.attn_pm.as<float>(),
                              w.attn_ps.as<float>(), st_, fuse_ ? freqs : nullptr, w.pos_d, rd);
   if (!fuse_) k::rope_last(w.o.as<bf16>(), B, H, D, rd, freqs, w.pos_d, true, st_);
+  k::rope_last_quant(w.o.as<bf16>(), B, H, D, 0, nullptr, nullptr, false, st_);  // reference act_quant(o) before wo_a (see attention()) — rd 0 = quantize only
   const int G = c.o_groups, sub = H * D / G, R = c.o_lora_rank;
   (k::decode_gemv2_on() ? k::gemv2_bf16_fp8_grouped : k::gemv_bf16_fp8_grouped)(w.o.as<bf16>(), H * D, A.wo_a_q.w.as<uint8_t>(), A.wo_a_q.s.as<uint8_t>(), B, G, R, sub, w.og.as<bf16>(), st_);
   if (fuse_) {
@@ -6757,6 +6762,7 @@ void Runtime::attention_verify_dev(const LayerWeights& L, int l, int M, int Tmax
   pmark("attn.sparse");
   }  // !front_done (Q2)
   {
+    k::rope_last_quant(w.o.as<bf16>(), M, H, D, 0, nullptr, nullptr, false, st_);  // reference act_quant(o) before wo_a (see attention()) — rd 0 = quantize only
     const int G = c.o_groups, sub = H * D / G, R = c.o_lora_rank;
     (k::decode_gemv2_on() ? k::gemv2_bf16_fp8_grouped : k::gemv_bf16_fp8_grouped)(w.o.as<bf16>(), H * D, A.wo_a_q.w.as<uint8_t>(), A.wo_a_q.s.as<uint8_t>(), M, G, R, sub, w.og.as<bf16>(), st_);
   }
