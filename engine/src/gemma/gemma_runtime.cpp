@@ -86,12 +86,14 @@ namespace {
 //   pieces from it (aliasing shared_ptrs: the block is unmapped with its last piece), larger saves allocate as before.
 // image memory is released through hive::image_reaper (hive/image_reaper.h — shared by all families since 2026-10-11)
 struct ImageArena {
-  static constexpr size_t kMin = (size_t)256 << 20, kMax = (size_t)1 << 30, kAlign = 4096;
+  // kStep: block sizes follow the largest image in 32 MiB steps — 256 MiB steps put the ~300 MiB images of short voice conversations
+  //   into 512 MiB blocks (2026-10-19: 90 of 115 saves 289-302 MiB, 41 % of each block unused)
+  static constexpr size_t kMin = (size_t)256 << 20, kMax = (size_t)1 << 30, kStep = (size_t)32 << 20, kAlign = 4096;
   struct Block { uint8_t* p; size_t n; };
   std::mutex mu;
   std::condition_variable cv;
   std::vector<Block> ready;
-  size_t want = kMin;   // block size: grows with the largest image seen (≤ kMax)
+  size_t want = kMin;   // block size: follows the latest image (kMin … kMax)
   std::thread th;
   static Block make(size_t n) {
     void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -117,17 +119,34 @@ struct ImageArena {
     });
     th.detach();
   }
-  // a populated block of at least n bytes (nullptr: none ready / too large)
+  // a populated block of at least n and at most 2n bytes (nullptr: none ready / too large / mostly unused).
+  //   The pieces of one save are carved from the block's front and nothing else is ever carved from the rest, while the block stays mapped
+  //   until its last piece goes — and the session budget (allocated_bytes) counts only the pieces. Taking a block for any save of 8 MiB
+  //   or more made each follow-up turn (a few tens of MB of new KV) hold a whole 256 MiB-1 GiB block: 2026-10-19 hived_gemma (voice
+  //   conversations beside a DeepSeek daemon, a few hours) had VmRSS 59.9 GB against 16.96 GB of counted session images (160 archived),
+  //   every large anonymous mapping a multiple of 0.5 GiB. A save the block would not fit within 2x allocates its own bytes; its host copy
+  //   runs on the checkpoint worker (async path).
   std::shared_ptr<uint8_t> take(size_t n) {
     std::lock_guard<std::mutex> lk(mu);
-    want = std::min(kMax, std::max(want, (n + kMin - 1) / kMin * kMin));
+    // the latest size, not the largest seen: one long prompt (a ~1 GiB image) used to make every later block 1 GiB for good, so the
+    //   ~300 MiB saves of the conversations after it each held 1 GiB. Ready blocks more than twice the new size go back (the thread refills).
+    want = std::min(kMax, std::max(kMin, (n + kStep - 1) / kStep * kStep));
+    for (auto it = ready.begin(); it != ready.end();)
+      if (it->n / 2 > want) { hive::image_reaper().put(it->p, it->n, hive::ImageReaper::kMunmap); it = ready.erase(it); }
+      else ++it;
+    static const bool tmi = getenv("HIVE_GEMMA_TIMING") && *getenv("HIVE_GEMMA_TIMING") && strcmp(getenv("HIVE_GEMMA_TIMING"), "0") != 0;
+    size_t first_fit = 0;   // the block the former rule (any ready block >= n) would have taken — for the timing log
+    for (size_t i = 0; i < ready.size(); ++i) if (ready[i].n >= n) { first_fit = ready[i].n; break; }
     for (size_t i = 0; i < ready.size(); ++i)
-      if (ready[i].n >= n) {
+      if (ready[i].n >= n && ready[i].n / 2 <= n) {
         Block b = ready[i];
         ready.erase(ready.begin() + i);
         cv.notify_one();
+        if (tmi) fprintf(stderr, "[gemma-timing] image arena: %zu MiB from a %zu MiB block\n", n >> 20, b.n >> 20);
         return std::shared_ptr<uint8_t>(b.p, [n = b.n](uint8_t* q) { hive::image_reaper().put(q, n, hive::ImageReaper::kMunmap); });
       }
+    if (tmi) fprintf(stderr, "[gemma-timing] image arena: %zu MiB allocated (%s)\n", n >> 20,
+                     first_fit ? ("former rule: a " + std::to_string(first_fit >> 20) + " MiB block").c_str() : "no ready block");
     cv.notify_one();
     return nullptr;
   }

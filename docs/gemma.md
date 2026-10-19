@@ -99,6 +99,14 @@ The math contract is the docstring of `oracle/gemma4_oracle.py` (this project's 
   the sliding pool, so two conversations taking turns evicted each other (first token 260–500 ms against 30–70). The keep margin covers
   how far a next turn rewinds: over 2,339 served follow-ups the rewind was 44 tokens at the median, 215 at p95 and 600 at p99.5.
   A session moved to a host image by the KV reclaim is resumed and rewound the same way when it returns.
+- **Host memory for session images** (`src/gemma/gemma_runtime.cpp`, `ImageArena`): a save whose new bytes are 8 MiB or more takes a
+  block from a background-populated arena (pages faulted in off the request path) when the block is at most twice the bytes; otherwise
+  the save allocates its own bytes. Block sizes follow the latest save in 32 MiB steps (256 MiB … 1 GiB), and ready blocks more than
+  twice that size are released. The session budget (`--host-session-mb`) counts the image bytes, so this keeps the process RSS close to
+  the budget: before, any save took any ready block and the block size only grew with the largest image seen, and a few hours of voice
+  conversations left VmRSS at 59.9 GB against 16.96 GB of counted images. Same workload on fresh daemons (one 33K-token prompt, then
+  twelve conversations × 8 turns with 1.5 s between turns, 2026-10-19): RSS beyond the counted images 5.96 GB → 0.60 GB (the ready
+  blocks). `HIVE_GEMMA_TIMING=1` logs each arena decision (`[gemma-timing] image arena: …`).
 - **MTP** (Frozen-KV assistant): the seed is the target's sampled next token (embedded with the target embedding × √3840) together with the
   final-normed hidden of the last processed row; every chain step runs at the rope position of the last written KV slot, reads the target's
   last sliding and last full layer KV (keys 0 … that slot), and feeds back `post_projection(norm(z))`.
