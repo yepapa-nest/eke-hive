@@ -924,8 +924,18 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     #   ~2,000 tokens of per-account instructions there, so its new conversations shared 8,879 leading tokens, but the only
     #   boundary sat at the end of the system/tools block (6,922) and every new conversation prefilled the rest again). Only when the
     #   next message is another user message — that is the shape of a fixed block; an ordinary first question is followed by its answer.
-    if n < len(messages) - 1 and messages[n].get("role") == "user" and messages[n + 1].get("role") == "user":
-        probes.append(messages[: n + 1])
+    #   A client may put a per-room notice (system/developer messages) between that block and the conversation (measured 2026-10-19, a
+    #   chat client: [system + tools] [user: per-person block] [system: this room's client-tool notice] [user: ...] — the boundary at the end
+    #   of the person's block was missing, so rooms of the same person shared only the system/tools block, 15.8K tokens). Then both the
+    #   block's end (every room of that person) and the notice's end (that person's rooms with the same notice) are boundaries.
+    if n < len(messages) - 1 and messages[n].get("role") == "user":
+        m = n + 1
+        while m < len(messages) and messages[m].get("role") in ("system", "developer"):
+            m += 1
+        if m < len(messages) and messages[m].get("role") == "user":
+            probes.append(messages[: n + 1])
+            if m > n + 1:
+                probes.append(messages[:m])
     turn_ends = [k for k in range(len(messages) - 1) if messages[k].get("role") == "assistant"]
     for k in turn_ends[-HINT_TURNS:]:
         probes.append(messages[: k + 1])

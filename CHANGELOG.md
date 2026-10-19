@@ -12,6 +12,18 @@
   from 28.9 to 19.4 ms. Two served conversations taking turns: first token 27 → 20 ms.
 
 - **Fewer conversations read again** (measured on the DeepSeek service's request log, 2026-10-16 … 19):
+  - A long prefill keeps a snapshot at a chunk end every 32,768 tokens (`HIVE_PREFIX_INTERVAL`, `0` = off): turn-end snapshots only
+    cover the turns a request was read in, so after a long re-read a change deep in the history re-read everything again (a 280K
+    conversation re-read from 0, then a change at 167,322 re-read all 297,628 tokens, ~100 s). No extra chunk, only the copy.
+    After a chunk that skipped the tail layers (every full chunk of a long DeepSeek prefill) the snapshot is flagged like a boundary
+    snapshot. Measured on the DeepSeek service (72 GB, 98,304-row chunks), a 199,508-token conversation read from the top and then sent
+    with a message at ~164K changed: 0 → 98,304 tokens reused, 43.5 → 23.3 s (twice). The session store also kept its 650 conversations
+    across both rebuilds of the day (canary KL 5.7e-6).
+  - A client's fixed first user message followed by per-room system notices and then the conversation gets boundaries at the end of
+    the block and at the end of the notices (only "followed by another user message" counted before). Measured with the DeepSeek
+    template and tokenizer on a chat client's first turns: rooms of one person share 19,827–22,778 tokens and the deepest boundary
+    went from the system/tools block (9,224–15,720) to the whole shared head. On the service, three rooms of one person in a row:
+    the second and third resume 19,806 of 19,813 and 22,757 of 22,764 tokens (6.0 → 0.4–0.5 s).
   - The session store outlives rebuilds: its layout key no longer names the build; a canary state checked at start-up decides whether
     a new build reads the stored images (five rebuilds in one day had each dropped every stored conversation). Runs of one build are
     not bit-identical (CPU-computed experts), so the canary is prefilled twice and the stored one must agree within four times that

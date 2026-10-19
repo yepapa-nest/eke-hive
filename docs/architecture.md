@@ -279,6 +279,10 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   so every turn leaves a shared snapshot the next one resumes from exactly. When the whole prompt is a text prefix of
   the next turn but its last token is not (Qwen ends the prompt in `<think>\n`, and the next turn merges that newline
   into `\n\n`), the hint sits one token before the end.
+  A client's fixed first user message (per-account instructions ahead of the conversation) ends at a boundary when
+  another user message follows, or when system messages follow that are in turn followed by a user message (a per-room
+  notice between the block and the conversation) — then the end of those notices is a boundary too, so rooms of one
+  person share the block and rooms with the same notice share the notice.
   With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
   on a conversation whose tail is replaced between turns (the previous request is not a prefix of the new one
   but shares a boundary), on a conversation with earlier turns that it has not seen yet (after a restart), or on one
@@ -290,6 +294,11 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   so the turn after it does not re-read the whole conversation a second time. The prompt checkpoint of that request
   shares the snapshot's rows (delta base), and a reset releases the session's checkpoints that the conversation has
   moved away from, so both fit the host budget together.
+  Boundaries only cover the turns a request was read in, so a long prefill also keeps a snapshot at a chunk end each
+  time it has read `HIVE_PREFIX_INTERVAL` tokens (32,768) past its last snapshot: a later request that changes the
+  history deep inside the conversation resumes from the nearest one before the change instead of from the top. A chunk
+  end costs no extra chunk, only the copy (a delta on the request's previous snapshot), and the snapshots go to the
+  session store like the others. Families that rewind (Gemma) cut their live or archived state back instead.
   With `HIVE_PREFIX_FIRST_TURN=seen` it asks for that chunk on a first turn whose system/tools block another
   conversation already sent (it keeps a hash per block), so the third and later conversations with a repeated block
   resume from it while a block that never repeats costs nothing.

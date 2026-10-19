@@ -675,7 +675,16 @@ int main(int argc, char** argv) {
   static const bool defer_ckpt = env_on("HIVE_DEFER_CKPT");
   // Graceful shutdown (optional, 0 = off = SIGTERM exits immediately): finish in-flight requests for up to N seconds, then cancel them (shutdown error)
   const double graceful_stop_s = getenv("HIVE_GRACEFUL_STOP_S") && *getenv("HIVE_GRACEFUL_STOP_S") ? std::max(0.0, atof(getenv("HIVE_GRACEFUL_STOP_S"))) : 0.0;
-  if (prefix_share) fprintf(stderr, "[hived] prefix share on: boundary snapshots, extra chunks per request %d\n", prefix_extra);
+  // HIVE_PREFIX_INTERVAL (with HIVE_PREFIX_SHARE; default 32768 tokens, "0" = off): a long prefill also keeps a snapshot at a chunk end
+  //   once it has read this many tokens past its last snapshot (or past where it resumed). Turn-end snapshots only cover the turns a
+  //   conversation was read in, so a long re-read left nothing between its head and its last turns. Measured 2026-10-19 (DeepSeek, a
+  //   chat client's 280K conversation): re-read from 0 at 09:01 (snapshots at 276,464 and later), then at 09:36 the client changed the
+  //   history at 167,322 and the request re-read all 297,628 tokens from 0 (~100 s) — "snapshot at 280573 shares 167322 tokens (prompt
+  //   differs)". A chunk end costs no extra chunk, only the image copy (a delta on the request's previous snapshot: new rows plus the
+  //   fixed window state), and the snapshots go to the session store with the others.
+  static const size_t prefix_interval = !prefix_share ? 0 : (getenv("HIVE_PREFIX_INTERVAL") && *getenv("HIVE_PREFIX_INTERVAL"))
+                                                                ? (size_t)std::max(0L, atol(getenv("HIVE_PREFIX_INTERVAL"))) : 32768;
+  if (prefix_share) fprintf(stderr, "[hived] prefix share on: boundary snapshots, extra chunks per request %d · interval %zu\n", prefix_extra, prefix_interval);
   if (defer_ckpt) fprintf(stderr, "[hived] deferred prompt checkpoint on (after the first token)\n");
   // HIVE_WARM_BUSY_CAP (optional; unset / "" / "0" = off): while other requests are decoding, the synchronous cache warm after a prefill is
   //   capped at N experts (1 = effectively skipped — the per-step paced promotions fill the cache instead). Measured (chat shape,
@@ -1643,6 +1652,8 @@ int main(int argc, char** argv) {
     std::vector<size_t> hints;
     std::shared_ptr<SeqImage> last_boundary;
     bool last_boundary_full = false;  // last_boundary was taken with the upper layers on (a complete state — usable as the checkpoint's base)
+    size_t last_snap_at = 0;  // HIVE_PREFIX_INTERVAL: position of this request's last snapshot (or where it resumed) · 0 interval = none for this request
+    bool interval_ok = false;
     ForwardStats st{};
     std::unique_ptr<PrefillPending> pending;
     // current chunk (chunk_begin -> chunk_end)
@@ -1763,6 +1774,7 @@ int main(int argc, char** argv) {
     if (sstore) sstore->put_snap(key, img, to_store_sig(sg), skipped);  // written on the store's thread
     last_boundary = img;
     J.last_boundary_full = !skipped;
+    J.last_snap_at = at;
     ++shared_saves;
     fprintf(stderr, "[hived] %s: prefix snapshot at %zu (upper %s · %zu entries)\n", A->sid.c_str(), at, skipped ? "skip" : "on", shared_snaps.size());
     host_total();
@@ -2250,6 +2262,11 @@ int main(int argc, char** argv) {
     //   (the first turn's head snapshot, shared by new conversations, is unaffected).
     //   That includes the generation-suffix cut (its point is the next turn re-rendering this prompt's end, which a rewind absorbs).
     if constexpr (RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) if (history) { J.extra_left = 0; hints.clear(); }
+    // HIVE_PREFIX_INTERVAL: the same requests that may take boundary snapshots (a rewinding family continues a changed history from its
+    //   live or archived state instead)
+    J.interval_ok = prefix_interval > 0 && prefix_share && !fake_head && (!has_images || image_ckpt) &&
+                    !RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>;
+    J.last_snap_at = common;
     if (history && J.extra_left <= 0 && !hints.empty() && !RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) {
       size_t deepest = 0;
       for (size_t h : hints) if (ids.size() - h > 16) deepest = h;  // a conversation boundary, not the generation-suffix hint
@@ -2343,6 +2360,12 @@ int main(int argc, char** argv) {
     J.ly_n = 0; J.ly_last = 0;
     i += M;
     if (!hints.empty() && i < ids.size() && std::binary_search(hints.begin(), hints.end(), i)) snapshot_boundary(i, !upper_needed);
+    // HIVE_PREFIX_INTERVAL: at least the interval past the last snapshot, not in the generation tail. A chunk that skipped the tail layers
+    //   (C1) is snapshotted too, flagged like a boundary snapshot (restored only when the continuing chunk is in tail mode — the rest of
+    //   a long prompt is): on DeepSeek every full chunk of a long prefill skips them (2026-10-19, 98,304-row chunks of a 199,508-token
+    //   prompt all "upper skip"), so requiring the upper layers kept nothing.
+    if (J.interval_ok && i < ids.size() && ids.size() - i > 16 && i - J.last_snap_at >= prefix_interval && hint_ok_j(J, i))
+      snapshot_boundary(i, !upper_needed);
     publish_stats(true);  // keep stats moving during long prefills (one chunk = seconds)
     if (stop_state.load() >= 2) A->cancel->store(true);  // graceful-stop deadline passed: stop before the next chunk (finished afterwards with a shutdown error)
     if (A->cancel->load()) return false;

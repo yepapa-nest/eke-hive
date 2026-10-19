@@ -873,6 +873,27 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         _, _, h3=self.hints_for(self.conv())
         self.assertNotIn(len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>first question')), h3)
 
+    def test_leading_user_block_then_room_notice(self):
+        """2026-10-19: a chat client sent [system + tools] [user: per-person block] [system: per-room notice] [user: ...] — the person's
+        block had no boundary because a system message, not a user message, followed it."""
+        msgs=[{'role':'system','content':self.SYS}, {'role':'user','content':'person block'}, {'role':'system','content':'room notice'},
+              {'role':'user','content':'question one'}]
+        prompt, ids, hints=self.hints_for(msgs)
+        sys_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>'))
+        block_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>person block'))  # before the next role marker: rooms with and without a notice share it
+        notice_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>person block<|system|>room notice<|user|>'))
+        self.assertEqual(hints, [sys_end, block_end, notice_end])
+        # another room of the same person without the notice shares the block; one with the same notice shares the notice too
+        _, ids2, h2=self.hints_for(msgs[:2]+[{'role':'user','content':'other room'}])
+        self.assertEqual(ids2[:block_end], ids[:block_end])  # a snapshot at block_end serves it (its own boundary includes the next marker)
+        _, ids3, h3=self.hints_for(msgs[:3]+[{'role':'user','content':'third room'}])
+        self.assertIn(notice_end, h3); self.assertEqual(ids3[:notice_end], ids[:notice_end])
+        # several notices in a row: one boundary at the end of the last; a block followed by its answer stays an ordinary first turn
+        _, _, h4=self.hints_for(msgs[:3]+[{'role':'developer','content':'more'}, {'role':'user','content':'q'}])
+        self.assertIn(block_end, h4); self.assertNotIn(notice_end, h4)
+        _, _, h5=self.hints_for(msgs[:3]+[{'role':'assistant','content':'a'}])
+        self.assertEqual(h5, [sys_end])
+
     def test_boundary_stops_where_the_next_content_starts(self):
         """2026-10-08: a next message starting with "<" (a per-turn "<info-msg>" block) shared "<" with the empty probe's
         "<|assistant|>" and the boundary took that token — the next turn (user's words there) could not resume it."""

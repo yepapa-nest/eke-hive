@@ -856,6 +856,41 @@ def sc_share_c1(h, ck):
     ck.eq('C1 E chunks', chunks(h, 'ce'), [(1536, 'skip'), (1164, 'on'), (136, 'on')])
 
 
+def sc_share_interval(h, ck, every):
+    """HIVE_PREFIX_INTERVAL: a long prefill keeps a snapshot at a chunk end once it has read `every` tokens past its last snapshot (or
+    where it resumed) — 2026-10-19 (DeepSeek): a 280K conversation re-read from 0 kept snapshots only near its end, and a change at
+    167,322 then re-read all 297,628 tokens from 0."""
+    A = tokens(1400, 150)
+    done_ok(ck, f'interval {every}: long first read', h.generate('iv', A, 3), A, 3, 0)
+    ck.eq(f'interval {every}: natural chunks (no extra cut)', chunks(h, 'iv'), [(256, 'on')] * 5 + [(120, 'on')])
+    snaps = [l for l in log_lines(h, 'iv: prefix snapshot')]
+    want = [512, 1024] if every == 512 else []
+    ck.eq(f'interval {every}: snapshots at chunk ends', [int(re.search(r'at (\d+)', l)[1]) for l in snaps], want)
+    B = A[:900] + tokens(300, 151)  # the history changes at 900 — the conversation resumes from the deepest interval snapshot before it
+    done_ok(ck, f'interval {every}: change deep in the history', h.generate('iv', B, 3), B, 3, 512 if every == 512 else 0)
+    n0 = len(log_lines(h, 'iv: prefix snapshot'))
+    C = B + tokens(200, 152)  # resumed at 1200: the next interval counts from there
+    done_ok(ck, f'interval {every}: append-only turn', h.generate('iv', C, 3), C, 3, None)
+    ck.eq(f'interval {every}: no snapshot on a short continuation', log_lines(h, 'iv: prefix snapshot')[n0:], [])
+    D = tokens(1400, 153)
+    done_ok(ck, f'interval {every}: other conversation', h.generate('iw', D, 3, boundaries=[700]), D, 3, 0)
+    got = [int(re.search(r'at (\d+)', l)[1]) for l in log_lines(h, 'iw: prefix snapshot')]
+    # the hint at 700 (inside the third chunk, an extra cut) restarts the count: 768 is too close, the next one is 1212 (700 + 2 chunks)
+    ck.eq(f'interval {every}: count restarts at a boundary snapshot', got, [512, 700, 1212] if every == 512 else [700])
+
+
+def sc_share_interval_c1(h, ck):
+    """HIVE_PREFIX_INTERVAL after an upper-skipped chunk (C1): the snapshot is kept, flagged, and restored when the continuation is in
+    tail mode — on DeepSeek every full chunk of a long prefill skips the tail layers (2026-10-19)."""
+    X = tokens(1536, 160)
+    A = X + tokens(1300, 161)
+    done_ok(ck, 'interval C1: long read', h.generate('ix', A, 3), A, 3, 0)
+    ck.eq('interval C1: chunks', chunks(h, 'ix'), [(1536, 'skip'), (1300, 'on')])
+    ck.true('interval C1: snapshot flagged upper skip', any('ix: prefix snapshot at 1536 (upper skip' in l for l in log_lines(h, 'prefix snapshot')))
+    B = X + tokens(1300, 162)  # the history changes right after it; the continuation is one tail-mode chunk
+    done_ok(ck, 'interval C1: change after the snapshot resumes it', h.generate('ix', B, 3), B, 3, 1536)
+
+
 def sc_share_free(h, ck):
     P = tokens(520, 130)
     done_ok(ck, 'H5 free cut: 520 with hint 300', h.generate('fa', P, 3, boundaries=[300]), P, 3, 0)
@@ -1018,6 +1053,12 @@ def run_round2(exe, td):
         sc_share_image(h, ck)
     finally:
         stop_clean(h, ck)
+    for every in (512, 0):
+        h = Hived(exe, td, {**SHARE, 'HIVE_PREFIX_INTERVAL': str(every)}, name=f'interval{every}')
+        try:
+            sc_share_interval(h, ck, every)
+        finally:
+            stop_clean(h, ck)
     h = Hived(exe, td, {**SHARE, 'HIVE_PREFIX_EXTRA_CHUNKS': '0'}, name='sharefree')
     try:
         sc_share_free(h, ck)
@@ -1031,6 +1072,11 @@ def run_round2(exe, td):
     h = Hived(exe, td, {**SHARE, 'FAKE_KV_SOURCE': '1'}, args=TAIL_ARGS, name='sharec1')
     try:
         sc_share_c1(h, ck)
+    finally:
+        stop_clean(h, ck)
+    h = Hived(exe, td, {**SHARE, 'FAKE_KV_SOURCE': '1', 'HIVE_PREFIX_INTERVAL': '512'}, args=TAIL_ARGS, name='intervalc1')
+    try:
+        sc_share_interval_c1(h, ck)
     finally:
         stop_clean(h, ck)
     for on in (False, True):
