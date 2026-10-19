@@ -682,8 +682,7 @@ int main(int argc, char** argv) {
   //   history at 167,322 and the request re-read all 297,628 tokens from 0 (~100 s) — "snapshot at 280573 shares 167322 tokens (prompt
   //   differs)". A chunk end costs no extra chunk, only the image copy (a delta on the request's previous snapshot: new rows plus the
   //   fixed window state), and the snapshots go to the session store with the others.
-  static const size_t prefix_interval = !prefix_share ? 0 : (getenv("HIVE_PREFIX_INTERVAL") && *getenv("HIVE_PREFIX_INTERVAL"))
-                                                                ? (size_t)std::max(0L, atol(getenv("HIVE_PREFIX_INTERVAL"))) : 32768;
+  static const size_t prefix_interval = !prefix_share ? 0 : (getenv("HIVE_PREFIX_INTERVAL") && *getenv("HIVE_PREFIX_INTERVAL")) ? (size_t)std::max(0L, atol(getenv("HIVE_PREFIX_INTERVAL"))) : 32768;
   if (prefix_share) fprintf(stderr, "[hived] prefix share on: boundary snapshots, extra chunks per request %d · interval %zu\n", prefix_extra, prefix_interval);
   if (defer_ckpt) fprintf(stderr, "[hived] deferred prompt checkpoint on (after the first token)\n");
   // HIVE_WARM_BUSY_CAP (optional; unset / "" / "0" = off): while other requests are decoding, the synchronous cache warm after a prefill is

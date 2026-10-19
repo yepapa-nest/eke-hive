@@ -213,6 +213,8 @@ def source_exprs(td):
     exprs['HIVE_BATCH_PREFILL'] = expression('engine/src/runtime.cpp', r'batch_prefill_ = (env_on\("HIVE_BATCH_PREFILL"\));')
     pe, pe_loc = expression('engine/src/hived.cpp', r'static const int prefix_extra = ([^;]*);')
     exprs['HIVE_PREFIX_EXTRA_CHUNKS'] = (pe.replace('prefix_share', 'env_on("HIVE_PREFIX_SHARE")'), pe_loc)
+    pi, pi_loc = expression('engine/src/hived.cpp', r'static const size_t prefix_interval = ([^;]*);')
+    exprs['HIVE_PREFIX_INTERVAL'] = (pi.replace('prefix_share', 'env_on("HIVE_PREFIX_SHARE")'), pi_loc)
     # cold load (parsers = inline functions of hive/bulk_load.h — the probe includes that header as is and calls them)
     for name, call in (('HIVE_LOAD_PAR', 'hive::load_par_threads()'), ('HIVE_LOAD_PREFAULT', 'hive::load_prefault_threads()'),
                        ('HIVE_LOAD_CHUNK_MB', '(hive::load_chunk_bytes() >> 20)'), ('HIVE_LOAD_BUFFERED', '(!hive::load_opts_from_env(8).direct)'),
@@ -281,6 +283,7 @@ def source_exprs(td):
         'HIVE_IDX_MSUB_ACTUAL': SWITCH_NUM, 'HIVE_PREFIX_SHARE': SWITCH_NUM, 'HIVE_DEFER_CKPT': SWITCH_NUM,
         'HIVE_GRACEFUL_STOP_S': {UNSET: 0, '': 0, '0': 0, '-1': 0, '2.5': 2.5, '30': 30},
         'HIVE_PREFIX_EXTRA_CHUNKS': {UNSET: 0, '': 0, '0': 0, '3': 0},  # not read without HIVE_PREFIX_SHARE (0) — the enabled case is below
+        'HIVE_PREFIX_INTERVAL': {UNSET: 0, '': 0, '0': 0, '4096': 0},  # likewise (enabled case below)
         'HIVE_MTP_GATE2': SWITCH_NUM, 'HIVE_BATCH_WINDOW': SWITCH_NUM, 'HIVE_BATCH_SJF': SWITCH_NUM, 'HIVE_PREFILL_FAIR': SWITCH_NUM,
         'HIVE_BATCH_WINDOW_MS': {UNSET: 50, '': 50, '0': 0, '-1': 0, '120': 120, '99999': 10000},
         'HIVE_MTP_VERIFY2': SWITCH_NUM, 'HIVE_MTP_BATCH': SWITCH_NUM, 'HIVE_MTP_GATE3': SWITCH_NUM,
@@ -359,6 +362,15 @@ def source_exprs(td):
         rows.append(('HIVE_PREFIX_EXTRA_CHUNKS+SHARE', val, want, got))
         if got != want:
             bad.append(('HIVE_PREFIX_EXTRA_CHUNKS+SHARE', val, want, got))
+    for val, want in ((UNSET, 32768), ('', 32768), ('0', 0), ('4096', 4096), ('-5', 0), ('x', 0)):
+        env = {k: v for k, v in os.environ.items() if not k.startswith('HIVE_')}
+        env['HIVE_PREFIX_SHARE'] = '1'
+        if val is not None:
+            env['HIVE_PREFIX_INTERVAL'] = val
+        got = float(dict(l.split('=', 1) for l in subprocess.run([exe], env=env, capture_output=True, text=True, check=True).stdout.split())['HIVE_PREFIX_INTERVAL'])
+        rows.append(('HIVE_PREFIX_INTERVAL+SHARE', val, want, got))
+        if got != want:
+            bad.append(('HIVE_PREFIX_INTERVAL+SHARE', val, want, got))
     for val, want in ((UNSET, 2), ('', 2), ('0', 0), ('x', 0), ('-5', 0), ('1280', 2), ('6400', 10), ('1e9', 13)):
         env = {k: v for k, v in os.environ.items() if not k.startswith('HIVE_')}
         env['HIVE_PREFILL_HOST_TILES'] = '1'
@@ -514,7 +526,7 @@ DOC_OPTIONS = (
     'HIVE_PREFILL_FAIR', 'HIVE_PREFILL_HOST_MB', 'HIVE_PREFILL_HOST_TILES', 'HIVE_PREFILL_MULTI_TAIL_SHORT',
     'HIVE_PREFILL_PAUSE_PROMOTE', 'HIVE_PREFILL_PROF', 'HIVE_PREFILL_SHORT_ADAPT', 'HIVE_PREFILL_SMALL',
     'HIVE_PREFILL_SPLIT', 'HIVE_PREFILL_TAIL_SHORT', 'HIVE_PREFILL_YIELD', 'HIVE_PREFILL_YIELD_MAX',
-    'HIVE_PREFIX_EXTRA_CHUNKS', 'HIVE_PREFIX_SHARE', 'HIVE_PROMOTE_BYTES', 'HIVE_PROMOTE_SCORE',
+    'HIVE_PREFIX_EXTRA_CHUNKS', 'HIVE_PREFIX_INTERVAL', 'HIVE_PREFIX_SHARE', 'HIVE_PROMOTE_BYTES', 'HIVE_PROMOTE_SCORE',
     'HIVE_SHORT_DMA_CAP', 'HIVE_STAGE_COPY2D', 'HIVE_TAIL_SPLIT', 'HIVE_TILE_GROUP_GEMM', 'HIVE_VIT_CACHE_MB',
 )
 
