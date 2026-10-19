@@ -5,11 +5,14 @@
 
 API (one request per WebSocket connection):
   WS  /ws/speak   client text frame {"type": "speak", "text": "...", "voice": "sohee", "instruct": "", "language": "Korean"}
-                  (optional "temperature" 0.05-2.0, "top_k" 1-2048 and "seed" ≥ 0 override the server's sampling for this request)
+                  (optional "temperature" 0.05-2.0, "top_k" 1-2048 and "seed" ≥ 0 override the server's sampling for this request;
+                   "temperature" / "top_k" set both stages, "sub_temperature" / "sub_top_k" then set the code predictor's alone)
                   -> binary frames: raw PCM16 little-endian mono 24 kHz, 7680 samples (4 codec frames, 320 ms) each, the last one shorter
                   -> text frame {"type": "done", "audio_ms": N, "first_ms": N, "total_ms": N}
                   errors: {"type": "error", "message": "..."} then done. Empty text: done with audio_ms 0 only.
                   Closing the connection stops the generation before the next frame (barge-in): the socket is read while generating.
+                  Silence: after speech, silent chunks are held and at most --silence-keep-ms of a pause is sent; a pause of
+                  --silence-stop-ms (or that long with no speech at all) ends the take ("done" then carries "stopped": "silence").
   GET /health     {"ok": true, "speakers": [...], ...} — ok once the engine is loaded, its graphs captured and one sentence synthesized.
 One generation runs at a time; further connections wait their turn (a client that leaves while waiting is skipped).
 
@@ -22,6 +25,7 @@ Usage: python3 server/speech/tts_server.py --model /models/Qwen3-TTS-12Hz-1.7B-C
 from __future__ import annotations
 
 import argparse
+import array
 import asyncio
 import base64
 import concurrent.futures
@@ -29,6 +33,7 @@ import ctypes
 import glob
 import hashlib
 import json
+import math
 import os
 import secrets
 import struct
@@ -340,6 +345,12 @@ class Server:
             return 0
         return self.a.max_frames_base + self.a.max_frames_per_token * max(n_text, 0)
 
+    def is_voiced(self, pcm: bytes) -> bool:
+        """RMS of a PCM16 chunk above --silence-rms (int16 units)."""
+        a = array.array("h")
+        a.frombytes(pcm)
+        return bool(a) and math.sqrt(math.fsum(x * x for x in a) / len(a)) > self.a.silence_rms
+
     def default_voice(self) -> str:
         sp = self.prompter.speakers if self.prompter else []
         return "sohee" if "sohee" in [s.lower() for s in sp] else (sp[0] if sp else "")
@@ -403,6 +414,7 @@ class Server:
         watcher = asyncio.create_task(watch())
         loop = asyncio.get_running_loop()
         audio_samples, first_ms, err, cap = 0, None, None, 0
+        made_samples, stopped, dropped_ms = 0, "", 0
         try:
             if not self.ready:
                 raise RuntimeError("model is not loaded" + (f": {self.load_error}" if self.load_error else ""))
@@ -422,10 +434,27 @@ class Server:
                 k = req.get("top_k")
                 if isinstance(k, int) and not isinstance(k, bool) and 1 <= k <= 2048:
                     sampling.top_k = sampling.sub_top_k = k
+                # the code predictor (codebooks 1-15) alone: a low first-codebook temperature evens the delivery, but the same low
+                #   temperature on the code predictor made comma lists lose their place — measured 2026-10-19 (a voice client, an added
+                #   Korean voice, instruct + 0.4 on both): a comma list of the Korean numbers eleven … twenty (10 items) spoke 2/10 and 8/10 in 2 of 3 takes and filled the rest with silence to the
+                #   length cap; the reference keeps both stages at 0.9 (generation_config.json subtalker_temperature)
+                t = req.get("sub_temperature")
+                if isinstance(t, (int, float)) and not isinstance(t, bool) and 0.05 <= t <= 2.0:
+                    sampling.sub_temperature = float(t)
+                k = req.get("sub_top_k")
+                if isinstance(k, int) and not isinstance(k, bool) and 1 <= k <= 2048:
+                    sampling.sub_top_k = k
                 if isinstance(req.get("seed"), int) and not isinstance(req.get("seed"), bool) and req["seed"] >= 0:
                     seed = req["seed"]
                 await loop.run_in_executor(self.worker, self.engine.start, ids, ins, sid, lid, seed, sampling)
                 fut = loop.run_in_executor(self.worker, self.engine.next_chunk, cancel)
+                # Silence (2026-10-19, a voice client): when the model loses its place or misses EOS it keeps emitting silent frames until the
+                #   length cap — 21.5 s pieces, a 66 s answer for "count to 30". Natural pauses are <= 0.9 s in sentences and <= 1.0 s in
+                #   calm comma lists, so silent chunks are held: a pause sends at most silence_keep_ms of them, and silence_stop_ms of
+                #   silence (or that long before any speech) ends the take.
+                keep_chunks = max(0, self.a.silence_keep_ms * SAMPLE_RATE // 1000 // CHUNK_SAMPLES)
+                held: list[bytes] = []
+                quiet_samples, spoke = 0, False
                 while True:
                     pcm = await fut
                     if pcm is None:
@@ -433,9 +462,22 @@ class Server:
                     fut = loop.run_in_executor(self.worker, self.engine.next_chunk, cancel)  # the next chunk runs while this one is sent
                     if first_ms is None:
                         first_ms = (time.perf_counter() - t0) * 1000
-                    audio_samples += len(pcm) // 2
+                    made_samples += len(pcm) // 2
+                    out: list[bytes] = []
+                    if self.a.silence_stop_ms <= 0 or self.is_voiced(pcm):
+                        out, held, quiet_samples, spoke = held + [pcm], [], 0, True
+                    else:
+                        quiet_samples += len(pcm) // 2
+                        if len(held) < keep_chunks:
+                            held.append(pcm)
+                        else:
+                            dropped_ms += round(len(pcm) / 2 / SAMPLE_RATE * 1000)
+                        if quiet_samples * 1000 >= self.a.silence_stop_ms * SAMPLE_RATE:
+                            stopped = "silence"
                     try:
-                        await ws.send_bytes(pcm)
+                        for c in out:
+                            await ws.send_bytes(c)
+                            audio_samples += len(c) // 2
                     except WsClosed:
                         cancel.value = 1
                         try:
@@ -443,6 +485,18 @@ class Server:
                         except Exception:  # noqa: BLE001
                             pass
                         return
+                    if stopped:
+                        cancel.value = 1
+                        try:
+                            await fut
+                        except Exception:  # noqa: BLE001
+                            pass
+                        cancel.value = 0  # the engine stopped for us, not because the client left: still answer "done"
+                        held = held if spoke else []
+                        break
+                for c in held:  # a pause at the end (natural, or the start of a stopped run) — at most silence_keep_ms
+                    await ws.send_bytes(c)
+                    audio_samples += len(c) // 2
         except WsClosed:
             raise
         except Exception as e:  # noqa: BLE001
@@ -451,12 +505,19 @@ class Server:
             watcher.cancel()
         if cancel.value:
             return
-        if err is None and cap and audio_samples >= cap * 1920:
+        if stopped:
+            print(f"[tts] silence stop after {round(made_samples / SAMPLE_RATE, 1)} s generated ({text[:40]!r})", flush=True)
+        if err is None and cap and made_samples >= cap * 1920:
             print(f"[tts] length cap: {cap} frames for {len(ids) - 8} text tokens ({text[:40]!r})", flush=True)
         if err is not None:
             await ws.send_text(json.dumps({"type": "error", "message": str(err) or repr(err)}, ensure_ascii=False))
-        await ws.send_text(json.dumps({"type": "done", "audio_ms": round(audio_samples / SAMPLE_RATE * 1000), "first_ms": round(first_ms or 0),
-                                       "total_ms": round((time.perf_counter() - t0) * 1000)}))
+        done = {"type": "done", "audio_ms": round(audio_samples / SAMPLE_RATE * 1000), "first_ms": round(first_ms or 0),
+                "total_ms": round((time.perf_counter() - t0) * 1000)}
+        if stopped:
+            done["stopped"] = stopped
+        if dropped_ms:
+            done["dropped_ms"] = dropped_ms
+        await ws.send_text(json.dumps(done))
 
 
 async def amain(a) -> None:
@@ -482,6 +543,9 @@ def main() -> None:
     ap.add_argument("--rep-penalty", type=float, default=1.05)
     ap.add_argument("--max-frames-base", type=int, default=20, help="length cap: frames allowed beyond the per-token budget")
     ap.add_argument("--max-frames-per-token", type=int, default=8, help="length cap: frames (80 ms) per text token; 0 = no cap")
+    ap.add_argument("--silence-rms", type=float, default=328.0, help="chunk RMS (int16) at or below which a chunk counts as silent")
+    ap.add_argument("--silence-keep-ms", type=int, default=960, help="longest pause sent; silence beyond it is dropped")
+    ap.add_argument("--silence-stop-ms", type=int, default=3200, help="silence that ends the take; 0 = off (send every chunk)")
     a = ap.parse_args()
     try:
         asyncio.run(amain(a))

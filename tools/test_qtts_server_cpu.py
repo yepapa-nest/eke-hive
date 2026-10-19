@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Eke Hive Authors
 """CPU test of server/speech/tts_server.py with a fake engine (no GPU, no model): the /ws/speak protocol (PCM chunks then done, empty text,
-the text-proportional length cap,
+the text-proportional length cap, per-request sampling (both stages, then the code predictor alone), silence (pauses kept up to
+--silence-keep-ms, a --silence-stop-ms run ends the take),
 error then done, unknown voice / language), barge-in (closing the socket stops the generation), queued connections, /health, 404, a
 fragmented and a masked-large client frame, and the voice / language resolution rules of the reference (auto = no language id, dialect
 speakers under chinese / auto, dialect names rejected as languages). Uses its own minimal WebSocket client (stdlib only)."""
@@ -89,12 +90,18 @@ class Client:
 class FakeEngine:
     info = {"weight_mb": 1, "buffer_mb": 1, "context_mb": 1, "process_mb": 3, "max_seq": 2048, "limit_mb": 0}
 
-    def __init__(self, chunks=6):
+    VOICED = b"\xe8\x03"  # 1000 — above --silence-rms
+    SILENT = b"\x01\x00"
+
+    def __init__(self, chunks=6, pattern=None):
         self.n, self.chunks, self.cancelled, self.run, self.starts = 0, chunks, False, 0, []
+        self.pattern = pattern  # "v"/"s" per chunk; None = all voiced
+        self.temps = []
 
     def start(self, ids, ins, sid, lid, seed, sampling):
         self.starts.append((sid, lid, ins, sampling.max_frames, len(ids)))
-        self.n = self.chunks
+        self.temps.append((round(sampling.temperature, 3), round(sampling.sub_temperature, 3), sampling.top_k, sampling.sub_top_k))
+        self.n = len(self.pattern) if self.pattern else self.chunks
 
     def next_chunk(self, cancel):
         for _ in range(4):  # 4 frames per chunk, cancel checked before each
@@ -106,7 +113,10 @@ class FakeEngine:
             return None
         self.n -= 1
         self.run += 1
-        return b"\x01\x00" * (T.CHUNK_SAMPLES if self.n else 1920)
+        if self.pattern:
+            kind = self.pattern[len(self.pattern) - self.n - 1]
+            return (self.VOICED if kind == "v" else self.SILENT) * T.CHUNK_SAMPLES
+        return self.VOICED * (T.CHUNK_SAMPLES if self.n else 1920)
 
 
 def make_prompter():
@@ -143,7 +153,7 @@ async def run():
     p = make_prompter()
     test_resolve(p)
     a = types.SimpleNamespace(model="m", lib=None, vram_limit_mb=0, max_seq=0, seed=-1, temperature=0.9, top_k=50, rep_penalty=1.05,
-                              max_frames_base=20, max_frames_per_token=8)
+                              max_frames_base=20, max_frames_per_token=8, silence_rms=328.0, silence_keep_ms=960, silence_stop_ms=3200)
     srv = T.Server(a)
     srv.engine, srv.prompter, srv.ready = FakeEngine(), p, True
     server = await asyncio.start_server(srv.handle, "127.0.0.1", 0)
@@ -185,6 +195,41 @@ async def run():
     pcm, msgs = await c.messages()
     check("large request frame + instruct", msgs[-1]["type"] == "done" and srv.engine.starts[-1][2] is not None)
     c.close()
+
+    # per-request sampling: temperature sets both stages, sub_temperature / sub_top_k then the code predictor alone
+    c = await Client.connect(port)
+    await c.send_text(json.dumps({"type": "speak", "text": "x", "temperature": 0.4}))
+    await c.messages()
+    c.close()
+    check("temperature sets both stages", srv.engine.temps[-1] == (0.4, 0.4, 50, 50), str(srv.engine.temps[-1]))
+    c = await Client.connect(port)
+    await c.send_text(json.dumps({"type": "speak", "text": "x", "temperature": 0.4, "sub_temperature": 0.9, "sub_top_k": 30}))
+    await c.messages()
+    c.close()
+    check("sub_temperature / sub_top_k set the code predictor alone", srv.engine.temps[-1] == (0.4, 0.9, 50, 30), str(srv.engine.temps[-1]))
+    c = await Client.connect(port)
+    await c.send_text(json.dumps({"type": "speak", "text": "x", "sub_temperature": 9, "sub_top_k": True}))
+    await c.messages()
+    c.close()
+    check("out-of-range sub_* keep the server's", srv.engine.temps[-1] == (0.9, 0.9, 50, 50), str(srv.engine.temps[-1]))
+
+    # silence: a natural pause passes, a long one is shortened to silence_keep_ms (3 chunks) and 10 silent chunks (3.2 s) end the take
+    C = 2 * T.CHUNK_SAMPLES
+    for name, pattern, want_chunks, want_stop, want_dropped in (
+            ("pause of 2 chunks sent whole", "vssv", 4, False, 0),
+            ("pause of 6 chunks shortened to 3", "vssssssv", 5, False, 960),
+            ("10 silent chunks end the take", "v" + "s" * 14 + "v", 4, True, 7 * 320),
+            ("no speech at all ends the take, nothing sent", "s" * 14, 0, True, 7 * 320)):
+        srv.engine = FakeEngine(pattern=pattern)
+        c = await Client.connect(port)
+        await c.send_text(json.dumps({"type": "speak", "text": "x"}))
+        pcm, msgs = await c.messages()
+        c.close()
+        d = msgs[-1]
+        ok = (len(pcm) == want_chunks and all(len(x) == C for x in pcm) and d["type"] == "done"
+              and (d.get("stopped") == "silence") == want_stop and d.get("dropped_ms", 0) == want_dropped
+              and d["audio_ms"] == want_chunks * 320 and (not want_stop or srv.engine.run <= 11))
+        check(f"silence: {name}", ok, f"chunks {len(pcm)} done {d} run {srv.engine.run}")
 
     srv.engine = FakeEngine(chunks=50)
     c = await Client.connect(port)

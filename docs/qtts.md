@@ -13,7 +13,7 @@ PCM while the audio is being generated.
 
 | Endpoint | |
 |---|---|
-| `WS /ws/speak` | One request per connection. The client sends one text frame: `{"type": "speak", "text": "...", "voice": "sohee", "instruct": "", "language": "Korean"}`. `voice` is one of the checkpoint's speakers, case-insensitive; the default is `sohee`. `instruct` is an optional style instruction. `language` is a checkpoint language or `Auto`; the default is `Korean`. Optional `temperature` (0.05–2.0), `top_k` (1–2048) and `seed` (≥ 0) override the server's sampling for this request (a lower temperature gives an evener delivery). Any other field is ignored. The server answers with binary frames of raw PCM16 little-endian mono 24 kHz, without a header: 7680 samples (4 codec frames, 320 ms) each, the last one shorter. It ends with the text frame `{"type": "done", "audio_ms": N, "first_ms": N, "total_ms": N}`. The times are measured from the request. An error sends `{"type": "error", "message": "..."}` and then `done`. Empty text sends only `{"type": "done", "audio_ms": 0}`. **Closing the connection stops the generation before its next frame:** the socket is read while generating. |
+| `WS /ws/speak` | One request per connection. The client sends one text frame: `{"type": "speak", "text": "...", "voice": "sohee", "instruct": "", "language": "Korean"}`. `voice` is one of the checkpoint's speakers, case-insensitive; the default is `sohee`. `instruct` is an optional style instruction. `language` is a checkpoint language or `Auto`; the default is `Korean`. Optional `temperature` (0.05–2.0), `top_k` (1–2048) and `seed` (≥ 0) override the server's sampling for this request; `temperature` / `top_k` set both stages, then optional `sub_temperature` / `sub_top_k` set the code predictor (codebooks 1–15) alone. A lower first-codebook temperature gives an evener delivery, but keep the code predictor near 0.9: 0.4 on both stages made comma lists lose their place (2026-10-19, below). Any other field is ignored. The server answers with binary frames of raw PCM16 little-endian mono 24 kHz, without a header: 7680 samples (4 codec frames, 320 ms) each, the last one shorter. It ends with the text frame `{"type": "done", "audio_ms": N, "first_ms": N, "total_ms": N}` (plus `"stopped": "silence"` and `"dropped_ms": N` when the silence rule below acted). The times are measured from the request. An error sends `{"type": "error", "message": "..."}` and then `done`. Empty text sends only `{"type": "done", "audio_ms": 0}`. **Closing the connection stops the generation before its next frame:** the socket is read while generating. |
 | `GET /health` | `{"ok": true, "speakers": [...], "tts_impl": "hive-qtts", "vram_process_mb": ..., "max_seq": ...}`. `ok` stays false until the engine is loaded, its CUDA graphs are captured and one warm-up sentence has been synthesized. |
 
 One generation runs at a time. Further connections wait in arrival order, and a client that leaves while waiting is skipped. The
@@ -92,6 +92,25 @@ Settings (`config/qtts.env`, overridable by the environment): `HIVE_CONTAINER` (
 and keeps babbling: the reference did so on 5 of 11 seeds for "あ。" and 2 of 30 for the one-syllable Korean "a." (ah). Normal speech stays at most 4.2 frames per
 token, so the cap leaves at least 2× headroom and ends a runaway 2-token take after 2.9 s. Profiles: `HIVE_MODEL=tts` with `HIVE_VRAM_GB` 8–96 (`config/profiles/tts*.env`). Server-only flags: `--seed N` (fixed
 sampling seed, tests), `--temperature`, `--top-k`, `--rep-penalty`.
+
+**Silence:** when the model loses its place or misses EOS it can keep emitting silent frames up to the length cap. After speech, silent
+chunks (RMS ≤ `--silence-rms`, 328 in int16 units) are held; a pause sends at most `--silence-keep-ms` (960) of them, and
+`--silence-stop-ms` (3200; 0 = off) of silence — or that long before any speech — ends the take (`[tts] silence stop` in the log).
+Natural pauses measured ≤ 0.9 s in sentences and ≤ 1.0 s in calm comma lists.
+
+**2026-10-19 sampling measurement** (a voice client, the CustomVoice checkpoint with two added Korean voices A and B, a calm instruct;
+each take transcribed by Qwen3-ASR and the list items counted; comma lists of the Korean numbers one … ten and eleven … twenty and the
+seven weekdays × 6 takes = 162 items per voice):
+
+| first codebook / code predictor | voice A items | voice B items | silence stops | pitch spread of one sentence over 4 takes (semitones, A / B) |
+|---|---|---|---|---|
+| 0.4 / 0.4 (the client's setting until then) | 111 / 162 | 129 / 162 | 7 / 7 | 1.11 / 1.68 |
+| 0.7 / 0.9 | 160 / 162 | 162 / 162 | 0 / 1 | 1.12 / 1.63 |
+| 0.9, top-k 20 / 0.9 | 162 / 162 | 161 / 162 | 0 / 0 | 1.74 / 1.51 |
+| 0.7 / 0.7 (a client sending `sub_temperature` to an older server) | 162 / 162 | — | 0 | 1.30 |
+
+At 0.4 / 0.4 the failing takes speak the first items and then only silence until the cap ("eleven, twelve." and 19 s of silence).
+Without the instruct and at 0.9 / 0.9 the lists come out whole too (107 / 108 in a 4-take run).
 
 ## Tests
 
