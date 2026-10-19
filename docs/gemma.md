@@ -1,6 +1,6 @@
 # Gemma 4 12B in Eke Hive
 
-> **Status (2026-10-18):** validated end to end on the GPU against a reference server running the same checkpoint (SGLang, fp8 KV,
+> **Status (2026-10-18; measurements updated 2026-10-19):** validated end to end on the GPU against a reference server running the same checkpoint (SGLang, fp8 KV,
 > MTP 3) with that server's own client harnesses, both measured back to back on the same card. Greedy decoding agrees with the reference
 > server's argmax on 35 of 37 teacher-forced steps (the two misses are near-ties of 0.17 and 0.38 logits; the fp32 oracle picks the same
 > token as this engine at one of them).
@@ -14,6 +14,14 @@
 | one-token turn judgment (70 / 32 held-out / 30 barge-in) | 94.3 % · **93.8 %** · 100 %, 60 ms | 94.3 % · 87.5 % · 100 %, 64 ms |
 
 One difference: `tool_choice: "required"` is not enforced (the request is served as `auto`).
+
+**2026-10-19 (KV pool split, short-prefill attention, cluster GEMM):** the same chat harness on the served model beside the 72 GB
+DeepSeek: first token p50 / p95 45 / 63 ms, first sentence 90 / 131 ms (from 93 / 150), delegation 1.00; one-token turn judgment
+94.3 % · 87.5 % · 100 %, 60 ms with a maximum of 67 (from 69 ms, maximum 411); tool battery unchanged. The client's system prompt was
+revised the same morning to delegate less; with it the decode median is 301 tok/s and the Korean-argument case delegates 4 of 10
+times; with the earlier prompt, on this build, 334 tok/s and 10 of 10 — the engine change leaves both alone. A conversation turn's
+tail after 3,000 tokens (`tests/gemma_tail.cpp`, medians of 20): 70 rows 28.9 → 19.4 ms, 128 rows 36.6 → 29.4 ms. Two conversations
+taking turns on the served model (client-side first token, streaming): p50 213 → 20 ms, maximum 850 → 22 ms.
 
 **Images (2026-10-18):** image parts are served through the checkpoint's encoder-free vision embedder (below). Measured on the GPU
 against the fp32 oracle (`oracle/gemma4_oracle.py --images`, whose embedder matches the Hugging Face module to a relative 2e-7) on three
