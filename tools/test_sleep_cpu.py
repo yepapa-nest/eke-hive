@@ -280,6 +280,9 @@ def daemon_tests(td, exe=None):
               and sl3.get('host_memory', {}).get('dense_host_copy_mib', 0) > 0 and 'note' not in sl3, repr(sl3))
         check(f'({name}) wake restored VMM', inf3['wake'].get('wake', {}).get('vmm', {}).get('restored_mib', 0) > 0 and inf3['wake'].get('wake', {}).get('level') == 3,
               repr(inf3['wake']))
+        hm = inf3['stats_awake'].get('host_memory', {})
+        check(f'({name}) awake host_memory shows the kept sleep shadows and all pinned memory',  # ~14 GB of RSS looked unaccounted without them (hived.cpp cuda_pinned_bytes)
+              hm.get('dense_host_copy_mib', 0) > 0 and 'cuda_pinned_mib' in hm, repr(hm))
         ok_tokens(f'({name}) turn 2 after level-3 sleep/wake', q2, ids_q3, 12)
         check(f'({name}) turn 2 == no-sleep daemon', q2['tokens'] == c0[1]['tokens'] and q2['done'] and q2['done']['cached_prefix'] == c0[1]['done']['cached_prefix'])
         ok_tokens(f'({name}) turn 1 with VMM device memory (no sleep yet)', q1, A, 12)

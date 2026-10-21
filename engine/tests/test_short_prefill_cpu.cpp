@@ -179,11 +179,11 @@ int main() {
              "const bool small_fwd = sp::small_forward(spo_.small_rows, verify_, batch_ != nullptr, tiled, M, opt_.prefill_threshold);",
              "if (M >= opt_.prefill_threshold || small_fwd) store_.flush_promotions();",
              "in_prefill_ = (M_orig >= opt_.prefill_threshold || small_fwd) && !verify_;",
-             "if (small_fwd_) return false;",
+             "if (small_fwd_ && M >= spo_.small_rows) return false;",  // HIVE_TAIL_MIN_ROWS: only full-row layers of a SMALL chunk are exempt (off = every layer)
              "if (small_fwd_ && opt_.promote_misses > 0) for (int e = 0; e < E; ++e) if (!by_e[e].empty() && store_.slot_of(l, e) < 0) step_miss_.push_back(l * c.n_routed + e);",
              "auto mshort = [&](int rows) { return sp::multi_short(spo_.multi_tail_short, opt_.cpu_for_misses, rows, opt_.prefill_threshold); };",
              "if (n_short == 0) { moe_experts_multi(model_.layer(l), l, subs, stats); return; }",
-             "return tail_len > 0 && M >= opt_.prefill_threshold && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();"})
+             "return tail_len > 0 && M >= min_rows && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();"})  // min_rows = threshold unless HIVE_TAIL_MIN_ROWS (⑦)
       EXPECT(rt.find(needle) != std::string::npos, "runtime.cpp contract missing: %s", needle);
     // Q3: forward_multi encoder layers [0, L) keep the default call (no short-path branch) · only the two upper-layer sites (L · L+1..) use up_experts
     const size_t a = rt.find("// ---- Encoder layers [0, L): all units"), b = rt.find("// ---- Tail layer L (last kv source)"), z = rt.find("// ---- Last layer tail → head (logits)");
@@ -260,6 +260,38 @@ int main() {
     for (size_t q = rt.find("obs_off = true"); q != std::string::npos; q = rt.find("obs_off = true", q + 1)) ++n_off;
     EXPECT(n_off == 1, "obs_off set in exactly one place (%zu)", n_off);
     printf("short_prefill F1: kind truth table · %ld observations = moe_experts_multi observations · text contract ok\n", n_obs);
+  }
+  // ⑦ HIVE_TAIL_MIN_ROWS: parsing (switch rule) · effective floor (off / SMALL off / no tail = threshold; on = min(threshold, max(req, small, tail + 1))) ·
+  //    runtime.cpp text contracts (tail_mode_for and the CPU-layer engine read the same value; the SMALL streaming rule only exempts full-row layers)
+  {
+    struct { const char* v; int want; } t7[] = {{nullptr, 0}, {"", 0}, {"0", 0}, {"1", 2}, {"x", 2}, {"-5", 2}, {"3.5", 2}, {"256", 256}, {"600", 600}};
+    for (auto& t : t7) { const int got = sp::parse_tail_min(t.v); EXPECT(got == t.want, "parse_tail_min(%s) = %d, want %d", t.v ? t.v : "null", got, t.want); }
+    EXPECT(sp::tail_min_rows(0, 256, 128, 1024) == 1024, "off = threshold");
+    EXPECT(sp::tail_min_rows(256, 0, 128, 1024) == 1024, "SMALL off = threshold");
+    EXPECT(sp::tail_min_rows(256, 256, 0, 1024) == 1024, "no decoder tail = threshold");
+    EXPECT(sp::tail_min_rows(2, 256, 128, 1024) == 256, "lowest allowed = SMALL floor");
+    EXPECT(sp::tail_min_rows(2, 100, 128, 1024) == 129, "lowest allowed = decoder_tail + 1");
+    EXPECT(sp::tail_min_rows(600, 256, 128, 1024) == 600, "value used as given");
+    EXPECT(sp::tail_min_rows(5000, 256, 128, 1024) == 1024, "never above the threshold");
+    // monotone in req and never below either existing bound
+    for (int req = 1; req < 3000; req += 7) {
+      const int a = sp::tail_min_rows(req, 256, 128, 1024), b = sp::tail_min_rows(req + 7, 256, 128, 1024);
+      EXPECT(a <= b && a >= 256 && a <= 1024, "tail_min_rows(%d) = %d (next %d)", req, a, b);
+    }
+    std::ifstream f("engine/src/runtime.cpp");
+    std::stringstream ss; ss << f.rdbuf();
+    const std::string rt = ss.str();
+    for (const char* needle : {
+             "if (env_on(\"HIVE_TAIL_MIN_ROWS\")) spo_.tail_min_rows = sp::tail_min_rows(sp::parse_tail_min(getenv(\"HIVE_TAIL_MIN_ROWS\")), spo_.small_rows, opt_.decoder_tail, opt_.prefill_threshold);",
+             "const int min_rows = spo_.tail_min_rows > 0 ? spo_.tail_min_rows : opt_.prefill_threshold;",
+             "return tail_len > 0 && M >= min_rows && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();",
+             "o.tail_min_rows = spo_.tail_min_rows > 0 ? spo_.tail_min_rows : opt_.prefill_threshold;",
+             "if (small_fwd_ && M >= spo_.small_rows) return false;"})
+      EXPECT(rt.find(needle) != std::string::npos, "runtime.cpp HIVE_TAIL_MIN_ROWS contract missing: %s", needle);
+    // the SMALL rule must be decided before the short-tail formula (otherwise full-row SMALL layers would leave the streaming path)
+    const size_t q0 = rt.find("bool Runtime::prefill_short_moe(int M) const {");
+    EXPECT(q0 != std::string::npos && rt.find("if (small_fwd_ && M >= spo_.small_rows) return false;", q0) < rt.find("return sp::short_moe(", q0), "prefill_short_moe order");
+    printf("short_prefill HIVE_TAIL_MIN_ROWS: parsing · floor · text contract ok\n");
   }
   if (fails) { fprintf(stderr, "short_prefill: %d failure(s)\n", fails); return 1; }
   printf("short_prefill: %ld random cases (off/same size = baseline candidates · larger = baseline top depth · smaller = subset, %.1f fewer on average) · parsing, truth table, text contract ok\n", n_cases,

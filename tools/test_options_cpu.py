@@ -188,6 +188,9 @@ def source_exprs(td):
     assert 'const long want = end != v && end && *end == 0 && n >= 2 && n <= (1L << 30) ? n : floor;' in sph and 'const long floor = std::max<long>(9, (long)max_batch + 1);' in sph, 'parse_small drifted'
     exprs['HIVE_PREFILL_SMALL'] = ('[] { const char* v = getenv("HIVE_PREFILL_SMALL"); if (!(v && *v && strcmp(v, "0") != 0)) return 0L; char* end = nullptr; const long n = strtol(v, &end, 10); const long floor = std::max<long>(9, 8L + 1); const long want = end != v && end && *end == 0 && n >= 2 && n <= (1L << 30) ? n : floor; return std::max(want, floor); }()',
                                    expression('engine/src/runtime.cpp', r'(env_on\("HIVE_PREFILL_SMALL"\))')[1])
+    assert 'return end != v && end && *end == 0 && n >= 2 && n <= (1L << 30) ? (int)n : 2;' in sph, 'parse_tail_min drifted'
+    exprs['HIVE_TAIL_MIN_ROWS'] = ('[] { if (!env_on("HIVE_TAIL_MIN_ROWS")) return 0; const char* v = getenv("HIVE_TAIL_MIN_ROWS"); char* end = nullptr; const long n = strtol(v, &end, 10); const int req = end != v && end && *end == 0 && n >= 2 && n <= (1L << 30) ? (int)n : 2; return std::min(1024, std::max({req, 256, 128 + 1})); }()',
+                                   expression('engine/src/runtime.cpp', r'(env_on\("HIVE_TAIL_MIN_ROWS"\))')[1])  # with SMALL floor 256 · decoder tail 128 · threshold 1024
     exprs['HIVE_MTP_VERIFY2_FUSED'] = expression('engine/src/runtime.cpp', r'static const bool v2_fused = (env_on\("HIVE_MTP_VERIFY2_FUSED"\));')
     rt_el = (ROOT / 'engine/src/runtime.cpp').read_text()
     assert 'if (end != v && end && *end == 0 && x >= 2) S = (int)std::min<long>(x, 1 << 20);' in rt_el, 'HIVE_CACHE_ELASTIC parse drifted'
@@ -293,6 +296,7 @@ def source_exprs(td):
         'HIVE_DECODE_IDXSCORE2_KPT': {UNSET: 2, '': 2, '0': 2, '1': 1, '3': 2, '4': 4},
         'HIVE_DECODE_FUSED3': SWITCH_NUM, 'HIVE_DECODE_FUSED3_STAGES': {UNSET: 4, '': 4, '0': 4, '2': 3, '4': 4, '5': 5, '9': 5},
         'HIVE_PREFILL_MULTI_TAIL_SHORT': SWITCH_NUM, 'HIVE_PREFILL_SMALL': {UNSET: 0, '': 0, '0': 0, '1': 9, 'x': 9, '4': 9, '64': 64},  # assuming max_batch 8
+        'HIVE_TAIL_MIN_ROWS': {UNSET: 0, '': 0, '0': 0, '1': 256, 'x': 256, '-3': 256, '600': 600, '5000': 1024},  # SMALL 256 · tail 128 · threshold 1024
         'HIVE_MTP_VERIFY2_FUSED': SWITCH_NUM, 'HIVE_MTP_VERIFY_ROWIND': SWITCH_NUM,
         'HIVE_CACHE_ELASTIC': {UNSET: 0, '': 0, '0': 0, '1': 128, 'x': 128, '64': 128, '1023': 1023},  # small-panel rows S (limit below = service window 128)
         'HIVE_PREFILL_YIELD': SWITCH_NUM, 'HIVE_PREFILL_YIELD_MAX': {UNSET: 0, '': 0, '0': 0, '-3': 0, 'x': 0, '4096': 4096},  # 0 = default (prefill_threshold − 1) · only read when YIELD is on (only the expression here)
@@ -527,7 +531,7 @@ DOC_OPTIONS = (
     'HIVE_PREFILL_PAUSE_PROMOTE', 'HIVE_PREFILL_PROF', 'HIVE_PREFILL_SHORT_ADAPT', 'HIVE_PREFILL_SMALL',
     'HIVE_PREFILL_SPLIT', 'HIVE_PREFILL_TAIL_SHORT', 'HIVE_PREFILL_YIELD', 'HIVE_PREFILL_YIELD_MAX',
     'HIVE_PREFIX_EXTRA_CHUNKS', 'HIVE_PREFIX_INTERVAL', 'HIVE_PREFIX_SHARE', 'HIVE_PROMOTE_BYTES', 'HIVE_PROMOTE_SCORE',
-    'HIVE_SHORT_DMA_CAP', 'HIVE_STAGE_COPY2D', 'HIVE_TAIL_SPLIT', 'HIVE_TILE_GROUP_GEMM', 'HIVE_VIT_CACHE_MB',
+    'HIVE_SHORT_DMA_CAP', 'HIVE_STAGE_COPY2D', 'HIVE_TAIL_MIN_ROWS', 'HIVE_TAIL_SPLIT', 'HIVE_TILE_GROUP_GEMM', 'HIVE_VIT_CACHE_MB',
 )
 
 

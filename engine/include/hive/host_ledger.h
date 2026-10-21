@@ -5,7 +5,7 @@
 //
 // host_total used to walk every held image and insert every segment into one std::set to count shared segments once.
 //   Images share their unchanged prefix with the image they were saved from, so one image is thousands of segments
-//   (measured 2026-10-21, DS service: median 5,994 · p90 8,466 per image) and the walk grew with everything kept —
+//   (measured 2026-10-21, production deployment: median 5,994 · p90 8,466 per image) and the walk grew with everything kept —
 //   1,649 boundary snapshots + 111 archived sessions after 39 h. It ran on the engine thread once a second during
 //   decode (stats) and several times per request (checkpoint, boundary snapshot, chunk end, budget trim): 3.1 s of a
 //   13 s profile, ~15 ms of idle engine time per decode step, 13–175-token follow-up prefills taking 3–4 s, and

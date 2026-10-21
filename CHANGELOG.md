@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **The image placeholder written as text no longer fails the request**: a tool result or message that quoted the DeepSeek image
+  placeholder (`<｜deepseek_image｜>`) as text made the reference encoding reject the prompt, and since the text stays in the history every
+  later turn of that conversation failed with 400 (2026-10-21, a scheduled-job conversation whose tool output held the chat template
+  source). The server now puts a zero-width space after the first character of the placeholder wherever it appears as text — content,
+  reasoning, tool arguments (also JSON-escaped ones) — so the tokenizer reads it as ordinary text; image blocks still become image tokens,
+  and a request without the placeholder in its text is byte-identical (`tools/test_inert_placeholder_ref.py` on the real checkpoint).
+- **Long-context indexer kernels adopted**: `HIVE_DECODE_TOPK2` and `HIVE_DECODE_IDXSCORE2` (both bit-identical) are now recommended
+  (`1`) for DeepSeek. The 2026-10-01 "no effect" verdict was measured up to 80K context only; at 524K the full-range indexer layers went
+  413 → 97 µs and the candidate-pool layer 909 → 245 µs per step (`test_decode_longctx`, 403 cases byte-identical, 4K–524K), and a
+  445K-token conversation's decode steps spent 4.78 → 3.20 ms in the indexer stage. `HIVE_TAIL_MIN_ROWS=1` is recommended with them:
+  390–758-token follow-up prefills 1.75–2.39 → 1.45–1.72 s (see docs/configuration.md and docs/validation.md).
+- **Requests with images read as fast as text and keep their prefix**: one image anywhere in a request made the daemon decide the chunk
+  cap and the tail-layer skip for the whole request — every chunk at `--max-chunk` rows with the tail layers on, each one re-streaming the
+  non-resident experts. A 572,678-token conversation with screenshots took 35 chunks of 16,384 rows and 226 s (DeepSeek service,
+  2026-10-21) where a text prompt runs 98,304-row passes. The cap and the skip are now decided per chunk: only the chunk holding an image
+  span follows the single-chunk rule. And the API server prepared such requests on a separate path — the whole prompt tokenized again on
+  every turn (1.3–1.6 s at 580–659K tokens), no boundary hints, no read-ahead matching. `MediaTokens` now tokenizes them through the token
+  cache and expands each image placeholder by the reference `prepare_vl_inputs` rule, with token offsets that keep every image span whole,
+  so they get boundary hints and the divergence fields like text (byte-identical to the old path on the real checkpoint: 300/300 random
+  requests, `tools/test_media_tokens_ref.py`; a 276K-token next turn 835 → 47 ms). 128K prompt with an image on a store-less daemon:
+  43.9 s → 9.5 s (the text prefix resumed from a boundary snapshot of the previous request).
+- **The request record says which message changed**: `msg_diverge` (first changed message, roles, message counts, prefix hashes — no
+  content) per conversation key, also for image requests and across a new session key (a changed head), and `restore_ms` for host image
+  restores (before, they were counted as queue time).
+- **Smaller fixes**: the lazily loaded vision encoder closes the checkpoint shard it opened (926 MiB of RSS); `/health` reports the sleep
+  shadows (`dense_host_copy_mib`) and all pinned memory (`cuda_pinned_mib`, `host_images`, `host_segments`), so pinned RAM is fully
+  accounted; MTP verify steps lend the elastic expert slots back (a two-chunk prefill followed only by verify steps kept 21 % of the cache
+  reclaimed for the whole answer); a restore loads one image instead of the session's and then a deeper shared snapshot; the snapshot pool
+  caches only sizes that recur from one save to the next; the session store index drops expired entries as it writes; `HIVE_TAIL_MIN_ROWS`
+  (off by default) and `HIVE_HINT_PARALLEL` (off by default) are opt-in.
+
 - **Session RAM accounting no longer slows decoding as conversations pile up**: the host budget total (`host_total`, also the stats'
   `host_session_bytes`) walked every kept image and put every segment into one set to count shared prefixes once. An image is
   thousands of segments (median 5,994, p90 8,466 on the DeepSeek service), and the walk ran on the engine thread once a second while

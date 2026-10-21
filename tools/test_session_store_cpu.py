@@ -113,6 +113,23 @@ def run(exe, td):
     ck.true('a checkpoint whose last token differs is not read', 'Q2: checkpoint restored' not in h.tail(1000000) and store_stats(h).get('loads', 0) == 0,
             json.dumps(store_stats(h)))
     kill(h)
+    # 3f. M4 (2026-10-21): known_ entries of segments no image holds any more were erased only with their pack — the index grew with every
+    #     segment ever written. Twenty follow-up turns of one conversation (each checkpoint replaces the previous one and shares its prefix rows):
+    #     after the last write the index holds only segments some image still holds (the host ledger's segments). Allocations whose
+    #     address is reused overwrite their entry, so the leak showed only for segments whose address was not reused (here 46 vs 42).
+    h = t.Hived(exe, td, env, name='st3f')
+    K = t.tokens(300, 1630)
+    for turn in range(20):
+        r = h.generate('K', K, 2)
+        t.done_ok(ck, f'M4 turn {turn}', r, K, 2, None)
+        wait_writes(h, turn + 1)
+        K = K + t.tokens(40, 1631 + turn)
+    st, hs = store_stats(h), h.stats()
+    # the pruning is amortized (each write scans twice the entries it adds — session_store.h prune_known): the index stays within twice the
+    #   live segments; convergence over long random runs and "live entries never dropped" are engine/tests/test_session_store_index_cpu.cpp
+    ck.true('M4: the store index stays within twice the live segments', 0 < st.get('known', 0) <= 2 * hs.get('host_segments', 0),
+            f"known {st.get('known')} · host segments {hs.get('host_segments')} · written {st.get('written')}")
+    kill(h)
     # 4. a damaged pack: detected, the request prefills from 0 and stays correct
     packs = sorted(Path(store).glob('*/packs/*.pack'), key=lambda p: p.stat().st_size)
     for p in packs:

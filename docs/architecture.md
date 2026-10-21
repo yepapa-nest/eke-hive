@@ -157,7 +157,11 @@ Sleep waits for running requests to finish; requests arriving while asleep wait 
 the slots and reloads the experts that were resident. Level 3 needs `HIVE_SLEEP_VMM=1`: device memory is
 allocated through CUDA virtual memory management, so physical memory can be released and remapped at the same
 addresses — captured CUDA graphs and pointers stay valid. The pinned shadows are allocated in the background at
-start (`HIVE_SLEEP_PREPIN`), which makes the first sleep fast.
+start (`HIVE_SLEEP_PREPIN`), which makes the first sleep fast. They stay allocated while awake and are reused by
+every later sleep — about 10 GB of pinned host RAM for DeepSeek-V4.1-Flash (10,256 MiB in 449 regions, measured
+2026-10-21), on top of the experts, the engram tables and the session images. `/health` reports them as
+`host_memory.dense_host_copy_mib`, and all pinned host memory (images, shadows, embedding table, prefill host tiles,
+work buffers) as `host_memory.cuda_pinned_mib`.
 
 ## Decode path
 

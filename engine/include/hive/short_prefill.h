@@ -11,6 +11,7 @@
 //     HIVE_PREFILL_MULTI_TAIL_SHORT  route upper-layer units of forward_multi (host tiles / multiple sequences) with rows < prefill_threshold to the short-prefill path (the forward_multi counterpart of TAIL_SHORT)
 //     HIVE_PREFILL_SMALL             send the experts of chunks below prefill_threshold (all layers, all rows) through the streaming path (moe_experts — staging-ring DMA + CPU for misses with few rows).
 //                                    Tail mode stays off there (only for rows ≥ prefill_threshold) — decoder replay is not extended below that
+//     HIVE_TAIL_MIN_ROWS             (opt-in, needs a quality A/B) extend decoder-tail mode to SMALL chunks with ≥ N rows (tail_min_rows below)
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -41,6 +42,29 @@ inline int parse_small(const char* v, int max_batch) {
   const long want = end != v && end && *end == 0 && n >= 2 && n <= (1L << 30) ? n : floor;
   return (int)std::max(want, floor);
 }
+// HIVE_TAIL_MIN_ROWS value → requested row floor of decoder-tail mode (0 = off: tail mode only for chunks with rows ≥ prefill_threshold, as before).
+//   Off = unset / "" / "0". On = an integer N ≥ 2 gives N; anything else ("1", non-numeric, negative) = 2, i.e. "as low as allowed" — the floor
+//   tail_min_rows() raises it to (absorbed, not rejected).
+inline int parse_tail_min(const char* v) {
+  if (!v || !*v || !std::strcmp(v, "0")) return 0;
+  char* end{nullptr};
+  const long n = std::strtol(v, &end, 10);
+  return end != v && end && *end == 0 && n >= 2 && n <= (1L << 30) ? (int)n : 2;
+}
+// Effective lower row bound of decoder-tail mode (Runtime::tail_mode_for). Off (req 0), HIVE_PREFILL_SMALL off or no decoder tail = prefill_threshold
+//   (the default formula). On = min(threshold, max(req, small_rows, decoder_tail + 1)) — both lower bounds are existing boundaries, not new constants:
+//   · small_rows = the HIVE_PREFILL_SMALL floor: chunks below it take the decode-policy expert path (moe_decode_experts, not a prefill forward); tail
+//     mode is only extended to chunks that already run as prefill (in_prefill_), so the tail layers' path selection stays a prefill decision.
+//   · decoder_tail + 1 = the existing "M > tail_len" condition of tail_mode_for.
+//   Why it is opt-in: decoder replay (--decoder-replay, P6) is an approximation by design (tail rows do not see upper-layer window keys before the
+//   replayed span), so extending tail mode to 256–1023-row chunks changes outputs of follow-up turns. It needs a quality A/B before any adoption.
+//   (The model report's deployment recipe, §3.2.2 "Decoder SWA Bounded Replay", replays the last n_win prompt tokens at every prefill — this switch
+//   moves hive's 256–1023-row chunks toward that recipe; chunks below the floor keep continuing from the stored decoder window.)
+inline int tail_min_rows(int req, int small_rows, int decoder_tail, int threshold) {
+  if (req <= 0 || small_rows <= 0 || decoder_tail <= 0) return threshold;
+  return std::min(threshold, std::max({req, small_rows, decoder_tail + 1}));
+}
+
 // Is this forward (single sequence, not tiled) a HIVE_PREFILL_SMALL chunk: floor ≤ M < prefill_threshold, and not verify / batch decode
 inline bool small_forward(int floor, bool verify, bool batch, bool tiled, int M, int prefill_threshold) {
   return floor > 0 && !verify && !batch && !tiled && M >= floor && M < prefill_threshold;

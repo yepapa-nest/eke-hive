@@ -212,7 +212,8 @@ class Runtime {
     int adapt_rows = 0;           // HIVE_PREFILL_SHORT_ADAPT: streaming layers with rows <= N use their own adaptive DMA share instead of the fixed share (HIVE_DMA_FRAC_PREFILL) (0 = off)
     bool prof = false;            // HIVE_PREFILL_PROF: per prefill forward, a [prefill-prof] phase breakdown (host clock + GPU events)
     bool multi_tail_short = false;  // HIVE_PREFILL_MULTI_TAIL_SHORT: forward_multi upper-layer units (rows < threshold) use the short-prefill path
-    int small_rows = 0;             // HIVE_PREFILL_SMALL: row lower bound (0 = off) — experts of chunks with bound <= M < threshold use the streaming path (tail mode stays off)
+    int small_rows = 0;             // HIVE_PREFILL_SMALL: row lower bound (0 = off) — experts of chunks with bound <= M < threshold use the streaming path (tail mode stays off unless HIVE_TAIL_MIN_ROWS)
+    int tail_min_rows = 0;          // HIVE_TAIL_MIN_ROWS: effective decoder-tail row floor (sp::tail_min_rows; 0 = off = prefill_threshold, the default formula)
   };
   const ShortPrefillOpts& short_prefill_opts() const { return spo_; }
   void set_short_prefill_opts(const ShortPrefillOpts& o) { spo_ = o; }

@@ -3,6 +3,7 @@
 // Vision encoder implementation — follows the reference vision.py exactly (bf16 compute, fp32 accumulation). One image at a time.
 #include "hive/vision.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -171,6 +172,15 @@ Vision::Vision(Model& model, Blas& blas, cudaStream_t st, int max_patches) : mod
 
 void Vision::load() {
   Checkpoint& ck = model_.ckpt();
+  // Every tensor below is copied to the device, so the shards this load opens are closed at the end. Startup closes all shards
+  //   (Checkpoint::release_all), but the lazy encoder loads later and its shard stayed mapped for the process lifetime: measured 2026-10-21
+  //   (production deployment), model-00001 (vision + aligner, 926 MiB) resident in hived's RSS for hours after the first image request — counted in VmRSS
+  //   and outside every host-memory field, so it read as growth "outside the accounting".
+  const std::vector<std::string> before = ck.open_shards();
+  struct CloseNew {
+    Checkpoint& ck; const std::vector<std::string>& before;
+    ~CloseNew() { for (const auto& s : ck.open_shards()) if (std::find(before.begin(), before.end(), s) == before.end()) ck.close_open_shard(s); }
+  } close_new{ck, before};
   const Config& c = model_.cfg();
   auto raw = [&](const std::string& n) {
     const TensorInfo& t = ck.get(n);

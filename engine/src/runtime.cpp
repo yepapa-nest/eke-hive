@@ -1093,6 +1093,10 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   spo_.multi_tail_short = env_on("HIVE_PREFILL_MULTI_TAIL_SHORT");
   //   HIVE_PREFILL_SMALL: on = row floor max(N or none, max_batch+1, 9); off = 0 (hive/short_prefill.h parse_small)
   spo_.small_rows = env_on("HIVE_PREFILL_SMALL") ? sp::parse_small(getenv("HIVE_PREFILL_SMALL"), opt_.max_batch) : 0;
+  //   HIVE_TAIL_MIN_ROWS: decoder-tail mode (P6 bounded replay) also for HIVE_PREFILL_SMALL chunks with ≥ N rows (hive/short_prefill.h tail_min_rows; off = 0 = only rows ≥ prefill_threshold).
+  //   Measured (service log 2026-10-21, [prefill-prof], 600 W): follow-up chunks of 365 / 459 rows ran all 40 layers on every row at 32.2 / 38.0 ms per layer, while the
+  //   128-row tail layers of a 2,237-row chunk took 14.2 ms per layer — tail mode on such chunks is expected to save roughly 20 × (32 − 15…19) ≈ 0.26–0.35 s (estimate, not measured).
+  if (env_on("HIVE_TAIL_MIN_ROWS")) spo_.tail_min_rows = sp::tail_min_rows(sp::parse_tail_min(getenv("HIVE_TAIL_MIN_ROWS")), spo_.small_rows, opt_.decoder_tail, opt_.prefill_threshold);
   CUDA_CHECK(cudaEventCreateWithFlags(&dma_e0_, cudaEventDefault));
   CUDA_CHECK(cudaEventCreateWithFlags(&prefetch_begin_, cudaEventDefault));
   CUDA_CHECK(cudaEventCreateWithFlags(&prefetch_end_, cudaEventDefault));
@@ -1261,7 +1265,7 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
     o.vision = false;
     o.ext_engram = true;
     o.decoder_tail = opt_.decoder_tail;
-    o.tail_min_rows = opt_.prefill_threshold;   // the same chunks as tail_mode_for
+    o.tail_min_rows = spo_.tail_min_rows > 0 ? spo_.tail_min_rows : opt_.prefill_threshold;   // the same chunks as tail_mode_for
     auto X = std::make_shared<ds::cpu::ExpertHalves>();
     const HalfLayout& hl = store_.half_layout();
     X->w1 = hl.w1; X->s1 = hl.s1; X->w3 = hl.w3; X->s3 = hl.s3; X->w2 = hl.w2; X->s2 = hl.s2;
@@ -1614,6 +1618,8 @@ void Runtime::quiesce_after_host_error() {
 
 void Runtime::save_image(const Seq& s, SeqImage& img, const SeqImage* base) const {
   const Config& c = model_.cfg();
+  // one pinned-pool epoch per save (HostImagePool::end_epoch decides which sizes recur) — closed on every way out, a throw included
+  struct PoolEpoch { HostImagePool* p; ~PoolEpoch() { if (p) p->end_epoch(); } } pool_epoch{snapshot_pool_.get()};
   const bool async = env_on("HIVE_CKPT_ASYNC");
   if (!env_on("HIVE_CKPT_DELTA") || !base || base == &img || base->generation != s.generation || base->pos > s.pos ||
       base->tokens.size() > s.tokens.size() || !std::equal(base->tokens.begin(), base->tokens.end(), s.tokens.begin())) base = nullptr;
@@ -1889,7 +1895,8 @@ bool Runtime::tail_mode_for(int M) const {
   const Config& c = model_.cfg();
   const int tail_layer = c.kv_source_layers.empty() ? -1 : *std::max_element(c.kv_source_layers.begin(), c.kv_source_layers.end());
   const int tail_len = opt_.decoder_tail > 0 ? opt_.decoder_tail : 0;
-  return tail_len > 0 && M >= opt_.prefill_threshold && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();
+  const int min_rows = spo_.tail_min_rows > 0 ? spo_.tail_min_rows : opt_.prefill_threshold;  // HIVE_TAIL_MIN_ROWS (off = 0 = the default formula)
+  return tail_len > 0 && M >= min_rows && M > tail_len && tail_layer >= 0 && tail_layer < gpu_layers();
 }
 // H2/H3: number of sub-chunks for a chunk of M rows = T of tile_plan (1 when M ≤ max_chunk)
 int Runtime::slots_for(int M) const { return M <= opt_.max_chunk ? 1 : (M + opt_.max_chunk - 1) / opt_.max_chunk; }
@@ -4352,7 +4359,10 @@ void Runtime::engram_dev(const LayerWeights& L, int M) {
 //   kernels accumulate in different orders), (c) expert output → acc accumulation order (accum_bf16_rows_seq/accum_f32_rows vs fixed-order accumulation). Off = unchanged.
 //   Outside the conditions (verify, CPU misses off, rows ≥ threshold, not a prefill) the base path runs. The upper layers of forward_multi (H2/H3) call moe_experts_multi directly and never reach this.
 bool Runtime::prefill_short_moe(int M) const {
-  if (small_fwd_) return false;  // Q3 HIVE_PREFILL_SMALL chunks: layers with rows < threshold are full-row layers, not the tail — keep the streaming path (off = small_fwd_ always false)
+  // Q3 HIVE_PREFILL_SMALL chunks: layers with all of the chunk's rows (M ≥ the SMALL floor) are full-row layers, not the tail — keep the streaming path (off = small_fwd_ always false).
+  //   With HIVE_TAIL_MIN_ROWS a SMALL chunk can be in tail mode; its tail layers then have decoder_tail rows (< the floor) and take the same short tail path as
+  //   long-prefill tail layers. Without HIVE_TAIL_MIN_ROWS every layer of a SMALL chunk has M ≥ small_rows, so this is the previous rule.
+  if (small_fwd_ && M >= spo_.small_rows) return false;
   return sp::short_moe(spo_.tail_short, in_prefill_, verify_, batch_ != nullptr, opt_.cpu_for_misses, M, opt_.prefill_threshold);
 }
 
@@ -6781,6 +6791,11 @@ void Runtime::verify_decode(std::vector<VerifyPart>& parts, std::vector<float>& 
   for (const VerifyPart& p : parts) M += p.M;
   HIVE_CHECK(mtp_on_ && v2_ok_ && P >= 1 && P <= kVParts && M >= 1 && M <= v2_rows_, "verify2 rows");
   HIVE_CHECK(v_M_ == 0 && vparts_.empty(), "rollback pending");
+  // Q1 HIVE_CACHE_ELASTIC: a verify step is a "forward with rows ≤ S" too (verify rows ≤ 8 < S) but does not go through forward()/forward_batch(), so it
+  //   never reached their lend point. Measured (service log 2026-10-21): after a two-chunk follow-up prefill (365 + 3 rows) every decode step was an
+  //   MTP verify and the request finished with "resident 2200/2208" — the 577 elastic slots (21 % of the cache) stayed reclaimed for the whole answer.
+  //   Same call as the head of forward_batch (off, already lent or prefill pending = does nothing).
+  ElasticScope::lend_if_idle(*this);
   for (const VerifyPart& p : parts) {
     HIVE_CHECK(p.seq && p.ids && p.M >= 1 && p.seq->pos + p.M <= p.seq->cap, "context overflow");  // same formula as forward (per part)
     if (p.seq->snapshot_fence) CUDA_CHECK(cudaStreamWaitEvent(st_, p.seq->snapshot_fence->event, 0));

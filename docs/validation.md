@@ -86,9 +86,9 @@ the kernel it replaces, and new arithmetic is also tested against a host double-
 | Bandwidth probes | `test_dma` (pinned RAM → VRAM per NUMA node), `bench_gemv` |
 | CPU expert kernel | `test_expert_cpu` (AVX2 kernel against the reference, bf16 bit-identical) |
 
-In the last full run of the DeepSeek kernel tests every one passed, bit-identical or within its tolerance, except one: the
-alternative long-context top-k kernel (`HIVE_DECODE_TOPK2`) differed in four fp32 cases at k = 2048. That switch
-is off and was not adopted.
+In the last full run of the DeepSeek kernel tests every one passed, bit-identical or within its tolerance. The long-context
+indexer kernels (`HIVE_DECODE_TOPK2`, `HIVE_DECODE_IDXSCORE2`) once differed in four fp32 cases at k = 2048; after the fix
+`test_decode_longctx` passed all 403 cases byte-identical from 4K to 524K context (2026-10-21), and both are on in the service.
 
 ## Oracle and layer comparisons
 

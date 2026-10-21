@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 import unittest
@@ -1886,6 +1887,651 @@ class AnnouncedToolsTests(unittest.TestCase):
         self.assertEqual([t['function']['name'] for t in out[0]['tools']], ['a', 'later'])
         self.assertNotIn('tools', out[2])
         self.assertIn('tools', given[2])   # the caller's messages are not mutated
+
+
+# ---------------------------------------------------------------------------------------------------------- HIVE_HINT_PARALLEL
+# boundary_hints as it was before the renders were listed first and handed to the render pool (main ec451e3, verbatim) — the
+#   reference the pooled and the serial path are compared with
+OLD_BOUNDARY_HINTS = r'''
+def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None,
+                   gen_cut: bool = False) -> list[int]:
+    """H5 (HIVE_PREFIX_SHARE): **exact token offsets** in the encoded prompt — end of the system/tool block, end of a leading
+    user message followed by another user message, and ends of completed assistant turns.
+    Makes no assumption about the reference template's internals: for each boundary, render "the messages before it + an
+    empty user message" with the same encode_prompt, measure the common-prefix length c against the full prompt string
+    (past that point the next message's content / generation prompt diverges), tokenize the full prompt once more with an
+    offset mapping, and emit the number of tokens that end at or before c. If the offset tokenization's ids differ from
+    the ids actually sent, emit nothing.
+    Results are always prefix positions of ids (a wrong boundary only loses a reuse opportunity — the daemon compares the
+    token prefix itself). Image requests emit nothing, since text offsets do not match the placeholder expansion.
+    Cost: two template renders per boundary (<= 1 + HINT_TURNS) + string compares, plus one extra full-prompt tokenization
+    unless the caller passes the token end offsets of ids (`ends`, from TokenCache) — only when enabled. With HIVE_HINT_CACHE
+    (HintProbeCache) a boundary whose messages were probed on an earlier request costs a compare instead of its renders."""
+    if ends is None or len(ends) != len(ids):
+        try:
+            enc = TOK(prompt, return_offsets_mapping=True)
+            if list(enc["input_ids"]) != list(ids):
+                return []
+            ends = [int(e) for _, e in enc["offset_mapping"]]
+        except Exception:
+            return []
+    import itertools, operator
+    mono = _ends_monotonic(ends) if HintProbeCache.enabled() else None  # HIVE_HINT_CACHE: the same check vectorized (~3 ms at 150K tokens)
+    if mono is None:
+        mono = all(map(operator.le, ends, itertools.islice(ends, 1, None)))
+    if not mono:
+        return []  # non-monotonic mapping (unknown tokenizer) — no boundaries
+    import bisect
+    probes = []
+    n = 0
+    while n < len(messages) and messages[n].get("role") in ("system", "developer"):
+        n += 1
+    if n or tools:
+        probes.append(messages[:n])
+    # A client's fixed context sent as the first user message, ahead of the conversation (measured 2026-10-14: a chat client put
+    #   ~2,000 tokens of per-account instructions there, so its new conversations shared 8,879 leading tokens, but the only
+    #   boundary sat at the end of the system/tools block (6,922) and every new conversation prefilled the rest again). Only when the
+    #   next message is another user message — that is the shape of a fixed block; an ordinary first question is followed by its answer.
+    #   A client may put a per-room notice (system/developer messages) between that block and the conversation (measured 2026-10-19, a
+    #   chat client: [system + tools] [user: per-person block] [system: this room's client-tool notice] [user: ...] — the boundary at the end
+    #   of the person's block was missing, so rooms of the same person shared only the system/tools block, 15.8K tokens). Then both the
+    #   block's end (every room of that person) and the notice's end (that person's rooms with the same notice) are boundaries.
+    if n < len(messages) - 1 and messages[n].get("role") == "user":
+        m = n + 1
+        while m < len(messages) and messages[m].get("role") in ("system", "developer"):
+            m += 1
+        if m < len(messages) and messages[m].get("role") == "user":
+            probes.append(messages[: n + 1])
+            if m > n + 1:
+                probes.append(messages[:m])
+    turn_ends = [k for k in range(len(messages) - 1) if messages[k].get("role") == "assistant"]
+    for k in turn_ends[-HINT_TURNS:]:
+        probes.append(messages[: k + 1])
+    out = set()
+    if gen_cut and messages:
+        # Where the next turn's prompt leaves this one: the generation prompt ends in a reasoning-start token (DeepSeek
+        #   "<｜Assistant｜><think>", GLM "<|assistant|><think>"), while the next turn renders this answer without its reasoning
+        #   ("...</think>answer"). A checkpoint at the prompt end therefore never matches the next turn — measured 2026-10-08: the
+        #   previous prompt ended "<｜Assistant｜><think>" and the next one had "<｜Assistant｜></think>a1" there, so every follow-up turn
+        #   with reasoning on re-read the whole conversation. Rendering this conversation plus a finished assistant turn finds the
+        #   point without knowing the template (llama.cpp checkpoints a few tokens before the prompt end for the same reason).
+        try:
+            # the next turn = this answer followed by a user message (the DeepSeek template keeps the reasoning markers of a final
+            #   assistant message and drops them only once a user message follows — a probe ending in the answer misses the cut)
+            done, media = encode_prompt(list(messages) + [{"role": "assistant", "content": "\x00"}, {"role": "user", "content": "\x02"}],
+                                        tools, thinking_mode, effort)
+            other, _ = encode_prompt(list(messages) + [{"role": "assistant", "content": "\x01"}, {"role": "user", "content": "\x02"}],
+                                     tools, thinking_mode, effort)
+        except Exception:
+            done, media = None, None
+        if done is not None and not media:
+            c = min(_common_prefix_len(done, prompt), _common_prefix_len(done, other))
+            t = bisect.bisect_right(ends, c)
+            # The whole prompt is a text prefix of the next turn (Qwen: the prompt ends "<think>\n", the next turn has "<think>\n\n</think>"
+            #   there) — but not a token prefix: the last "\n" merges with the next one into a "\n\n" token. Measured 2026-10-14, 27B: the
+            #   next turn diverged one token before the prompt end, so neither the prompt checkpoint nor any snapshot matched and every
+            #   follow-up turn after a long one re-read it all (62K tokens, 15.4 s). Cut one token earlier — only when the next turn
+            #   really tokenizes that place differently (a few dozen characters re-tokenized from the start of the last token).
+            if t == len(ids) and c >= len(prompt) and len(ids) >= 2:
+                try:
+                    s0 = ends[-2]
+                    enc = TOK(done[s0:s0 + 64], return_offsets_mapping=True)
+                    first = next((i for i, (a, b) in zip(enc["input_ids"], enc["offset_mapping"]) if b > a), None)  # skip a zero-width BOS
+                    if first != ids[-1]:
+                        t -= 1
+                except Exception:
+                    pass
+            if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
+                out.add(t)
+        # Where a request that adds a message without this answer leaves this one: the end of the last message, before the generation
+        #   prompt. Measured 2026-10-18/19 (DeepSeek, chat mode): a background job sent each item twice — the second prompt was the first
+        #   one up to "<｜Assistant｜></think>" plus ~52 tokens of a further user message. The prompt-end checkpoint sat 2 tokens past the
+        #   divergence and a rewind of the live state is impossible (window ring, compressor state), so 54 second requests re-read
+        #   23-44K tokens each (1.63M tokens over three days, 6-10 s apiece). The daemon cuts every generation-suffix hint (each piece
+        #   after one is about one decode step).
+        try:
+            more, media2 = encode_prompt(list(messages) + [{"role": "user", "content": "\x02"}], tools, thinking_mode, effort)
+        except Exception:
+            more, media2 = None, None
+        if more is not None and not media2:
+            c = _common_prefix_len(more, prompt)
+            t = bisect.bisect_right(ends, c)
+            # The last token before that point can merge with what the further message brings (measured 2026-10-19, DeepSeek: a second
+            #   user message is joined to the first with "\n\n", the first one's closing "." merged with it, and the request parted one
+            #   token before the hint) — cut one token earlier when the further rendering tokenizes that place differently.
+            if 2 <= t < len(ids):
+                try:
+                    s0 = ends[t - 2]
+                    enc = TOK(more[s0:s0 + 64], return_offsets_mapping=True)
+                    first = next((i for i, (a, b) in zip(enc["input_ids"], enc["offset_mapping"]) if b > a), None)  # skip a zero-width BOS
+                    if first != ids[t - 1]:
+                        t -= 1
+                except Exception:
+                    pass
+            if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
+                out.add(t)
+    # HIVE_HINT_CACHE: probe renders seen on an earlier request are reused (HintProbeCache). Off (or inputs that cannot be
+    #   snapshotted) = the loop below without a cache, unchanged.
+    cache = HINT_CACHE if probes and HintProbeCache.enabled() and HINT_CACHE.usable() else None
+    if cache is not None:
+        try:
+            fmsgs = [_freeze(m) for m in messages[: max(len(p) for p in probes)]]
+            ftools, fmode, feff = _freeze(tools), _freeze(thinking_mode), _freeze(effort)
+        except Exception:  # noqa: BLE001 — not JSON-like (or too deep): this request renders every probe
+            cache = None
+    for pre in probes:
+        if cache is not None:
+            fpre = tuple(fmsgs[: len(pre)])
+            key = (len(pre), fmode, feff, hash(fpre[-1]) if fpre else None)
+            hit, kept = cache.get(key, fpre, ftools)
+            if hit:
+                if kept is None:  # that probe rendered media: no boundary
+                    continue
+                # kept = text[:c_other], so its common prefix with the prompt is min(cpl(text, prompt), cpl(text, other)) — the
+                #   same cap at the next message's content as below (the "<info-msg>" fix, 0ab95c3)
+                t = bisect.bisect_right(ends, _common_prefix_len(kept, prompt))
+                if 0 < t < len(ids):
+                    out.add(t)
+                continue
+            try:
+                text, media = encode_prompt(list(pre) + [{"role": "user", "content": ""}], tools, thinking_mode, effort)
+                other, _ = encode_prompt(list(pre) + [{"role": "user", "content": "\x00"}], tools, thinking_mode, effort)
+            except Exception:
+                continue
+            if media:
+                cache.put(key, fpre, ftools, None)
+                continue
+            c_other = _common_prefix_len(text, other)
+            cache.put(key, fpre, ftools, text[:c_other])
+            c = min(_common_prefix_len(text, prompt), c_other)
+            t = bisect.bisect_right(ends, c)
+            if 0 < t < len(ids):
+                out.add(t)
+            continue
+        try:
+            text, media = encode_prompt(list(pre) + [{"role": "user", "content": ""}], tools, thinking_mode, effort)
+            # Where the next message's own content starts: the same probe with a different content diverges exactly there.
+            #   Without this cap the boundary ran into the content whenever it began with a character the template's next text
+            #   also begins with — a per-turn info block "<info-msg>" placed before the user's message against the empty
+            #   probe's "<｜Assistant｜>" shares "<", so the boundary took that "<" token. The next turn has the user's words
+            #   there, never matched the snapshot, and re-read the whole conversation (measured 2026-10-08: "reuse 0 via reset ·
+            #   common with live 24731" with the snapshot at 24732, every follow-up turn cached 0).
+            other, _ = encode_prompt(list(pre) + [{"role": "user", "content": "\x00"}], tools, thinking_mode, effort)
+        except Exception:
+            continue
+        if media:
+            continue
+        c = min(_common_prefix_len(text, prompt), _common_prefix_len(text, other))
+        t = bisect.bisect_right(ends, c)  # number of leading tokens ending at or before c (a prefix, since offsets are monotonic)
+        if 0 < t < len(ids):
+            out.add(t)
+    return sorted(out)
+
+
+'''
+
+# A checkpoint for load_modules: an encoder in the style of the reference one (reasoning only after the last user message, tools in
+#   system messages, tool calls, mid-conversation system messages, a generation prompt after a user / tool / system message) and a
+#   small BPE tokenizer with the role markers as special tokens. Both written by this test.
+POOL_ENCODING = r'''
+import copy, json
+
+def encode_messages(messages, thinking_mode="chat", return_multi_modal_data=False, reasoning_effort=None):
+    msgs = copy.deepcopy(messages)
+    last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=-1)
+    out = ["<|bos|>"]
+    if thinking_mode == "thinking" and reasoning_effort is not None:
+        out.append("[effort %s]" % (reasoning_effort,))
+    for i, m in enumerate(msgs):
+        r = m.get("role")
+        if r in ("system", "developer"):
+            out.append("<|system|>" + str(m.get("content") or ""))
+            if m.get("tools"):
+                out.append("<|tools|>" + json.dumps(m["tools"], sort_keys=True))
+        elif r == "user":
+            out.append("<|user|>" + str(m.get("content") or ""))
+        elif r == "assistant":
+            out.append("<|assistant|>")
+            if thinking_mode == "thinking":
+                out.append("(think" + m["reasoning_content"] + ")" if i > last_user and m.get("reasoning_content") else ")")
+            out.append(str(m.get("content") or ""))
+            for c in m.get("tool_calls") or []:
+                a = c["function"]["arguments"]
+                out.append("<|call|>" + c["function"]["name"] + ":" + (a if isinstance(a, str) else json.dumps(a)))
+            out.append("<|eos|>")
+        elif r == "tool":
+            out.append("<|tool|>" + str(m.get("content") or ""))
+    if msgs and msgs[-1].get("role") in ("user", "tool", "system", "developer"):
+        out.append("<|assistant|>" + ("(think" if thinking_mode == "thinking" else ""))
+    text = "".join(out)
+    return (text, {}) if return_multi_modal_data else text
+'''
+POOL_SPECIAL = ['<|bos|>', '<|system|>', '<|tools|>', '<|user|>', '<|assistant|>', '<|call|>', '<|eos|>', '<|tool|>']
+POOL_WORDS = 'the of and to in is that for it as with < > <info> </info> ( ) . , ! ? : 1 2 3 x y z think go read path / .. " { }'.split(' ') + ['\n', '\n\n', ' ']
+
+
+def pool_ckpt(root):
+    """A checkpoint directory load_modules can read: config.json, encoding/encoding.py, a fast tokenizer."""
+    from tokenizers import Tokenizer as RTok, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+    import random
+    os.makedirs(os.path.join(root, 'encoding'))
+    with open(os.path.join(root, 'config.json'), 'w') as f: json.dump({}, f)
+    with open(os.path.join(root, 'encoding', 'encoding.py'), 'w') as f: f.write(POOL_ENCODING)
+    rnd = random.Random(3)
+    corpus = [''.join(rnd.choice(POOL_WORDS) for _ in range(60)) for _ in range(3000)]
+    tok = RTok(models.BPE(unk_token=None, byte_fallback=False))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    from tokenizers import decoders
+    tok.decoder = decoders.ByteLevel()
+    tok.train_from_iterator(corpus, trainers.BpeTrainer(vocab_size=600, special_tokens=POOL_SPECIAL, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False))
+    PreTrainedTokenizerFast(tokenizer_object=tok, bos_token='<|bos|>', eos_token='<|eos|>').save_pretrained(root)
+    return root
+
+
+def pool_conversation(rnd, scale=1):
+    """A random conversation for the pool comparison (tools, tool results, fixed leading block, notices, reasoning, long turns)."""
+    W = POOL_WORDS
+    def txt(a, b): return ''.join(rnd.choice(W) for _ in range(rnd.randint(a, b)))
+    tools = None if rnd.random() < 0.3 else [{'type': 'function', 'function': {'name': f't{i}', 'description': txt(2, 10),
+                                              'parameters': {'type': 'object', 'properties': {'q': {'type': 'string'}}}}} for i in range(rnd.randint(1, 3))]
+    m = []
+    if rnd.random() < 0.8: m.append({'role': 'system', 'content': txt(3, 40 * scale)})
+    if rnd.random() < 0.3: m.append({'role': 'user', 'content': txt(3, 30)})
+    if rnd.random() < 0.3: m.append({'role': rnd.choice(['system', 'developer']), 'content': txt(1, 10)})
+    for k in range(rnd.randint(1, 7)):
+        m.append({'role': 'user', 'content': txt(0, 30 * scale)})
+        if rnd.random() < 0.2: m.append({'role': 'system', 'content': txt(1, 8)})
+        a = {'role': 'assistant', 'content': txt(0, 30 * scale)}
+        if rnd.random() < 0.5: a['reasoning_content'] = txt(1, 20)
+        if tools and rnd.random() < 0.4:
+            a['tool_calls'] = [{'id': f'c{k}', 'type': 'function', 'function': {'name': tools[0]['function']['name'],
+                                'arguments': rnd.choice([json.dumps({'q': txt(1, 5)}), {'q': txt(1, 5)}])}}]
+            m.append(a); m.append({'role': 'tool', 'tool_call_id': f'c{k}', 'content': txt(1, 40 * scale)})
+            m.append({'role': 'assistant', 'content': txt(1, 20)})
+        else:
+            m.append(a)
+    last = rnd.random()
+    if last < 0.8: m.append({'role': 'user', 'content': txt(0, 20)})
+    elif last < 0.9: m.append({'role': 'tool', 'tool_call_id': 'x', 'content': txt(0, 20)})
+    return m, tools, rnd.choice(['thinking', 'chat']), rnd.choice([None, 'high', 50, 50.0, True])
+
+
+class HintPoolTests(unittest.TestCase):
+    """HIVE_HINT_PARALLEL: the hints with the renders in worker processes == the serial renders == boundary_hints before the change
+    (verbatim), on random conversations, with the probe cache off, filling and hit; the request-path halves; a dead worker; the
+    dropped batch; and negative controls (mutants of the new code must be caught)."""
+    N = int(os.environ.get('HIVE_HINT_POOL_CASES') or 400)
+    GLOBALS = ('TOK', 'ENC', 'IMG', 'FAMILY', 'STOP_IDS', 'EOS_TEXTS', 'DSML_START', 'LOADED_CKPT', 'LOADED_BIND', 'HINT_CACHE', 'RENDER_POOL')
+
+    @classmethod
+    def setUpClass(cls):
+        cls.saved = {k: getattr(s, k) for k in cls.GLOBALS}
+        cls.saved_encode = s.encode_prompt
+        cls.saved_path, cls.saved_enc_mod = list(sys.path), sys.modules.pop('encoding', None)
+        cls.env = {k: os.environ.pop(k, None) for k in ('HIVE_HINT_CACHE', 'HIVE_HINT_PARALLEL')}
+        cls.td = tempfile.TemporaryDirectory()
+        # the worker functions pickle by module name: as a script the server is "__main__"; loaded from its path here, its name must be
+        #   importable for pickle (the workers load it from its path under that name)
+        cls.had_mod = sys.modules.get(s.__name__)
+        sys.modules[s.__name__] = s
+        s.encode_prompt = ORIG_ENCODE_PROMPT
+        s.load_modules(pool_ckpt(cls.td.name))
+        s.RENDER_POOL = s.RenderPool()
+        ns = dict(vars(s))
+        exec(OLD_BOUNDARY_HINTS, ns)
+        cls.old_ns = ns
+        import random
+        rnd = random.Random(11)
+        cls.cases = []
+        while len(cls.cases) < cls.N:   # conversations of 1-4 turns, each turn a case: later turns meet the probe cache entries of earlier ones
+            m, tools, mode, eff = pool_conversation(rnd, 1 if len(cls.cases) % 8 else 30)
+            for turn in range(rnd.randint(1, 4)):
+                prompt, media = s.encode_prompt(m, tools, mode, eff)
+                enc = s.TOK(prompt, return_offsets_mapping=True)
+                cls.cases.append((list(m), tools, mode, eff, prompt, list(enc['input_ids']), array('q', [e for _, e in enc['offset_mapping']]), rnd.random() < 0.8))
+                more, *_ = pool_conversation(rnd)
+                nxt = [x for x in more if x['role'] != 'system'][-4:]
+                ends_at = [k for k, x in enumerate(m) if x['role'] == 'assistant']
+                if ends_at and rnd.random() < 0.3:   # an edited history: cut after an earlier answer and ask something else
+                    m = m[: rnd.choice(ends_at) + 1] + [{'role': 'user', 'content': 'instead %d' % turn}]
+                else:
+                    m = m + [{'role': 'assistant', 'content': 'answer %d' % turn, 'reasoning_content': 'r'}] + (
+                        nxt if nxt and nxt[-1]['role'] == 'user' else [{'role': 'user', 'content': 'next'}])
+
+    @classmethod
+    def tearDownClass(cls):
+        if s.RENDER_POOL.ex is not None:
+            s.RENDER_POOL.ex.shutdown(wait=True, cancel_futures=True)
+        for k, v in cls.saved.items(): setattr(s, k, v)
+        if cls.had_mod is None: sys.modules.pop(s.__name__, None)
+        s.encode_prompt = cls.saved_encode
+        sys.path[:] = cls.saved_path
+        sys.modules.pop('encoding', None)
+        if cls.saved_enc_mod is not None: sys.modules['encoding'] = cls.saved_enc_mod
+        for k, v in cls.env.items():
+            os.environ.pop(k, None)
+            if v is not None: os.environ[k] = v
+        cls.td.cleanup()
+
+    def setUp(self):
+        os.environ.pop('HIVE_HINT_CACHE', None); os.environ.pop('HIVE_HINT_PARALLEL', None)
+
+    def old(self, c):
+        m, tools, mode, eff, prompt, ids, ends, gc = c
+        os.environ['HIVE_HINT_CACHE'] = '0'
+        try:
+            return self.old_ns['boundary_hints'](m, tools, mode, eff, prompt, ids, ends, gen_cut=gc)
+        finally:
+            os.environ.pop('HIVE_HINT_CACHE')
+
+    def new(self, c, cache=True, workers='0', halves=False):
+        m, tools, mode, eff, prompt, ids, ends, gc = c
+        os.environ['HIVE_HINT_PARALLEL'] = workers
+        if not cache: os.environ['HIVE_HINT_CACHE'] = '0'
+        try:
+            if halves:   # the request path: start before the tokenization, finish after it
+                st = s.boundary_hints_start(m, tools, mode, eff, prompt, gen_cut=gc)
+                s.TOK(prompt, return_offsets_mapping=True)
+                return s.boundary_hints_finish(st, ids, ends)
+            return s.boundary_hints(m, tools, mode, eff, prompt, ids, ends, gen_cut=gc)
+        finally:
+            os.environ.pop('HIVE_HINT_PARALLEL', None); os.environ.pop('HIVE_HINT_CACHE', None)
+
+    def mismatches(self, limit=None):
+        """Cases where any path differs from the old function (stops after `limit` mismatches)."""
+        bad = []
+        s.HINT_CACHE = s.HintProbeCache()
+        for i, c in enumerate(self.cases):
+            want = self.old(c)
+            got = [self.new(c, cache=False), self.new(c), self.new(c),                     # serial: no cache, cache filling, cache hit
+                   self.new(c, cache=False, workers='1'), self.new(c, workers='1', halves=True)]
+            if any(g != want for g in got):
+                bad.append((i, want, got))
+                if limit and len(bad) >= limit: break
+        return bad
+
+    def test_pool_serial_and_old_agree(self):
+        bad = self.mismatches()
+        self.assertEqual(bad[:3], [])
+        print(f'hint pool: {len(self.cases)} cases × 5 paths == the old function · {sum(1 for c in self.cases if self.old(c))} with hints · '
+              f'{s.RENDER_POOL.batches} pooled batches')
+        self.assertGreater(s.RENDER_POOL.batches, self.N // 2)
+        self.assertFalse(s.RENDER_POOL.failed)
+        self.assertGreater(sum(1 for c in self.cases if self.old(c)), self.N * 3 // 4)   # most cases do have hints
+
+    def test_off_switch_renders_on_the_thread(self):
+        b0 = s.RENDER_POOL.batches
+        for v in ('', '0'):
+            os.environ['HIVE_HINT_PARALLEL'] = v
+            self.assertFalse(s.RENDER_POOL.usable())
+            c = self.cases[1]
+            self.assertEqual(s.boundary_hints(*c[:7], gen_cut=c[7]), self.old(c))
+        os.environ.pop('HIVE_HINT_PARALLEL')
+        self.assertEqual(s.RENDER_POOL.batches, b0)
+
+    def test_swapped_encoder_is_not_pooled(self):
+        b0 = s.RENDER_POOL.batches
+        s.encode_prompt = lambda *a: ORIG_ENCODE_PROMPT(*a)   # a test or family swap: the workers would not render what this thread renders
+        try:
+            c = self.cases[2]
+            self.assertEqual(self.new(c, workers='1'), self.old(c))
+            self.assertEqual(s.RENDER_POOL.batches, b0)
+        finally:
+            s.encode_prompt = ORIG_ENCODE_PROMPT
+
+    def test_dropped_batch_waits_and_closes(self):
+        c = max(self.cases, key=lambda c: len(c[4]))
+        self.assertEqual(self.new(c, workers='1'), self.old(c))   # the pool (and its pipes) up before counting
+        fds = len(os.listdir('/proc/self/fd'))
+        os.environ['HIVE_HINT_PARALLEL'] = '1'
+        try:
+            for _ in range(5):
+                st = s.boundary_hints_start(c[0], c[1], c[2], c[3], c[4], gen_cut=True)
+                self.assertTrue(st[-1][6], 'renders were handed to the pool')
+                self.assertEqual(s.boundary_hints_finish(st, c[5][:-1]), [])   # ids that do not match the prompt: no hints
+        finally:
+            os.environ.pop('HIVE_HINT_PARALLEL')
+        self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
+
+    def test_zy_dead_worker_is_absorbed(self):
+        """Last (it turns the pool off for the process): a killed worker → that batch renders on the thread, same hints, one log line."""
+        import signal
+        c = self.cases[3]
+        self.assertEqual(self.new(c, workers='1'), self.old(c))   # pool up
+        ex = s.RENDER_POOL.ex
+        for pid in list(ex._processes): os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        for c in self.cases[:20]:
+            self.assertEqual(self.new(c, workers='1'), self.old(c))
+        self.assertTrue(s.RENDER_POOL.failed)
+        s.RENDER_POOL = s.RenderPool()   # a fresh pool for any test that runs after this one
+
+    def test_zz_negative_controls(self):
+        """Mutants of the new code (comparison helpers, the job list, the split halves) must make the comparison fail."""
+        import inspect
+        mutants = [
+            ('_probe_cpl', 'return min(a[1], b[1])', 'return min(a[1], b[1]) - 1'),
+            ('_probe_cpl', 'return a[1] + _common_prefix_len(a[2], b[2])', 'return a[1]'),
+            ('_probe_slice', 'return prompt[i:c] + tail[:j - c]', 'return prompt[i:c] + tail[:j - c - 1]'),
+            ('_probe_result', 'return bool(media), c, text[c:]', 'return bool(media), c, text[c + 1:]'),
+            ('boundary_hints_start', 'jobs.append((len(pre), [{"role": "user", "content": ""}]))',
+             'jobs.append((len(pre) - 1, [{"role": "user", "content": ""}]))'),
+            ('boundary_hints_start', 'jobs.append((len(messages), [{"role": "user", "content": "\\x02"}]))',
+             'jobs.append((len(messages) - 1, [{"role": "user", "content": "\\x02"}]))'),
+            ('boundary_hints_finish', 'r_more = rendered[j_done + 2]', 'r_more = rendered[j_done]'),
+            ('boundary_hints_finish', 'c = min(r_text[1], c_other)', 'c = r_text[1]'),
+            ('boundary_hints_finish', 'if r_text[0] and not media_ok:', 'if not r_text[0] and not media_ok:'),
+            ('boundary_hints_finish', 't = bisect.bisect_right(ends, _common_prefix_len(kept, prompt))',
+             't = bisect.bisect_right(ends, _common_prefix_len(kept, prompt) - 1)'),
+        ]
+        caught = []
+        for name, a, b in mutants:
+            orig = getattr(s, name)
+            src = inspect.getsource(orig)
+            self.assertEqual(src.count(a), 1, (name, a))
+            ns = vars(s)
+            exec(src.replace(a, b), ns)
+            try:
+                bad = self.mismatches(limit=1)
+            finally:
+                ns[name] = orig
+            caught.append(bool(bad))
+            self.assertTrue(bad, f'mutant not caught: {name}: {a!r} -> {b!r}')
+        print(f'hint pool: {len(caught)} mutants, {sum(caught)} caught')
+
+
+class DivergeRecordTests(unittest.IsolatedAsyncioTestCase):
+    """MessageTrail: request records name the first changed message (index, roles, counts, prefix hashes — no content), follow a
+    conversation across a session-key change by its hashed conversation key, and give image requests prev_prompt_tokens / diverge_at
+    in the daemon's ids; diverge_hint reuses the computed hints. Mutants of the new code must be caught."""
+    SYS = 'system prompt ' * 10
+
+    def setUp(self):
+        self.saved = (s.TOK, s.ENC, s.DAEMON, s.log_request, s.encode_prompt, s.tokenize_with_images, s.MSGTRAIL, s.TOKCACHE)
+        s.TOK = HintTokenizer(); s.ENC = Encoder(); s.INFLIGHT.clear(); s.DAEMON = RecDaemon()
+        s.encode_prompt = hint_encode
+        s.tokenize_with_images = lambda prompt, media, key=None: (s.TOK.encode(prompt), [], b'')
+        s.MSGTRAIL = s.MessageTrail(); s.TOKCACHE = s.TokenCache()
+        self.recs = []; s.log_request = lambda rec: self.recs.append(dict(rec))
+        self.env = {k: os.environ.pop(k, None) for k in ('HIVE_PREFIX_SHARE',)}
+
+    def tearDown(self):
+        s.TOK, s.ENC, s.DAEMON, s.log_request, s.encode_prompt, s.tokenize_with_images, s.MSGTRAIL, s.TOKCACHE = self.saved
+        for k, v in self.env.items():
+            os.environ.pop(k, None)
+            if v is not None: os.environ[k] = v
+
+    def conv(self, *turns):
+        m = [{'role': 'system', 'content': self.SYS}, {'role': 'user', 'content': 'first question'}]
+        for k, (a, u) in enumerate(turns):
+            m += [{'role': 'assistant', 'content': a}, {'role': 'user', 'content': u}]
+        return m
+
+    async def ask(self, msgs, **extra):
+        await s.chat(Request({'messages': msgs, 'reasoning_effort': 'none', **extra}))
+        return self.recs[-1]
+
+    async def scenario(self):
+        """The checks, as a list of failures (the mutants below must produce at least one)."""
+        bad = []
+        def want(cond, what):
+            if not cond: bad.append(what)
+        r1 = await self.ask(self.conv(), prompt_cache_key='room-1')
+        want('msg_diverge' not in r1 and r1.get('head') and r1.get('conv'), 'first request: identity, no divergence')
+        r2 = await self.ask(self.conv(('a1', 'q2')), prompt_cache_key='room-1')
+        want('msg_diverge' not in r2 and r2['session'] == r1['session'], 'an extension: no divergence')
+        r3 = await self.ask(self.conv(('a1 rewritten', 'q2'), ('a2', 'q3')), prompt_cache_key='room-1')
+        d = r3.get('msg_diverge') or {}
+        want(d.get('at') == 2 and d.get('prev') == 4 and d.get('new') == 6 and d.get('role') == 'assistant' and d.get('prev_role') == 'assistant',
+             f'an edited answer: message 2 of 4 -> 6 ({d})')
+        want(d.get('head') == s._short_hash('a1 rewritten') and d.get('prev_head') == s._short_hash('a1'), 'prefix hashes of the changed message')
+        want('from_session' not in d, 'same session: no from_session')
+        # a new head (the first user message changed) moves the session key; the conversation key links it to the previous one
+        m4 = self.conv(('a1', 'q2')); m4[1] = {'role': 'user', 'content': 'first question, edited'}
+        r4 = await self.ask(m4, prompt_cache_key='room-1')
+        d = r4.get('msg_diverge') or {}
+        want(r4['session'] != r3['session'] and r4.get('conv') == r3.get('conv') and r4.get('head') != r3.get('head'), 'new session key, same conversation')
+        want(d.get('from_session') == r3['session'] and d.get('at') == 1 and d.get('prev') == 6 and d.get('new') == 4, f'session change followed ({d})')
+        # another conversation key with the same head: a different conversation, nothing compared
+        r5 = await self.ask(self.conv(), prompt_cache_key='room-2')
+        want('msg_diverge' not in r5 and r5.get('conv') != r4.get('conv'), 'another conversation key: no divergence')
+        # image requests: the token fields come from the daemon's ids
+        img = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}
+        def media_encode(m, *a):
+            t, _ = hint_encode([dict(x, content=x['content'] if isinstance(x['content'], str) else 'IMG') for x in m], *a)
+            return t, [{'image': 1}]
+        s.encode_prompt = media_encode
+        s.tokenize_with_images = lambda prompt, media, key=None: (s.TOK.encode(prompt) + [7] * 5, [{'start': 0}], b'x')
+        mi = self.conv(('a1', 'q2')); mi[3] = {'role': 'user', 'content': [img, {'type': 'text', 'text': 'q2'}]}
+        r6 = await self.ask(mi, prompt_cache_key='room-3')
+        r7 = await self.ask(mi + [{'role': 'assistant', 'content': 'a3'}, {'role': 'user', 'content': 'q4'}], prompt_cache_key='room-3')
+        want(r7.get('prev_prompt_tokens') == r6['prompt_tokens'], f"image request: prev_prompt_tokens ({r7.get('prev_prompt_tokens')} vs {r6['prompt_tokens']})")
+        want(isinstance(r7.get('diverge_at'), int) and 0 < r7['diverge_at'] < r6['prompt_tokens'], f"image request: diverge_at ({r7.get('diverge_at')})")
+        ids6 = s.TOK.encode(media_encode(mi, None, 'chat', None)[0]) + [7] * 5
+        ids7 = s.TOK.encode(media_encode(mi + [{'role': 'assistant', 'content': 'a3'}, {'role': 'user', 'content': 'q4'}], None, 'chat', None)[0]) + [7] * 5
+        k = next((i for i, (x, y) in enumerate(zip(ids6, ids7)) if x != y), min(len(ids6), len(ids7)))
+        want(r7.get('diverge_at') == k, f"image request: diverge_at = common ids ({r7.get('diverge_at')} vs {k})")
+        # nothing of the messages' text in any record
+        text = json.dumps(self.recs)
+        want(not any(w in text for w in ('first question', 'a1 rewritten', 'q2', 'q3')), 'no message content in the records')
+        return bad
+
+    async def test_records(self):
+        self.assertEqual(await self.scenario(), [])
+
+    class _TokenCacheLike:
+        """The token cache's contract for the record (ids, ends; last_diverge per key) over the test tokenizer."""
+        def __init__(self): self.lock = __import__('threading').Lock(); self.last_diverge = {}; self.prev = {}; self.hits = 0; self.entries = {}; self.sent_len = {}
+        def tokenize(self, key, prompt):
+            ids = s.TOK.encode(prompt); ends = [e for _, e in s.TOK(prompt, True)['offset_mapping']]
+            if key in self.prev:
+                old = self.prev[key]
+                k = next((i for i, (x, y) in enumerate(zip(old, ids)) if x != y), min(len(old), len(ids)))
+                self.last_diverge[key] = (len(old), k)
+            self.prev[key] = ids
+            return ids, ends
+        def usable(self): return False
+
+    async def diverge_hint_case(self):
+        os.environ['HIVE_PREFIX_SHARE'] = '1'
+        s.TOKCACHE = self._TokenCacheLike()
+        await self.ask(self.conv(('a1', 'q2'), ('a2', 'q3')), prompt_cache_key='h')
+        r = await self.ask(self.conv(('a1', 'q2'), ('a2 changed', 'q3')), prompt_cache_key='h')
+        hints = s.DAEMON.kw[-1].get('boundaries') or []
+        below = [h for h in hints if h <= r['diverge_at']]
+        return r, hints, below
+
+    async def test_diverge_hint_reuses_the_hints(self):
+        r, hints, below = await self.diverge_hint_case()
+        self.assertTrue(len(below) >= 2, (r.get('diverge_at'), hints))   # more than one boundary before the change: the deepest is meant
+        self.assertEqual(r.get('diverge_hint'), max(below))
+        self.assertEqual((r.get('msg_diverge') or {}).get('at'), 4)
+
+    async def test_zz_negative_controls(self):
+        import inspect
+        mutants = [('MessageTrail', 'while k < n and old[k][0] == cur[k][0]:', 'while k < n - 1 and old[k][0] == cur[k][0]:'),
+                   ('MessageTrail', 'if prev is None and conv and self.by_conv.get(conv) in self.entries:', 'if False:'),
+                   ('MessageTrail', '"head": cur[k][2] if k < len(cur) else None', '"head": cur[k - 1][2] if k < len(cur) else None'),
+                   ('MessageTrail', 'out.update(prev_prompt_tokens=len(prev[2]), diverge_at=_common_ids_len(prev[2], mids))',
+                    'out.update(prev_prompt_tokens=len(mids), diverge_at=_common_ids_len(prev[2], mids))'),
+                   ('_common_ids_len', 'return int(d[0]) if d.size else n', 'return int(d[0]) + 1 if d.size else n'),
+                   ('_message_text', 'return c', 'return c[1:]'),
+                   ('_diverge_hint', 'return max(below) if below else None', 'return min(below) if below else None')]
+        caught = 0
+        had = sys.modules.get(s.__name__)
+        sys.modules[s.__name__] = s   # inspect finds a class's source through its module
+        self.addCleanup(lambda: sys.modules.pop(s.__name__, None) if had is None else None)
+        for name, a, b in mutants:
+            orig = getattr(s, name)
+            src = inspect.getsource(orig)
+            self.assertEqual(src.count(a), 1, (name, a))
+            exec(src.replace(a, b), vars(s))
+            try:
+                s.MSGTRAIL = s.MessageTrail(); s.TOKCACHE = s.TokenCache(); self.recs.clear()
+                s.encode_prompt = hint_encode
+                s.tokenize_with_images = lambda prompt, media, key=None: (s.TOK.encode(prompt), [], b'')
+                bad = await self.scenario()
+                if name == '_diverge_hint':
+                    s.encode_prompt = hint_encode
+                    s.tokenize_with_images = lambda prompt, media, key=None: (s.TOK.encode(prompt), [], b'')
+                    r, hints, below = await self.diverge_hint_case()
+                    if r.get('diverge_hint') != max(below): bad.append('diverge_hint')
+            finally:
+                vars(s)[name] = orig
+            self.assertTrue(bad, f'mutant not caught: {name}: {a!r} -> {b!r}')
+            caught += 1
+        print(f'diverge record: {len(mutants)} mutants, {caught} caught')
+
+
+class InertPlaceholderTests(unittest.TestCase):
+    """The image placeholder quoted as text is read as text (2026-10-21: a tool result holding the DS chat template made every later
+    request of that conversation a 400); image blocks and requests without the placeholder are untouched."""
+    PH = "<\uff5cdeepseek_image\uff5c>"
+
+    def setUp(self):
+        self.enc = s.ENC
+        s.ENC = type("E", (), {"IMAGE_PLACEHOLDER": self.PH})()
+
+    def tearDown(self):
+        s.ENC = self.enc
+
+    def test_text_everywhere_and_images_kept(self):
+        img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD" + self.PH}}
+        msgs = [{"role": "system", "content": "sys " + self.PH},
+                {"role": "user", "content": [{"type": "text", "text": "a" + self.PH + "b"}, img]},
+                {"role": "assistant", "content": "", "reasoning_content": "r" + self.PH,
+                 "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": '{"x": "' + self.PH + '"}'}}]},
+                {"role": "tool", "tool_call_id": "c", "content": [{"type": "text", "text": "{%- set IMG = \"" + self.PH + "\" -%}"}, img]}]
+        tools = [{"type": "function", "function": {"name": "f", "description": "d" + self.PH, "parameters": {}}}]
+        m2, t2 = s.inert_image_placeholders(msgs, tools)
+        text = json.dumps([m2, t2], ensure_ascii=False)
+        self.assertEqual(text.count(self.PH), 2, text)               # only the two image URLs keep it (references, not text)
+        self.assertEqual(text.count("<\u200b\uff5cdeepseek_image\uff5c>"), 6, text)
+        self.assertEqual(m2[1]["content"][1], img)                   # image blocks unchanged
+        self.assertIn(self.PH, msgs[0]["content"])                    # the caller's messages are not modified
+
+    def test_escaped_in_arguments(self):
+        args = json.dumps({"note": "x" + self.PH})                  # ensure_ascii: the placeholder hides as \\uff5c escapes
+        self.assertNotIn(self.PH, args)
+        m2, _ = s.inert_image_placeholders([{"role": "assistant", "content": "", "tool_calls": [{"id": "c", "type": "function",
+                                            "function": {"name": "f", "arguments": args}}]}], None)
+        got = json.loads(m2[0]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(got, {"note": "x<\u200b\uff5cdeepseek_image\uff5c>"})
+        plain = json.dumps({"a": 1})
+        m3, _ = s.inert_image_placeholders([{"role": "assistant", "tool_calls": [{"function": {"arguments": plain}}]}], None)
+        self.assertIs(m3[0]["tool_calls"][0]["function"]["arguments"], plain)   # arguments without it keep their bytes
+
+    def test_untouched_without_placeholder(self):
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "plain <\uff5cUser\uff5c> text"}]}, {"role": "assistant", "content": "ok"}]
+        tools = [{"type": "function", "function": {"name": "f"}}]
+        m2, t2 = s.inert_image_placeholders(msgs, tools)
+        self.assertIs(m2, msgs); self.assertIs(t2, tools)            # same objects = same bytes for every request accepted before
+
+    def test_no_placeholder_in_encoder(self):
+        s.ENC = type("E", (), {})()
+        msgs = [{"role": "user", "content": self.PH}]
+        self.assertIs(s.inert_image_placeholders(msgs, None)[0], msgs)
 
 
 if __name__=='__main__': unittest.main()

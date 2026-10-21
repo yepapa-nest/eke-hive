@@ -9,7 +9,7 @@
 //    optional thinking cap: "think_cap":N,"think_end_id":id,"think_start_id":id,"think_open":true,"think_exit_ids":[...]; optional "prefix_extra":1;
 //    optional "stages":true (adds {"admitted":true,"cached":c,"total":n} once the reuse is decided — sent only to requests that ask)}
 //   {"op":"cancel","rid":...} · {"op":"flush"} · {"op":"sleep","level":1|2|3} · {"op":"wake"} · {"op":"stats"}
-//   -> response lines: [{"admitted":...} with "stages"] {"progress":i,"total":n} after each prefill chunk · {"id":123} ... {"done":true,"n":k,"finish":"stop|length","prefill_ms":..,"decode_ms":..,"cached_prefix":p}
+//   -> response lines: [{"admitted":...} with "stages"] {"progress":i,"total":n} after each prefill chunk · {"id":123} ... {"done":true,"n":k,"finish":"stop|length","prefill_ms":..,"decode_ms":..,"cached_prefix":p,"restore_ms":..} (restore_ms = host image restores, part of prefill_ms)
 //   {"op":"cancel","session":"s1"}  -> {"ok":true}
 //   {"op":"cancel","session":"s1","rid":"r1"}  -> {"ok":true}  (with rid: only the request that passed the same rid to generate)
 //   {"op":"stats"} -> cache and routing statistics ("state": ready|draining|sleeping|waking, "vram", the last "sleep"/"wake" report)
@@ -282,6 +282,26 @@ json proc_memory_mib() {
   }
   fclose(f);
   return out;
+}
+
+// All CUDA pinned host memory of this process: cudaHostAlloc maps it as shared /dev/zero, and pinned pages are always resident, so the sum of
+//   those mappings is their RSS. It holds the session images (counted in host_session_bytes), the pinned copies of the dense weights kept for
+//   level-3 sleep (dense_host_copy_mib, hive/devmem.h prepare_shadows), the embedding table, the prefill host tiles and the work buffers.
+//   Measured 2026-10-21 (production deployment, 8.5 h after a restart): 22,127 MiB in 3,429 mappings, of which 10,256 MiB were sleep shadows ("sleep shadows
+//   pinned ahead" at startup), 1,262 MiB the embedding table, 1,920 MiB the host tiles — host_session_bytes was 7,742 MiB, so without these two
+//   fields ~14 GB of RSS looked unaccounted. Reads /proc/self/maps (4,514 lines: ~1-2 ms), so publish_stats refreshes it at most every 10 s.
+size_t cuda_pinned_bytes() {
+  FILE* f = fopen("/proc/self/maps", "r");
+  if (!f) return 0;
+  size_t n = 0;
+  char line[512];
+  while (fgets(line, sizeof line, f)) {
+    if (!strstr(line, " /dev/zero")) continue;
+    unsigned long a = 0, b = 0;
+    if (sscanf(line, "%lx-%lx", &a, &b) == 2 && b > a) n += b - a;
+  }
+  fclose(f);
+  return n;
 }
 
 }  // namespace
@@ -1121,6 +1141,7 @@ int main(int argc, char** argv) {
   json vmm_info = json::object();  // level 3 (VMM release) report — released bytes, shadow copies, time, errors
   json vram_json = json::object(), host_mem_json = json::object();
   double vram_ms = -1e18;
+  double pinned_ms = -1e18, pinned_mib = 0;  // cuda_pinned_mib in host_memory (publish_stats)
   int vram_power = -1;  // the power state of the last device query — a new state queries again (publish_stats)
   auto power_name = [](int p) { return p == kPowerDraining ? "draining" : p == kPowerSleeping ? "sleeping" : p == kPowerWaking ? "waking" : "ready"; };
   // Mutable engine state never crosses threads. Stats readers only copy this snapshot.
@@ -1146,6 +1167,10 @@ int main(int argc, char** argv) {
     s["host_session_bytes"] = host_total();
     s["host_session_peak_bytes"] = host_peak_bytes;
     s["snapshot_pool_cached_bytes"] = rt.snapshot_pool_cached_bytes();
+    // the ledger's own counts (images and distinct segments behind host_session_bytes) — bytes per image and per segment can then be compared
+    //   with the pinned mappings (host_memory.cuda_pinned_mib); without them the 2 MiB-chunk share of the pinned memory could not be attributed
+    s["host_images"] = host_ledger.images();
+    s["host_segments"] = host_ledger.segments();
     s["decode_dma_rows"] = decode_dma_rows;
     s["decode_streamed_records"] = tot_streamed.load();
     s["host_accounting_scope"] = "reuse state/capacities/pinned pool, approximate metadata; not process RSS";
@@ -1171,6 +1196,9 @@ int main(int argc, char** argv) {
       host_mem_json = proc_memory_mib();
       host_mem_json["experts_pinned_mib"] = store.experts_host_bytes() / 1048576.0;
       host_mem_json["engram_mib"] = store.engram_host_bytes() / 1048576.0;
+      host_mem_json["dense_host_copy_mib"] = devmem::shadow_bytes() / 1048576.0;  // sleep shadows (pinned even while awake)
+      if (last_stats - pinned_ms >= 10000.0) { pinned_mib = cuda_pinned_bytes() / 1048576.0; pinned_ms = last_stats; }
+      host_mem_json["cuda_pinned_mib"] = pinned_mib;  // every cudaHostAlloc mapping (see cuda_pinned_bytes), refreshed at most every 10 s
       vram_ms = last_stats;
       vram_power = power.load();
     }
@@ -1435,6 +1463,7 @@ int main(int argc, char** argv) {
     bool stages = false;  // the request asked for stage lines ("stages": true) — also gets read progress inside a forward (pg_targets)
     bool defer_ckpt = false, defer_warm = false;  // HIVE_DEFER_CKPT: prompt checkpoint and warm_after_prefill deferred until after the first token is sent
     double t0 = 0, t1 = 0;
+    double restore_ms = 0;  // host image restores of this request (load_image of a checkpoint / archived / parent / shared snapshot, plus session-store reads) — part of prefill_ms
     size_t common = 0, prompt_len = 0;
     ForwardStats ds{};
   };
@@ -1509,7 +1538,7 @@ int main(int argc, char** argv) {
                  {"cached_prefix", (int)A.common}, {"prefill_tokens", (int)(A.prompt_len - A.common)},
                  {"decode_hit", A.ds.n_hit}, {"decode_cpu", A.ds.n_cpu}, {"cpu_wait_ms", A.ds.ms_cpu_wait}, {"batch_rows", (int)active.size()}, {"held_steps", A.held_steps},
                  {"decode_dma_rows", A.ds.n_dma_rows}, {"cpu_span_ms", A.ds.ms_cpu_span}, {"timing_scope", "shared_batch_spans_not_additive"},
-                 {"mtp_steps", A.mtp_steps}, {"mtp_drafted", A.mtp_drafted}, {"mtp_accepted", A.mtp_accepted}};
+                 {"mtp_steps", A.mtp_steps}, {"mtp_drafted", A.mtp_drafted}, {"mtp_accepted", A.mtp_accepted}, {"restore_ms", A.restore_ms}};
     if (A.think_cap > 0) {  // only for requests that received a thinking cap (off = done message shape unchanged)
       done["think_cap"] = A.think_cap;
       done["think_tokens"] = A.think_n;
@@ -1522,13 +1551,14 @@ int main(int argc, char** argv) {
     else send_json(A.r.fd, done);
     finish_socket(A.r.fd);
     // Logging: the request line ends with " · wall t0= t1= t2= queue_ms= rid=" — t0 admission (prefill start), t1 prefill end, t2 finish, in
-        //   epoch ms (wall_off taken at startup = system clock - now_ms) · queue_ms = time queued by the receiver thread -> t0 · "-" without rid
+        //   epoch ms (wall_off taken at startup = system clock - now_ms) · queue_ms = time queued by the receiver thread -> t0 (before any restore) ·
+        //   restore_ms = host image restores inside prefill_ms · "-" without rid
     const std::string rid_s = A.r.req.value("rid", "");
     fprintf(stderr, "[hived] %s: prefill %zu tok %.0f ms · decode %d tok %.0f ms (%.1f tok/s, batch %zu) · hit %d cpu %d · resident %d/%d · mtp %ld/%ld in %ld steps · %s"
-            " · wall t0=%.0f t1=%.0f t2=%.0f queue_ms=%.0f rid=%s\n",
+            " · wall t0=%.0f t1=%.0f t2=%.0f queue_ms=%.0f restore_ms=%.0f rid=%s\n",
             A.sid.c_str(), A.prompt_len - A.common, A.t1 - A.t0, A.n, t2 - A.t1, A.n > 1 ? (A.n - 1) * 1000.0 / (t2 - A.t1) : 0.0, active.size(),
             A.ds.n_hit, A.ds.n_cpu, store.n_resident(), store.n_slots(), A.mtp_accepted, A.mtp_drafted, A.mtp_steps, A.finish.c_str(),
-            A.t0 + wall_off, A.t1 + wall_off, t2 + wall_off, A.r.t_recv > 0 ? std::max(0.0, A.t0 - A.r.t_recv) : 0.0, rid_s.empty() ? "-" : rid_s.c_str());
+            A.t0 + wall_off, A.t1 + wall_off, t2 + wall_off, A.r.t_recv > 0 ? std::max(0.0, A.t0 - A.r.t_recv) : 0.0, A.restore_ms, rid_s.empty() ? "-" : rid_s.c_str());
     active_sids.erase(A.sid);
     {  // if this was the session's last request, remove its flag entry too (otherwise the map grew per session)
       std::lock_guard<std::mutex> lk(mu);
@@ -1674,15 +1704,38 @@ int main(int argc, char** argv) {
       ~SidHold() { if (s) s->erase(sid); }
     } admit_hold;
   };
+  // The first image span that ends after `at` (null = the rest of the prompt is text). Chunk rules depend on the images of the chunk being cut,
+  //   not on whether the request has an image somewhere: the runtime's limits are per forward (runtime.cpp — host/tiled passes and the C1 skip
+  //   take only forwards whose own chunk has no image).
+  auto next_span_j = [&](const PJob& J, size_t at) -> const ImageInput* {
+    const ImageInput* best = nullptr;
+    for (const auto& x : J.all_images)
+      if ((size_t)x.start + x.types.size() > at && (!best || x.start < best->start)) best = &x;
+    return best;
+  };
   auto plan_chunk_j = [&](PJob& J, size_t at, size_t cap) -> size_t {
-    auto& ids = J.ids; auto& all_images = J.all_images;
+    auto& ids = J.ids;
     const size_t rem = ids.size() - at;
     if (rem <= cap) return rem;
     // HIVE_TAIL_SPLIT: one more cut would leave the last piece below the tail-mode minimum (tail_need) -> pull the boundary in so the last is
         // tail_need. Only if this chunk is also in tail mode (never create a short-path chunk).
-    if (tail_split && tail_need > 0 && all_images.empty() && rem - cap < (size_t)tail_need && rt.tail_mode_for((int)(rem - (size_t)tail_need)))
+    if (tail_split && tail_need > 0 && !next_span_j(J, at) && rem - cap < (size_t)tail_need && rt.tail_mode_for((int)(rem - (size_t)tail_need)))
       return rem - (size_t)tail_need;  // < cap (rem - cap < tail_need)
     return cap;
+  };
+  // Rows of the chunk starting at `at` under `cap`, image spans applied. One span = one chunk of at most max_chunk rows (the vision path runs in
+  //   a single forward, as before): when the next span ends within max_chunk of `at`, this is that span's chunk (it also takes the text around
+  //   the span up to max_chunk); otherwise the chunk is text with the full cap and ends at the span's start if it would reach it. Every chunk
+  //   re-streams the non-resident experts, so neither side leaves a piece shorter than max_chunk minus the span. Measured 2026-10-21 (DS
+  //   service): a 572,678-token cold prefill with one image near the end ran as 35 chunks of 16,384 rows, every one "upper on" (226 s), because
+  //   the cap and the C1 skip were decided for the whole request; text requests of the same day ran 98,304-row passes with the tail layers
+  //   skipped (19-24 s each).
+  auto chunk_rows_j = [&](PJob& J, size_t at, size_t cap) -> size_t {
+    const ImageInput* x = next_span_j(J, at);
+    if (!x) return plan_chunk_j(J, at, cap);
+    const size_t s0 = (size_t)x->start, s1 = s0 + x->types.size();
+    if (s0 <= at || s1 - at <= (size_t)max_chunk) return plan_chunk_j(J, at, std::min(cap, (size_t)max_chunk));
+    return std::min(plan_chunk_j(J, at, cap), s0 - at);
   };
   // this chunk's cap (busy cap / budget when decoders exist) — the loop and the boundary-snapshot restore check (C1) use the same formula
   auto cap_now_j = [&](PJob& J) -> size_t {
@@ -1725,7 +1778,7 @@ int main(int argc, char** argv) {
     auto& ids = J.ids; auto& all_images = J.all_images;
     auto plan_chunk = [&](size_t at, size_t c) { return plan_chunk_j(J, at, c); };
     std::vector<size_t> p{first};
-    for (size_t x = from; x < ids.size();) { const size_t m = plan_chunk(x, cap); p.push_back(m); x += m; }
+    for (size_t x = from; x < ids.size();) { const size_t m = chunk_rows_j(J, x, cap); p.push_back(m); x += m; }
     std::array<size_t, 3> r{p.size(), 0, 0};  // chunks · streaming chunks · C1 skips
     for (size_t j = 0; j < p.size(); ++j) {
       if (p[j] >= stream_floor) ++r[1];
@@ -2072,14 +2125,39 @@ int main(int argc, char** argv) {
       S->ckpt.reset(); std::vector<float>().swap(S->ckpt_logits); std::vector<Session::ImgSig>().swap(S->ckpt_sig);
       S->history.clear();
     }
+    // Restores from host images are timed into A->restore_ms; t0 (prefill start) is taken before them, so queue_ms is the wait for admission only
+    //   and the restore is part of prefill_ms. Before, a checkpoint / archived / parent restore ran before t0 and was reported as queue time
+    //   (service log 2026-10-21: prompt-ckpt reuse at 256K+ had a queue_ms median of 83.5 ms against 14 ms for live reuse).
+    A->t0 = now_ms();
+    auto timed_load = [&](const SeqImage& img) {
+      const double tl = now_ms();
+      rt.load_image(*S->seq, img);
+      A->restore_ms += now_ms() - tl;
+      fprintf(stderr, "[hived] %s: restored host image at %lld (%.0f ms)\n", A->sid.c_str(), (long long)img.pos, now_ms() - tl);
+    };
+    // The session's own state (checkpoint / archived / parent checkpoint) is loaded once the restore point is final — after the shared boundary
+    //   snapshots below were considered. Loading it first and then a deeper shared snapshot copied two full images (measured 2026-10-21, DS
+    //   service: a 425K session image (~400 MB) loaded and then replaced by a snapshot 2 tokens deeper, 364 ms). A pending load is completed on
+    //   every path out of setup (early returns, exceptions), so the session's tokens and its sequence never disagree.
+    struct DeferredLoad {
+      std::function<void(const SeqImage&)> load; Seq* seq = nullptr;
+      std::shared_ptr<SeqImage> img;
+      void flush() { if (auto i = std::move(img)) load(*i); }
+      ~DeferredLoad() { try { flush(); } catch (...) { if (seq) seq->broken = true; } }  // broken: the next request cannot take the half-restored state as live
+    } deferred{timed_load, S->seq.get(), nullptr};
     if (pick == 0 || pick == 2 || pick == 3) {
       if (pick == 0) { rt.reset_seq(*S->seq); S->img_sig.clear(); }
-      else { rt.load_image(*S->seq, pick == 2 ? *S->ckpt : *S->live); S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig; }
+      else {
+        const auto& img = pick == 2 ? S->ckpt : S->live;
+        if (archived_rw) timed_load(*img);  // a rewinding family cuts the loaded state back right away (its result decides common below)
+        else deferred.img = img;
+        S->img_sig = pick == 2 ? S->ckpt_sig : S->live_sig;
+      }
       if (archived_rw && !rt_rewind(rt, *S->seq, archived_rw)) { rt.reset_seq(*S->seq); S->img_sig.clear(); common = 0; pick = 0; }  // its window is gone
       S->tokens.assign(ids.begin(), ids.begin() + common);
     }
     if (pick == 5) {  // the parent conversation's prompt checkpoint (above) — a complete prompt-end state, so also this request's delta base
-      rt.load_image(*S->seq, *parent_img);
+      deferred.img = parent_img;
       S->img_sig = parent_sig;
       S->tokens.assign(ids.begin(), ids.begin() + common);
       J.last_boundary = parent_img; J.last_boundary_full = true;
@@ -2134,21 +2212,20 @@ int main(int argc, char** argv) {
           for (const auto& o : S->img_sig) if (o.start == r.start && o.end == r.end && o.hash == r.hash) { found = true; break; }
           if (!found) sig_ok = false;
         }
-        if ((!image_ckpt && span_after) || !sig_ok) { rt.reset_seq(*S->seq); S->tokens.clear(); S->img_sig.clear(); common = 0; pick = 0; }
+        if ((!image_ckpt && span_after) || !sig_ok) { deferred.img.reset(); rt.reset_seq(*S->seq); S->tokens.clear(); S->img_sig.clear(); common = 0; pick = 0; }
       }
     }
-    // prefill (chunks)
-    A->t0 = now_ms();
+    // prefill (chunks) — A->t0 was taken before the restores above
     bool& last_upper_skipped = J.last_upper_skipped;  // did the last chunk run skip the tail layers — if it is cut after that, the tail-layer ring holds stale values and must not be continued
     // Chunking while others decode: chunk sizes trade transfer cost against decoder stalls. Measured: 1023 rows take the grouped path (<1024,
         //   85% CPU experts) at 7.4 s per chunk, slower than a streaming 1K chunk (4.7-6.3 s), so busy chunks use the streaming path. Each prefill
         //   chunk re-streams the non-resident experts (~207 GB) over PCIe, so larger chunks are cheaper: splitting a 9.7K prompt into 2048-token
         //   chunks = 5 chunks = 5x the transfer (measured 61.6 s vs ~16 s unsplit). The default does not split — other decoders run only via
         //   decode_share between chunks (with a single chunk they pause for that chunk).
-        // Tile = max_chunk x prefill_tile tokens in one forward (experts transferred once per encoder layer). Image requests use max_chunk per the
-        // single-chunk rule.
-    size_t& chunk_cap = J.chunk_cap;  // text = max_chunk x prefill_slots (host tiles included — equals prefill_tile when off)
-    chunk_cap = all_images.empty() ? (size_t)max_chunk * (size_t)rt.prefill_slots() : (size_t)max_chunk;
+        // Tile = max_chunk x prefill_tile tokens in one forward (experts transferred once per encoder layer). A chunk holding an image span uses
+        // max_chunk per the single-chunk rule (chunk_rows_j); the text of an image request takes the text cap.
+    size_t& chunk_cap = J.chunk_cap;  // max_chunk x prefill_slots (host tiles included — equals prefill_tile when off)
+    chunk_cap = (size_t)max_chunk * (size_t)rt.prefill_slots();
     size_t& busy_cap = J.busy_cap;
     busy_cap = busy_chunk <= 0 ? chunk_cap : std::min<size_t>(chunk_cap, (size_t)busy_chunk);
     // One chunk-size rule: the chunk to cut from at within cap. This chunk and the "next chunk" used for the C1 decision share the same function.
@@ -2170,6 +2247,7 @@ int main(int argc, char** argv) {
         if (prefix_key(pids.data(), (size_t)pos, sig_upto_j(J, (size_t)pos)) != key) continue;
         if (auto L = sstore->load_snap(key)) {
           shared_snaps[key] = SharedSnap{L->image, from_store_sig(L->sig), L->upper_skipped, now_ms()};
+          A->restore_ms += L->ms;
           fprintf(stderr, "[hived] %s: boundary snapshot at %lld restored from the session store (%.2f GB in %.0f ms)\n", A->sid.c_str(), (long long)pos,
                   L->bytes / 1073741824.0, L->ms);
           host_total();
@@ -2187,7 +2265,7 @@ int main(int argc, char** argv) {
         const size_t k = e.image ? (size_t)e.image->pos : 0;
         if (k <= best_len || k >= ids.size() || e.image->tokens.size() != k || !std::equal(e.image->tokens.begin(), e.image->tokens.end(), ids.begin())) continue;
         if (!images_match(e.sig, k)) continue;
-        if (e.upper_skipped && !(all_images.empty() && rt.tail_mode_for((int)plan_chunk(k, restore_cap)))) continue;  // C1 validity
+        if (e.upper_skipped && !rt.tail_mode_for((int)chunk_rows_j(J, k, restore_cap))) continue;  // C1 validity (the first chunk from k, image spans applied)
         best = &e; best_len = k;
       }
       if (!best && common == 0) {  // log why the deepest snapshot sharing this prompt's head was not taken (2026-10-14: a new conversation
@@ -2205,7 +2283,8 @@ int main(int argc, char** argv) {
         if (near_m) fprintf(stderr, "[hived] %s: shared-prefix not used — snapshot at %zu shares %zu tokens (%s)\n", A->sid.c_str(), near_k, near_m, why);
       }
       if (best) {
-        rt.load_image(*S->seq, *best->image);
+        deferred.img.reset();  // the deeper shared snapshot replaces the session's own state — one load instead of two
+        timed_load(*best->image);
         // the restored rows are exact: this request's later boundary snapshots and its prompt checkpoint share them (HIVE_CKPT_DELTA) instead of
         //   copying the whole prompt again (measured 2026-10-15 GLM 145K: 2.8 GB per checkpoint after a shared-prefix restore, 147 MB with a base)
         if (!best->upper_skipped) { J.last_boundary = best->image; J.last_boundary_full = true; }
@@ -2219,6 +2298,7 @@ int main(int argc, char** argv) {
         common = best_len; pick = 4;
       }
     }
+    deferred.flush();  // the session's own state, when no deeper shared snapshot was taken
     // HIVE_IMAGE_CKPT: images entirely inside the reused prefix are already processed (not fed to chunks again — the loop only covers i >= common).
         //   Removing them from the chunk rules means a new span without images uses the same chunk rules as a text request (tiles, C1, tail split,
         //   budget). Images in the new span keep the rule one span = one chunk. Lossless: chunk boundaries do not change the result (same property
@@ -2228,8 +2308,6 @@ int main(int argc, char** argv) {
       for (auto& x : all_images) if ((size_t)x.start + x.types.size() > common) suffix.push_back(x);
       if (suffix.size() != all_images.size()) {
         all_images = std::move(suffix);
-        chunk_cap = all_images.empty() ? (size_t)max_chunk * (size_t)rt.prefill_slots() : (size_t)max_chunk;
-        busy_cap = busy_chunk <= 0 ? chunk_cap : std::min<size_t>(chunk_cap, (size_t)busy_chunk);
       }
     }
     A->common = common;
@@ -2295,7 +2373,7 @@ int main(int argc, char** argv) {
     auto plan_chunk = [&](size_t at, size_t cap) { return plan_chunk_j(J, at, cap); };
     auto hint_cut = [&](size_t at, int m, size_t cap) { return hint_cut_j(J, at, m, cap); };
     const size_t chunk_now = std::min(cap_now(), lim);  // lim = this round's slots x max_chunk (unlimited on the single path)
-    int M = (int)plan_chunk(i, chunk_now);
+    int M = (int)chunk_rows_j(J, i, chunk_now);
     M = hint_cut(i, M, chunk_now);
     for (auto& x : all_images) {  // if the chunk splits a span, cut before the span (error if the span is longer than a chunk)
       size_t s0 = (size_t)x.start, s1 = s0 + x.types.size();
@@ -2327,8 +2405,10 @@ int main(int argc, char** argv) {
     if (!active.empty()) { next_cap = busy_cap; if (prefill_budget_ms>0 && all_images.empty()) next_cap = std::min(next_cap, stream_floor); }
     if (batched) next_cap = std::min(c1_floor_j(J), (size_t)max_chunk);  // batched: the next round may have one slot and decoders present (c1_floor_j)
     else if (prefill_yield || layer_yield) next_cap = std::min(next_cap, c1_floor_j(J));  // HIVE_PREFILL_YIELD / HIVE_LAYER_YIELD: active can grow between chunks (inside the forward for layer yield) — use the decoders-present lower bound
-    const size_t next_min = rem_after > 0 ? plan_chunk(i + (size_t)M, next_cap) : 0;
-    J.upper_needed = !(rem_after > 0 && all_images.empty() && rt.tail_mode_for(M) && rt.tail_mode_for((int)next_min));
+    const size_t next_min = rem_after > 0 ? chunk_rows_j(J, i + (size_t)M, next_cap) : 0;
+    // the C1 skip needs this chunk free of images (the runtime skips the tail layers only then); the next chunk only has to be in tail mode,
+    //   which depends on its rows alone — an image chunk of tail-mode size runs the tail like any other
+    J.upper_needed = !(rem_after > 0 && chunk_images.empty() && rt.tail_mode_for(M) && rt.tail_mode_for((int)next_min));
     J.hit0 = st.n_hit; J.str0 = st.n_streamed; J.cpu0 = st.n_cpu; J.dma0 = st.n_dma_rows;
     J.wait0 = st.ms_cpu_wait; J.span0 = st.ms_cpu_span;
     st.tail_rows = 0;  // the runtime overwrites it only for tail-mode chunks — clear it so it reads as a per-chunk value

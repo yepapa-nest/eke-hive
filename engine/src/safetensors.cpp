@@ -112,6 +112,12 @@ size_t Checkpoint::release_all() {
   return n;
 }
 
+std::vector<std::string> Checkpoint::open_shards() const {
+  std::vector<std::string> out;
+  for (const auto& [shard, f] : open_) out.push_back(shard);
+  return out;
+}
+
 void Checkpoint::close_shard(const std::string& name) {
   auto it = weight_map_.find(name);
   if (it == weight_map_.end()) return;

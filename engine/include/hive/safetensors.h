@@ -66,6 +66,10 @@ class Checkpoint {
   //   kcompactd burned a full core (CPU at 92 °C). Experts, dense weights, engram and embeddings are all copied to the arena/VRAM/pinned
   //   memory, so the shards are never read again.
   size_t release_all();  // returns the number of bytes evicted
+  // Shards open now (keys of open_) and closing one by that key: munmap only — the page cache is left to the kernel (reclaimable), unlike
+  //   release_all. For loads after startup (the lazy vision encoder) that would otherwise keep their shard mapped for the process lifetime.
+  std::vector<std::string> open_shards() const;
+  void close_open_shard(const std::string& shard) { open_.erase(shard); }
 
  private:
   std::string dir_;

@@ -609,6 +609,22 @@ def sc_tail_split(h, ck, want):
     ck.eq('tail split: chunk sizes / upper_needed', chunks(h, 'ts'), want)
 
 
+def sc_image_long(h, ck):
+    # 2026-10-21: an image request's chunk cap and C1 skip were decided for the whole request — a 572,678-token cold prefill with one image near
+    #   the end ran as 35 max_chunk chunks, all with the tail layers on. Now only the chunk holding the span is a max_chunk forward; the text
+    #   before it takes the full tile cap (here 3 x 1536) and skips the tail layers when the next chunk is in tail mode (lossless chunking: same tokens).
+    im = image(5000, 3, 3, 150)
+    P = tokens(6000, 151)
+    done_ok(ck, 'image long A: tokens unchanged', h.generate('il', P, 3, [im]), P, 3, 0, [im])
+    ck.eq('image long A: text pass at the tile cap, span in one max_chunk chunk', chunks(h, 'il'), [(4608, 'skip'), (1392, 'on')])
+    im2 = image(9000, 3, 3, 152)
+    Q = tokens(10000, 153)
+    done_ok(ck, 'image long B: tokens unchanged', h.generate('im', Q, 3, [im2]), Q, 3, 0, [im2])
+    # the second text chunk ends at the span; the span's chunk takes the 991 text rows after it (3 forwards — ending the text where a max_chunk
+    #   chunk ending at the span begins would have made 4)
+    ck.eq('image long B: chunks', chunks(h, 'im'), [(4608, 'skip'), (4392, 'on'), (1000, 'on')])
+
+
 def sc_disconnect_prefill(h, ck):
     """D10: a client gone during chunk k is seen at chunk k's progress write, before chunk k+1 runs."""
     P = tokens(1100, 82)  # 5 chunks of <=256 at FAKE_PREFILL_MS each
@@ -738,6 +754,11 @@ def run_extras(exe, td):
                 ck.true('tail split: startup line names the tail-mode minimum', 'final prefill chunk >= 1101 rows' in h.tail(100000))
         finally:
             stop_clean(h, ck)
+    h = Hived(exe, td, {**kv, 'HIVE_TAIL_SPLIT': '1'}, args=(*TAIL_ARGS, '--prefill-tile', '3', '--max-ctx', '16384'), name='imglong')
+    try:
+        sc_image_long(h, ck)
+    finally:
+        stop_clean(h, ck)
     h = Hived(exe, td, {'FAKE_PREFILL_MS': str(300 * SLOW)}, name='dp')
     try:
         sc_disconnect_prefill(h, ck)
@@ -790,6 +811,21 @@ def sc_share_cross(h, ck):
     ids5 = SYS + tokens(20, 104)  # malformed hints are absorbed (ignored), never an error; the stored snapshot still applies
     done_ok(ck, 'H5 malformed boundaries ignored', h.generate('se', ids5, 3, boundaries=['x', -1, 1e9, None, 10 ** 12, 300.5, [300]]), ids5, 3, 300)
     done_ok(ck, 'H5 boundaries not a list: ignored', h.generate('sf', ids5, 3, boundaries={'a': 300}), ids5, 3, 300)
+
+
+def sc_restore_once(h, ck):
+    # B2 (2026-10-21): the session's own checkpoint was loaded and then replaced by a deeper shared snapshot — two full image copies (425K: ~400 MB,
+    #   364 ms). The restore point is now chosen first and loaded once. Needs the 300-token system snapshot that sc_share_cross left.
+    SYS = tokens(300, 100)
+    g1 = SYS[:270]
+    done_ok(ck, 'B2 T1: prompt checkpoint at 270', h.generate('sg', g1, 3), g1, 3, None)
+    before = len(log_lines(h, 'sg: restored host image'))
+    g2 = SYS + tokens(30, 105)
+    r = done_ok(ck, 'B2 T2: checkpoint 270 < shared snapshot 300 -> resume at 300', h.generate('sg', g2, 4), g2, 4, 300)
+    loads = log_lines(h, 'sg: restored host image')[before:]
+    ck.eq('B2 T2: one host image restore (the shared snapshot only)', [l.split('restored host image at ')[1].split(' ')[0] for l in loads], ['300'])
+    ck.true('B3: done carries restore_ms', r['done'] is not None and isinstance(r['done'].get('restore_ms'), (int, float)) and r['done']['restore_ms'] >= 0, repr(r['done']))
+    ck.true('B3: request line carries restore_ms', any('restore_ms=' in l for l in log_lines(h, 'sg: prefill ')), '')
 
 
 def sc_parent_ckpt(h, ck):
@@ -971,8 +1007,9 @@ def sc_image_turns(h, ck, image_ckpt):
     ids2 = P + tokens(600, 153)  # the reply is not in the next prompt (reference drop_thinking): the live state cannot continue
     n0 = len(chunks(h, 'm'))
     done_ok(ck, 'M3 turn2 same image', h.generate('m', ids2, 5, [im1]), ids2, 5, 300 if image_ckpt else 0, [im1])
-    ck.eq('M3 turn2 chunks (image only inside the reused prefix -> text rules: tile 2 x 256)', new_chunks(h, 'm', n0),
-          [(512, 'on'), (88, 'on')] if image_ckpt else [(256, 'on')] * 3 + [(132, 'on')])
+    # image only inside the reused prefix -> text rules (tile 2 x 256); read from 0 -> the span's chunk is one max_chunk forward and the text
+    #   after it takes the tile cap (before 2026-10-21 every chunk of an image request was capped at max_chunk)
+    ck.eq('M3 turn2 chunks', new_chunks(h, 'm', n0), [(512, 'on'), (88, 'on')] if image_ckpt else [(256, 'on'), (512, 'on'), (132, 'on')])
     done_ok(ck, 'M3 turn3 image bytes changed -> no reuse', h.generate('m', ids2, 5, [im2]), ids2, 5, 0, [im2])
     im3 = image(len(ids2) + 20, 3, 3, 154)
     ids4 = ids2 + tokens(20, 155) + tokens(9, 156) + tokens(10, 157)
@@ -1048,6 +1085,7 @@ def run_round2(exe, td):
     h = Hived(exe, td, {**SHARE, 'HIVE_IMAGE_CKPT': '1'}, name='share')
     try:
         sc_share_cross(h, ck)
+        sc_restore_once(h, ck)
         sc_parent_ckpt(h, ck)
         sc_share_edit(h, ck)
         sc_share_image(h, ck)

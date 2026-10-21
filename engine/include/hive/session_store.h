@@ -289,7 +289,7 @@ class SessionStore {
     std::lock_guard<std::mutex> lk(im_);
     return {{"dir", dir_}, {"ckpts", ckpt_.size()}, {"snaps", snaps_.size()}, {"bytes", disk_bytes_}, {"budget", budget_},
             {"writes", st_.writes}, {"write_fail", st_.write_fail}, {"loads", st_.loads}, {"load_fail", st_.load_fail},
-            {"evicted", st_.evicted}, {"written", st_.written}, {"queue", queued_.load()}, {"canary", !canary_.file.empty()}};
+            {"evicted", st_.evicted}, {"written", st_.written}, {"queue", queued_.load()}, {"canary", !canary_.file.empty()}, {"known", known_.size()}};
   }
   // Waits until the writer is idle (tests and the flush op).
   void drain() { std::unique_lock<std::mutex> lk(qm_); idle_cv_.wait(lk, [&] { return q_.empty() && !busy_; }); }
@@ -370,6 +370,22 @@ class SessionStore {
     gc_packs();
     for (auto& [id, n] : pack_bytes_) disk_bytes_ += (size_t)std::max(0LL, n);
   }
+  // Entries of known_ whose allocation is gone can never match again (find checks owner.expired()), but they were erased only when their
+  //   pack was dropped, and packs live as long as any stored entry refers to them — so known_ (and the shared_ptr control blocks its weak
+  //   references keep, ~170 B per entry) grew with every segment ever written. Each write examines twice the entries it added, resuming where
+  //   the previous write stopped and wrapping around, and erases the expired ones (live entries are never touched).
+  // Bound: a write adding k entries examines 2k, so a full pass over N entries takes at most N/2k writes that add at most N/2 — every entry
+  //   already expired when a pass starts is gone when it ends, and the map stays within about twice the live entries plus one pass of expiries.
+  const uint8_t* prune_from_ = nullptr;
+  void prune_known(size_t budget) {  // under im_
+    if (known_.empty()) return;
+    auto it = known_.lower_bound(prune_from_);
+    for (size_t n = 0, end = std::min(budget, known_.size()); n < end; ++n) {
+      if (it == known_.end()) it = known_.begin();
+      it = it->second.owner.expired() ? known_.erase(it) : std::next(it);
+    }
+    prune_from_ = it == known_.end() ? nullptr : it->first;
+  }
   void gc_packs() {  // under im_ (or before the writer starts)
     std::set<uint64_t> used;
     for (auto& [k, m] : ckpt_) used.insert(m.packs.begin(), m.packs.end());
@@ -438,6 +454,7 @@ class SessionStore {
     std::lock_guard<std::mutex> lk(im_);
     if (ar.fresh) { pack_bytes_[pack] = (long long)ar.off; disk_bytes_ += ar.off; }
     for (auto& [owner, r] : ar.made) known_[owner.get()] = {owner, r};
+    prune_known(2 * ar.made.size());
     Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"];
     collect_packs(ar.out, e.packs); if (!logit_ref.empty()) e.packs.insert(pack);
     if (j.kind == "ckpt") ckpt_[j.name] = e; else if (j.kind == "snap") snaps_[j.key] = e; else canary_ = e;

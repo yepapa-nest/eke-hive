@@ -22,6 +22,8 @@ COMMON=r'''
 #include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <random>
+#include <set>
 using namespace hive;
 using json=nlohmann::json;
 SocketWriter* output;
@@ -42,9 +44,33 @@ int main(){
  a.segments.clear(); assert(b.segments[0].data.get()[0]==42);
  int allocations=0,frees=0;
  auto pool=std::make_shared<HostImagePool>(128,[&](size_t n){++allocations;return new uint8_t[n];},[&](uint8_t* p){++frees;delete[] p;});
- {auto x=pool->acquire(64);}assert(pool->cached_bytes()==64);
- {auto x=pool->acquire(64);assert(allocations==1);auto y=pool->acquire(129);}assert(frees==1);
- auto survivor=pool->acquire(64);pool.reset();assert(frees==1);survivor.reset();assert(frees==2);
+ // a size is cached only when the last two saves (epochs) both acquired it
+ {auto x=pool->acquire(64);pool->end_epoch();}assert(pool->cached_bytes()==0&&frees==1);   // one save: not recurring, freed
+ {auto x=pool->acquire(64);pool->end_epoch();}assert(pool->cached_bytes()==64&&frees==1);  // second save: recurring, cached
+ {auto x=pool->acquire(64);assert(allocations==2);auto y=pool->acquire(129);pool->end_epoch();}assert(frees==2);  // reused; 129 > limit freed
+ {auto x=pool->acquire(32);pool->end_epoch();}assert(pool->cached_bytes()==0&&frees==4);  // a save without 64: its bin is emptied, 32 not recurring
+ auto survivor=pool->acquire(64);pool.reset();assert(frees==4);survivor.reset();assert(frees==5);  // the last block keeps the pool alive
+ {  // sessions taking turns: three sessions save in rotation, each save = fixed-size pieces (ring, MTP ring, compressor state) + a delta of a
+    //   new size; a session's previous image is released after its next save. Fixed sizes must stay cached and reused, deltas never cached.
+  long al=0,fr=0; std::set<size_t> fixed{4096,1024,256};
+  auto pp=std::make_shared<HostImagePool>(1<<20,[&](size_t n){++al;return new uint8_t[n];},[&](uint8_t* p){++fr;delete[] p;});
+  std::vector<std::vector<std::shared_ptr<uint8_t>>> held(3);
+  std::mt19937 rng(3); long fixed_allocs_late=0;
+  for(int save=0;save<300;++save){
+   const int s=save%3; std::vector<std::shared_ptr<uint8_t>> img;
+   const long a0=al;
+   for(size_t n:fixed) for(int k=0;k<4;++k) img.push_back(pp->acquire(n));
+   const long fixed_new=al-a0;
+   img.push_back(pp->acquire(5000+save*7+rng()%5));  // delta: a new size every save
+   pp->end_epoch();
+   held[s].swap(img);  // the session's previous image is released here
+   img.clear();
+   if(save>=6) fixed_allocs_late+=fixed_new;
+   assert(pp->cached_bytes()<=4*(4096+1024+256));  // only fixed pieces are ever cached (at most one image's worth waiting)
+  }
+  assert(fixed_allocs_late==0);  // after warm-up every fixed piece came from the cache
+  held.clear(); pp.reset(); assert(al==fr);
+ }
  int slow[2],fast[2]; assert(socketpair(AF_UNIX,SOCK_STREAM,0,slow)==0); assert(socketpair(AF_UNIX,SOCK_STREAM,0,fast)==0);
  int small=4096; setsockopt(slow[0],SOL_SOCKET,SO_SNDBUF,&small,sizeof(small));
  SocketWriter w; w.add(slow[0]);w.add(fast[0]);
