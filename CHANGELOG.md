@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Session RAM accounting no longer slows decoding as conversations pile up**: the host budget total (`host_total`, also the stats'
+  `host_session_bytes`) walked every kept image and put every segment into one set to count shared prefixes once. An image is
+  thousands of segments (median 5,994, p90 8,466 on the DeepSeek service), and the walk ran on the engine thread once a second while
+  decoding and several times per request. After 39 h (1,649 boundary snapshots, 111 evicted sessions) it took 3.1 s of a 13 s profile:
+  ~15 ms of idle engine time per decode step, 13–175-token follow-up prefills taking 3–4 s, single-stream decode down to ~24 tok/s.
+  A ledger (`hive/host_ledger.h`) now keeps each image's metadata and each segment's holder count and only reads the images that
+  appeared or went away since the last pass — the same total (`tests/test_host_ledger_cpu.cpp` checks it against the full walk), no
+  image kept alive longer. 2,000 images / 400K segments: 139 ms per walk → 0.3 ms per pass. Its own RAM follows the live segments
+  (~117 MB for 3.85M). After the restart the same short request decoded at 76–81 tok/s instead of 42.6, and a 22-token prefill took
+  ~200 ms instead of 666.
+
+- **No absurd time left while a prompt is read** (`HIVE_STAGE_STATUS`): a new 92,706-token read that took 24.7 s was shown about
+  222 minutes left at 8,037 tokens (DeepSeek service, 2026-10-19). The kept fit had a negative cost at position 0 (a = -0.00037 s,
+  b = 1.37e-8): the old check only looked at the chunks' mid positions, and the slope had been bent by 1–8-row tail chunks (4–32 ms
+  per token against 0.2–0.3 for whole chunks), by a slower tail-layer chunk after a long one and by reads resuming 98K–300K tokens deep.
+  Now a fit is used and kept only if a > 0, b >= 0 and it predicts its chunks' total time within ±50 % (else the read's own average
+  speed with the kept slope); chunks under 1,024 tokens stay out of the fit; a read whose reused prefix is over a quarter of its end
+  position does not replace the kept fit; `prefill-rate.json` stores the chunks it came from and is ignored at start unless it passes
+  the same check (the old file has no chunks and is dropped); and a time left implying a speed 8x below the slowest (or above the
+  fastest) whole chunk measured is reported as null, which clients hide. Replaying that day's reads: 23.2 s left at 8,037 tokens
+  (22.3 s really left; the old code gave 12,891 s).
+
 - **Gemma prefill GEMM, K split across a thread-block cluster**: the 17–192-row int4 GEMM was bound by L2 traffic (weights re-read per
   16-token block, activations per 64-row block); the default kernel now gives each of the 8 K-split ranks its own block of a cluster, so
   one staged activation tile feeds 128 rows and the weights are read once, and sums the ranks' partials in rank order — outputs

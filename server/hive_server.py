@@ -1735,23 +1735,68 @@ async def models():
 #   key when it sends one (a room keeps its key when its system text changes; the session also hashes that text), else the session.
 #   The last fit is kept next to the daemon socket (prefill-rate.json) so a restarted server has it before the first
 #   chunk of the first request ends (measured 2026-10-15 GLM: no time left for the first 25 s after a restart without it).
+#   A fit is used and kept only when it is sane (prefill_cost_ok): positive from position 0 on and close to the chunk times it came from;
+#   the file holds those chunks so a restarted server checks it the same way. A time left that implies a speed far outside the measured
+#   whole-chunk speeds is not shown (null) — see stage_prefill.
 STAGE_STATUS = env_on("HIVE_STAGE_STATUS")
 STAGE_KEEP_S = 120.0
 STAGES: dict = {}
 STAGE_SEEN: OrderedDict = OrderedDict()  # conversations this server has served (LRU)
 STAGE_SEEN_CAP = 4096
 STAGE_FIT_MIN = 16384  # tokens a request must have read before its fitted cost becomes the prior for later requests
-PREFILL_COST: dict = {"a": None, "b": None}  # seconds per prompt token = a + b * position (prior from the last long read)
+# A read whose reused prefix is more than this fraction of its end position does not replace the prior: its cost at position 0 is
+#   an extrapolation from deep positions (measured 2026-10-19 DeepSeek: 199,510-token reads resuming at 98,304 fitted a = -0.00072 s).
+STAGE_PRIOR_BASE = 0.25
+# Chunks shorter than this are mostly fixed per-chunk cost, not a cost per position: measured 2026-10-19 DeepSeek, the 1–8-row tail
+#   chunks of a read took 25–182 ms (4–32 ms per token) against 0.2–0.3 ms per token for the 17K–98K-row chunks before them, and a fit
+#   through them gave a negative a (a 19,809-token read: a = -0.033 s, b = 3.3e-6). They stay out of the fit and of the speed bounds.
+FIT_CHUNK_MIN = 1024
+FIT_TOL = 0.5  # an accepted fit predicts the total time of the chunks it was fitted on within ±50 %
+# The time left is hidden (null) when it implies an average speed this many times below the slowest (or above the fastest) whole
+#   chunk measured — this request's chunks, before its first one the prior's. Measured 2026-10-19 DeepSeek: a 92,706-token read
+#   (24.7 s, chunks at 4,150 and 1,148 tok/s) was shown "222 minutes left" at 8,037 tokens (6.6 tok/s implied) from a prior with a < 0.
+ETA_SANE = 8.0
+PREFILL_COST: dict = {"a": None, "b": None, "chunks": None}  # seconds per prompt token = a + b * position (prior from the last long read)
 PREFILL_RATE_FILE: str | None = None
 
 
+def fit_chunks(chunks: list) -> list:
+    """The chunks a fit and the speed bounds use: those of at least FIT_CHUNK_MIN tokens (all of them when none is that long)."""
+    big = [c for c in chunks if c[0] >= FIT_CHUNK_MIN]
+    return big or list(chunks)
+
+
+def prefill_cost_ok(a, b, chunks) -> bool:
+    """A cost a + b * position (seconds per token) is used and kept only if it is positive from position 0 on (a > 0, b >= 0) and
+    predicts the total time of the chunks it was fitted on ((tokens, mid position, seconds) each) within ±FIT_TOL.
+    Measured 2026-10-19 DeepSeek: a fit with a = -0.00037, b = 1.37e-8 passed the old check (positive at the chunks' mid positions)
+    and, kept as the prior, gave a new 92,706-token read 222 minutes left at 8,037 tokens (it took 24.7 s in all)."""
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(a) and math.isfinite(b) and a > 0 and b >= 0) or not chunks:
+        return False
+    t_all = sum(t for n, m, t in chunks)
+    pred = sum(n * (a + b * m) for n, m, t in chunks)
+    return t_all > 0 and abs(pred - t_all) <= FIT_TOL * t_all
+
+
+def prior_cost() -> tuple | None:
+    a, b = PREFILL_COST["a"], PREFILL_COST["b"]
+    return (a, b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) and a > 0 and b >= 0 else None
+
+
 def prefill_rate_load(path: str) -> None:
+    """The fit kept by the last server (prefill-rate.json: a, b and the chunks it was fitted on); ignored unless prefill_cost_ok
+    accepts it on those chunks (a file without chunks, written before the check existed, is ignored too)."""
     global PREFILL_RATE_FILE
     PREFILL_RATE_FILE = path
     try:
         d = json.load(open(path))
-        if isinstance(d.get("a"), (int, float)) and d["a"] > 0 and isinstance(d.get("b"), (int, float)) and d["b"] >= 0:
-            PREFILL_COST.update(a=float(d["a"]), b=float(d["b"]))
+        chunks = [tuple(float(x) for x in c) for c in d.get("chunks") or []]
+        if all(len(c) == 3 and c[0] > 0 and c[2] > 0 for c in chunks) and prefill_cost_ok(d.get("a"), d.get("b"), chunks):
+            PREFILL_COST.update(a=float(d["a"]), b=float(d["b"]), chunks=chunks)
     except Exception:  # noqa: BLE001 — no file yet / unreadable: learnt again from the first long read
         pass
 
@@ -1762,7 +1807,8 @@ def prefill_rate_save() -> None:
     try:
         tmp = PREFILL_RATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"a": PREFILL_COST["a"], "b": PREFILL_COST["b"], "at": round(time.time())}, f)
+            json.dump({"a": PREFILL_COST["a"], "b": PREFILL_COST["b"], "chunks": [list(c) for c in PREFILL_COST["chunks"] or []],
+                       "at": round(time.time())}, f)
         os.replace(tmp, PREFILL_RATE_FILE)
     except Exception:  # noqa: BLE001 — display aid only
         pass
@@ -1783,27 +1829,43 @@ def stage_open(rid: str, prompt_tokens: int, session: str | None = None) -> None
 
 
 def prefill_fit(chunks: list, prior_b: float | None, min_span: float = 0.0) -> tuple:
-    """Seconds per prompt token = a + b * position, fitted to the chunks read so far ((tokens, mid position, seconds) each) by least
-    squares on the chunk times. The cost grows with the position (attention over everything before it): measured 2026-10-15, 27B
-    227K tokens read at 4,376 tok/s near the start and 1,088 near the end, so the last chunk's rate alone predicted half the real
-    time. One chunk, chunks spanning less than min_span positions, or a fit that is not positive over the read keep the prior slope
-    and fit the level only — a slope from a narrow stretch swings wildly (measured 2026-10-15, 27B with 2,048-row chunks: the time
-    left jumped to 756 s and 425 s within the first 10 % of a 114 s read)."""
-    if len(chunks) >= 2 and chunks[-1][1] - chunks[0][1] >= min_span:
-        s11 = sum(n * n for n, m, t in chunks); s12 = sum(n * n * m for n, m, t in chunks); s22 = sum((n * m) ** 2 for n, m, t in chunks)
-        t1 = sum(n * t for n, m, t in chunks); t2 = sum(n * m * t for n, m, t in chunks)
+    """Seconds per prompt token = a + b * position, fitted to the chunks read so far ((tokens, mid position, seconds) each, the position
+    absolute — reused prefix included, as the time left is summed from base + done to base + total) by least squares on the chunk
+    times. The cost grows with the position (attention over everything before it): measured 2026-10-15, 27B 227K tokens read at
+    4,376 tok/s near the start and 1,088 near the end, so the last chunk's rate alone predicted half the real time. Chunks shorter than
+    FIT_CHUNK_MIN are left out (fit_chunks). One chunk, chunks spanning less than min_span positions, or a fit prefill_cost_ok rejects
+    keep the prior slope and fit the level only (the request's own average speed) — a slope from a narrow stretch swings wildly
+    (measured 2026-10-15, 27B with 2,048-row chunks: the time left jumped to 756 s and 425 s within the first 10 % of a 114 s read),
+    and a slope through chunks of different kinds is not a cost per position (measured 2026-10-19 DeepSeek, a 92,706-token read: an
+    89,305-row chunk at 4,150 tok/s, then a 3,399-row chunk with the tail layers at 1,148 tok/s fitted a = -0.00037)."""
+    use = fit_chunks(chunks)
+    if len(use) >= 2 and use[-1][1] - use[0][1] >= min_span:
+        s11 = sum(n * n for n, m, t in use); s12 = sum(n * n * m for n, m, t in use); s22 = sum((n * m) ** 2 for n, m, t in use)
+        t1 = sum(n * t for n, m, t in use); t2 = sum(n * m * t for n, m, t in use)
         det = s11 * s22 - s12 * s12
         if det > 1e-9 * s11 * s22:
             a, b = (t1 * s22 - t2 * s12) / det, (s11 * t2 - s12 * t1) / det
-            last = chunks[-1][1]
-            if b >= 0 and a + b * last > 0 and a + b * chunks[0][1] > 0:
+            if prefill_cost_ok(a, b, use):
                 return a, b
-    n_all = sum(n for n, m, t in chunks); t_all = sum(t for n, m, t in chunks); nm = sum(n * m for n, m, t in chunks)
-    b = prior_b or 0.0
+    n_all = sum(n for n, m, t in use); t_all = sum(t for n, m, t in use); nm = sum(n * m for n, m, t in use)
+    b = prior_b if isinstance(prior_b, (int, float)) and prior_b >= 0 else 0.0
     a = (t_all - b * nm) / n_all
     if a <= 0:
         a, b = t_all / n_all, 0.0
     return a, b
+
+
+def prefill_eta_sane(p0: int, p1: int, eta: float, chunks: list | None) -> bool:
+    """False when a time left of eta seconds for positions p0..p1 implies an average speed more than ETA_SANE times below the slowest
+    (or above the fastest) of the whole chunks given (tok/s each, chunks of at least FIT_CHUNK_MIN tokens). No such chunk, or less than
+    FIT_CHUNK_MIN tokens left (mostly the fixed cost of the last chunks): nothing to compare, True."""
+    speeds = [n / t for n, m, t in chunks or () if n >= FIT_CHUNK_MIN and t > 0]
+    left = p1 - p0
+    if not speeds or left < FIT_CHUNK_MIN:
+        return True
+    if eta <= 0:
+        return False
+    return min(speeds) / ETA_SANE <= left / eta <= max(speeds) * ETA_SANE
 
 
 def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | None = None, partial: bool = False) -> None:
@@ -1812,14 +1874,16 @@ def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | N
     prefill_rate = the current speed (tok/s at the position reached), prefill_eta_s = the fitted cost summed over what is left.
     Only whole chunks feed the fit: a layer fraction is not a position (all rows of a chunk advance together), and fitting those points
     swung the slope — measured 2026-10-15 GLM 250K, time left 997 s for a moment inside the first chunk instead of ~85 s. A partial point
-    moves the shown progress (and, before any fit exists, gives the level: the chunk's own speed so far)."""
+    moves the shown progress (and, before any fit exists, gives the level: the chunk's own speed so far).
+    A time left that prefill_eta_sane rejects (against this request's whole chunks, before its first one the prior's) is reported as
+    null with the rate: clients hide it then."""
     st = STAGES.get(rid)
     if st is None:
         return
     now = time.time()
     if total is not None:
         st.update(stage="prefill", cached_tokens=cached or 0, prefill_total=total, prefill_done=0, _t_last=now, _done_last=0, _chunks=[])
-        cost = (PREFILL_COST["a"], PREFILL_COST["b"]) if PREFILL_COST["a"] else None
+        cost = prior_cost()
     else:
         if st.get("stage") != "prefill":
             return
@@ -1838,26 +1902,31 @@ def stage_prefill(rid: str, done: int, total: int | None = None, cached: int | N
             st.update(prefill_done=done, _t_last=now, _done_last=done)
             # the prior fit (the last long read) until this request has read STAGE_FIT_MIN tokens; then its own chunks, with a new slope
             #   only once they span a quarter of the whole read (prefill_fit min_span)
-            prior = (PREFILL_COST["a"], PREFILL_COST["b"]) if PREFILL_COST["a"] else None
+            prior = prior_cost()
             if prior and done < STAGE_FIT_MIN:
                 cost = prior
             else:
                 span = 0.25 * int(st.get("prefill_total") or 0)
-                cost = prefill_fit(st["_chunks"], PREFILL_COST["b"], span) if st["_chunks"] else st.get("_cost")
-            if cost and cost is not prior and done >= STAGE_FIT_MIN:
-                PREFILL_COST.update(a=cost[0], b=cost[1])
+                cost = prefill_fit(st["_chunks"], prior[1] if prior else None, span) if st["_chunks"] else st.get("_cost")
+            # it becomes the prior once STAGE_FIT_MIN tokens are read, if it is sane on the chunks it came from and the read started
+            #   near position 0 (STAGE_PRIOR_BASE)
+            use = fit_chunks(st["_chunks"])
+            if (cost and cost is not prior and done >= STAGE_FIT_MIN and base <= STAGE_PRIOR_BASE * (base + done)
+                    and prefill_cost_ok(cost[0], cost[1], use)):
+                PREFILL_COST.update(a=cost[0], b=cost[1], chunks=use)
                 prefill_rate_save()
             st["_cost"] = cost
     if total is not None:
         st["_cost"] = cost
     p0 = int(st.get("cached_tokens") or 0) + int(st.get("prefill_done") or 0)
     p1 = int(st.get("cached_tokens") or 0) + int(st.get("prefill_total") or 0)
+    st["prefill_rate"] = st["prefill_eta_s"] = None
     if cost:
         a, b = cost
-        st["prefill_rate"] = round(1.0 / (a + b * p0)) if a + b * p0 > 0 else None
-        st["prefill_eta_s"] = round(max(0.0, a * (p1 - p0) + b * (p1 * p1 - p0 * p0) / 2.0), 1)
-    else:
-        st["prefill_rate"] = st["prefill_eta_s"] = None
+        eta = max(0.0, a * (p1 - p0) + b * (p1 * p1 - p0 * p0) / 2.0)
+        if prefill_eta_sane(p0, p1, eta, st.get("_chunks") or PREFILL_COST["chunks"]):
+            st["prefill_rate"] = round(1.0 / (a + b * p0)) if a + b * p0 > 0 else None
+            st["prefill_eta_s"] = round(eta, 1)
     st["updated"] = round(now, 3)
 
 

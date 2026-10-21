@@ -403,6 +403,136 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         finally:
             s.time.time = saved_time; s.PREFILL_COST.update(saved_cost)
 
+    # The long reads (16,384+ tokens) a DeepSeek service did between two restarts, 2026-10-19 13:33–18:12, from its daemon log:
+    #   (chunk start, chunk end, ms) absolute positions — the first start is the reused prefix. Short reads in between are left out
+    #   (they never replace the prior). Reads 2, 3, 6 and 9 resume deep in a long conversation; most reads end with 1–8-row tail chunks.
+    DAY_READS = (
+        ((0, 98304, 17966), (98304, 195073, 20124), (195073, 197285, 1071), (197285, 199497, 1242), (199497, 199505, 181), (199505, 199508, 97)),
+        ((98304, 195075, 20132), (195075, 197287, 1096), (197287, 199499, 1234), (199499, 199507, 182), (199507, 199510, 98)),
+        ((98304, 195078, 20201), (195078, 197290, 1041), (197290, 199502, 1207), (199502, 199510, 175), (199510, 199513, 95)),
+        ((0, 19806, 5561), (19806, 19807, 32), (19807, 19809, 67)),
+        ((0, 22757, 5827), (22757, 22758, 25), (22758, 22760, 58)),
+        ((145683, 179699, 8572), (179699, 179747, 361), (179747, 179750, 75)),
+        ((0, 17170, 5057), (17170, 17173, 80)),
+        ((0, 23034, 5702), (23034, 23037, 102)),
+        ((302975, 340418, 10931), (340418, 342070, 2517), (342070, 342073, 103)),
+        ((0, 20878, 5505), (20878, 20880, 80)),
+        ((0, 89305, 21520), (89305, 92704, 2962), (92704, 92706, 78)),   # 18:12, a new conversation: 24.7 s in all
+    )
+
+    async def test_prefill_eta_after_a_day_of_reads(self):
+        """The 2026-10-19 bug: after the reads above the kept fit was a = -0.00037, b = 1.37e-8 (a < 0 passed the old check, which only
+        looked at the chunks' mid positions; tail chunks and deep resumed reads bent the slope), and the 18:12 read of 92,706 tokens
+        (24.7 s) was told ~215 minutes left at 8,037 tokens (222 on screen). Now every kept prior is sane and that point gets about 22 s left."""
+        s.STAGE_STATUS = True
+        saved_time, saved_cost = s.time.time, dict(s.PREFILL_COST)
+        clock = [1000.0]
+        s.time.time = lambda: clock[0]
+        try:
+            s.PREFILL_COST.update(a=None, b=None, chunks=None)
+            for i, read in enumerate(self.DAY_READS):
+                cached, total = read[0][0], read[-1][1]
+                rid, t0 = f'day{i}', clock[0]
+                s.stage_open(rid, total, f'conv-day{i}'); s.stage_prefill(rid, 0, total=total - cached, cached=cached)
+                if i == len(self.DAY_READS) - 1:                                  # the 18:12 read: a point inside its first chunk
+                    start, end, ms = read[0]
+                    dt = ms / 1000 * 8037 / (end - start)
+                    clock[0] += dt; s.stage_prefill(rid, 8037, partial=True)
+                    eta = s.STAGES[rid]['prefill_eta_s']
+                    left = sum(ms for _, _, ms in read) / 1000 - dt                   # 22.3 s really left
+                    self.assertIsNotNone(eta)
+                    self.assertAlmostEqual(eta, left, delta=0.25 * left)
+                    self.assertAlmostEqual(dt + eta, 24.7, delta=0.25 * 24.7)
+                    clock[0] = t0
+                before = dict(s.PREFILL_COST)
+                for start, end, ms in read:
+                    clock[0] += ms / 1000; s.stage_prefill(rid, end - cached)
+                    if s.PREFILL_COST['a'] is not None:                         # every kept prior is sane on its own chunks
+                        self.assertTrue(s.prefill_cost_ok(s.PREFILL_COST['a'], s.PREFILL_COST['b'], s.PREFILL_COST['chunks']))
+                if cached:                                                        # deep resumed reads never replace the prior
+                    self.assertEqual(s.PREFILL_COST, before)
+            self.assertGreater(s.PREFILL_COST['a'], 0); self.assertGreaterEqual(s.PREFILL_COST['b'], 0)
+        finally:
+            s.time.time = saved_time; s.PREFILL_COST.update(saved_cost)
+
+    def test_prefill_fit_rejects_the_bent_slopes(self):
+        """The fits that went wrong on 2026-10-19: tail chunks (1–8 rows, 4–32 ms per token) and a slower tail-layer chunk after a long
+        one gave a < 0; deep resumed reads gave a < 0 too. Now the slope is checked (prefill_cost_ok) and the level is the read's own."""
+        def chunks(read):
+            return [(e - b, b + (e - b) / 2.0, ms / 1000) for b, e, ms in read]
+        for read in (self.DAY_READS[1], self.DAY_READS[3], self.DAY_READS[-1]):   # old fits: a = -0.00072, -0.033, -0.00037
+            ch = chunks(read)
+            a, b = s.prefill_fit(ch, None, 0.25 * (read[-1][1] - read[0][0]))
+            self.assertGreater(a, 0); self.assertGreaterEqual(b, 0)
+            self.assertTrue(s.prefill_cost_ok(a, b, s.fit_chunks(ch)))
+            t = sum(c[2] for c in ch)
+            self.assertAlmostEqual(sum(n * (a + b * m) for n, m, _ in ch), t, delta=0.1 * t)
+        self.assertFalse(s.prefill_cost_ok(-0.00037066, 1.3719e-08, chunks(self.DAY_READS[-1])))
+        self.assertFalse(s.prefill_cost_ok(1e-3, 0.0, chunks(self.DAY_READS[-1])))         # ~4x the measured time
+        self.assertFalse(s.prefill_cost_ok(1e-4, -1e-9, chunks(self.DAY_READS[-1])))
+        self.assertFalse(s.prefill_cost_ok(2.6e-4, 0.0, []))
+
+    def test_prefill_rate_load_checks_the_file(self):
+        """A kept fit is loaded only when it is sane on the chunks stored with it: the file the 2026-10-19 service kept (a < 0, no
+        chunks), a file without chunks and one that does not reproduce its chunks are ignored."""
+        saved_cost = dict(s.PREFILL_COST)
+        good = [[20878, 10439.0, 5.505]]
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                f = os.path.join(d, 'prefill-rate.json')
+                for bad in ({'a': -0.0003706596098990203, 'b': 1.371871275846038e-08, 'at': 1792401148},
+                            {'a': 2.6e-4, 'b': 2.6e-10},                                          # sane numbers, no chunks to check
+                            {'a': 2.6e-3, 'b': 2.6e-10, 'chunks': good},                          # 10x the measured time
+                            {'a': 2.6e-4, 'b': 2.6e-10, 'chunks': [[20878, 10439.0]]}):          # malformed chunk
+                    with open(f, 'w') as fh: json.dump(bad, fh)
+                    s.PREFILL_COST.update(a=None, b=None, chunks=None)
+                    s.prefill_rate_load(f)
+                    self.assertIsNone(s.PREFILL_COST['a'], repr(bad))
+                    self.assertIsNone(s.prior_cost())
+                with open(f, 'w') as fh: json.dump({'a': 2.6e-4, 'b': 2.6e-10, 'chunks': good}, fh)
+                s.prefill_rate_load(f)
+                self.assertEqual((s.PREFILL_COST['a'], s.PREFILL_COST['b']), (2.6e-4, 2.6e-10))
+                self.assertEqual(s.PREFILL_COST['chunks'], [(20878.0, 10439.0, 5.505)])
+        finally:
+            s.PREFILL_COST.update(saved_cost); s.PREFILL_RATE_FILE = None
+
+    async def test_partial_eta_null_when_implausible(self):
+        """Inside the first chunk the time left comes from the prior. A prior with a < 0 (what the 2026-10-19 server held in memory before
+        the 18:12 read: a = -0.0395, b = 3.8e-6 → 12,891 s left at 8,037 of 92,706) is not used: the chunk's own speed is. A sane prior
+        that extrapolates far past what it measured (a steep slope from a 33K read, applied to a 1M read) gives a speed more than
+        ETA_SANE times below its slowest chunk: the time left is null (clients hide it) until this read's own chunks give a sane one."""
+        s.STAGE_STATUS = True
+        saved_time, saved_cost = s.time.time, dict(s.PREFILL_COST)
+        clock = [1000.0]
+        s.time.time = lambda: clock[0]
+        try:
+            s.PREFILL_COST.update(a=-0.03946884546421123, b=3.806161524202415e-06, chunks=None)
+            s.stage_open('n1', 92706, 'convn1'); s.stage_prefill('n1', 0, total=92706, cached=0)
+            st = s.STAGES['n1']
+            self.assertIsNone(st['prefill_eta_s'])
+            clock[0] += 1.937; s.stage_prefill('n1', 8037, partial=True)            # 89,305 rows in 21.52 s
+            self.assertAlmostEqual(st['prefill_eta_s'], (92706 - 8037) * 1.937 / 8037, delta=0.5)   # ~20 s, the chunk's own pace
+
+            steep = [(16384, 8192.0, 4.096), (16384, 24576.0, 8.192)]                 # 4,000 then 2,000 tok/s
+            a, b = s.prefill_fit(steep, None)
+            self.assertTrue(s.prefill_cost_ok(a, b, steep))
+            s.PREFILL_COST.update(a=a, b=b, chunks=steep)
+            s.stage_open('n2', 50000, 'convn2'); s.stage_prefill('n2', 0, total=50000, cached=0)
+            self.assertIsNotNone(s.STAGES['n2']['prefill_eta_s'])                    # a read like the measured one: shown
+            s.stage_open('n3', 1000000, 'convn3'); s.stage_prefill('n3', 0, total=1000000, cached=0)
+            st = s.STAGES['n3']
+            self.assertIsNone(st['prefill_eta_s']); self.assertIsNone(st['prefill_rate'])   # 7,755 s = 129 tok/s implied
+            clock[0] += 2.0; s.stage_prefill('n3', 8000, partial=True)
+            self.assertIsNone(st['prefill_eta_s'])
+            A, B = 6e-4, 1e-10                                                      # its own chunks, ~1,600 tok/s falling slowly
+            true = lambda p0, p1: A * (p1 - p0) + B * (p1 * p1 - p0 * p0) / 2
+            for done in range(65536, 327681, 65536):
+                clock[0] += true(done - 65536, done) - (2.0 if done == 65536 else 0); s.stage_prefill('n3', done)
+            self.assertIsNotNone(st['prefill_eta_s'])                               # shown again, from its own fit
+            self.assertAlmostEqual(st['prefill_eta_s'], true(327680, 1000000), delta=0.02 * true(327680, 1000000))
+        finally:
+            s.time.time = saved_time; s.PREFILL_COST.update(saved_cost)
+
     async def test_prerender_scheduled_on_final_answers_only(self):
         """HIVE_TURN_PRERENDER hook: both paths hand the generated text to schedule_prerender when the turn ends with an answer, never for
         a tool call (the turn goes on)."""

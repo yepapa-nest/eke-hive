@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace hive {
@@ -45,6 +46,11 @@ class HostImagePool : public std::enable_shared_from_this<HostImagePool> {
   }
 };
 
+// Optional observer of allocated_bytes walks: when set, every segment a walk visits (deduplicated or not) is appended
+//   as (data, bytes). Used by HostLedger (hive/host_ledger.h) to learn an image's segments through each family's own
+//   allocated_bytes, so no family needs a second walker. Engine-thread only; null outside that collection.
+inline thread_local std::vector<std::pair<const void*, size_t>>* segment_sink = nullptr;
+
 // Immutable completed-prefix segments. Only the new suffix is transferred; no
 // CPU memcpy of the old prefix and no mutable sharing between snapshots.
 struct HostImageBuffer {
@@ -62,7 +68,10 @@ struct HostImageBuffer {
   }
   size_t allocated_bytes(std::set<const void*>& seen) const {
     size_t n = segments.capacity() * sizeof(Segment);
-    for (auto& s : segments) if (seen.insert(s.data.get()).second) n += s.n;
+    for (auto& s : segments) {
+      if (segment_sink) segment_sink->emplace_back(s.data.get(), s.n);
+      if (seen.insert(s.data.get()).second) n += s.n;
+    }
     return n;
   }
 };

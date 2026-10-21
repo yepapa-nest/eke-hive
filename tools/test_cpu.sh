@@ -12,6 +12,7 @@ trap 'rm -rf "$HIVE_TEST_BUILD_DIR"' EXIT
 python3 tools/test_cache_cpu.py
 python3 tools/test_cache_replay_cpu.py
 python3 tools/test_host_cpu.py
+T=$(mktemp -d)/host_ledger; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_host_ledger_cpu.cpp -o "$T" && "$T"  # hived host_total ledger == full deduplicating walk (shared prefixes, repeats, drops, address reuse), no image kept alive, pass cost
 T=$(mktemp -d)/grouped_plan; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_grouped_plan_cpu.cpp -o "$T" && "$T"  # grouped prefill plan (slot/release invariants)
 T=$(mktemp -d)/prefill_split; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_prefill_split_cpu.cpp -o "$T" && "$T"  # HIVE_PREFILL_SPLIT=balance cost model (cold start, limits, convergence)
 T=$(mktemp -d)/decode_split; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_decode_split_cpu.cpp -o "$T" && "$T"  # HIVE_DECODE_SPLIT=balance cost model (table, cold start, verify back-off, exhaustive minimum, synthetic world)

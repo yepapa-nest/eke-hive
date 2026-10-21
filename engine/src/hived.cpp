@@ -53,6 +53,7 @@
 #include "hive/cache_reserve.h"
 #include "hive/clock.h"
 #include "hive/engram_hash.h"
+#include "hive/host_ledger.h"
 #include "hive/mtp_gate.h"
 #include "hive/sampler.h"
 #include "hive/socket_writer.h"
@@ -209,17 +210,18 @@ struct Session {
   std::vector<ImgSig> ckpt_sig, live_sig;
   struct Frame { std::shared_ptr<SeqImage> image; std::vector<float> logits; std::vector<ImgSig> sig; };
   std::deque<Frame> history;
-  size_t host_bytes(std::set<const void*>& seen) const {
+  // Host bytes outside the images (the images themselves are counted once each by HostLedger — see host_total)
+  size_t host_bytes() const {
     size_t n = tokens.capacity() * sizeof(int32_t) + ckpt_logits.capacity() * sizeof(float);
     if (seq) n += seq->tokens.capacity()*sizeof(int32_t) + seq->engram_history.capacity()*sizeof(int64_t);
     n += (img_sig.capacity() + ckpt_sig.capacity() + live_sig.capacity()) * sizeof(ImgSig);
-    if (ckpt) n += ckpt->allocated_bytes(seen);
-    if (live) n += live->allocated_bytes(seen);
-    for (const auto& f : history) {
-      n += sizeof(Frame) + f.logits.capacity() * sizeof(float) + f.sig.capacity() * sizeof(ImgSig);
-      if (f.image) n += f.image->allocated_bytes(seen);
-    }
+    for (const auto& f : history) n += sizeof(Frame) + f.logits.capacity() * sizeof(float) + f.sig.capacity() * sizeof(ImgSig);
     return n;
+  }
+  template <class F> void each_image(F&& f) const {
+    f(ckpt);
+    f(live);
+    for (const auto& h : history) f(h.image);
   }
 };
 
@@ -856,13 +858,18 @@ int main(int argc, char** argv) {
   std::map<uint64_t, SharedSnap> shared_snaps;  // prefix hash -> boundary snapshot (shared by all sessions; reclaimed under the same budget in the same recency order)
   long shared_hits = 0, shared_saves = 0;
   size_t host_peak_bytes = 0;
+  // Images (and the segments they share) counted incrementally — the full walk this replaced grew with every kept image and ran on
+  //   this thread once a second while decoding (measurements in hive/host_ledger.h)
+  hive::HostLedger<SeqImage> host_ledger;
   auto host_total = [&](const SeqImage* transient = nullptr) {
-    std::set<const void*> seen;
     size_t n = rt.snapshot_pool_cached_bytes();
-    for (const auto& [id, s] : sessions) n += s.host_bytes(seen);
-    for (const auto& [id, s] : archived) n += s.host_bytes(seen);
-    for (const auto& [key, e] : shared_snaps) n += sizeof(e) + e.sig.capacity() * sizeof(Session::ImgSig) + (e.image ? e.image->allocated_bytes(seen) : 0);
-    if (transient) n += transient->allocated_bytes(seen);
+    host_ledger.begin();
+    const auto visit = [&](const std::shared_ptr<SeqImage>& img) { host_ledger.visit(img); };
+    for (const auto& [id, s] : sessions) { n += s.host_bytes(); s.each_image(visit); }
+    for (const auto& [id, s] : archived) { n += s.host_bytes(); s.each_image(visit); }
+    for (const auto& [key, e] : shared_snaps) { n += sizeof(e) + e.sig.capacity() * sizeof(Session::ImgSig); visit(e.image); }
+    n += host_ledger.end();
+    if (transient) n += host_ledger.extra(transient);
     host_peak_bytes = std::max(host_peak_bytes, n);
     return n;
   };
