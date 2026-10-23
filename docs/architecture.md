@@ -133,8 +133,10 @@ The checkpoint's three MTP stages are loaded as layers 40–42, sharing the expe
 2. **Sync**: for every processed position the MTP stages update their own KV rings.
 3. **Draft**: one pass over a block of positions produces draft tokens and a confidence per draft.
 4. **Gate**: drafts are verified only when the measured cost table (cost per number of verify rows) and the
-   observed acceptance rate predict a gain (`HIVE_MTP_GATE2/3`). At short context a single decode step is cheap
-   enough that drafting rarely pays; at long context it does.
+   observed acceptance rate predict a gain (`HIVE_MTP_GATE2/3`). A cell of the cost table is only updated when its
+   row count is chosen, so stale cells are re-measured once per window — when every verify cell is stale, when the
+   next larger one is, and when T(2) is stale beside a fresher larger cell — so that a cold first sample cannot lock
+   speculation out for the life of the process.
 5. **Verify**: `[token, d1..dk]` run as rows of one decode-path forward (`HIVE_MTP_VERIFY2`), giving per-row logits.
 6. **Accept**: row *i*'s sample from the target distribution is compared with draft *i+1*; on a mismatch the
    sample is the correction token. Every emitted token is drawn from the target distribution, so the output
@@ -308,6 +310,67 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   resume from it while a block that never repeats costs nothing.
 - **Cache flush.** `POST /flush_cache` drops all reusable prompt state in the daemon (refused while a request is
   decoding); benchmarks call it between runs so every axis starts cold.
+- **Session cache location.** `GET /v1/hive/cache?key=…` says where each conversation's reusable state is, and
+  `POST /v1/hive/cache/load` reads a conversation that is only on disk back into RAM ahead of its next turn (see
+  [Session cache location](#session-cache-location) below).
+
+### Session cache location
+
+A conversation's reusable state can be in one of three tiers, and the next turn's cost depends on which:
+
+| Tier | What it is | `tokens` | `bytes` |
+| --- | --- | --- | --- |
+| `vram` | The session holds a pooled sequence whose KV is its token history (sequence present, not broken, position = token count) | The length of that history (prompt + the output fed back so far) | `0` — the device KV comes from the session pool reserved at start-up and is not attributed per session |
+| `ram` | Host images of the session: its prompt-end checkpoint, the last state captured when it left the pool, history frames. A resident session whose sequence was offloaded (sleep level 2), or an archived session | The furthest image position | The images' host bytes, segments shared between them counted once |
+| `ssd` | The session's prompt checkpoint in the session store (`HIVE_SESSION_STORE`) | The checkpoint position | The byte ranges a load reads (including ranges shared with other stored entries) |
+| `none` | Nothing reusable | `0` | `0` |
+
+`tokens` is an upper bound on what a next request reuses from that tier: the request reuses the common prefix of its
+prompt with that state, and the whole state only when the prompt extends it exactly (a template that drops the last
+answer's reasoning makes the next prompt diverge at the start of that answer — the prompt checkpoint, listed under
+`ram`/`ssd`, is the state that matches then). A session can be in several tiers at once (a resident session also keeps its
+checkpoint in RAM and on disk); the answer names the fastest one and lists every tier under `tiers`.
+
+Daemon (`hived` socket, one JSON line each way):
+
+```
+{"op":"where","sessions":["3f2c…","9a01…"]}
+→ {"ok":true,"sessions":{"3f2c…":{"where":"vram","tokens":120412,"bytes":0,
+                                   "tiers":{"vram":{"tokens":120412,"bytes":0},"ram":{"tokens":119870,"bytes":6123456789},
+                                            "ssd":{"tokens":119870,"bytes":6198765432}}},
+                         "9a01…":{"where":"none","tokens":0,"bytes":0,"tiers":{}}}}
+{"op":"load","session":"3f2c…"}
+→ {"ok":true,"session":"3f2c…","loaded":true,"read_ms":1180.4,"read_bytes":6198765432,"where":"ram","tokens":119870,"bytes":6198770000,"tiers":{…}}
+```
+
+- `where` is answered on the socket thread from a view the engine thread publishes with its statistics (at most a
+  second old; refreshed at once at every request end, prefill chunk, flush, sleep/wake and load) plus the store's
+  index — it never waits behind a request. A session being loaded carries `"loading": true`.
+- `load` reads the session's stored prompt checkpoint on a loader thread (nice +10, the same reader the request path
+  uses, with its own file descriptors), outside every lock, and hands the image to the engine thread, which attaches
+  it as an archived session at the top of its loop — the next request of that session revives it like any archived
+  session, without reading the disk. The reply comes once the image is attached, so during a long prefill it waits
+  for that forward to end. It answers `"loaded": false` with a `reason` and the current place when: the session is
+  already in VRAM or RAM (also when a request took it in while the read ran), there is no stored checkpoint or no
+  store, the stored image is larger than the whole `--host-session-mb` budget (not read), the read fails, or a flush
+  happened during the read. The host budget is then enforced by the usual least-recently-used reclaim, keeping the
+  loaded session (the newest). Two loads of one session read the disk once.
+- Asleep (any level) a load is still attached: archived state is host memory only, as for a flush or the level-2
+  offload while asleep. Nothing is moved from RAM to VRAM by either command; a request does that.
+
+API server: the daemon knows sessions, a client knows its conversations. The server records, for every request with a
+conversation key (`prompt_cache_key`, `session_id`, `X-Session-ID` or `user`), the key → the session its latest request ran
+under (the base session — not a `~k` auxiliary one), and keeps that table in `conv-sessions.json` next to the daemon
+socket (keys stored hashed, written on a timer thread at most every 2 s after a change, 4,096 most recent keys) so it
+survives a server restart as the stored checkpoints do. A key whose conversation changed its head (another first user
+message or system text) moves to the new session.
+
+| Endpoint | Answer |
+| --- | --- |
+| `GET /v1/hive/cache?key=K1&key=K2` | `{"sessions":[{"key":"K1","session":"3f2c…","where":"ssd","tokens":119870,"bytes":6198765432,"tiers":{…}},{"key":"K2","session":null,"where":"none","tokens":0,"bytes":0,"tiers":{}}]}` — one daemon `where` for all known keys; unknown keys answer `session: null`, `none` |
+| `POST /v1/hive/cache/load` `{"key":"K1"}` | The daemon's `load` answer with `key` (`loaded`, `where`, `tokens`, `bytes`, `tiers`, `reason`, `read_ms`); an unknown key answers `session: null`, `none`, `loaded: false`; no key: 400. Still loading after `HIVE_CACHE_LOAD_TIMEOUT_S` (120): 202 with the current place and `"loading": true` (the read continues; poll `GET`) |
+
+Both follow the other control endpoints: `HIVE_API_KEY` applies, 503 while the daemon socket is not there.
 
 ## GLM-5.3-Flash
 

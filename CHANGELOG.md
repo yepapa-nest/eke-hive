@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Speculation no longer locks itself out after a cold start (HIVE_MTP_GATE2)**: the first 2-row verifies after a start run cold
+  (29.7–79.8 ms while an ordinary step took 46.9 ms, a DeepSeek production deployment, 2026-10-22) and the measured cost of T(2) settled at 50.5 ms. Warm
+  2-row verifies take 22–30 ms against a 16–17 ms ordinary step, but at 50.5 ms the gate never chose k = 1 again, so T(2) was never
+  re-measured: high-confidence steps kept a larger verify slot fresh, which keeps the "every verify slot stale" re-measurement from firing,
+  and the stale-slot rule only covered slots larger than the chosen k. Thinking traffic at temperature 1 (mid confidence, where k = 1
+  decides) speculated on 23–29 % of its decode steps instead of ~97 %, and single-stream decode fell from ~80 to ~50 tok/s. A stale T(2)
+  beside a fresh larger slot is now re-measured once per kStale window on a step the table would not speculate on, and the daemon drafts
+  for that window even when the stale table says speculation cannot pay. Loss bound as the existing re-measurement: one 2-row verify per
+  512 decisions. The gate only decides how many drafts are verified — acceptance and sampling are unchanged (`test_mtp_gate_cpu` R2, with
+  the trap reproduced on the previous rule). The shared gate serves every family with `HIVE_MTP_GATE2=1`.
+- **`tools/bench_chat.py --effort / --temperature`**: the published numbers stay at thinking off and temperature 0 (the defaults); the
+  options measure the thinking traffic a chat client sends (e.g. `--effort low --temperature 1.0`), which the gate lockout above did not
+  show at the defaults.
+- **Where a conversation's cache is, and reading it back from disk ahead of time**: `GET /v1/hive/cache?key=…` answers, per client
+  conversation key, whether its reusable state is in VRAM (a pooled sequence), in RAM (host images: prompt checkpoint, last state, archived
+  session) or only in the session store on disk, with the tokens that tier can serve and its size; `POST /v1/hive/cache/load` reads a
+  stored prompt checkpoint into RAM as an archived session, so the next turn starts with a host restore instead of a disk read. The daemon
+  gains `{"op":"where"}` (answered on the socket thread from a published view — never behind a request) and `{"op":"load"}` (read on a
+  loader thread at nice +10 with the request path's reader, attached by the engine thread at the top of its loop, in any power state). The
+  server keeps conversation key → session in `conv-sessions.json` next to the daemon socket (hashed keys) so the answer survives a restart.
+  Nothing else changes: no field of a generate request or response, and the session store's layout and key are untouched
+  (`tools/test_cache_where_cpu.py`, `tools/test_cache_server_cpu.py`).
 - **The image placeholder written as text no longer fails the request**: a tool result or message that quoted the DeepSeek image
   placeholder (`<｜deepseek_image｜>`) as text made the reference encoding reject the prompt, and since the text stays in the history every
   later turn of that conversation failed with 400 (2026-10-21, a scheduled-job conversation whose tool output held the chat template

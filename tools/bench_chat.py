@@ -5,7 +5,8 @@
 
 Twelve different chat prompts (5 Korean explanations, 3 English explanations, 2 code, 2 creative — the kind of traffic the
 maintainers send), answers up to --max-tokens (600), temperature 0, thinking off (reasoning_effort none; GLM maps it to its lowest
-effort). Decode speed counts only the tokens after the first one over the time after the first token, so prompt processing is not
+effort) — the published numbers. --effort / --temperature switch to the thinking traffic of a chat client (thinking tokens count as
+decoded tokens). Decode speed counts only the tokens after the first one over the time after the first token, so prompt processing is not
 mixed in. Steps:
   c1: the twelve prompts one after another — total decode tokens / total decode time (also per kind), median per request, time to first token
   cN (N = 2, 4, 8, ...): N streams at once, each walking the prompt list from a different start — total tok/s over the wall time of the
@@ -36,13 +37,15 @@ P.add_argument("--out", default=os.path.join(os.environ.get("HIVE_STATE_DIR", "r
 P.add_argument("--max-tokens", type=int, default=600)
 P.add_argument("--conc", default="1,2,4,8,16,32", help="concurrency levels")
 P.add_argument("--long", default="17000,42000,54000", help="approximate prompt sizes in tokens for the long-prompt step ('' = skip)")
+P.add_argument("--effort", default="none", help="reasoning_effort of every request (none = thinking off, the published numbers; low / medium / high = the thinking traffic a chat client sends)")
+P.add_argument("--temperature", type=float, default=0.0, help="sampling temperature of every request (0 = greedy, the published numbers; chat clients usually send 1.0)")
 P.add_argument("--long-timeout", type=float, default=0, help="seconds; a long prompt with no first token by then is recorded as a timeout and the longer ones are not sent (0 = no cap; the published VRAM-size tables use 600 s)")
 A = P.parse_args()
 
 
 def stream(prompt, max_tokens, timeout=3600):
-    body = json.dumps({"model": "hive", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0,
-                       "reasoning_effort": "none", "stream": True, "stream_options": {"include_usage": True}}).encode()
+    body = json.dumps({"model": "hive", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": A.temperature,
+                       "reasoning_effort": A.effort, "stream": True, "stream_options": {"include_usage": True}}).encode()
     t0 = time.time(); first = None; n = 0; usage = None
     req = urllib.request.Request(A.base + "/v1/chat/completions", body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -65,7 +68,7 @@ def stream(prompt, max_tokens, timeout=3600):
             "prompt": (usage or {}).get("prompt_tokens")}
 
 
-res = {"name": A.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "max_tokens": A.max_tokens}
+res = {"name": A.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "max_tokens": A.max_tokens, "effort": A.effort, "temperature": A.temperature}
 for N in [int(x) for x in A.conc.split(",") if x.strip()]:
     out = []
     lock = threading.Lock()

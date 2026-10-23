@@ -22,7 +22,12 @@ Commands (the server started with the shipped configuration):
 ```bash
 python3 tools/bench_chat.py --name deepseek                                          # 1–32 streams, 17K / 42K / 54K prompts
 python3 tools/bench_chat.py --name glm --long 17000,42000,54000,100000,200000,250000   # GLM, up to 250K
+python3 tools/bench_chat.py --name deepseek-think --effort low --temperature 1.0 --conc 1,4 --long ""   # thinking traffic of a chat client
 ```
+
+The headline numbers use the defaults (thinking off, temperature 0). `--effort` / `--temperature` measure the thinking traffic a chat
+client sends; speculation decides differently there (mid-confidence drafts, where verifying one draft is what pays), so a regression
+can show on that axis and not on the headline one.
 
 Decode, tok/s in total (per stream), and time to first token, median (max) — GPU at its full 600 W, and with the board capped
 at 300 W (`nvidia-smi -pl 300`):

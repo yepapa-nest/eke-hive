@@ -2566,6 +2566,130 @@ async def stage_status(rid: str):
     return {"id": rid, **{k: v for k, v in st.items() if not k.startswith("_")}}
 
 
+# ---- session cache location (2026-10-22): where a conversation's reusable state is, and loading it from disk ahead of its next turn -----
+#   A client knows its conversations by its own key (conversation_key: prompt_cache_key, session_id, X-Session-ID, user); the daemon knows
+#   sessions (session_id_for: that key + the conversation's head). ConvSessions keeps key -> the session its latest request ran under, on
+#   disk next to the daemon socket (conv-sessions.json), so the answer survives a server restart as the daemon's stored checkpoints do.
+#   GET  /v1/hive/cache?key=K[&key=K2...] → {"sessions":[{"key","session","where","tokens","bytes","tiers"[,"loading"]}]} (hived op "where")
+#   POST /v1/hive/cache/load {"key":K}    → the same fields for that key + "loaded" (hived op "load": a stored checkpoint read into RAM)
+#   where: vram | ram | ssd | none (fastest tier holding state; tokens/bytes/tiers as defined in docs/architecture.md). A key this server has
+#   not seen answers session null, where none — the client then has nothing to reload and reads the conversation in by sending it.
+class ConvSessions:
+    """conv key -> (session, last seen). Keys are kept hashed (no client strings on disk). Bounded LRU (cap); written atomically, at most
+    every SAVE_DELAY_S after a change, on a timer thread (never on the event loop)."""
+
+    SAVE_DELAY_S = 2.0
+
+    def __init__(self, cap: int = 4096):
+        self.cap = cap
+        self.entries: OrderedDict = OrderedDict()  # hashed key -> (session, epoch s)
+        self.lock = threading.Lock()
+        self.path: str | None = None
+        self.timer: threading.Timer | None = None
+
+    @staticmethod
+    def _h(key: str) -> str:
+        return hashlib.sha256(("conv:" + key).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+    def load(self, path: str) -> None:
+        self.path = path
+        try:
+            d = json.load(open(path))
+            rows = [r for r in d.get("entries") or [] if isinstance(r, list) and len(r) == 3 and all(isinstance(x, str) for x in r[:2])]
+        except Exception:  # noqa: BLE001 — no file yet / unreadable: learnt again from the next requests
+            return
+        with self.lock:
+            for hk, sid, ts in sorted(rows, key=lambda r: r[2] if isinstance(r[2], (int, float)) else 0)[-self.cap:]:
+                self.entries[hk] = (sid, ts)
+
+    def note(self, key: str, session: str) -> None:
+        if not key or not session:
+            return
+        hk = self._h(key)
+        with self.lock:
+            changed = self.entries.get(hk, (None,))[0] != session
+            self.entries[hk] = (session, round(time.time()))
+            self.entries.move_to_end(hk)
+            while len(self.entries) > self.cap:
+                self.entries.popitem(last=False)
+            if changed and self.path and self.timer is None:
+                self.timer = threading.Timer(self.SAVE_DELAY_S, self.save)
+                self.timer.daemon = True
+                self.timer.start()
+
+    def get(self, key: str) -> str | None:
+        with self.lock:
+            e = self.entries.get(self._h(key))
+        return e[0] if e else None
+
+    def save(self) -> None:
+        with self.lock:
+            self.timer = None
+            rows = [[hk, sid, ts] for hk, (sid, ts) in self.entries.items()]
+            path = self.path
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"v": 1, "entries": rows}, f)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 — a lost write only costs the location of conversations not seen since the restart
+            pass
+
+
+CONV_SESSIONS = ConvSessions()
+CACHE_LOAD_TIMEOUT_S = float(os.environ.get("HIVE_CACHE_LOAD_TIMEOUT_S") or 120)
+_CACHE_NONE = {"where": "none", "tokens": 0, "bytes": 0, "tiers": {}}
+
+
+async def _cache_where(sessions: list[str]) -> dict:
+    if not sessions:
+        return {}
+    res = await asyncio.wait_for(DAEMON.control("where", sessions=sessions), timeout=10.0)
+    return res.get("sessions") or {} if isinstance(res, dict) else {}
+
+
+@app.get("/v1/hive/cache")
+async def cache_where(request: Request):
+    keys = [k for k in request.query_params.getlist("key") if k][:1024]
+    sids = {k: CONV_SESSIONS.get(k) for k in keys}
+    try:
+        found = await _cache_where(sorted({v for v in sids.values() if v}))
+    except (FileNotFoundError, ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
+        return JSONResponse({"ok": False, "state": "loading", "error": f"daemon not ready: {e}"}, status_code=503)
+    return {"sessions": [{"key": k, "session": sids[k], **(found.get(sids[k]) or _CACHE_NONE if sids[k] else _CACHE_NONE)} for k in keys]}
+
+
+@app.post("/v1/hive/cache/load")
+async def cache_load(request: Request):
+    body, bad = await read_body(request)
+    if bad is not None:
+        return bad
+    key = body.get("key")
+    if not isinstance(key, str) or not key:
+        return JSONResponse(_err("key (a conversation key) is required"), status_code=400)
+    sid = CONV_SESSIONS.get(key)
+    if not sid:
+        return {"key": key, "session": None, "loaded": False, "reason": "unknown key", **_CACHE_NONE}
+    try:
+        res = await asyncio.wait_for(DAEMON.control("load", session=sid), timeout=CACHE_LOAD_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        # the daemon keeps reading (a long conversation, or attached only after a long prefill ends): 202 with the place it has now
+        try:
+            now = (await _cache_where([sid])).get(sid) or _CACHE_NONE
+        except Exception:  # noqa: BLE001
+            now = _CACHE_NONE
+        return JSONResponse({"key": key, "session": sid, "loaded": False, "reason": "still loading", **now, "loading": True}, status_code=202)
+    except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
+        return JSONResponse({"ok": False, "state": "loading", "error": f"daemon not ready: {e}"}, status_code=503)
+    if not isinstance(res, dict) or res.get("error"):
+        err = res.get("error") if isinstance(res, dict) else "bad daemon reply"
+        return JSONResponse({"ok": False, "key": key, "session": sid, "error": err}, status_code=503 if "shutting down" in str(err) else 500)
+    res.pop("ok", None)
+    return {"key": key, **res}
+
+
 # HIVE_TURN_PRERENDER (default off): when a turn ends with a final answer, read the conversation ahead in the form its next request
 #   will have, so the next user message resumes right before itself.
 #   Why: the next request drops this turn's reasoning — the DeepSeek and Qwen templates remove reasoning before the last user message,
@@ -2611,14 +2735,22 @@ def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_
         isinstance(m, dict) and m.get("role") == "assistant" and (m.get("reasoning_content") or m.get("reasoning")) for m in messages[last_user + 1:])
     if not had_reasoning:
         return None
+    # A client that sends earlier turns' reasoning back keeps this turn's too: the next request is this conversation as it is plus the
+    #   answer with its reasoning (the template then decides what it renders — DeepSeek's reference encoding keeps it whenever the request
+    #   has tools). Dropping it here read ahead a prompt that client never sends (2026-10-22, a client replaying reasoning_content on
+    #   every turn): the snapshot went unused and the whole turn was read again in the background for nothing.
+    keeps = any(isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content") for m in messages[:last_user])
     hist = []
     for i, m in enumerate(messages):
         m = dict(m)
-        if i > last_user and m.get("role") == "assistant":
+        if i > last_user and m.get("role") == "assistant" and not keeps:
             m.pop("reasoning_content", None)
             m.pop("reasoning", None)
         hist.append(m)
-    hist.append({"role": "assistant", "content": parsed["content"]})
+    answer = {"role": "assistant", "content": parsed["content"]}
+    if keeps and parsed.get("reasoning_content"):
+        answer["reasoning_content"] = parsed["reasoning_content"]
+    hist.append(answer)
     pa, media_a = encode_prompt(hist + [{"role": "user", "content": "x"}], tools, thinking_mode, effort)
     pb, _ = encode_prompt(hist + [{"role": "user", "content": "y"}], tools, thinking_mode, effort)
     if media_a:
@@ -2845,6 +2977,8 @@ async def chat(request: Request):
             #   a generation-suffix hint stays (a free cut)
             prefix_extra = True
             hints = [h for h in hints if h <= seen_at or len(ids) - h <= GEN_TAIL_MAX]
+    if conv_key:  # session cache location: the conversation's session (the base one — the "~k" split below is per request, not the conversation's)
+        CONV_SESSIONS.note(conv_key, session)
     if INFLIGHT.get(session, 0) > 0:  # concurrent request in the same conversation (regenerate, two tabs, parallel bench) — separate session
         # B8: a per-request "~<uuid>" session would fill the daemon session pool and archived budget with single-use
         #   sessions and push real conversations out of the LRU. Use fixed per-conversation auxiliary slots (~1, ~2, ...,
@@ -3407,6 +3541,7 @@ def main():
     ARGS = VisionArgs(CFG)
     load_modules(a.ckpt)
     DAEMON = Daemon(a.sock)
+    CONV_SESSIONS.load(os.path.join(os.path.dirname(os.path.abspath(a.sock)), "conv-sessions.json"))
     if STAGE_STATUS:
         prefill_rate_load(os.path.join(os.path.dirname(os.path.abspath(a.sock)), "prefill-rate.json"))
     import uvicorn

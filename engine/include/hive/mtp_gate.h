@@ -105,6 +105,16 @@ struct Gate {
     return any && clock - probe_at > kStale;
   }
   mutable long probe_at = -(kStale + 1);  // decision time of the last re-measurement (written by choose_k)
+  // T(2) (the k = 1 verify) is not fresh while a larger verify slot is — is this a window where one re-measurement (k = 1) is allowed? probe_due covers "every verify
+  //   slot stale" and choose_k's larger-slot rule covers slots above the chosen k; neither reaches a stale T(2) while high-confidence steps keep a larger slot fresh
+  //   (measured 2026-10-22/23 on a DeepSeek production deployment: a cold first T(2) of 50.5 ms stayed in the table for the whole process — see choose_k and test_mtp_gate_cpu R2).
+  //   hived.cpp also drafts when this holds, since a stale inflated T(2) can make can_profit false.
+  bool small_probe_due() const {
+    if (n[2] == 0 || fresh(2) || clock - small_probe_at <= kStale) return false;   // never measured: vcost(2) comes from the measured slots (no cold sample to clear)
+    for (int m = 3; m <= kMaxRows; ++m) if (fresh(m)) return true;
+    return false;
+  }
+  mutable long small_probe_at = -(kStale + 1);  // decision time of the last re-measurement of a stale T(2) (written by choose_k)
   mutable long reprobe_at = -(kStale + 1);  // decision time of the last re-measurement of a stale larger verify slot (choose_k)
   double p_accept(bool sampled, float c) const {
     const int b = bucket(c), s = sampled ? 1 : 0;
@@ -142,6 +152,17 @@ struct Gate {
     }
     if (k == 0 && n_drafts >= 1 && max_k >= 1 && remaining >= 1 && conf[0] >= conf_min && probe_due()) {
       probe_at = clock;
+      if (e_out) *e_out = 1.0 + p_accept(sampled, conf[0]);
+      if (ms_out) *ms_out = vcost(2);
+      return 1;
+    }
+    // Re-measurement of a stale T(2) while a larger verify slot is fresh — one per window, only on a step the table would not speculate on (k = 0). Measured 2026-10-22
+    //   (DeepSeek 96 GB production deployment, HIVE_TRACE_MTP): right after a start the first 2-row verifies took 29.7–79.8 ms (T(1) 46.9 ms, cold) and T(2) settled at 50.5 ms; then T(1)
+    //   was 16–17 ms and real 2-row verifies 22–30 ms (12k verifies 10-22..23), but k = 1 never won against 50.5 ms, so T(2) was never re-measured, while k = 5 on
+    //   high-confidence steps kept T(6) fresh (probe_due never fired). Thinking traffic at temperature 1 (mid confidence, where k = 1 decides) speculated on 23–29 % of
+    //   the steps instead of ~97 % and single-stream decode fell from ~80 to ~50 tok/s. Loss bound as probe_due: one 2-row verify per kStale decisions.
+    if (k == 0 && n_drafts >= 1 && max_k >= 1 && remaining >= 1 && conf[0] >= conf_min && small_probe_due()) {
+      small_probe_at = clock;
       if (e_out) *e_out = 1.0 + p_accept(sampled, conf[0]);
       if (ms_out) *ms_out = vcost(2);
       return 1;

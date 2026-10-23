@@ -109,6 +109,7 @@ Endpoints:
 | `POST /release_memory_occupation`, `POST /resume_memory_occupation` | Sleep / wake (below) |
 | `POST /flush_cache` | Drop cached prompt state (benchmarks); 400 while a request runs |
 | `GET /v1/hive/requests/{id}` | Engine-side stage of a request (only with `HIVE_STAGE_STATUS`, see [configuration](configuration.md)) |
+| `GET /v1/hive/cache`, `POST /v1/hive/cache/load` | Where a conversation's cache is (VRAM, RAM, disk) and reading it from disk into RAM ([architecture](architecture.md#session-cache-location)) |
 
 Reasoning (DeepSeek): thinking is on by default at effort 75 (the model's documented default, "high"). `reasoning_effort`
 accepts `none` (no thinking), `minimal` (25), `low` (50), `medium`/`high` (75), `xhigh`/`max` (100) or a number

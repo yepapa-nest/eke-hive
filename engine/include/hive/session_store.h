@@ -266,7 +266,7 @@ class SessionStore {
     enqueue(std::move(j));
   }
   bool has_canary() { std::lock_guard<std::mutex> lk(im_); return !canary_.file.empty(); }
-  std::unique_ptr<Loaded<Image>> load_canary() { std::string f; { std::lock_guard<std::mutex> lk(im_); f = canary_.file; } return load(f); }
+  std::unique_ptr<Loaded<Image>> load_canary() { std::string f; { std::lock_guard<std::mutex> lk(im_); f = canary_.file; } return load(f, fds_); }
   size_t entries() { std::lock_guard<std::mutex> lk(im_); return ckpt_.size() + snaps_.size(); }
   bool has_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); return ckpt_.count(sid) > 0; }
   // position and last token of a session's checkpoint on disk (-1 = none) — the caller checks the token before reading GBs
@@ -282,9 +282,24 @@ class SessionStore {
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
     return v;
   }
+  // Position and size of a session's stored checkpoint (pos -1 = none). bytes = every byte range the meta names (fields and logits) — what a
+  //   load reads, including the ranges it shares with other entries. Index only (no disk access): any thread.
+  struct CkptInfo { int64_t pos = -1; size_t bytes = 0; };
+  CkptInfo ckpt_info(const std::string& sid) {
+    std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid);
+    return it == ckpt_.end() ? CkptInfo{} : CkptInfo{it->second.pos, it->second.bytes};
+  }
   // ---- engine thread: load (reads the disk) ----
-  std::unique_ptr<Loaded<Image>> load_ckpt(const std::string& sid) { return load(meta_of("ckpt", sid)); }
-  std::unique_ptr<Loaded<Image>> load_snap(uint64_t key) { return load(meta_of("snap", hex16(key))); }
+  std::unique_ptr<Loaded<Image>> load_ckpt(const std::string& sid) { return load(meta_of("ckpt", sid), fds_); }
+  std::unique_ptr<Loaded<Image>> load_snap(uint64_t key) { return load(meta_of("snap", hex16(key)), fds_); }
+  // ---- any thread: the same checkpoint load with its own pack descriptors (hived's {"op":"load"} reads on a loader thread while the engine
+  //   thread may load through fds_) — opened for this load and closed after it ----
+  std::unique_ptr<Loaded<Image>> load_ckpt_detached(const std::string& sid) {
+    std::map<uint64_t, int> fds;
+    auto out = load(meta_of("ckpt", sid), fds);
+    for (auto& [id, fd] : fds) ::close(fd);
+    return out;
+  }
   json stats() {
     std::lock_guard<std::mutex> lk(im_);
     return {{"dir", dir_}, {"ckpts", ckpt_.size()}, {"snaps", snaps_.size()}, {"bytes", disk_bytes_}, {"budget", budget_},
@@ -312,7 +327,7 @@ class SessionStore {
 
  private:
   struct Job { std::string kind, name; uint64_t key = 0; std::shared_ptr<Image> image; std::vector<float> logits; std::vector<Sig> sig; bool upper_skipped = false; };
-  struct Meta { std::string file; int64_t pos = 0; int32_t last_tok = -1; double last_used = 0; std::set<uint64_t> packs; };
+  struct Meta { std::string file; int64_t pos = 0; int32_t last_tok = -1; double last_used = 0; std::set<uint64_t> packs; size_t bytes = 0; };  // bytes: in memory only (ckpt_info)
   std::string root_, dir_;
   size_t budget_;
   std::thread th_;
@@ -325,7 +340,7 @@ class SessionStore {
   std::map<uint64_t, long long> pack_bytes_;    // pack id -> size
   size_t disk_bytes_ = 0;
   std::map<const uint8_t*, typename WriteAr::Known> known_;
-  std::map<uint64_t, int> fds_;                 // engine thread only (load)
+  std::map<uint64_t, int> fds_;                 // engine thread only (load_ckpt / load_snap / load_canary; load_ckpt_detached has its own)
   uint64_t next_pack_ = 0;
   Stats st_;
 
@@ -343,6 +358,13 @@ class SessionStore {
     if (j.is_array() && j.size() == 4 && j[0].is_string() && j[3].is_string()) { out.insert(std::stoull(j[0].get<std::string>(), nullptr, 16)); return; }
     if (j.is_array() || j.is_object()) for (const auto& e : j) collect_packs(e, out);
   }
+  // Total length of the byte ranges in a meta's fields / logits (the same [pack, offset, length, hash] shape collect_packs reads).
+  static size_t range_bytes(const json& j) {
+    if (j.is_array() && j.size() == 4 && j[0].is_string() && j[3].is_string()) return j[2].is_number_unsigned() ? j[2].get<size_t>() : 0;
+    size_t n = 0;
+    if (j.is_array() || j.is_object()) for (const auto& e : j) n += range_bytes(e);
+    return n;
+  }
   // Start-up: drop temporary files, read the metas whose packs are all present, then drop packs nothing refers to.
   void scan() {
     for (const auto& sub : {"packs", "metas"})
@@ -359,6 +381,7 @@ class SessionStore {
       Meta e; e.file = path;
       try { e.pos = m.at("pos").get<int64_t>(); e.last_tok = m.at("last_tok").get<int32_t>(); e.last_used = m.at("last_used").get<double>(); } catch (...) { ::unlink(path.c_str()); continue; }
       collect_packs(m.at("fields"), e.packs); if (m.contains("logits")) collect_packs(m["logits"], e.packs);
+      e.bytes = range_bytes(m.at("fields")) + (m.contains("logits") ? range_bytes(m["logits"]) : 0);
       bool ok = true;
       for (uint64_t p : e.packs) if (!pack_bytes_.count(p)) ok = false;
       if (!ok) { ::unlink(path.c_str()); continue; }
@@ -457,6 +480,7 @@ class SessionStore {
     prune_known(2 * ar.made.size());
     Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"];
     collect_packs(ar.out, e.packs); if (!logit_ref.empty()) e.packs.insert(pack);
+    e.bytes = range_bytes(ar.out) + (logit_ref.empty() ? 0 : (size_t)logit_ref[0].len);
     if (j.kind == "ckpt") ckpt_[j.name] = e; else if (j.kind == "snap") snaps_[j.key] = e; else canary_ = e;
     gc_packs();  // a replaced checkpoint's packs that no entry refers to any more
     if (j.kind != "canary") { ++st_.writes; st_.written += ar.fresh; st_.write_ms += wall_ms() - t0; }  // the counters are conversation state
@@ -474,19 +498,19 @@ class SessionStore {
       gc_packs();
     }
   }
-  int pack_fd(uint64_t id) {
-    auto it = fds_.find(id);
-    if (it != fds_.end()) return it->second;
+  int pack_fd(uint64_t id, std::map<uint64_t, int>& fds) {
+    auto it = fds.find(id);
+    if (it != fds.end()) return it->second;
     const int fd = ::open(pack_path(id).c_str(), O_RDONLY);
-    if (fd >= 0) fds_[id] = fd;
+    if (fd >= 0) fds[id] = fd;
     return fd;
   }
-  std::unique_ptr<Loaded<Image>> load(const std::string& path) {
+  std::unique_ptr<Loaded<Image>> load(const std::string& path, std::map<uint64_t, int>& fds) {
     if (path.empty()) return nullptr;
-    try { return load_file(path); } catch (...) { std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr; }
+    try { return load_file(path, fds); } catch (...) { std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr; }
   }
-  std::unique_ptr<Loaded<Image>> load_file(const std::string& path) {
-    if (fds_.size() > 256) { for (auto& [id, fd] : fds_) ::close(fd); fds_.clear(); }
+  std::unique_ptr<Loaded<Image>> load_file(const std::string& path, std::map<uint64_t, int>& fds) {
+    if (fds.size() > 256) { for (auto& [id, fd] : fds) ::close(fd); fds.clear(); }
     const double t0 = wall_ms();
     auto fail = [&]() -> std::unique_ptr<Loaded<Image>> { std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr; };
     json m;
@@ -499,7 +523,7 @@ class SessionStore {
     std::vector<Job> jobs;
     bool fd_ok = true;
     auto read = [&](const Ref& r, uint8_t* dst) {
-      const int fd = pack_fd(r.pack);
+      const int fd = pack_fd(r.pack, fds);
       if (fd < 0) { fd_ok = false; return false; }
       jobs.push_back({r, dst, fd});
       return true;
@@ -537,7 +561,9 @@ class SessionStore {
     out->image->generation = 0xC0000000u | (++gen & 0x3FFFFFFFu);
     out->bytes = ar.bytes_read; out->ms = wall_ms() - t0;
     std::lock_guard<std::mutex> lk(im_);
-    for (auto& [p, r] : ar.loaded) known_[p.get()] = {p, r};
+    // only ranges whose pack is still on disk: the writer (budget eviction) or a clear may have dropped it while this read ran — a later save
+    //   must not refer to it (a load on the loader thread runs concurrently with both)
+    for (auto& [p, r] : ar.loaded) if (pack_bytes_.count(r.pack)) known_[p.get()] = {p, r};
     if (m.value("kind", "") != "canary") ++st_.loads;
     return out;
   }

@@ -1189,6 +1189,15 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             nids = s.TOK.encode(keep_all(nxt, None, 'thinking', None)[0])
             b = bounds[-1]
             self.assertEqual(ids[:b], nids[:b]); self.assertEqual(nids[b - 1], MARKERS['<|user|>'])
+            # a client that sends earlier turns' reasoning back (keeps it on every turn) sends this turn's too: the plan keeps it
+            kept = [{'role': 'system', 'content': self.SYS}, {'role': 'user', 'content': 'hello'},
+                    {'role': 'assistant', 'content': 'Hi.', 'reasoning_content': 'greet back'}, *msgs[1:]]
+            ids, bounds, _ = s.prerender_plan(kept, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            nxt_kept = [*kept, {'role': 'assistant', 'content': 'Added the semicolon.', 'reasoning_content': 'line 3 needs a semicolon'},
+                        {'role': 'user', 'content': 'thanks, run the tests'}]
+            nids = s.TOK.encode(keep_all(nxt_kept, None, 'thinking', None)[0])
+            b = bounds[-1]
+            self.assertEqual(ids[:b], nids[:b]); self.assertEqual(nids[b - 1], MARKERS['<|user|>'])
             s.encode_prompt = think_encode
             self.assertIsNone(s.prerender_plan(msgs[:2], None, 'thinking', None, 'Done.'))                       # no reasoning in the turn
             self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'again</think>[call]'))             # the turn goes on (a tool call)

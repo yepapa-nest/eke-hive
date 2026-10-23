@@ -22,6 +22,7 @@ echo '== TSAN: paced promotion H2D (E4 HIVE_DECODE_COPY_PRIO — dispatcher afte
 echo '== TSAN: snapshot fences + pinned pool matrix (+ skipped-fence negative control)'; $R python3 tools/test_snapshot_cpu.py
 echo '== TSAN: real hived.cpp daemon matrix'; $R python3 tools/test_daemon_cpu.py
 echo '== TSAN: server <-> daemon sessions'; $R python3 tools/test_server_session_cpu.py
+echo '== TSAN: session cache where/load (receiver + loader + engine threads)'; $R python3 tools/test_cache_where_cpu.py
 echo '== TSAN: sleep/wake (Z1 — real store release/restore on async fake streams + real hived state machine)'; HIVE_SLEEP_TESTS=store,daemon $R python3 tools/test_sleep_cpu.py
 echo '== TSAN negative control: daemon without snapshot-fence wait must be reported'
 HIVE_DAEMON_NEGATIVE=fence $R python3 tools/test_daemon_cpu.py | tail -1

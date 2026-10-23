@@ -305,7 +305,8 @@ int main() {
     const int k_old = brute_k(g, false, one, 5, -1.f, 100, true);
     const int k_new = g.choose_k(false, one.data(), 1, 5, -1.f, 100);
     EXPECT(k_old == 1, "scenario must reproduce the pre-F1 draft (old k %d)", k_old);
-    EXPECT(k_new == 0, "measured T2 %.1f > (1+p)·T1 — must not draft (got k %d)", g.vcost(2), k_new);
+    // R2: a stale T(2) beside a fresh larger slot is re-measured once per window (k = 1) — after that the measured T2 > (1+p)·T1 keeps it at k = 0
+    EXPECT(k_new == 1 && g.choose_k(false, one.data(), 1, 5, -1.f, 100) == 0, "measured T2 %.1f > (1+p)·T1 — one re-measure, then no draft (got k %d)", g.vcost(2), k_new);
     // the profit check uses the same cost: the old formula interpolates T2 = 38.5 -> "profitable" (backoff 8) ·
     // F1 says "hopeless" (backoff 32)
     const bool old_profit = old_can_profit(g, 5);
@@ -503,6 +504,38 @@ int main() {
     EXPECT(first2 >= 0 && first2 <= hive::mtpg::kStale + 2, "stale cold verify slot was never re-measured (first k >= 2 at %d)", first2);
     EXPECT(k2 > hive::mtpg::kStale, "after the re-measurement k >= 2 should dominate (%d)", k2);
     EXPECT(k2 < 3 * hive::mtpg::kStale - hive::mtpg::kStale + 2, "k >= 2 before the slot went stale (%d)", k2);
+  }
+  // (R2) cold first sample of the smallest verify slot while a larger one stays fresh (measured 2026-10-22/23, DeepSeek 96 GB production deployment, HIVE_TRACE_MTP): right after a
+  //   start the first 2-row verifies took 29.7–79.8 ms (T(1) 46.9 ms, cold) and T(2) settled at 50.5 ms. Afterwards T(1) was 16–17 ms and real 2-row verifies
+  //   22–30 ms, but k = 1 was never chosen again, so T(2) was never re-measured: high-confidence steps kept T(6) fresh (k = 5), so probe_due (every verify slot
+  //   stale) never fired, and R1 only re-measures larger slots. Thinking traffic (mid confidence, where k = 1 decides) speculated on 23–29 % of the steps instead of
+  //   ~97 % (10-15..17) and single-stream decode fell from ~80 to ~50 tok/s. The stale smallest slot must be re-measured once per kStale window — also before
+  //   drafting (hived.cpp drafts only if can_profit || probe_due || small_probe_due), since a stale inflated T(2) can make can_profit false.
+  {
+    hive::mtpg::Gate g;
+    g.observe_step(1, 46.9); g.observe_step(2, 50.5); g.observe_step(6, 60.0);   // cold start samples (trace values)
+    for (int i = 0; i < 30; ++i) g.observe_step(1, 17.0);                         // T(1) warms up within the first steps; T(2) keeps its cold value
+    float hi[5] = {8.f, 8.f, 8.f, 8.f, 8.f}, mid[5] = {2.5f, 0.8f, 0.3f, -0.5f, -1.f};
+    for (int i = 0; i < 6; ++i) g.observe_accept(true, hi, 5, 5);
+    int mid_n = 0, mid_k1 = 0, first1 = -1, mid_k1_late = 0, mid_late = 0;
+    for (long d = 0; d < 3 * hive::mtpg::kStale; ++d) {
+      g.tick();
+      g.observe_step(1, 17.0);
+      const bool is_hi = d % 4 == 0;
+      const float* c = is_hi ? hi : mid;
+      int k = 0;
+      if (g.can_profit(true, 5) || g.probe_due() || g.small_probe_due()) k = g.choose_k(true, c, 5, 5, -1.f, 1000);   // hived.cpp pre-draft condition
+      if (!is_hi) {
+        ++mid_n; if (k == 1) { ++mid_k1; if (first1 < 0) first1 = (int)d; }
+        if (d >= 2 * hive::mtpg::kStale) { ++mid_late; if (k == 1) ++mid_k1_late; }
+      }
+      if (k > 0) g.observe_step(k + 1, 22.0 + 5.5 * (k - 1));   // warm verify cost (trace: 2 rows 22.2 · 6 rows 44.7 ms)
+    }
+    fprintf(stderr, "[R2 stale cold smallest slot] first mid-confidence k = 1 at decision %d · %d of %d mid steps k = 1 (last third %d of %d)\n",
+            first1, mid_k1, mid_n, mid_k1_late, mid_late);
+    EXPECT(first1 < 0 || first1 > 100, "the trap is not reproduced: k = 1 already at decision %d (the cold T(2) should block it until it is stale)", first1);
+    EXPECT(first1 >= 0 && first1 <= hive::mtpg::kStale + 4, "stale cold smallest verify slot was never re-measured (first k = 1 at %d)", first1);
+    EXPECT(mid_late > 0 && mid_k1_late * 10 >= mid_late * 9, "after the re-measurement mid-confidence steps should speculate with k = 1 (%d of %d)", mid_k1_late, mid_late);
   }
   if (fails) { fprintf(stderr, "test_mtp_gate_cpu: %d FAILED\n", fails); return 1; }
   fprintf(stderr, "test_mtp_gate_cpu: all passed\n");

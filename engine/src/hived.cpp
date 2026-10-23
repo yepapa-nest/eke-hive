@@ -19,6 +19,12 @@
 //   {"op":"set","mtp_batch":1|0|-1} -> {"ok":true,"mtp_batch":v} — run-time HIVE_MTP_BATCH override (-1 = startup value; needs the verify decode path allocated at startup)
 //   {"op":"flush"} — drop every reusable prompt state (session tokens/checkpoints/history, archived sessions, shared boundary snapshots)
 //     when no request is decoding; replies {"ok":true,...} or {"error":"not idle",...}. The expert VRAM cache (weights) is kept.
+//   {"op":"where","sessions":["s1",...]} -> {"ok":true,"sessions":{"s1":{"where":"vram|ram|ssd|none","tokens":N,"bytes":B,"tiers":{...}[,"loading":true]}}}
+//     where a session's reusable state is, fastest tier first (answered on the receiver thread from a snapshot the engine thread publishes —
+//     never waits for a request; "tokens" / "bytes" / the tiers are defined at the "where / load" block below and in docs/architecture.md)
+//   {"op":"load","session":"s1"} -> {"ok":true,"session":"s1","loaded":true|false,"where":...,"tokens":N,"bytes":B[,"reason":...]}
+//     reads the session's stored prompt checkpoint (HIVE_SESSION_STORE) on a loader thread and attaches it as an archived (RAM) session; a
+//     session already in VRAM or RAM is left as it is and its place returned
 //   (optional) generate's "history":true — the conversation already has a turn (enables the long re-read boundary snapshot; HIVE_PREFIX_SHARE only).
 //   (optional) generate's "prefix_extra":N — per-request extra-chunk budget for boundary cuts (overrides HIVE_PREFIX_EXTRA_CHUNKS; HIVE_PREFIX_SHARE only).
 // Sessions: if a session's previous token sequence is a prefix of the new request, only the remainder is prefilled (conversation cache).
@@ -26,8 +32,10 @@
 #include <climits>
 #include <fcntl.h>
 #include <csignal>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -858,6 +866,14 @@ int main(int argc, char** argv) {
   struct Ctl { int fd; bool sleep; double deadline; int level; };
   std::deque<Ctl> ctl_q;
   std::vector<int> flush_q;  // {"op":"flush"} connections waiting for the engine thread (handled at the top of the loop, never mid-request)
+  // {"op":"load"} (the "where / load" block below): connections queued for the loader thread · images it read, waiting for the engine thread
+  //   to attach them (top of the loop, like flush) · sessions being loaded -> every connection waiting for that load (all under mu)
+  std::deque<std::pair<int, std::string>> load_q;
+  std::condition_variable load_cv;
+  struct LoadDone { std::string sid; std::shared_ptr<hive::store::Loaded<SeqImage>> img; uint64_t flush_gen; };
+  std::deque<LoadDone> attach_q;
+  std::map<std::string, std::vector<int>> load_waiting;
+  std::atomic<uint64_t> flush_gen{0};  // raised by every flush — a load read before it is not attached after it
   std::atomic<long> tot_routed{0}, tot_hit{0}, tot_cpu{0}, tot_streamed{0};  // decode totals (stats op)
   long draft_routed = 0, draft_hit = 0, draft_cpu = 0, draft_dma_rows = 0, decode_dma_rows = 0;
   double draft_ms = 0;
@@ -1148,11 +1164,88 @@ int main(int argc, char** argv) {
   std::mutex stats_mu;
   json stats_snapshot;
   double last_stats = 0;
+  // ---- where / load: where each session's reusable state is (2026-10-22: a per-conversation cache-location column with a manual reload in
+  //   the operator's console — a session in VRAM, in RAM or only on disk costs the next turn nothing, a short restore, or a disk read + restore).
+  //   Tiers, fastest first:
+  //     vram — the session holds a pooled sequence whose KV is its token history (seq present, not broken, pos == tokens): a request that
+  //            extends those tokens prefills only the rest. tokens = that history's length. bytes = 0: the device KV comes from the session
+  //            pool reserved at start-up and is not attributed per session.
+  //     ram  — host images of the session (prompt-end checkpoint, the last state captured at eviction, history frames): a resident session
+  //            whose sequence was offloaded (sleep level 2) or an archived one. tokens = the furthest image position. bytes = those images'
+  //            host bytes, shared segments counted once.
+  //     ssd  — the session's prompt checkpoint in the session store. tokens = its position. bytes = the byte ranges a load reads.
+  //   tokens is the most a next request can reuse from that tier: it reuses the common prefix of its prompt with that state (the whole state
+  //   only when the prompt extends it exactly). A session in several tiers reports the fastest one at the top and every tier under "tiers".
+  //   The engine thread publishes the vram/ram view with the stats (at most a second old — at once at every request end, prefill chunk,
+  //   flush, sleep/wake and load); the receiver thread answers {"op":"where"} from it and the store's index, so a long prefill never delays it.
+  struct Loc { int64_t vram_tokens = -1, ram_tokens = -1; size_t ram_bytes = 0; };
+  std::mutex loc_mu;
+  std::shared_ptr<const std::map<std::string, Loc>> loc_snapshot = std::make_shared<const std::map<std::string, Loc>>();
+  // per session: the images its ram bytes were computed for (weak — never keeps an image alive) — recomputed only when they change
+  struct LocBytes { std::vector<std::weak_ptr<SeqImage>> imgs; size_t bytes = 0; };
+  std::map<std::string, LocBytes> loc_bytes;
+  auto publish_locations = [&] {
+    auto m = std::make_shared<std::map<std::string, Loc>>();
+    auto ram_of = [&](const std::string& id, const Session& s, Loc& L) {
+      std::vector<std::shared_ptr<SeqImage>> v;
+      s.each_image([&](const std::shared_ptr<SeqImage>& p) { if (p) v.push_back(p); });
+      if (v.empty()) return;
+      auto& e = loc_bytes[id];
+      bool same = e.imgs.size() == v.size();
+      for (size_t k = 0; same && k < v.size(); ++k) same = !e.imgs[k].owner_before(v[k]) && !v[k].owner_before(e.imgs[k]);
+      if (!same) {
+        std::set<const void*> seen;
+        size_t b = 0;
+        for (const auto& p : v) b += p->allocated_bytes(seen);
+        e.imgs.assign(v.begin(), v.end());
+        e.bytes = b;
+      }
+      for (const auto& p : v) L.ram_tokens = std::max<int64_t>(L.ram_tokens, p->pos);
+      L.ram_bytes = e.bytes;
+    };
+    for (const auto& [id, s] : sessions) {
+      Loc L;
+      if (s.seq && !s.seq->broken && !s.tokens.empty() && s.seq->pos == (int64_t)s.tokens.size()) L.vram_tokens = (int64_t)s.tokens.size();
+      ram_of(id, s, L);
+      if (L.vram_tokens >= 0 || L.ram_tokens >= 0) m->emplace(id, L);
+    }
+    for (const auto& [id, s] : archived) {
+      Loc L;
+      ram_of(id, s, L);
+      if (L.ram_tokens >= 0) m->emplace(id, L);
+    }
+    for (auto it = loc_bytes.begin(); it != loc_bytes.end();) it = sessions.count(it->first) || archived.count(it->first) ? std::next(it) : loc_bytes.erase(it);
+    std::lock_guard<std::mutex> lk(loc_mu);
+    loc_snapshot = std::move(m);
+  };
+  // One session's place (any thread): the published vram/ram view, the store's index, and whether a load is running.
+  auto where_json = [&](const std::string& sid) -> json {
+    std::shared_ptr<const std::map<std::string, Loc>> snap;
+    { std::lock_guard<std::mutex> lk(loc_mu); snap = loc_snapshot; }
+    json tiers = json::object();
+    if (auto it = snap->find(sid); it != snap->end()) {
+      if (it->second.vram_tokens >= 0) tiers["vram"] = {{"tokens", it->second.vram_tokens}, {"bytes", 0}};
+      if (it->second.ram_tokens >= 0) tiers["ram"] = {{"tokens", it->second.ram_tokens}, {"bytes", it->second.ram_bytes}};
+    }
+    if (auto* ss = sstore_live.load()) {
+      const auto ci = ss->ckpt_info(sid);
+      if (ci.pos >= 0) tiers["ssd"] = {{"tokens", ci.pos}, {"bytes", ci.bytes}};
+    }
+    json out = {{"where", "none"}, {"tokens", 0}, {"bytes", 0}};
+    for (const char* t : {"vram", "ram", "ssd"})
+      if (tiers.contains(t)) { out = {{"where", t}, {"tokens", tiers[t]["tokens"]}, {"bytes", tiers[t]["bytes"]}}; break; }
+    out["tiers"] = std::move(tiers);
+    bool loading;
+    { std::lock_guard<std::mutex> lk(mu); loading = load_waiting.count(sid) > 0; }
+    if (loading) out["loading"] = true;
+    return out;
+  };
   // force = at each request end and prefill chunk (publishing only at the top of the loop dropped the last second of a finished request for
     //   the 30 s idle cv wait, and froze during long prefills). Otherwise throttled to once per second.
   auto publish_stats = [&](bool force = false) {
     if (!force && now_ms() - last_stats < 1000) return;
     last_stats = now_ms();
+    publish_locations();
     const auto cs = store.cache_stats();
     json s = {{"build_id", HIVE_BUILD_ID}, {"snapshot_ms", last_stats}, {"slots", store.n_slots()},
               {"resident", cs.resident}, {"unique_resident", cs.unique}, {"pending", cs.pending},
@@ -1358,6 +1451,17 @@ int main(int argc, char** argv) {
         finish_socket(fd); incoming.erase(fd);
         continue;
       }
+      if (op == "where") {  // {"sessions":[sid,...]} (or "session":sid) — answered here from the published view, never queued behind a request
+        json out = {{"ok", true}, {"sessions", json::object()}};
+        std::vector<std::string> ids;
+        if (j.contains("sessions") && j["sessions"].is_array())
+          for (const auto& v : j["sessions"]) if (v.is_string() && ids.size() < 4096) ids.push_back(v.get<std::string>());
+        if (j.contains("session") && j["session"].is_string()) ids.push_back(j["session"].get<std::string>());
+        for (const auto& id : ids) out["sessions"][id] = where_json(id);
+        send_json(fd, out);
+        finish_socket(fd); incoming.erase(fd);
+        continue;
+      }
       if (op == "set") {  // run-time switches (only the keys below; others are ignored, values absorbed: number → 1 if > 0, 0 if == 0, -1 if < 0 = startup value)
         json out = {{"ok", true}};
         if (j.contains("mtp_batch") && j["mtp_batch"].is_number()) {
@@ -1378,6 +1482,14 @@ int main(int argc, char** argv) {
       if (stop_state.load() != 0) {  // draining for graceful shutdown: no new generate (cancel and stats are still accepted)
         send_json(fd, {{"error", "daemon shutting down"}});
         finish_socket(fd); incoming.erase(fd);
+        continue;
+      }
+      if (op == "load") {  // {"session":sid} — read on the loader thread, attached by the engine thread; one reply line when done
+        const std::string sid = j.value("session", "");
+        if (sid.empty()) { send_json(fd, {{"error", "load needs a session"}}); finish_socket(fd); incoming.erase(fd); continue; }
+        { std::lock_guard<std::mutex> lk(mu); load_q.emplace_back(fd, sid); }
+        incoming.erase(fd);
+        load_cv.notify_one();
         continue;
       }
       // Sleep/wake: {"op":"sleep"[, "timeout_s":N]} · {"op":"wake"} — handled by the engine thread, which answers one line on this connection
@@ -1422,6 +1534,75 @@ int main(int argc, char** argv) {
       incoming.erase(fd);
       cv.notify_one();
       }
+    }
+  });
+
+  // {"op":"load"} loader thread: a stored prompt checkpoint is read here — off the engine thread and outside every lock (GBs for a long
+  //   conversation: the store reads ~6.5 GB/s on the reference disk, so a 7.5 GB image is over a second) — with the same reader the request path
+  //   uses (SessionStore::load_ckpt_detached = load_ckpt with its own pack descriptors), then handed to the engine thread, which attaches it as
+  //   an archived session at the top of its loop (handle_attach) exactly as an evicted session is kept: the next request of that session
+  //   revives it like any archived one (no disk read on the request path). Rules:
+  //   · a session already in VRAM or RAM is left as it is (its place is the answer) — also when the engine took it in while this read ran;
+  //   · two loads of one session read once (the second connection waits for the first's answer);
+  //   · an image larger than the whole host_session_mb budget is not read (attaching it would evict every other session and still not fit);
+  //     otherwise the budget is enforced by archive_trim's least-recently-used rule, keeping the loaded session (it is the newest);
+  //   · a flush during the read wins — the image is dropped (flush promises that nothing reusable is left);
+  //   · asleep (any level) the attach still happens: archived state is host memory only, the same as a flush or the level-2 offload does
+  //     while asleep, and wake does not touch it;
+  //   · the thread runs at nice +10 (its read threads inherit it): the read and its hash checks run beside the CPU expert pool.
+  std::thread loader([&] {
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10) != 0) {}  // best effort: a refused priority change keeps the default
+    using CkptInfo = hive::store::SessionStore<SeqImage>::CkptInfo;
+    for (;;) {
+      std::pair<int, std::string> job;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        load_cv.wait(lk, [&] { return !load_q.empty() || stop_state.load() == 3; });
+        if (load_q.empty()) return;
+        job = std::move(load_q.front());
+        load_q.pop_front();
+      }
+      const int fd = job.first;
+      const std::string& sid = job.second;
+      auto answer = [&](bool loaded, const char* reason) {
+        json o = {{"ok", true}, {"session", sid}, {"loaded", loaded}};
+        o.update(where_json(sid));
+        if (reason) o["reason"] = reason;
+        return o;
+      };
+      auto reply = [&](const std::vector<int>& fds, const json& o) { for (int f : fds) { send_json(f, o); finish_socket(f); } };
+      if (stop_state.load() != 0) { reply({fd}, {{"error", "daemon shutting down"}}); continue; }
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        if (auto w = load_waiting.find(sid); w != load_waiting.end()) { w->second.push_back(fd); continue; }
+      }
+      const std::string at = where_json(sid)["where"].get<std::string>();
+      if (at == "vram" || at == "ram") { reply({fd}, answer(false, "already in memory")); continue; }
+      auto* ss = sstore_live.load();
+      const CkptInfo ci = ss ? ss->ckpt_info(sid) : CkptInfo{};
+      if (ci.pos < 0) { reply({fd}, answer(false, ss ? "no stored checkpoint" : "no session store")); continue; }
+      if ((double)ci.bytes > std::max(0.0, host_session_mb) * 1048576.0) { reply({fd}, answer(false, "larger than the host session budget")); continue; }
+      { std::lock_guard<std::mutex> lk(mu); load_waiting[sid].push_back(fd); }
+      const uint64_t gen = flush_gen.load();
+      std::shared_ptr<hive::store::Loaded<SeqImage>> img(ss->load_ckpt_detached(sid));
+      if (!img) {
+        std::vector<int> fds;
+        { std::lock_guard<std::mutex> lk(mu); fds = std::move(load_waiting[sid]); load_waiting.erase(sid); }
+        fprintf(stderr, "[hived] load %.16s: the stored checkpoint could not be read (pos %lld)\n", sid.c_str(), (long long)ci.pos);
+        reply(fds, answer(false, "read failed"));
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        if (stop_state.load() == 0) attach_q.push_back({sid, std::move(img), gen});
+      }
+      if (img) {  // shutting down: the engine loop may be gone — answer here
+        std::vector<int> fds;
+        { std::lock_guard<std::mutex> lk(mu); fds = std::move(load_waiting[sid]); load_waiting.erase(sid); }
+        reply(fds, {{"error", "daemon shutting down"}});
+        continue;
+      }
+      cv.notify_all();
     }
   });
 
@@ -2962,7 +3143,7 @@ int main(int argc, char** argv) {
         //   accepted if it equals d_{i+1} (t' = d); otherwise t' is the next token (correction) — either way emitted tokens follow the target
         //   distribution p(.|prefix) (independent of the draft distribution, lossless). If all are accepted, row k's sample is a bonus.
     if (stepping.size() == 1 && rt.mtp_enabled() && mtp_max > 0 && stepping[0]->S->seq->mtp_hidden_valid && !fake_head &&
-        (mtp_gate2 ? gate2.known() && stepping[0]->g2.want() && (gate2.can_profit(stepping[0]->temperature > 0.f, mtp_max) || gate2.probe_due())
+        (mtp_gate2 ? gate2.known() && stepping[0]->g2.want() && (gate2.can_profit(stepping[0]->temperature > 0.f, mtp_max) || gate2.probe_due() || gate2.small_probe_due())
                    : stepping[0]->mtp_skip <= 0)) {  // gate 2: a regular step must be measured once (T(1)) before starting
       // If the table says "no prospect" (can_profit false — even the best learned acceptance gives E(k)/T(k+1) <= 1/T(1)) and it is not a
             //   re-measurement window, do not draft — the post-draft decision (choose_k) would be 0 anyway and only the draft cost D would be paid
@@ -3719,6 +3900,7 @@ int main(int argc, char** argv) {
     const size_t n_arch = archived.size(), n_snap = shared_snaps.size();
     {
       std::lock_guard<std::mutex> lk(mu);
+      flush_gen.fetch_add(1);  // a load still reading is dropped when it arrives (handle_attach)
       for (auto& [id, V] : sessions) {
         if (V.tokens.empty() && !V.ckpt && !V.live && V.history.empty()) continue;
         V.tokens.clear(); V.history.clear(); V.ckpt.reset(); V.live.reset();
@@ -3738,6 +3920,42 @@ int main(int argc, char** argv) {
     if (sstore) fr["stored"] = n_disk;
     for (int fd : fds) ctl_reply(fd, fr);
     publish_stats(true);
+  };
+  // {"op":"load"}: attach the images the loader thread read (rules at the loader). Host-side only, so it runs in every power state.
+  auto handle_attach = [&] {
+    std::deque<LoadDone> todo;
+    { std::lock_guard<std::mutex> lk(mu); todo.swap(attach_q); }
+    for (auto& d : todo) {
+      const char* reason = nullptr;
+      std::vector<int> fds;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        if (d.flush_gen != flush_gen.load()) reason = "flushed while reading";
+        else if (sessions.count(d.sid) || archived.count(d.sid)) reason = "already in memory";
+        else {
+          Session fresh;
+          fresh.ckpt = d.img->image;
+          fresh.ckpt_logits = std::move(d.img->logits);
+          fresh.ckpt_sig = from_store_sig(d.img->sig);
+          fresh.last_used = now_ms();
+          archived.emplace(d.sid, std::move(fresh));
+          archive_trim(d.sid);
+          publish_locations();  // before the session leaves load_waiting: a load queued behind this one must see it in RAM, not read it again
+        }
+        fds = std::move(load_waiting[d.sid]);
+        load_waiting.erase(d.sid);
+      }
+      const double read_ms = d.img->ms;
+      const size_t read_bytes = d.img->bytes;
+      fprintf(stderr, "[hived] load %.16s: stored checkpoint (pos %lld · %.2f GB read in %.0f ms) %s\n", d.sid.c_str(), (long long)d.img->image->pos,
+              read_bytes / 1073741824.0, read_ms, reason ? reason : "attached in RAM");
+      d.img.reset();  // not attached: dropped here (the image reaper frees large pieces off this thread)
+      publish_stats(true);  // the reply below reads the published view
+      json o = {{"ok", true}, {"session", d.sid}, {"loaded", reason == nullptr}, {"read_ms", read_ms}, {"read_bytes", read_bytes}};
+      o.update(where_json(d.sid));
+      if (reason) o["reason"] = reason;
+      for (int f : fds) ctl_reply(f, o);
+    }
   };
   auto handle_ctl = [&] {
     std::deque<Ctl> todo;
@@ -3818,6 +4036,13 @@ int main(int argc, char** argv) {
         std::vector<int> fl;
         { std::lock_guard<std::mutex> lk(mu); fl.swap(flush_q); }
         for (int fd : fl) ctl_reply(fd, {{"error", "daemon shutting down"}});
+        std::vector<int> lw;  // loads read but not attached: their waiters are told (the loader answers the jobs still queued)
+        {
+          std::lock_guard<std::mutex> lk(mu);
+          for (auto& d : attach_q) { for (int f : load_waiting[d.sid]) lw.push_back(f); load_waiting.erase(d.sid); }
+          attach_q.clear();
+        }
+        for (int fd : lw) ctl_reply(fd, {{"error", "daemon shutting down"}});
       }
       std::deque<Request> rejected;
       { std::lock_guard<std::mutex> lk(mu); rejected.swap(queue); }
@@ -3830,6 +4055,7 @@ int main(int argc, char** argv) {
     // sleep/wake (without control requests power is always ready — the two branches below are never taken)
     handle_ctl();
     handle_flush();  // {"op":"flush"}: refused while a request decodes; while asleep it clears host-side state only
+    handle_attach();  // {"op":"load"}: images the loader thread read — attached in every power state (host memory only)
     if (power.load() == kPowerDraining) {
       const double tn = now_ms();
       std::vector<int> late;
@@ -3856,7 +4082,7 @@ int main(int argc, char** argv) {
     if (power.load() == kPowerSleeping) {
       sweep_cancelled_queue();
       std::unique_lock<std::mutex> lk(mu);
-      cv.wait_for(lk, std::chrono::seconds(1), [&] { return !ctl_q.empty() || !flush_q.empty() || stop_state.load() != 0; });  // sweep cancelled queued requests every second
+      cv.wait_for(lk, std::chrono::seconds(1), [&] { return !ctl_q.empty() || !flush_q.empty() || !attach_q.empty() || stop_state.load() != 0; });  // sweep cancelled queued requests every second
       continue;
     }
     // 1) take a new request: wait if active is empty, otherwise take one and prefill it only if a seat (max_batch) is free
@@ -3864,7 +4090,7 @@ int main(int argc, char** argv) {
       Request r;
       bool got = false;
       std::unique_lock<std::mutex> lk(mu);
-      if (active.empty()) cv.wait_for(lk, std::chrono::seconds(30), [&] { return !queue.empty() || stop_state.load() != 0 || !ctl_q.empty() || !flush_q.empty(); });  // wake every 30 s for idle cleanup (vision encoder release)
+      if (active.empty()) cv.wait_for(lk, std::chrono::seconds(30), [&] { return !queue.empty() || stop_state.load() != 0 || !ctl_q.empty() || !flush_q.empty() || !attach_q.empty(); });  // wake every 30 s for idle cleanup (vision encoder release)
       if (!queue.empty() && (int)active.size() < max_batch && !sleep_asked.load()) {
         // Priority: the best-priority queued request first (FIFO among equals), and none below a running request's priority — its
         //   prefill would interrupt that request's decode (the decode_step rule holds it anyway). Without the field everything is 0: FIFO as before.
@@ -3896,9 +4122,11 @@ int main(int argc, char** argv) {
     //   messages are flushed (up to 2 s) -> remove the socket file -> exit 0.
     //   Runtime and store destructors are not run (_exit) — that path is not exercised in operation; the OS reclaims process memory and the device.
   if (power.load() != kPowerSleeping) save_cache_state();  // asleep means nothing is resident — keep the file written at sleep time
-  stop_state.store(3);
+  { std::lock_guard<std::mutex> lk(mu); stop_state.store(3); }
+  load_cv.notify_all();
   { const char b = 1; const ssize_t w = ::write(stop_pipe[1], &b, 1); (void)w; }
   acceptor.join();
+  loader.join();  // a read in progress finishes first (its waiters are answered by the loader)
   ::close(lfd);
   const bool flushed = writer.wait_idle(2000);
   ::unlink(sock_path.c_str());
