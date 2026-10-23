@@ -150,7 +150,7 @@ int main(){
  puts("decode CPU: injected host exception, quiescence boundary, session/fd/cancel cleanup OK");
 }
 '''
-ingress=src[src.index('  std::thread acceptor([&] {'):src.index('  // ---- processing loop')]
+ingress=src[src.index('  std::thread acceptor([&] {'):src.index('  // {"op":"load"} loader thread')]  # the loader thread (session store reads) stays outside this slice
 SERVER=r'''
 int main(int argc,char** argv){
  int lfd=socket(AF_UNIX,SOCK_STREAM,0);sockaddr_un a{};a.sun_family=AF_UNIX;strncpy(a.sun_path,argv[1],sizeof(a.sun_path)-1);
@@ -168,6 +168,9 @@ int main(int argc,char** argv){
  std::vector<int> flush_q;  // {"op":"flush"} connections (hived) — none are drained in this fixture
  std::atomic<int> g_mtp_batch_override{-1};  // {"op":"set","mtp_batch":...} run-time override (hived global — the engine thread is not part of this fixture)
  const size_t kMaxHeaderBytes=(size_t)64<<20,kMaxBinBytes=(size_t)1<<30;  // request size caps (hived, next to the listening socket)
+ // {"op":"where"} / {"op":"load"} (hived session cache lookup): no session store in this fixture — every session is "none", loads stay queued
+ auto where_json=[](const std::string&){return json{{"where","none"},{"tokens",0},{"bytes",0}};};
+ std::deque<std::pair<int,std::string>> load_q;std::condition_variable load_cv;
  auto now_ms=[]{return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();};
 '''+ingress+r'''
  acceptor.join();
