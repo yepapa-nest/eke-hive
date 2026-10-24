@@ -20,6 +20,8 @@ constexpr long kStale = 512;           // only slots measured within this many d
 constexpr double kPriorSlope = 0.151;  // per-row increment / T(1) when only one slot is measured (layer-chain measurement above)
 constexpr double kAlpha = 0.2;         // cost EMA
 constexpr double kPriorW = 4.0;        // weight of the acceptance prior (v1 table)
+constexpr long kFollow = 8;            // a re-measurement's follow-up verify (see follow_due) must come within this many decisions
+constexpr long kWarm = 16;             // decisions after a prefill whose cost samples are not fed to the table (see mark_cold)
 constexpr int kBuckets = 8;
 
 inline int bucket(float c) { return c < 0.f ? 0 : c < 1.f ? 1 : c < 2.f ? 2 : c < 3.f ? 3 : c < 4.f ? 4 : c < 5.f ? 5 : c < 7.f ? 6 : 7; }
@@ -35,12 +37,26 @@ struct Gate {
   double hit[2][kBuckets] = {}, tried[2][kBuckets] = {};
 
   void tick() { ++clock; }
+  // A prefill ran (hived.cpp: prefill_epoch changed — a new request's prompt, a layer-yield run of another one): the next kWarm decisions are cold and their
+  //   cost samples (steps, verifies, drafts) stay out of the table; decisions keep using the warm table. Measured 2026-10-24 (DeepSeek 96 GB production deployment,
+  //   600 W, HIVE_TRACE_MTP, 135 requests): by decision index after a request's start, 5–6-row verifies took 59–64 ms (1st–6th) · 52–55 (7th–10th) ·
+  //   ~48.5 (11th–14th) · 45 ms from the 15th on; 2-row verifies 34–47 ms early against 21–28 ms later; drafts 18–27 ms on some first steps against 3.5 ms.
+  //   Most requests there decode 150–800 tokens after a prefill, so these samples kept T(2) at 43–44 ms in the table (steady 2-row verify ~27 ms) — above the
+  //   break-even of mid-confidence steps — and a request ended before the slot was re-measured (kStale): 41–50 tok/s on those requests vs 100.7 tok/s
+  //   (speculation on 92 % of the steps) on one 7,861-token answer. Re-measurement windows (probe_due · small_probe_due · batch_probe_due) wait for the warm-up.
+  //   An unmeasured slot (n == 0) still takes its first sample during the warm-up: the gate cannot start on an empty slot (no old constants), a cold first sample
+  //   is what the re-measurement rules above clear, and short runs keep their former start (tools/test_think_cap_cpu batch-clamp mutant needs the batch path).
+  void mark_cold() { cold_since = clock; }
+  bool warming() const { return clock - cold_since <= kWarm; }
+  long cold_since = -(kWarm + 1);
   void observe_step(int M, double ms) {
     if (M < 1 || M > kMaxRows || !(ms > 0) || !std::isfinite(ms)) return;  // drop negative/NaN samples (absorbs clock going backwards)
+    if (warming() && n[M] > 0) return;                                      // cold after a prefill (mark_cold) — an unmeasured slot still takes its first sample
+    if (M == 2 && clock == cold_at) { cold_at = -1; return; }               // the first verify of a re-measurement is cold — dropped (see follow_due)
     t[M] = n[M] == 0 || clock - last[M] > kStale ? ms : t[M] * (1 - kAlpha) + ms * kAlpha;  // a stale slot is replaced by the new sample
     ++n[M]; last[M] = clock;
   }
-  void observe_draft(double ms) { if (ms > 0 && std::isfinite(ms)) { draft_ms = n_draft ? draft_ms * (1 - kAlpha) + ms * kAlpha : ms; ++n_draft; } }
+  void observe_draft(double ms) { if (ms > 0 && std::isfinite(ms) && !(warming() && n_draft > 0)) { draft_ms = n_draft ? draft_ms * (1 - kAlpha) + ms * kAlpha : ms; ++n_draft; } }
   bool fresh(int M) const { return M >= 1 && M <= kMaxRows && n[M] > 0 && clock - last[M] <= kStale; }
   bool known() const { for (int m = 1; m <= kMaxRows; ++m) if (n[m] > 0) return true; return false; }
   // Current cost of row count M (ms). Measured slot → its value · in between → linear interpolation of the neighbouring measured slots · outside → extrapolation with the slope of two measured slots on that side (prior slope if none).
@@ -100,6 +116,7 @@ struct Gate {
   }
   // There are verify slots but none is fresh (no verification for kStale decisions) — is this a window where one re-measurement (k = 1) is allowed (see the comment above choose_k)?
   bool probe_due() const {
+    if (warming()) return false;
     bool any = false;
     for (int m = 2; m <= kMaxRows; ++m) { if (fresh(m)) return false; if (n[m] > 0) any = true; }
     return any && clock - probe_at > kStale;
@@ -110,12 +127,23 @@ struct Gate {
   //   (measured 2026-10-22/23 on a DeepSeek production deployment: a cold first T(2) of 50.5 ms stayed in the table for the whole process — see choose_k and test_mtp_gate_cpu R2).
   //   hived.cpp also drafts when this holds, since a stale inflated T(2) can make can_profit false.
   bool small_probe_due() const {
+    if (warming()) return false;
     if (n[2] == 0 || fresh(2) || clock - small_probe_at <= kStale) return false;   // never measured: vcost(2) comes from the measured slots (no cold sample to clear)
     for (int m = 3; m <= kMaxRows; ++m) if (fresh(m)) return true;
     return false;
   }
   mutable long small_probe_at = -(kStale + 1);  // decision time of the last re-measurement of a stale T(2) (written by choose_k)
   mutable long reprobe_at = -(kStale + 1);  // decision time of the last re-measurement of a stale larger verify slot (choose_k)
+  // A re-measurement of T(2) (probe_due / small_probe_due) is two verifies: the first sample is dropped and the next k = 1 verify within kFollow decisions is the one
+  //   that enters the table. Measured 2026-10-23/24 (DeepSeek 96 GB production deployment, 600 W, HIVE_TRACE_MTP, 21 h after the small_probe_due fix): consecutive
+  //   k = 1 verifies after a run of declines took 29.5 / 21.7 / 22.1 / 21.4 ms (median, 1st..4th, n 1,158 / 357 / 178 / 103) while k = 1 verifies inside a speculating
+  //   run took 22.7 ms (n 4,294 · mean 26.5 · T(1) 16.8 · accepted 0.80 → break-even T(2) 30.2). The re-measured T(2) took the cold first value, so 69 % of the
+  //   re-measurements were declined again at once and thinking traffic still speculated on 22–28 % of the steps (decode ~54 tok/s instead of ~80). Only the first
+  //   verify is cold, so one follow-up is enough. Loss bound: two 2-row verifies per kStale decisions instead of one.
+  //   hived.cpp drafts on a follow-up decision even while the request's backoff pauses (the probe's on_spec can set skip from the stale cost).
+  bool follow_due() const { return follow_at >= 0 && clock > follow_at && clock - follow_at <= kFollow; }
+  mutable long follow_at = -1;  // decision time of the re-measurement whose follow-up is pending (−1 none)
+  mutable long cold_at = -1;    // decision time whose 2-row verify sample observe_step drops
   double p_accept(bool sampled, float c) const {
     const int b = bucket(c), s = sampled ? 1 : 0;
     return (hit[s][b] + kPriorW * prior_p(b)) / (tried[s][b] + kPriorW);
@@ -150,8 +178,15 @@ struct Gate {
       if (!(tv > 0)) break;
       if (e / tv > best) { best = e / tv; k = i + 1; if (e_out) *e_out = e; if (ms_out) *ms_out = tv; }
     }
+    if (k == 1 || clock - follow_at > kFollow) follow_at = -1;   // a k = 1 verify of its own (or an expired window) ends a pending follow-up
+    if (k == 0 && n_drafts >= 1 && max_k >= 1 && remaining >= 1 && conf[0] >= conf_min && follow_due()) {   // follow-up verify of a re-measurement (see follow_due)
+      follow_at = -1;
+      if (e_out) *e_out = 1.0 + p_accept(sampled, conf[0]);
+      if (ms_out) *ms_out = vcost(2);
+      return 1;
+    }
     if (k == 0 && n_drafts >= 1 && max_k >= 1 && remaining >= 1 && conf[0] >= conf_min && probe_due()) {
-      probe_at = clock;
+      probe_at = clock; follow_at = cold_at = clock;
       if (e_out) *e_out = 1.0 + p_accept(sampled, conf[0]);
       if (ms_out) *ms_out = vcost(2);
       return 1;
@@ -162,7 +197,7 @@ struct Gate {
     //   high-confidence steps kept T(6) fresh (probe_due never fired). Thinking traffic at temperature 1 (mid confidence, where k = 1 decides) speculated on 23–29 % of
     //   the steps instead of ~97 % and single-stream decode fell from ~80 to ~50 tok/s. Loss bound as probe_due: one 2-row verify per kStale decisions.
     if (k == 0 && n_drafts >= 1 && max_k >= 1 && remaining >= 1 && conf[0] >= conf_min && small_probe_due()) {
-      small_probe_at = clock;
+      small_probe_at = clock; follow_at = cold_at = clock;
       if (e_out) *e_out = 1.0 + p_accept(sampled, conf[0]);
       if (ms_out) *ms_out = vcost(2);
       return 1;
@@ -233,7 +268,7 @@ struct BatchChoice {
 //   that slot was never chosen again and so never updated. The ordinary batch-step slot (row S) is always fresh, so Gate::probe_due (which looks at rows ≥ 2) is
 //   always false in batch mode — hence S is passed in. Loss bound: at most one K = 1 verification per window (kStale decisions), after the draft cost is already paid.
 inline bool batch_probe_due(const Gate& g, int S, int max_rows = kMaxRows) {
-  if (S < 1 || S >= kMaxRows) return false;
+  if (S < 1 || S >= kMaxRows || g.warming()) return false;
   max_rows = std::min(max_rows, kMaxRows);
   bool any = false;
   for (int m = S + 1; m <= max_rows; ++m) { if (g.fresh(m)) return false; if (g.n[m] > 0) any = true; }

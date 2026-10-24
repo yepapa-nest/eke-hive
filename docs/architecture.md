@@ -136,7 +136,10 @@ The checkpoint's three MTP stages are loaded as layers 40–42, sharing the expe
    observed acceptance rate predict a gain (`HIVE_MTP_GATE2/3`). A cell of the cost table is only updated when its
    row count is chosen, so stale cells are re-measured once per window — when every verify cell is stale, when the
    next larger one is, and when T(2) is stale beside a fresher larger cell — so that a cold first sample cannot lock
-   speculation out for the life of the process.
+   speculation out for the life of the process. A re-measurement of T(2) is two verifies: the first one after a run of
+   declines is cold and is dropped, the next one enters the table. After a prefill (a new prompt, or a layer-yield run
+   of another request) the next 16 decisions keep using the table but do not feed it — the first verifies after a
+   prefill run up to ~40 % slower — and a cell that was never measured still takes its first sample.
 5. **Verify**: `[token, d1..dk]` run as rows of one decode-path forward (`HIVE_MTP_VERIFY2`), giving per-row logits.
 6. **Accept**: row *i*'s sample from the target distribution is compared with draft *i+1*; on a mismatch the
    sample is the correction token. Every emitted token is drawn from the target distribution, so the output

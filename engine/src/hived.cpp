@@ -3137,13 +3137,15 @@ int main(int argc, char** argv) {
     //   those of GATE2 (only samples are filtered).
   static const bool mtp_gate3 = env_on("HIVE_MTP_GATE3");
   static mtpg::Gate gate2;
+  static long gate2_epoch = -1;   // prefill_epoch the gate last saw — a change starts its warm-up (Gate::mark_cold)
+  if (mtp_gate2 && gate2_epoch != prefill_epoch) { gate2_epoch = prefill_epoch; gate2.mark_cold(); }
   if (mtp_gate2 && stepping.size() == 1) gate2.tick();
   // ---- DSpark speculation (one active sequence that has the target-layer hidden state) ----
     //   Of B drafts, the leading k above the confidence threshold are verified as [tok, d1..dk] -> a sample t' is drawn from row i's logits and
         //   accepted if it equals d_{i+1} (t' = d); otherwise t' is the next token (correction) — either way emitted tokens follow the target
         //   distribution p(.|prefix) (independent of the draft distribution, lossless). If all are accepted, row k's sample is a bonus.
     if (stepping.size() == 1 && rt.mtp_enabled() && mtp_max > 0 && stepping[0]->S->seq->mtp_hidden_valid && !fake_head &&
-        (mtp_gate2 ? gate2.known() && stepping[0]->g2.want() && (gate2.can_profit(stepping[0]->temperature > 0.f, mtp_max) || gate2.probe_due() || gate2.small_probe_due())
+        (mtp_gate2 ? gate2.known() && (gate2.follow_due() || (stepping[0]->g2.want() && (gate2.can_profit(stepping[0]->temperature > 0.f, mtp_max) || gate2.probe_due() || gate2.small_probe_due())))
                    : stepping[0]->mtp_skip <= 0)) {  // gate 2: a regular step must be measured once (T(1)) before starting
       // If the table says "no prospect" (can_profit false — even the best learned acceptance gives E(k)/T(k+1) <= 1/T(1)) and it is not a
             //   re-measurement window, do not draft — the post-draft decision (choose_k) would be 0 anyway and only the draft cost D would be paid
@@ -3272,6 +3274,8 @@ int main(int argc, char** argv) {
     const bool mtp_batch = mtp_batch_ov < 0 ? mtp_batch_env : mtp_batch_ov > 0;
     rt.set_mtp_batch(mtp_batch);  // a plain flag store each step (engine thread) — mtp_batch_enabled() still requires the startup allocation
     static mtpg::Gate gate_b;
+    static long gate_b_epoch = -1;  // same warm-up rule as gate2 (Gate::mark_cold)
+    if (mtp_batch && gate_b_epoch != prefill_epoch) { gate_b_epoch = prefill_epoch; gate_b.mark_cold(); }
     static mtpg::Backoff back_b;
     if (mtp_batch && stepping.size() >= 2) gate_b.tick();
     bool b_any_sampled = false;

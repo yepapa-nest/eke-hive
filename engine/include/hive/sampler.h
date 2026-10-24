@@ -33,6 +33,29 @@ inline int32_t sample(std::vector<float>& logits, float temperature, float top_p
   if (temperature <= 0.f) return (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
   float mx = -INFINITY;
   for (float v : logits) mx = std::max(mx, v);
+  // No nucleus and no top-k (top_p ≥ 1 or unset, top_k ≤ 0): the remaining rule needs no ordering — min_p keeps p_i ≥ min_p·p_max, i.e.
+  //   e_i = exp((l_i − max)/T) ≥ min_p (e_max = 1), and the multinomial draw over the kept mass is order-free. One pass instead of building and
+  //   fully sorting 129K pairs: the 1024 candidates never reach the mass 1.0 that "no top_p" asks for, so that sort ran for every token.
+  //   Measured 2026-10-24 (DeepSeek production deployment, a chat client sending temperature 1.0 · top_p 1.0 on every request, HIVE_PROFILE step-host):
+  //   sampling one pending token cost 6.2–9.1 ms per plain step (pre, 0.05–0.53 ms on 10-13..17) and 7.8–16 ms per verify step (post, 0.5–0.6 ms)
+  //   against a 17.3 ms forward. Same distribution (tests/test_sampler_cpu: "no truncation" cases); the token drawn for a given RNG state differs.
+  if (top_k <= 0 && !(top_p > 0.f && top_p < 1.f)) {
+    static thread_local std::vector<float> e;
+    e.resize(V);
+    double sum = 0;
+    for (int i = 0; i < V; ++i) {
+      const float x = expf((logits[i] - mx) / temperature);
+      e[i] = (min_p > 0.f && x < min_p) ? 0.f : x;
+      sum += e[i];
+    }
+    if (!(sum > 0)) return (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+    std::uniform_real_distribution<double> U(0.0, sum);
+    const double r = U(rng);
+    double c = 0;
+    int last = -1;
+    for (int i = 0; i < V; ++i) if (e[i] > 0.f) { c += e[i]; last = i; if (r <= c) return i; }
+    return last;
+  }
   std::vector<std::pair<float, int>> p(V);
   double sum = 0;
   for (int i = 0; i < V; ++i) { float e = expf((logits[i] - mx) / temperature); p[i] = {e, i}; sum += e; }
@@ -75,6 +98,7 @@ inline int32_t sample_cands(const Cands& c, std::vector<float>& full_logits, flo
   if (temperature <= 0.f) return c.argmax;
   const int NC = (int)c.idx.size();
   if (top_k > NC) return sample(full_logits, temperature, top_p, top_k, min_p, rng);
+  if (top_k <= 0 && !(top_p > 0.f && top_p < 1.f)) return sample(full_logits, temperature, top_p, top_k, min_p, rng);  // no nucleus: the candidates can never hold mass 1.0 — the order-free full path (see sample)
   std::vector<std::pair<float, int>> p;
   p.reserve(NC);
   const float it = 1.f / temperature;

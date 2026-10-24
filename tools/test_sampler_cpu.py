@@ -18,6 +18,9 @@ MUTANTS = [
     ('sample_cands ignores temperature in candidate probabilities', '(float)(expf((c.val[i] - c.mx) * it) / (double)c.sum)', '(float)(expf((c.val[i] - c.mx)) / (double)c.sum)'),
     ('sample cuts top_p late', 'while (k2 < keep) { c += p[k2].first; ++k2; if (c >= top_p) break; }', 'while (k2 < keep) { c += p[k2].first; ++k2; if (c >= top_p + 0.04) break; }'),
     ('sample_cands skips the full-sort fallback', '  if (top_k <= 0 && mass < need) return sample(full_logits, temperature, top_p, top_k, min_p, rng);  // mass outside the candidates is needed — full path\n', ''),
+    ('order-free path ignores min_p', '      e[i] = (min_p > 0.f && x < min_p) ? 0.f : x;', '      e[i] = x;'),
+    ('order-free path ignores temperature', '      const float x = expf((logits[i] - mx) / temperature);', '      const float x = expf(logits[i] - mx);'),
+    ('order-free path draws over part of the mass', '    std::uniform_real_distribution<double> U(0.0, sum);', '    std::uniform_real_distribution<double> U(0.0, sum * 0.9);'),
     ('request_seed uses the clock only', '  return splitmix64(base ^ splitmix64(counter.fetch_add(1, std::memory_order_relaxed) + 1) ^ ns);', '  (void)base; return ns / 1000000;'),
 ]
 

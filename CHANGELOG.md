@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Sampling without top-p or top-k no longer sorts the vocabulary**: with top_p 1.0 (or unset) and no top_k, the 1024 GPU candidates can
+  never hold the full probability mass, so every sampled token fell back to building and fully sorting 129K (probability, token) pairs —
+  8.5 ms per token on a 16-thread host CPU, against a 17 ms forward. A production deployment whose client sends temperature 1.0 · top_p 1.0
+  paid 6.2–9.1 ms per plain decode step and 7.8–16 ms per verify step on the host (0.05–0.6 ms while it ran greedy). That rule needs no
+  ordering: min_p keeps exp((l − max)/T) ≥ min_p and the multinomial draw is order-free, so it is now one pass (0.70 ms per token at V 129,280).
+  Same distribution (`test_sampler_cpu` adds three no-truncation cases and three mutants of the new path); the token drawn for a given RNG
+  state differs.
+- **Speculation cost samples skip the cold steps after a prefill (HIVE_MTP_GATE2, and the batch gate)**: on the same production deployment, with
+  the fix below, one 7,861-token answer decoded at 100.7 tok/s (speculation on 92 % of the steps), but most requests there decode 150–800
+  tokens right after a prefill and ran at 41–50 tok/s. By decision index after a request's start, 5–6-row verifies took 59–64 ms (1st–6th),
+  52–55 (7th–10th), ~48.5 (11th–14th) and 45 ms from the 15th on (2-row verifies 34–47 ms early, 21–28 ms later; 135 requests). Those samples
+  kept T(2) at 43–44 ms in the table, above the break-even of mid-confidence steps, and a short request ended before the slot was
+  re-measured. When a prefill has run (a new prompt, or a layer-yield run of another request), the next 16 decisions keep using the table
+  but do not feed it, and re-measurement windows wait for them; a slot that was never measured still takes its first sample. Lossless.
+  `test_mtp_gate_cpu` R4 (the previous gate: 85 of 1,700 warm mid-confidence steps with k = 1 in that world; the new one 1,700 of 1,700).
+- **A speculation re-measurement no longer trusts its cold first verify (HIVE_MTP_GATE2)**: after the re-measurement above shipped, the same
+  DeepSeek production deployment (21 h, 600 W) still speculated on only 22–28 % of its thinking decode steps. Consecutive k = 1 verifies
+  after a run of declines took 29.5 / 21.7 / 22.1 / 21.4 ms (median, 1st..4th) against 22.7 ms inside a speculating run (mean 26.5 ms ·
+  ordinary step 16.8 ms · break-even 30.2 ms at the measured acceptance) — only the first verify after a pause is cold, and the
+  re-measured T(2) took exactly that value, so 69 % of the re-measurements were declined again at once. A re-measurement is now two
+  verifies: the first sample is dropped and the next k = 1 verify within 8 decisions enters the table (the daemon drafts for it even while
+  the request's backoff pauses). Loss bound: two 2-row verifies per 512 decisions instead of one. `test_mtp_gate_cpu` R3 (the previous rule
+  gives 1 of 384 mid-confidence steps k = 1 in that world; the new one 384 of 384).
 - **Speculation no longer locks itself out after a cold start (HIVE_MTP_GATE2)**: the first 2-row verifies after a start run cold
   (29.7–79.8 ms while an ordinary step took 46.9 ms, a DeepSeek production deployment, 2026-10-22) and the measured cost of T(2) settled at 50.5 ms. Warm
   2-row verifies take 22–30 ms against a 16–17 ms ordinary step, but at 50.5 ms the gate never chose k = 1 again, so T(2) was never

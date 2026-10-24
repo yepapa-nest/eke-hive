@@ -474,7 +474,7 @@ Variables used only by the test harnesses (`HIVE_TEST_SANITIZER`, `HIVE_DAEMON_N
 | `stream` | false | Server-sent events |
 | `max_tokens`, `max_completion_tokens` | rest of the context | 0 or absent = up to `max_ctx` minus the prompt |
 | `temperature` | 1.0 | Sampling temperature (0 = greedy) |
-| `top_p` | 0.95 | Nucleus sampling |
+| `top_p` | 0.95 | Nucleus sampling. Below 1 the daemon samples within the GPU's top 1024 candidates when they hold the needed mass (else a full sort); at 1 (or with `min_p` only) it draws from the full distribution in one pass without sorting |
 | `top_k` | 0 = off | Top-k |
 | `min_p` | 0 | Min-p |
 | `seed` | 0 | Random seed |

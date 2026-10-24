@@ -320,9 +320,15 @@ int main() {
     EXPECT(q.choose_k(false, one.data(), 1, 5, -1.f, 100) == 0, "at most one probe per window");
     const float lowc[1] = {-0.5f};
     EXPECT(q.choose_k(false, lowc, 1, 5, 0.f, 100) == 0, "probe respects conf_min");
-    q.observe_step(2, 51.9);
+    q.observe_step(2, 51.9);   // the probe's own verify sample is dropped (cold — see Gate::follow_due) …
+    EXPECT(!q.fresh(2), "the probe's own sample must not enter the table");
+    q.tick(); q.observe_step(1, 20.0);
+    EXPECT(q.follow_due() && q.choose_k(false, lowc, 1, 5, 0.f, 100) == 0, "follow-up respects conf_min");
+    EXPECT(q.choose_k(false, one.data(), 1, 5, -1.f, 100) == 1 && !q.follow_due(), "… and the next decision verifies k = 1 once more (follow-up)");
+    q.observe_step(2, 51.9);   // … whose sample is kept
+    EXPECT(q.fresh(2) && near(q.vcost(2), 51.9), "follow-up sample enters the table (T2 %.1f)", q.vcost(2));
     for (int i = 0; i < 300; ++i) { q.tick(); q.observe_step(1, 20.0); }
-    EXPECT(!q.probe_due() && q.choose_k(false, one.data(), 1, 5, -1.f, 100) == 0, "fresh T2 → no probe");
+    EXPECT(!q.probe_due() && !q.follow_due() && q.choose_k(false, one.data(), 1, 5, -1.f, 100) == 0, "fresh T2 → no probe");
     for (int i = 0; i < 300; ++i) { q.tick(); q.observe_step(1, 20.0); }
     EXPECT(q.probe_due(), "next window after T2 goes stale again");
     // with no verify cell measured, the same prior-based exploration as before (T(1)·(1+0.151·(M−1)))
@@ -536,6 +542,64 @@ int main() {
     EXPECT(first1 < 0 || first1 > 100, "the trap is not reproduced: k = 1 already at decision %d (the cold T(2) should block it until it is stale)", first1);
     EXPECT(first1 >= 0 && first1 <= hive::mtpg::kStale + 4, "stale cold smallest verify slot was never re-measured (first k = 1 at %d)", first1);
     EXPECT(mid_late > 0 && mid_k1_late * 10 >= mid_late * 9, "after the re-measurement mid-confidence steps should speculate with k = 1 (%d of %d)", mid_k1_late, mid_late);
+  }
+  // (R3) cold first verify of every re-measurement (measured 2026-10-23/24, DeepSeek 96 GB production deployment, 600 W, HIVE_TRACE_MTP, 21 h after the R2 fix): T(1) 16.8 ms ·
+  //   consecutive k = 1 verifies after a run of declines 29.5 / 21.7 / 22.1 / 21.4 ms (median, 1st..4th) — only the first is cold. With the R2 rule alone the
+  //   re-measured T(2) took 29.5 ms, above the break-even of mid-confidence steps, so 69 % of the re-measurements were declined again at once and thinking traffic
+  //   still speculated on 22–28 % of the steps. Here a k = 1 verify costs 29.5 ms when the previous k = 1 verify is more than 16 decisions back, else 22 ms; the
+  //   mid-confidence steps (prior p 0.55 → break-even T(2) 26.4 ms) must speculate once the slot is re-measured. Negative control: with the R2-only gate
+  //   (hive 3bf5246) this world gives 1 of 384 mid steps k = 1 in the last third.
+  {
+    hive::mtpg::Gate g;
+    g.observe_step(1, 46.9); g.observe_step(2, 50.5); g.observe_step(6, 60.0);
+    for (int i = 0; i < 30; ++i) g.observe_step(1, 17.0);
+    float hi[5] = {8.f, 8.f, 8.f, 8.f, 8.f}, mid[5] = {2.5f, 0.8f, 0.3f, -0.5f, -1.f};
+    for (int i = 0; i < 6; ++i) g.observe_accept(true, hi, 5, 5);
+    long last_k1 = -1000;
+    int mid_late = 0, mid_k1_late = 0, first1 = -1;
+    for (long d = 0; d < 3 * hive::mtpg::kStale; ++d) {
+      g.tick();
+      g.observe_step(1, 17.0);
+      const bool is_hi = d % 4 == 0;
+      const float* c = is_hi ? hi : mid;
+      int k = 0;
+      if (g.follow_due() || g.can_profit(true, 5) || g.probe_due() || g.small_probe_due()) k = g.choose_k(true, c, 5, 5, -1.f, 1000);   // hived.cpp pre-draft condition
+      if (!is_hi && k == 1 && first1 < 0 && d > 0) first1 = (int)d;
+      if (!is_hi && d >= 2 * hive::mtpg::kStale) { ++mid_late; if (k == 1) ++mid_k1_late; }
+      if (k == 1) { g.observe_step(2, d - last_k1 > 16 ? 29.5 : 22.0); last_k1 = d; }
+      else if (k > 1) g.observe_step(k + 1, 22.0 + 5.5 * (k - 1));
+    }
+    fprintf(stderr, "[R3 cold first re-measurement] first mid-confidence k = 1 at decision %d · last third %d of %d mid steps k = 1\n", first1, mid_k1_late, mid_late);
+    EXPECT(first1 >= 0 && first1 <= hive::mtpg::kStale + 4 + (int)hive::mtpg::kFollow, "re-measurement with a cold first verify never recovered (first k = 1 at %d)", first1);
+    EXPECT(mid_late > 0 && mid_k1_late * 10 >= mid_late * 9, "a cold first verify must not lock the slot again (%d of %d)", mid_k1_late, mid_late);
+  }
+  // (R4) cold steps after every prefill (measured 2026-10-24, DeepSeek 96 GB production deployment, 600 W, HIVE_TRACE_MTP, 135 requests — see Gate::mark_cold):
+  //   short requests (60 decisions here) start after a prefill; their first 15 decisions are cold (T(1) 18 · 2-row verify 33 · 6-row 60 ms), the rest warm
+  //   (17 · 22 · 44.5 ms). Without the warm-up rule the cold samples keep T(2) above the mid-confidence break-even (prior p 0.55 → 26.4 ms at T(1) 17) and those
+  //   requests barely speculate; with it the table holds the warm costs. Negative control: with the gate of hive d6f208c (no warm-up) this world gives
+  //   85 of 1,700 warm mid-confidence steps k = 1.
+  {
+    hive::mtpg::Gate g;
+    g.observe_step(1, 17.0); g.observe_step(2, 22.0); g.observe_step(6, 44.5);   // a warm start (the trap here is not the first sample)
+    float hi[5] = {8.f, 8.f, 8.f, 8.f, 8.f}, mid[5] = {2.5f, 0.8f, 0.3f, -0.5f, -1.f};
+    for (int i = 0; i < 6; ++i) g.observe_accept(true, hi, 5, 5);
+    int warm_mid = 0, warm_mid_k1 = 0;
+    for (int req = 0; req < 60; ++req) {
+      g.mark_cold();                                             // hived.cpp: prefill_epoch changed
+      for (int d = 0; d < 60; ++d) {
+        const bool cold = d < 15;
+        g.tick();
+        g.observe_step(1, cold ? 18.0 : 17.0);   // the table T(1) stayed 17–18.5 ms in production while T(2) sat at 43 ms
+        const bool is_hi = d % 4 == 0;
+        const float* c = is_hi ? hi : mid;
+        int k = 0;
+        if (g.follow_due() || g.can_profit(true, 5) || g.probe_due() || g.small_probe_due()) k = g.choose_k(true, c, 5, 5, -1.f, 1000);
+        if (!is_hi && !cold && req >= 10) { ++warm_mid; if (k == 1) ++warm_mid_k1; }
+        if (k > 0) g.observe_step(k + 1, (cold ? 1.5 : 1.0) * (k == 1 ? 22.0 : 22.0 + 5.5 * (k - 1)) * (cold && k > 1 ? 0.9 : 1.0));
+      }
+    }
+    fprintf(stderr, "[R4 cold after prefill] warm mid-confidence steps k = 1: %d of %d (requests 10..59)\n", warm_mid_k1, warm_mid);
+    EXPECT(warm_mid > 0 && warm_mid_k1 * 10 >= warm_mid * 9, "cold samples after each prefill must not keep k = 1 off on warm steps (%d of %d)", warm_mid_k1, warm_mid);
   }
   if (fails) { fprintf(stderr, "test_mtp_gate_cpu: %d FAILED\n", fails); return 1; }
   fprintf(stderr, "test_mtp_gate_cpu: all passed\n");
