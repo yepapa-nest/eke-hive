@@ -12,6 +12,8 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace hive::mtpg {
 
@@ -27,6 +29,30 @@ constexpr int kBuckets = 8;
 inline int bucket(float c) { return c < 0.f ? 0 : c < 1.f ? 1 : c < 2.f ? 2 : c < 3.f ? 3 : c < 4.f ? 4 : c < 5.f ? 5 : c < 7.f ? 6 : 7; }
 // v1 table (hived.cpp p_accept, measured over 3,727 steps) = prior
 inline double prior_p(int b) { static const double p[kBuckets] = {0.06, 0.19, 0.36, 0.55, 0.65, 0.75, 0.85, 0.90}; return p[b]; }
+// HIVE_MTP_PRIOR: a family's own acceptance prior — kBuckets numbers in (0, 1], comma-separated, one per confidence bucket (bucket() order). Unset, "",
+//   "0" or anything else (a short list, a value outside (0, 1], trailing text) keeps the v1 table above (absorbed, not rejected). Reason: the v1 table
+//   came from random-token prompts and is far below real text. Measured on a DeepSeek production deployment (first draft accepted, by bucket of its
+//   confidence, temperature 1.0): 2026-10-17 0.34 · 0.49 · 0.69 · 0.87 · 0.96 · 0.98 · 1.00 · 1.00 (269k drafts) and 2026-10-24 0.36 · 0.57 · 0.76 ·
+//   0.90 · 0.96 · 0.99 · 1.00 · 1.00 (60k) against the v1 0.06 · 0.19 · 0.36 · 0.55 · 0.65 · 0.75 · 0.85 · 0.90. The gate learns a bucket only from drafts
+//   it verifies, so a bucket the prior calls hopeless stays at the prior — a family-specific prior gives it the measured start.
+inline bool parse_prior(const char* v, double* out) {
+  if (!v || !*v || !strcmp(v, "0")) return false;
+  double t[kBuckets];
+  const char* p = v;
+  for (int i = 0; i < kBuckets; ++i) {
+    char* e = nullptr;
+    const double x = strtod(p, &e);
+    if (e == p || !(x > 0.0 && x <= 1.0)) return false;
+    t[i] = x;
+    p = e;
+    while (*p == ' ') ++p;
+    if (i + 1 < kBuckets) { if (*p != ',') return false; ++p; }
+  }
+  while (*p == ' ') ++p;
+  if (*p) return false;
+  for (int i = 0; i < kBuckets; ++i) out[i] = t[i];
+  return true;
+}
 
 struct Gate {
   double t[kMaxRows + 1] = {};  // step cost EMA per row count (ms)
@@ -35,6 +61,7 @@ struct Gate {
   long clock = 0;               // decision count (ticks every single-stream decode step)
   double draft_ms = 0; long n_draft = 0;
   double hit[2][kBuckets] = {}, tried[2][kBuckets] = {};
+  double prior[kBuckets] = {0.06, 0.19, 0.36, 0.55, 0.65, 0.75, 0.85, 0.90};  // = prior_p unless HIVE_MTP_PRIOR (parse_prior) replaced it
 
   void tick() { ++clock; }
   // A prefill ran (hived.cpp: prefill_epoch changed — a new request's prompt, a layer-yield run of another one): the next kWarm decisions are cold and their
@@ -146,7 +173,7 @@ struct Gate {
   mutable long cold_at = -1;    // decision time whose 2-row verify sample observe_step drops
   double p_accept(bool sampled, float c) const {
     const int b = bucket(c), s = sampled ? 1 : 0;
-    return (hit[s][b] + kPriorW * prior_p(b)) / (tried[s][b] + kPriorW);
+    return (hit[s][b] + kPriorW * prior[b]) / (tried[s][b] + kPriorW);
   }
   // Verification compared the first n_cmp drafts and the first n_acc of them were accepted (n_acc ≤ n_cmp). Each compared draft i is a sample of "acceptance given all earlier ones were accepted".
   void observe_accept(bool sampled, const float* conf, int n_cmp, int n_acc) {
@@ -227,7 +254,7 @@ struct Gate {
     const int s = sampled ? 1 : 0;
     bool any = false; for (int b = 0; b < kBuckets; ++b) if (tried[s][b] > 0) any = true;
     double pmax = 0;
-    for (int b = 0; b < kBuckets; ++b) if (!any || tried[s][b] > 0) pmax = std::max(pmax, (hit[s][b] + kPriorW * prior_p(b)) / (tried[s][b] + kPriorW));
+    for (int b = 0; b < kBuckets; ++b) if (!any || tried[s][b] > 0) pmax = std::max(pmax, (hit[s][b] + kPriorW * prior[b]) / (tried[s][b] + kPriorW));
     double chain = 1, e = 1;
     for (int k = 1; k <= max_k && k + 1 <= kMaxRows; ++k) { chain *= pmax; e += chain; const double tv = vcost(k + 1); if (tv > 0 && e / tv > 1.0 / t1) return true; }  // vcost
     return false;
@@ -332,7 +359,7 @@ inline bool can_profit_batch(const Gate& g, int S, bool sampled, int max_k, int 
   const int si = sampled ? 1 : 0;
   bool any = false; for (int b = 0; b < kBuckets; ++b) if (g.tried[si][b] > 0) any = true;
   double pmax = 0;
-  for (int b = 0; b < kBuckets; ++b) if (!any || g.tried[si][b] > 0) pmax = std::max(pmax, (g.hit[si][b] + kPriorW * prior_p(b)) / (g.tried[si][b] + kPriorW));
+  for (int b = 0; b < kBuckets; ++b) if (!any || g.tried[si][b] > 0) pmax = std::max(pmax, (g.hit[si][b] + kPriorW * g.prior[b]) / (g.tried[si][b] + kPriorW));
   const double D = g.n_draft > 0 ? g.draft_ms : 0.0;
   double e = S;
   int k[kMaxRows] = {};

@@ -335,6 +335,7 @@ read by `hived_glm` too; `config/glm.env` sets `HIVE_CACHE_FIT`, `HIVE_CACHE_RES
 | --- | --- | --- | --- | --- |
 | `HIVE_MTP_GATE2` | off | `1` | Draft only when a measured per-row-count cost table and the online acceptance rate say it pays | adopted (step 9): c1 +2.6 %, c4 +2.4 %, c8 +2.7 % |
 | `HIVE_MTP_GATE3` | off | `1` | Drop cost samples taken while a CUDA graph was being captured | adopted (step 12) |
+| `HIVE_MTP_PRIOR` | built-in table | DeepSeek: `0.34,0.49,0.69,0.87,0.95,0.97,0.98,0.98` (`config/hive.env`) | The speculation gate's starting acceptance rate per confidence bucket (8 numbers in (0, 1]); anything else keeps the built-in table. The gate learns a bucket only from drafts it verifies, so a bucket whose prior is below the break-even is never tried — a family-measured prior starts it right | measured on a production deployment: first-draft acceptance by bucket 0.34–1.00 against the built-in 0.06–0.90 |
 | `HIVE_MTP_VERIFY2` | off | `1` | Run verify rows through the decode path (decode kernels, grouped experts) | adopted (step 12, with `_FUSED`): two-row verify at 80K 62.9 → 32.0 ms; decode after 80K +6.2 % |
 | `HIVE_MTP_VERIFY2_FUSED` | off | `1` | Use the fused attention front for verify rows (needs `HIVE_DECODE_ATTN_FUSED=1`) | adopted (step 12) |
 | `HIVE_MTP_VERIFY_ROWIND` | off | — | Make verify rows independent (all misses on CPU, fixed accumulation order) | rejected: same results, row independence not achieved |

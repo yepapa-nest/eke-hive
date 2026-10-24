@@ -98,7 +98,59 @@ inline int32_t sample_cands(const Cands& c, std::vector<float>& full_logits, flo
   if (temperature <= 0.f) return c.argmax;
   const int NC = (int)c.idx.size();
   if (top_k > NC) return sample(full_logits, temperature, top_p, top_k, min_p, rng);
-  if (top_k <= 0 && !(top_p > 0.f && top_p < 1.f)) return sample(full_logits, temperature, top_p, top_k, min_p, rng);  // no nucleus: the candidates can never hold mass 1.0 — the order-free full path (see sample)
+  if (top_k <= 0 && !(top_p > 0.f && top_p < 1.f)) {
+    // No nucleus: two stages over the GPU's numbers — e_i = exp((l_i − mx)·it) with mx, it and c.sum = Σ_V e_i the device computed for this row.
+    //   Draw u in [0, c.sum): below the candidates' mass the token is a candidate (picked in candidate order); above it, a token outside the
+    //   candidates, drawn in proportion to e_i over a host pass that skips the candidate indices (ascending — one merge pointer). Same distribution
+    //   as the full order-free pass (sample) up to the fp32 sum; the full logits are only read with probability (c.sum − Σ cand)/c.sum.
+    //   min_p (keep e_i ≥ min_p): if the smallest candidate is already below min_p every kept token is a candidate (they are the top NC), else
+    //   the full pass. Measured 2026-10-24 (DeepSeek production deployment, temperature 1.0 · top_p 1.0, HIVE_PROFILE step-host): after the
+    //   order-free full pass the verify steps still spent 2.27 ms per step sampling their rows (0.70 ms per row at V 129,280).
+    const float it = 1.f / temperature;
+    const int V = (int)full_logits.size();
+    double ec = 0, emin = INFINITY;
+    int nvalid = 0;
+    for (int i = 0; i < NC; ++i) if (c.idx[i] >= 0) { const double e = expf((c.val[i] - c.mx) * it); ec += e; emin = std::min(emin, e); ++nvalid; }
+    const bool all_in = nvalid >= V;
+    if (min_p > 0.f) {
+      if (!(all_in || emin < (double)min_p)) return sample(full_logits, temperature, top_p, top_k, min_p, rng);
+      double tot = 0;
+      for (int i = 0; i < NC; ++i) if (c.idx[i] >= 0) { const double e = expf((c.val[i] - c.mx) * it); if (e >= (double)min_p) tot += e; }
+      if (!(tot > 0)) return c.argmax;
+      std::uniform_real_distribution<double> U(0.0, tot);
+      const double r = U(rng);
+      double cum = 0;
+      int last = c.argmax;
+      for (int i = 0; i < NC; ++i) if (c.idx[i] >= 0) { const double e = expf((c.val[i] - c.mx) * it); if (e < (double)min_p) continue; cum += e; last = c.idx[i]; if (r <= cum) return c.idx[i]; }
+      return last;
+    }
+    if (!(ec > 0) || !std::isfinite(c.sum) || nvalid == 0) return sample(full_logits, temperature, top_p, top_k, min_p, rng);
+    const double total = std::max((double)c.sum, ec);  // fp32 rounding can leave c.sum a hair below the candidates' own sum: no mass outside then
+    std::uniform_real_distribution<double> U(0.0, total);
+    const double u = U(rng);
+    if (u < ec || all_in || V == 0) {
+      double cum = 0;
+      int last = c.argmax;
+      for (int i = 0; i < NC; ++i) if (c.idx[i] >= 0) { cum += expf((c.val[i] - c.mx) * it); last = c.idx[i]; if (u <= cum) return c.idx[i]; }
+      return last;
+    }
+    static thread_local std::vector<float> e;
+    e.resize(V);
+    double rest = 0;
+    for (int i = 0, j = 0; i < V; ++i) {
+      while (j < NC && (c.idx[j] < 0 || c.idx[j] < i)) ++j;
+      const bool cand = j < NC && c.idx[j] == i;
+      e[i] = cand ? 0.f : expf((full_logits[i] - c.mx) * it);
+      rest += e[i];
+    }
+    if (!(rest > 0)) return c.argmax;
+    std::uniform_real_distribution<double> U2(0.0, rest);
+    const double r = U2(rng);
+    double cum = 0;
+    int last = -1;
+    for (int i = 0; i < V; ++i) if (e[i] > 0.f) { cum += e[i]; last = i; if (r <= cum) return i; }
+    return last >= 0 ? last : c.argmax;
+  }
   std::vector<std::pair<float, int>> p;
   p.reserve(NC);
   const float it = 1.f / temperature;

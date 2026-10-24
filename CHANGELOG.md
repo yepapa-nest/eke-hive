@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Sampling without top-p or top-k draws from the GPU candidates first**: the device already sends the top 1024 values with the row maximum and the
+  full Σexp under the row's temperature. A token is now drawn in two stages — inside the candidates with their share of that sum, otherwise from
+  one host pass over the remaining logits (candidate indices skipped) — so the full logits are read only when the draw falls outside the
+  candidates. 0.60 → 0.07–0.28 ms per token at V 129,280 (lower when the candidates hold more mass); a production deployment still spent 2.27 ms
+  per verify step sampling its rows after the order-free pass below. With min_p, rows whose smallest candidate is already under min_p stay
+  inside the candidates; the rest take the full pass. Same distribution (`test_sampler_cpu`: a flat T 0.7 case and three mutants of the new path).
+- **`HIVE_MTP_PRIOR`: a family's own acceptance prior for the speculation gate**: the built-in table (0.06 … 0.90, random-token prompts) sits far
+  below real text — first-draft acceptance by confidence bucket on a DeepSeek production deployment was 0.34 · 0.49 · 0.69 · 0.87 · 0.96 · 0.98 ·
+  1.00 · 1.00 — and the gate learns a bucket only from drafts it verifies, so buckets the prior calls hopeless were never tried. Eight numbers in
+  (0, 1] replace the table (anything else keeps it); `config/hive.env` sets DeepSeek's. `test_mtp_gate_cpu` R5.
 - **Sampling without top-p or top-k no longer sorts the vocabulary**: with top_p 1.0 (or unset) and no top_k, the 1024 GPU candidates can
   never hold the full probability mass, so every sampled token fell back to building and fully sorting 129K (probability, token) pairs —
   8.5 ms per token on a 16-thread host CPU, against a 17 ms forward. A production deployment whose client sends temperature 1.0 · top_p 1.0

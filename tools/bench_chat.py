@@ -39,13 +39,17 @@ P.add_argument("--conc", default="1,2,4,8,16,32", help="concurrency levels")
 P.add_argument("--long", default="17000,42000,54000", help="approximate prompt sizes in tokens for the long-prompt step ('' = skip)")
 P.add_argument("--effort", default="none", help="reasoning_effort of every request (none = thinking off, the published numbers; low / medium / high = the thinking traffic a chat client sends)")
 P.add_argument("--temperature", type=float, default=0.0, help="sampling temperature of every request (0 = greedy, the published numbers; chat clients usually send 1.0)")
+P.add_argument("--top-p", type=float, default=None, help="top_p of every request (default: not sent = the server's default, as in the published numbers; 1.0 = no nucleus, what some chat clients send)")
 P.add_argument("--long-timeout", type=float, default=0, help="seconds; a long prompt with no first token by then is recorded as a timeout and the longer ones are not sent (0 = no cap; the published VRAM-size tables use 600 s)")
 A = P.parse_args()
 
 
 def stream(prompt, max_tokens, timeout=3600):
-    body = json.dumps({"model": "hive", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": A.temperature,
-                       "reasoning_effort": A.effort, "stream": True, "stream_options": {"include_usage": True}}).encode()
+    req_body = {"model": "hive", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": A.temperature,
+                "reasoning_effort": A.effort, "stream": True, "stream_options": {"include_usage": True}}
+    if A.top_p is not None:
+        req_body["top_p"] = A.top_p
+    body = json.dumps(req_body).encode()
     t0 = time.time(); first = None; n = 0; usage = None
     req = urllib.request.Request(A.base + "/v1/chat/completions", body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -68,7 +72,7 @@ def stream(prompt, max_tokens, timeout=3600):
             "prompt": (usage or {}).get("prompt_tokens")}
 
 
-res = {"name": A.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "max_tokens": A.max_tokens, "effort": A.effort, "temperature": A.temperature}
+res = {"name": A.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "max_tokens": A.max_tokens, "effort": A.effort, "temperature": A.temperature, "top_p": A.top_p}
 for N in [int(x) for x in A.conc.split(",") if x.strip()]:
     out = []
     lock = threading.Lock()

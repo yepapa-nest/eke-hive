@@ -485,7 +485,7 @@ def launchers(td):
 def presence_audit():
     """Layer 3b: no HIVE_* switch may be decided by getenv(...) != nullptr alone."""
     bad, paths = [], []
-    conv = r'(atoi|atol|atof|atoll|strtol|strtoll|strcmp|env_on|ly::parse_\w+|pg::parse_\w+)\s*\('  # T11 ly::parse_* = value parsing of hive/layer_yield.h (measured by the table)
+    conv = r'(atoi|atol|atof|atoll|strtol|strtoll|strcmp|env_on|ly::parse_\w+|pg::parse_\w+|mtpg::parse_\w+)\s*\('  # T11 ly::parse_* = value parsing of hive/layer_yield.h (measured by the table)
     for path in sorted((ROOT / 'engine/src').rglob('*.c*')):
         lines = path.read_text().splitlines()
         for n, line in enumerate(lines, 1):

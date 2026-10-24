@@ -3137,6 +3137,8 @@ int main(int argc, char** argv) {
     //   those of GATE2 (only samples are filtered).
   static const bool mtp_gate3 = env_on("HIVE_MTP_GATE3");
   static mtpg::Gate gate2;
+  static const bool gate2_prior = mtpg::parse_prior(getenv("HIVE_MTP_PRIOR"), gate2.prior);  // HIVE_MTP_PRIOR: the family's acceptance prior (hive/mtp_gate.h)
+  (void)gate2_prior;
   static long gate2_epoch = -1;   // prefill_epoch the gate last saw — a change starts its warm-up (Gate::mark_cold)
   if (mtp_gate2 && gate2_epoch != prefill_epoch) { gate2_epoch = prefill_epoch; gate2.mark_cold(); }
   if (mtp_gate2 && stepping.size() == 1) gate2.tick();
@@ -3274,6 +3276,8 @@ int main(int argc, char** argv) {
     const bool mtp_batch = mtp_batch_ov < 0 ? mtp_batch_env : mtp_batch_ov > 0;
     rt.set_mtp_batch(mtp_batch);  // a plain flag store each step (engine thread) — mtp_batch_enabled() still requires the startup allocation
     static mtpg::Gate gate_b;
+    static const bool gate_b_prior = mtpg::parse_prior(getenv("HIVE_MTP_PRIOR"), gate_b.prior);  // same prior as gate2
+    (void)gate_b_prior;
     static long gate_b_epoch = -1;  // same warm-up rule as gate2 (Gate::mark_cold)
     if (mtp_batch && gate_b_epoch != prefill_epoch) { gate_b_epoch = prefill_epoch; gate_b.mark_cold(); }
     static mtpg::Backoff back_b;

@@ -601,6 +601,23 @@ int main() {
     fprintf(stderr, "[R4 cold after prefill] warm mid-confidence steps k = 1: %d of %d (requests 10..59)\n", warm_mid_k1, warm_mid);
     EXPECT(warm_mid > 0 && warm_mid_k1 * 10 >= warm_mid * 9, "cold samples after each prefill must not keep k = 1 off on warm steps (%d of %d)", warm_mid_k1, warm_mid);
   }
+  // (R5) HIVE_MTP_PRIOR — parse rule (unset / "" / "0" / malformed keep the built-in table) and its effect: a fresh gate with the measured T(1) 17 ·
+  //   T(2) 22 ms declines a mid-confidence first draft (bucket [0, 1): built-in 0.19 → E 1.19 / 22 < 1 / 17) and, with the DeepSeek prior (0.49), verifies it.
+  {
+    double t[kBuckets];
+    for (const char* bad : {(const char*)nullptr, "", "0", "0.3,0.5", "0.34,0.49,0.69,0.87,0.95,0.97,0.98", "0.34,0.49,0.69,0.87,0.95,0.97,0.98,0.98,0.9",
+                            "0.34,0.49,0.69,0.87,0.95,0.97,0.98,1.5", "0.34,0.49,0.69,0.87,0.95,0.97,0.98,0", "0.34,0.49,0.69,0.87,0.95,0.97,0.98,0.98x", "a,b,c,d,e,f,g,h"})
+      EXPECT(!parse_prior(bad, t), "parse_prior must reject '%s'", bad ? bad : "(null)");
+    EXPECT(parse_prior("0.34,0.49,0.69,0.87,0.95,0.97,0.98,0.98", t) && near(t[0], 0.34) && near(t[7], 0.98), "parse_prior must accept the DeepSeek prior");
+    EXPECT(parse_prior(" 0.34 , 0.49,0.69,0.87,0.95,0.97,0.98,1 ", t) && near(t[7], 1.0), "parse_prior: spaces and 1.0 are fine");
+    const float mid[1] = {0.5f};
+    Gate a, b;
+    for (Gate* g : {&a, &b}) { g->observe_step(1, 17.0); g->observe_step(2, 22.0); }
+    EXPECT(near(a.prior[1], prior_p(1)), "default prior = built-in table");
+    EXPECT(a.choose_k(true, mid, 1, 5, -1.f, 100) == 0, "built-in prior: mid-confidence draft declined (E %.2f / T2 22 vs 1 / 17)", 1 + prior_p(1));
+    EXPECT(parse_prior("0.34,0.49,0.69,0.87,0.95,0.97,0.98,0.98", b.prior) && b.choose_k(true, mid, 1, 5, -1.f, 100) == 1, "DeepSeek prior: mid-confidence draft verified");
+    fprintf(stderr, "[R5 HIVE_MTP_PRIOR] parse rule + mid-confidence decision: built-in 0 · DeepSeek prior 1\n");
+  }
   if (fails) { fprintf(stderr, "test_mtp_gate_cpu: %d FAILED\n", fails); return 1; }
   fprintf(stderr, "test_mtp_gate_cpu: all passed\n");
   return 0;

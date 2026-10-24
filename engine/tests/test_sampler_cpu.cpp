@@ -107,6 +107,7 @@ static void test_sample_paths() {
       {1.0f, 1.0f, 0, 0.f, 3.0f, "no truncation, peaked (a chat client default: T 1.0 · top_p 1.0)"},
       {0.6f, 0.f, 0, 0.f, 3.0f, "no truncation, top_p unset, T 0.6"},
       {1.0f, 1.0f, 0, 0.05f, 2.5f, "min_p 0.05 without top_p (order-free path)"},
+      {0.7f, 1.0f, 0, 0.f, 1.0f, "no truncation, flat, T 0.7 (two-stage path leaves the candidates often)"},
   };
   const int V = 3000;
   const long N = 80000;

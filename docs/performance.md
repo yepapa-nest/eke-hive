@@ -60,6 +60,22 @@ current column's prompts are 17.7K / 44K / 57K tokens:
 One-stream decode moves by a few percent between runs of the same build (80.7 and 82.9 above are the same build at 600 / 300 W;
 the board cap costs prefill and many-stream decode, not one stream).
 
+#### Thinking traffic (2026-10-25, the VRAM-size cell)
+
+The VRAM-size table's cell (96 GB, 262K context, vision on, `--conc 1,4,8,16 --long 8000,32000,64000`, one discarded c1 pass, 600 W) run three
+times on the same build: the published axes (thinking off, temperature 0), the thinking traffic of a chat client (`--effort low --temperature 1.0`,
+server default top_p 0.95) and the same with `--top-p 1.0` (no nucleus — the case the order-free and two-stage sampling paths serve):
+
+| Axis | Thinking off, T 0 | Thinking low, T 1.0 | Thinking low, T 1.0, top_p 1.0 |
+| --- | --- | --- | --- |
+| c1 (tok/s) | 85.1 | 79.8 | 79.8 |
+| c4 / c8 / c16 total (tok/s) | 122.9 / 176.2 / 173.0 | 119.7 / 156.9 / 153.5 | 117.4 / 159.0 / 157.3 |
+| First token, 8K / 32K / 64K (s) | 3.82 / 6.55 / 11.56 | 3.77 / 6.53 / 11.59 | 3.77 / 6.55 / 11.60 |
+| Decode after it (tok/s) | 73.8 / 74.4 / 73.8 | 67.1 / 65.0 / 72.8 | 64.1 / 64.9 / 63.6 |
+
+The thinking columns speculate less (mid-confidence drafts at temperature 1) and sample every row; with top_p 1.0 they now cost the same as
+with top_p 0.95 — before the order-free path, every token of a top_p 1.0 request sorted the vocabulary (8.5 ms against a 17 ms step).
+
 The development history below uses the development benchmark `tools/bench_tune.py` ([How it is measured](#how-it-is-measured);
 it reads lower than the chat benchmark and was not re-run after step 21):
 

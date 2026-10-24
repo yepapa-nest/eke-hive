@@ -23,6 +23,7 @@ Commands (the server started with the shipped configuration):
 python3 tools/bench_chat.py --name deepseek                                          # 1–32 streams, 17K / 42K / 54K prompts
 python3 tools/bench_chat.py --name glm --long 17000,42000,54000,100000,200000,250000   # GLM, up to 250K
 python3 tools/bench_chat.py --name deepseek-think --effort low --temperature 1.0 --conc 1,4 --long ""   # thinking traffic of a chat client
+python3 tools/bench_chat.py --name deepseek-think-p1 --effort low --temperature 1.0 --top-p 1.0 --conc 1,4 --long ""   # the same with top_p 1.0 (no nucleus) — secondary
 ```
 
 The headline numbers use the defaults (thinking off, temperature 0). `--effort` / `--temperature` measure the thinking traffic a chat

@@ -21,6 +21,9 @@ MUTANTS = [
     ('order-free path ignores min_p', '      e[i] = (min_p > 0.f && x < min_p) ? 0.f : x;', '      e[i] = x;'),
     ('order-free path ignores temperature', '      const float x = expf((logits[i] - mx) / temperature);', '      const float x = expf(logits[i] - mx);'),
     ('order-free path draws over part of the mass', '    std::uniform_real_distribution<double> U(0.0, sum);', '    std::uniform_real_distribution<double> U(0.0, sum * 0.9);'),
+    ('two-stage path never leaves the candidates', '    if (u < ec || all_in || V == 0) {', '    if (true) {'),
+    ('two-stage rest pass ignores temperature', '      e[i] = cand ? 0.f : expf((full_logits[i] - c.mx) * it);', '      e[i] = cand ? 0.f : expf(full_logits[i] - c.mx);'),
+    ('two-stage rest pass counts the candidates again', '      e[i] = cand ? 0.f : expf((full_logits[i] - c.mx) * it);', '      e[i] = expf((full_logits[i] - c.mx) * it);'),
     ('request_seed uses the clock only', '  return splitmix64(base ^ splitmix64(counter.fetch_add(1, std::memory_order_relaxed) + 1) ^ ns);', '  (void)base; return ns / 1000000;'),
 ]
 
