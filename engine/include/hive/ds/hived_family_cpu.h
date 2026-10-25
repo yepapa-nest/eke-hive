@@ -129,6 +129,8 @@ struct ImageInput {
   int start = 0, n_vit_h = 0, n_vit_w = 0;
   std::vector<int8_t> types;
   const bf16* patches_dev = nullptr;   // host memory under the CUDA stand-in
+  const uint8_t* patches_host = nullptr;  // as hive/runtime.h: the request's payload bytes (hived sets these, not patches_dev)
+  size_t patch_bytes = 0;
 };
 
 struct Seq;

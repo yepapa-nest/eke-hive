@@ -1393,8 +1393,19 @@ int Runtime::cpu_block(Seq* const* row_seq, int M, const int64_t* pos_end, bool 
 void Runtime::ensure_vision() {
   if (vision_ || !vision_can_) return;
   const double t0 = now_ms();
-  vision_ = std::make_unique<Vision>(model_, *blas_, st_, vision_max_patches_);
-  size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+  size_t fr0 = 0, tot = 0; cudaMemGetInfo(&fr0, &tot);
+  try {
+    vision_ = std::make_unique<Vision>(model_, *blas_, st_, vision_max_patches_);
+  } catch (const DeviceOutOfMemory&) {
+    // the room it needs went elsewhere (graph_room keeps it for later instances, not for ones made before): free the graphs and try once more
+    const int n = evict_graphs(0);
+    fprintf(stderr, "[runtime] ⚠️vision encoder did not fit — destroyed %d graphs and retrying\n", n);
+    cudaMemGetInfo(&fr0, &tot);
+    vision_ = std::make_unique<Vision>(model_, *blas_, st_, vision_max_patches_);
+  }
+  size_t fr = 0; cudaMemGetInfo(&fr, &tot);
+  if (fr0 > fr) vision_bytes_ = std::max(vision_bytes_, fr0 - fr);
+  graph_room_short_ = 0;  // the floor changed (graph_room back-off)
   fprintf(stderr, "[runtime] vision encoder loaded (max %d patches) in %.0f ms · VRAM free %.0f MiB\n", vision_max_patches_, now_ms() - t0, fr / 1048576.0);
   vision_last_use_ = now_ms();
 }
@@ -1404,6 +1415,7 @@ void Runtime::release_vision_if_idle() {
   if (now_ms() - vision_last_use_ < opt_.vision_idle_ms) return;
   CUDA_CHECK(cudaStreamSynchronize(st_));
   vision_.reset();
+  graph_room_short_ = 0;  // the floor changed (graph_room back-off)
   fprintf(stderr, "[runtime] vision encoder released (idle)\n");
 }
 
@@ -3091,6 +3103,8 @@ void Runtime::merge_images(int M, const std::vector<ImageInput>& images) {
   for (const ImageInput& im : images) {
     const int span = (int)im.types.size();
     HIVE_CHECK(span <= c.vision_max_tokens + 64, "image span too long");
+    // host patches (hived): uploaded into the encoder's patch buffer here, one image at a time — no device memory per image (ImageInput)
+    const bf16* patches = im.patches_dev ? im.patches_dev : vision_->upload_patches(im.patches_host, im.patch_bytes);
     std::vector<int32_t> row_of(span, 0);
     int rows = 0;
     for (int p = 0; p < span; ++p) { row_of[p] = rows; if (im.types[p] == 1) ++rows; }
@@ -3103,15 +3117,18 @@ void Runtime::merge_images(int M, const std::vector<ImageInput>& images) {
       const int r = c.vision_downsample, oh = (im.n_vit_h + r - 1) / r, ow = (im.n_vit_w + r - 1) / r;
       const size_t obytes = std::min((size_t)oh * ow * c.dim * 2, w.img_rows.n);
       std::vector<uint8_t> host(pbytes);
-      CUDA_CHECK(cudaMemcpyAsync(host.data(), im.patches_dev, pbytes, cudaMemcpyDeviceToHost, st_));
-      CUDA_CHECK(cudaStreamSynchronize(st_));
+      if (im.patches_host && im.patch_bytes == pbytes) std::memcpy(host.data(), im.patches_host, pbytes);
+      else {
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), patches, pbytes, cudaMemcpyDeviceToHost, st_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+      }
       const uint64_t h = VitCache::hash_of(host.data(), pbytes, im.n_vit_h, im.n_vit_w, im.types.data(), im.types.size());
       if (const VitCache::Entry* e = vit_cache_->find(h, host.data(), pbytes, im.n_vit_h, im.n_vit_w, im.types.data(), im.types.size());
           e && e->rows.size() == obytes) {
         CUDA_CHECK(cudaMemcpyAsync(w.img_rows.p, e->rows.data(), obytes, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));  // the source is a cache entry (the next insert may evict it) — release only after the upload
       } else {
-        vision_->encode(im.patches_dev, im.n_vit_h, im.n_vit_w, w.img_rows.as<bf16>());
+        vision_->encode(patches, im.n_vit_h, im.n_vit_w, w.img_rows.as<bf16>());
         VitCache::Entry ne;
         ne.hash = h; ne.n_vit_h = im.n_vit_h; ne.n_vit_w = im.n_vit_w; ne.types = im.types; ne.patches = std::move(host);
         ne.rows.resize(obytes);
@@ -3120,7 +3137,7 @@ void Runtime::merge_images(int M, const std::vector<ImageInput>& images) {
         vit_cache_->insert(std::move(ne));
       }
     } else
-    vision_->encode(im.patches_dev, im.n_vit_h, im.n_vit_w, w.img_rows.as<bf16>());
+    vision_->encode(patches, im.n_vit_h, im.n_vit_w, w.img_rows.as<bf16>());
     CUDA_CHECK(cudaMemcpyAsync(w.img_types.p, im.types.data(), (size_t)span, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(w.img_row_of.p, row_of.data(), (size_t)span * 4, cudaMemcpyHostToDevice, st_));
     k::merge_image(w.h.as<bf16>(), c.hc, c.dim, im.start, span, w.img_types.as<int8_t>(), w.img_row_of.as<int32_t>(), w.img_rows.as<bf16>(),
@@ -3310,8 +3327,10 @@ void Runtime::tile_xchg(int s) {
 void Runtime::run_graph(int l, int M, int Tb, const std::function<void()>& body) {
   if (!graphs_) { body(); return; }
   GraphEntry& g = graphs_map_[std::make_tuple(l, vdec_ ? M + kVerifyGraphKey : M, Tb)];  // R1: the verify front has a different body (verify_decode.h steps 1–3), hence its own key
+  g.last = ++graph_clock_;
   if (g.exec) { CUDA_CHECK(cudaGraphLaunch(g.exec, st_)); return; }
   if (g.uses++ < 1) { ++graph_eager_; body(); return; }  // MB1: first use = eager (the batched MTP gate filters out this step's cost sample)
+  graph_room();  // a new instance: keep the VRAM floor first (runtime.h) — std::map references stay valid, and g has no instance yet
   cudaGraph_t graph = nullptr;
   capturing_ = true;
   ++graph_captures_;  // R1 (HIVE_MTP_GATE3: the gate discards cost samples of steps that included a capture)
@@ -3331,6 +3350,55 @@ void Runtime::run_graph(int l, int M, int Tb, const std::function<void()>& body)
   CUDA_CHECK(cudaGraphInstantiate(&g.exec, graph, 0));
   CUDA_CHECK(cudaGraphDestroy(graph));
   CUDA_CHECK(cudaGraphLaunch(g.exec, st_));
+}
+
+// VRAM floor for graph instances (runtime.h graph_clock_ comment). Floor = HIVE_GRAPH_VRAM_FLOOR_MB (unset, empty, non-numeric or negative = 128 MiB)
+//   plus, while the lazily loaded vision encoder is not loaded, what one load takes (measured at the first load — 1,966 MiB on 2026-10-25 — and
+//   2,048 MiB before it). Asked only before a new instance (rare once the working set is captured): one cudaMemGetInfo.
+void Runtime::graph_room() {
+  static const size_t floor_bytes = [] {
+    const char* v = getenv("HIVE_GRAPH_VRAM_FLOOR_MB");
+    char* end = nullptr;
+    const long long x = v && *v ? strtoll(v, &end, 10) : -1;
+    return (size_t)(v && *v && end && *end == 0 && x >= 0 ? x : 128) << 20;
+  }();
+  if (capturing_) return;  // never inside a capture (no sync / memory query there)
+  const size_t vision_need = vision_can_ && !vision_ ? (vision_bytes_ ? vision_bytes_ : (size_t)2048 << 20) : 0;
+  size_t fr = 0, tot = 0;
+  if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { (void)cudaGetLastError(); return; }
+  if (fr >= floor_bytes + vision_need) return;
+  // Back-off: when destroying every graph did not reach the floor (the memory went elsewhere), destroy again only after free VRAM fell another
+  //   64 MiB below what that left — otherwise each new instance would destroy the whole working set again.
+  if (graph_room_short_ && fr + ((size_t)64 << 20) > graph_room_short_) return;
+  const int n = evict_graphs(floor_bytes + vision_need);
+  size_t fr2 = 0;
+  cudaMemGetInfo(&fr2, &tot);
+  graph_room_short_ = fr2 < floor_bytes + vision_need ? fr2 : 0;
+  fprintf(stderr, "[runtime] graph room: destroyed %d least recently used graphs · VRAM free %.0f → %.0f MiB (floor %.0f%s) · %zu kept · %ld destroyed so far\n",
+          n, fr / 1048576.0, fr2 / 1048576.0, floor_bytes / 1048576.0, vision_need ? (" + vision " + std::to_string(vision_need >> 20) + " MiB").c_str() : "",
+          (size_t)std::count_if(graphs_map_.begin(), graphs_map_.end(), [](const auto& e) { return e.second.exec != nullptr; }), graph_evicted_);
+}
+
+int Runtime::evict_graphs(size_t want_free) {
+  std::vector<GraphEntry*> live;
+  for (auto& [key, g] : graphs_map_) if (g.exec) live.push_back(&g);
+  if (live.empty()) return 0;
+  std::sort(live.begin(), live.end(), [](const GraphEntry* a, const GraphEntry* b) { return a->last < b->last; });
+  CUDA_CHECK(cudaStreamSynchronize(st_));  // no instance is in flight when it is destroyed (its memory is returned at once)
+  int n = 0;
+  for (size_t i = 0; i < live.size(); ++i) {
+    cudaGraphExecDestroy(live[i]->exec);
+    live[i]->exec = nullptr;
+    live[i]->uses = 0;  // the next use runs eagerly, then captures again (run_graph)
+    ++n;
+    if (want_free && (n % 32 == 0 || i + 1 == live.size())) {  // check in batches — the driver returns memory in whole pages
+      size_t fr = 0, tot = 0;
+      cudaMemGetInfo(&fr, &tot);
+      if (fr >= want_free) break;
+    }
+  }
+  graph_evicted_ += n;
+  return n;
 }
 
 // D1 HIVE_DECODE_BLOCKING_SYNC: wait for the decode layer's routing sync (end of graph A → host reads route_ids_h) with a blocking wait instead of spinning.

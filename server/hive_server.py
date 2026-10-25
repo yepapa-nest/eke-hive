@@ -1706,8 +1706,9 @@ class Daemon:
 
 DAEMON: Daemon | None = None
 # Request log (read by tools/hive_monitor.py): one JSONL line per request — HIVE_REQUEST_LOG (path; "" = off; unset =
-#   /out/logs/requests-server.jsonl if /out/logs exists). Times are epoch ms: t_recv (HTTP received), t_first (first daemon
-#   token), t_done (finished). Write failures are absorbed (no effect on the request).
+#   /out/logs/requests-server.jsonl if /out/logs exists). Times are epoch ms: t_recv (HTTP received), t_send (handed to the daemon),
+#   t_admit (the daemon admitted it — requests with stages), t_first (first daemon token), t_done (finished). Image requests also carry
+#   images (count) and image_bytes (patch payload sent). Write failures are absorbed (no effect on the request).
 _REQ_LOG_LOCK = threading.Lock()
 
 
@@ -2303,8 +2304,11 @@ async def models():
 # HIVE_STAGE_STATUS (default off): the engine-side stage of each request, for clients that want to show what a response is waiting on.
 #   GET /v1/hive/requests/{id} (id = the response id, "chatcmpl-…", sent in the first stream chunk) →
 #   {"id", "stage": queued | prefill | thinking | tool_call | answer | done | error, "prompt_tokens", "cached_tokens", "prefill_total",
-#    "prefill_done", "prefill_rate", "prefill_eta_s", "seen_before", "tool_name", "updated"}. queued = waiting for the engine to admit it (other requests run), prefill = reading the
-#   prompt (cached_tokens reused, prefill_total to read, prefill_done after each chunk), then the generated text's stage. Off = the route
+#    "prefill_done", "prefill_rate", "prefill_eta_s", "seen_before", "tool_name", "updated"}. queued = other requests were in flight when it
+#   arrived, so it waits behind them until the engine admits it; prefill = reading the prompt (cached_tokens reused, prefill_total to read,
+#   prefill_done after each chunk — before the engine admits a request with nothing ahead, prefill with prefill_total 0: the prompt is being
+#   handed over), then the generated text's stage. A request with nothing ahead used to start as queued as well, so a client showed "waiting
+#   for an earlier request" for the whole hand-over — measured 2026-10-25, 15–31 s on a 430–460K-token browser conversation that ran alone. Off = the route
 #   answers 404 and nothing else changes (responses are byte-identical; the daemon line "admitted" is only sent when asked for).
 #   Entries live while the request runs and STAGE_KEEP_S after it ends.
 #   While reading: "prefill_rate" (tokens/s at the position reached) and "prefill_eta_s" (seconds left at "updated"), so a client can
@@ -2396,7 +2400,8 @@ def prefill_rate_save() -> None:
         pass
 
 
-def stage_open(rid: str, prompt_tokens: int, session: str | None = None) -> None:
+def stage_open(rid: str, prompt_tokens: int, session: str | None = None, ahead: bool = True) -> None:
+    """ahead = other requests are in flight (the daemon admits this one after them) — queued; else prefill with nothing read yet."""
     now = time.time()
     for k in [k for k, v in STAGES.items() if v.get("_ended") and now - v["_ended"] > STAGE_KEEP_S]:
         STAGES.pop(k, None)
@@ -2407,7 +2412,9 @@ def stage_open(rid: str, prompt_tokens: int, session: str | None = None) -> None
         STAGE_SEEN.move_to_end(session)
         while len(STAGE_SEEN) > STAGE_SEEN_CAP:
             STAGE_SEEN.popitem(last=False)
-    STAGES[rid] = {"stage": "queued", "prompt_tokens": prompt_tokens, "seen_before": seen, "updated": round(now, 3)}
+    STAGES[rid] = ({"stage": "queued", "prompt_tokens": prompt_tokens, "seen_before": seen, "updated": round(now, 3)} if ahead else
+                   {"stage": "prefill", "prompt_tokens": prompt_tokens, "seen_before": seen, "updated": round(now, 3), "cached_tokens": 0,
+                    "prefill_total": 0, "prefill_done": 0, "_t_last": now, "_done_last": 0, "_chunks": []})
 
 
 def prefill_fit(chunks: list, prior_b: float | None, min_span: float = 0.0) -> tuple:
@@ -2946,6 +2953,7 @@ async def chat(request: Request):
                            hints=round((t2h - t2 + t4 - t3) * 1000, 1))
             return ids, images, blob, hints
         t_prep = time.perf_counter()
+        prep_ms["before"] = round(time.time() * 1000.0 - t_recv, 1)  # body read and parse, conversation key and head (before prepare)
         ids, images, blob, hints = await asyncio.to_thread(prepare)
         prep_ms["total"] = round((time.perf_counter() - t_prep) * 1000, 1)
     except Exception as e:
@@ -3018,7 +3026,7 @@ async def chat(request: Request):
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     if STAGE_STATUS:  # GET /v1/hive/requests/{rid} (stage_status) — the daemon adds its "admitted" line only to requests that ask
-        stage_open(rid, len(ids), conv_key or session)
+        stage_open(rid, len(ids), conv_key or session, ahead=any(n > 0 for n in INFLIGHT.values()))
         sampling["stages"] = True
     stream = bool(body.get("stream"))
     # Reserve before yielding the response; two streams may be created before either
@@ -3059,6 +3067,7 @@ async def chat(request: Request):
     req_rec = {"t_recv": t_recv, "t_first": None, "endpoint": endpoint, "stream": stream, "max_tokens": sampling["max_tokens"], "session": session,
                "rid": rid, "daemon_rid": daemon_rid, "prompt_tokens": len(ids), "client": client_tags(request, body), "outcome": "closed", "done": None,
                "prep_ms": prep_ms, **({"priority": sampling["priority"]} if "priority" in sampling else {}), **diverge,
+               **({"images": len(images), "image_bytes": len(blob)} if images else {}),
                # record thinking mode and effort so it can be checked whether the requested effort actually arrived
                "thinking_mode": thinking_mode, "effort": effort,
                # thinking cap as received (null if none) — whether it was forced is done.think_forced (daemon), also lifted to the top level below
@@ -3095,6 +3104,7 @@ async def chat(request: Request):
         monitor = (asyncio.create_task(watch_disconnect())
                    if hasattr(request, 'is_disconnected') else None)
         try:
+            req_rec["t_send"] = time.time() * 1000.0  # with t_admit (the daemon's admitted line): where the time before the prefill goes
             async with aclosing(DAEMON.generate(session, ids, images, blob, rid=daemon_rid, **({"boundaries": hints} if hints else {}), **sampling)) as source:
                 async for msg in source:
                     if "id" in msg:
@@ -3115,6 +3125,8 @@ async def chat(request: Request):
                             yield ('done', {'done': True, 'n': generated, 'finish': 'stop', 'stop_sequence': stop_text.matched})
                             break
                     elif "admitted" in msg or "progress" in msg:  # sent with "stages" (admitted) / after each prefill chunk (progress)
+                        if "admitted" in msg:
+                            req_rec["t_admit"] = time.time() * 1000.0
                         if STAGE_STATUS:
                             if "admitted" in msg:
                                 stage_prefill(rid, 0, total=max(0, int(msg.get("total") or 0) - int(msg.get("cached") or 0)), cached=int(msg.get("cached") or 0))

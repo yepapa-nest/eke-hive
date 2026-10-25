@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Image requests no longer take device memory per image at admission (DeepSeek)**: hived copied every image of a request to its own device
+  buffer before the prefill, images inside the reused prefix included. A browser conversation sends its screenshots again on every turn
+  (9.4–10.7 MiB each); on a production deployment that gives the expert cache all but the reserve (VRAM 100 %), 146 MiB were free with the
+  vision encoder loaded, and every turn of that conversation failed with `cudaMalloc(9.4 MiB) failed: out of memory` from 12:51 on (4 failures
+  in 3 h). The patches now stay in the request's payload; the encoder uploads one image at a time into its own buffer (sized for the patch
+  budget at load, 13.5 MiB at 9,216 patches) right before encoding it, so images the prefix already holds are never uploaded. Other families
+  keep their device copy (their runtimes take device patches).
+- **A VRAM floor for decode CUDA graphs**: one graph per (layer, rows, attention bucket) stayed for the process lifetime, and each new
+  combination of batch size and context length instantiated more — the same deployment lost 450 MiB of its reserve in 12 h (free VRAM with the
+  encoder unloaded 2,464 → 2,012 MiB; right after loading it 498 → 136 MiB). Before a new instance, graphs not launched for the longest time
+  are destroyed until free VRAM covers `HIVE_GRAPH_VRAM_FLOOR_MB` (128) plus one encoder load while it is unloaded (measured at its first load);
+  a destroyed graph is captured again on later use. When destroying every graph does not reach the floor, it waits for another 64 MiB drop
+  before trying again. A failed encoder load destroys the graphs and retries once.
+- **`HIVE_STAGE_STATUS`: `queued` only behind other requests**: a request started as `queued` until the daemon admitted it, so a client showed
+  "waiting for an earlier request" for the whole hand-over even when it ran alone (15–31 s on a 430–460K-token conversation). With nothing
+  else in flight it now starts as `prefill` with nothing read yet. The request record adds `t_send` / `t_admit` (handed to the daemon /
+  admitted), `prep_ms.before` (body read and parse) and, for image requests, `images` and `image_bytes`.
 - **Sampling without top-p or top-k draws from the GPU candidates first**: the device already sends the top 1024 values with the row maximum and the
   full Σexp under the row's temperature. A token is now drawn in two stages — inside the candidates with their share of that sum, otherwise from
   one host pass over the remaining logits (candidate indices skipped) — so the full logits are read only when the draw falls outside the

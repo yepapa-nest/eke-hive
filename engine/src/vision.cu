@@ -168,6 +168,13 @@ Vision::Vision(Model& model, Blas& blas, cudaStream_t st, int max_patches) : mod
   const size_t max_rows = (size_t)N / (r * r) + 2 * (size_t)(sqrt((double)N) + 1) / r + 4;
   unfold.alloc(max_rows * vd * r * r * 2);
   al_hidden.alloc(max_rows * c.dim * 2);
+  patches_in.alloc((size_t)N * 3 * c.vision_patch * c.vision_patch * 2);  // one image at a time (upload_patches) — 13.5 MiB at 9216 patches
+}
+
+const bf16* Vision::upload_patches(const uint8_t* host, size_t bytes) {
+  HIVE_CHECK(host != nullptr && bytes <= patches_in.n, "image patches exceed the encoder's patch buffer");
+  CUDA_CHECK(cudaMemcpyAsync(patches_in.p, host, bytes, cudaMemcpyHostToDevice, st_));
+  return patches_in.as<bf16>();
 }
 
 void Vision::load() {

@@ -34,6 +34,9 @@ class Vision {
   Vision(Model& model, Blas& blas, cudaStream_t st, int max_patches);
   // patches: bf16 [n_vit_h·n_vit_w, 3·p·p] (device) → out: bf16 [n_llm_h·n_llm_w, dim] (device)
   void encode(const bf16* patches, int n_vit_h, int n_vit_w, bf16* out);
+  // Host patch bytes (bf16 [n_vit_h·n_vit_w, 3·p·p]) → the encoder's own patch buffer (sized for max_patches at load, so encoding a request's
+  //   images allocates nothing). Returns the device copy, valid until the next upload; the copy is ordered on the encoder stream.
+  const bf16* upload_patches(const uint8_t* host, size_t bytes);
   const VisionWeights& w() const { return w_; }
 
  private:
@@ -42,7 +45,7 @@ class Vision {
   cudaStream_t st_;
   VisionWeights w_;
   int max_patches_;
-  DevBuf x, xn, qkv, q, k, v, attn, o, mlp, act, cos_, sin_, unfold, al_hidden, scores, probs;
+  DevBuf x, xn, qkv, q, k, v, attn, o, mlp, act, cos_, sin_, unfold, al_hidden, scores, probs, patches_in;
   void load();
 };
 

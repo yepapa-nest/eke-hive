@@ -312,7 +312,8 @@ uint64_t content_at(const std::vector<ImageInput>* images, const int32_t* ids, i
   uint64_t v = (uint32_t)ids[m];
   if (images) for (const auto& im : *images)
     if (m >= im.start && m < im.start + (int)im.types.size()) {
-      const uint64_t h = fnv(reinterpret_cast<const uint8_t*>(im.patches_dev), (size_t)im.n_vit_h * im.n_vit_w * kFakePatchBytes);
+      const uint8_t* p = im.patches_dev ? reinterpret_cast<const uint8_t*>(im.patches_dev) : im.patches_host;  // hived hands over host bytes (ImageInput)
+      const uint64_t h = fnv(p, (size_t)im.n_vit_h * im.n_vit_w * kFakePatchBytes);
       v |= (h & 0xffffffffull) << 32;
     }
   return v;

@@ -130,7 +130,14 @@ struct RuntimeOptions {
 struct ImageInput {
   int start = 0, n_vit_h = 0, n_vit_w = 0;
   std::vector<int8_t> types;
-  const bf16* patches_dev = nullptr;  // [n_vit_h·n_vit_w, 3·p·p] bf16 (device)
+  const bf16* patches_dev = nullptr;  // [n_vit_h·n_vit_w, 3·p·p] bf16 (device) — or null and the host bytes below
+  // The same patches in host memory (hived: the request's binary payload, alive until the request ends). merge_images uploads them into the
+  //   encoder's own patch buffer right before encoding, so a request takes no device memory per image — measured 2026-10-25 (DeepSeek service,
+  //   VRAM 100 %): a browser conversation sent its screenshots on every turn and hived allocated 9.4–10.7 MiB per image at admission, images inside
+  //   the reused prefix included; with the encoder loaded 146 MiB were free, so the next turn failed with "cudaMalloc(9.4 MiB) failed: out of memory"
+  //   on every request of that conversation (4 failures in 3 h, each answered by the paid backup).
+  const uint8_t* patches_host = nullptr;
+  size_t patch_bytes = 0;
 };
 
 // HIVE_BATCH_PREFILL: one sequence's share of forward_multi (one chunk = that sequence's [pos, pos+M) — text only).
@@ -307,6 +314,7 @@ class Runtime {
   //   so the first step of a new row count or Tb bucket is slower than replay (hundreds of launches). Filtering captures alone lets that first sample into the cost table (observed: a
   //   batched c4 first 5-row verify of 47.5 ms vs T(4) 33 ms settled as "+14.5 ms per row" and every later draft decision was rejected, never re-measured). The batch gate filters samples by this count.
   long graph_eager_runs() const { return graph_eager_; }
+  long graph_evictions() const { return graph_evicted_; }   // graphs destroyed to keep the VRAM floor (graph_room)
   // Test only (CLI --verify2-test): while on, collect routing tables of decode-policy layers (moe_decode_experts — main and draft layers) in layer order (at the xtrace_layer site — entry = [layer, M, k, ids(M*k)]).
   //   Comparing expert sets per row and layer across two paths/runs tells whether a logit difference is a "routing flip (cascading amplification)". Off (default) does nothing.
   void set_route_capture(bool on) { route_cap_ = on; route_log_.clear(); }
@@ -555,9 +563,20 @@ class Runtime {
   bool graphs_ = true;
   bool capturing_ = false;
   bool dump_final_ = false;  // window that allows only the final dump at the end of forward_batch in graph mode
-  struct GraphEntry { cudaGraphExec_t exec = nullptr; int uses = 0; };
+  struct GraphEntry { cudaGraphExec_t exec = nullptr; int uses = 0; uint64_t last = 0; };
   std::map<std::tuple<int, int, int>, GraphEntry> graphs_map_;
   void run_graph(int l, int M, int Tb, const std::function<void()>& body);
+  // VRAM floor for decode graph instances (runtime.cpp graph_room): one graph per (layer, rows, attention bucket) is kept for the process
+  //   lifetime, and each new combination of batch size and context length instantiates more — measured 2026-10-25 (DeepSeek service, VRAM 100 %):
+  //   device free VRAM with the encoder unloaded fell 2,464 → 2,012 MiB over 12 h and 498 → 136 MiB right after loading it. Before a new graph is
+  //   instantiated, graphs not launched for the longest time are destroyed until free VRAM covers the floor plus the vision encoder when it is
+  //   not loaded (a destroyed graph is captured again on later use — the same kernels; only capture time is spent).
+  uint64_t graph_clock_ = 0;
+  long graph_evicted_ = 0;
+  size_t vision_bytes_ = 0;                   // device memory one encoder load took (measured at the first load; estimate before it)
+  size_t graph_room_short_ = 0;               // free VRAM left by the last graph_room that could not reach the floor (0 = it did) — back-off
+  void graph_room();
+  int evict_graphs(size_t want_free);         // destroys least recently launched graphs until free VRAM >= want_free (0 = all); returns how many
   void decode_front(int l, int M, int Tb, bool copy_acts);  // decode_layer graph A body (shared with the step graph)
   // HIVE_DECODE_STEP_GRAPH (env_on, constructor option block): one forward_batch step (all layers + head) as a single CUDA graph — instead of a host sync per layer,
   //   a GPU plan (hs_plan) + CPU pool dispatcher handshake (hive/decode_handshake.h, decode_dispatch.h). State is runtime.cpp's StepGraph (created on the first step when enabled —

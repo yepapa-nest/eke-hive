@@ -113,7 +113,7 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
       HIVE_CHECK(im.start >= 0 && im.start + (int)im.types.size() <= M && ones == n_img, "ds-cpu: image span does not match its patches");
       cpu::DsCpuEngine::Image x;
       x.start = im.start; x.n_vit_h = im.n_vit_h; x.n_vit_w = im.n_vit_w; x.types = im.types;
-      x.patches = reinterpret_cast<const uint16_t*>(im.patches_dev);
+      x.patches = im.patches_dev ? reinterpret_cast<const uint16_t*>(im.patches_dev) : reinterpret_cast<const uint16_t*>(im.patches_host);
       imgs.push_back(std::move(x));
     }
   if (M == 1 && imgs.empty()) {

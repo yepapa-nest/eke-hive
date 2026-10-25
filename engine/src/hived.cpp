@@ -261,6 +261,23 @@ struct Request {
   double t_recv = 0;  // time the receiver thread queued it (now_ms) — queue_ms in the request's final log line (receive -> prefill start)
 };
 
+// An image's patches at admission. Families whose ImageInput carries host fields (DeepSeek: hive/runtime.h, its CPU daemon) get the request's
+//   payload bytes — merge_images uploads only the images a chunk encodes, into the encoder's own buffer, so admission allocates no device memory
+//   (measured 2026-10-25, DeepSeek at VRAM 100 %: the per-image copy below failed every turn of a browser conversation, ImageInput). The other
+//   families (GLM, Qwen, Gemma, Q27) keep the device copy, held by the job until it ends. A template, so the branch a family lacks is discarded.
+template <class Img>
+void set_image_patches(Img& x, const uint8_t* bytes, size_t nb, std::vector<DevBuf>& keep) {
+  if constexpr (requires { x.patches_host; x.patch_bytes; }) {
+    x.patches_host = bytes;
+    x.patch_bytes = nb;
+  } else {
+    DevBuf d(nb);
+    CUDA_CHECK(cudaMemcpy(d.p, bytes, nb, cudaMemcpyHostToDevice));
+    x.patches_dev = d.as<bf16>();
+    keep.push_back(std::move(d));
+  }
+}
+
 SocketWriter* output = nullptr;
 bool send_json(int fd, const json& j) { return output->send(fd, j.dump() + "\n"); }
 void finish_socket(int fd) { output->finish(fd); }
@@ -1862,7 +1879,7 @@ int main(int argc, char** argv) {
     Session* S = nullptr;
     std::vector<Session::ImgSig> request_sig, req_sig;
     std::vector<ImageInput> all_images;
-    std::vector<DevBuf> patch_bufs;
+    std::vector<DevBuf> patch_bufs;  // families without host patch fields (see the image loop at admission)
     size_t common = 0, i = 0, chunk_cap = 0, busy_cap = 0;
     int pick = 0, extra_left = 0, n_chunks = 0;
     bool has_images = false, last_upper_skipped = false;
@@ -2374,11 +2391,9 @@ int main(int argc, char** argv) {
             x.start < 0 || (size_t)x.start >= ids.size() || x.types.empty()) { fail("image geometry invalid"); return nullptr; }
         if (off + nb > A->r.bin.size()) { fail("image bytes short"); return nullptr; }
         req_sig.push_back(request_sig[req_sig.size()]);
-        DevBuf d(nb);
-        CUDA_CHECK(cudaMemcpy(d.p, A->r.bin.data() + off, nb, cudaMemcpyHostToDevice));
+        // DeepSeek: the patches stay in the request's payload (A->r.bin lives until the request ends) — set_image_patches
+        set_image_patches(x, A->r.bin.data() + off, nb, patch_bufs);
         off += nb;
-        x.patches_dev = d.as<bf16>();
-        patch_bufs.push_back(std::move(d));
         all_images.push_back(std::move(x));
       }
       if (!all_images.empty() && !rt.has_vision()) { fail("vision encoder not loaded"); return nullptr; }
