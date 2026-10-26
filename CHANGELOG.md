@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Large requests reach the daemon in one write (server)**: the API server wrote a request's payload from the event loop, one socket
+  buffer (~256 KiB) per loop iteration. An agent conversation that carries 12 screenshots sends 118 MB per turn (~460 iterations), and on a
+  production deployment those turns reached the daemon 12–20 s after the server handed them over (p50 16 s over 150 turns; text requests
+  0.05 s). A request of 1 MiB or more is now written by a worker thread with one blocking `sendall`, then read back through asyncio — 12-image
+  turns 0.50–0.65 s.
+- **`HIVE_LAYER_YIELD_SLICE` (new, off by default): every queued request can start during a long prefill**: a request no yield rule admits
+  whole (longer than the short and mid rules allow) starts at a layer yield as a sliced prefill — its chunks of at most N rows (and at most
+  the rows the runtime parked) run at the following yields, alternating with the paused prefill, and the one left when either finishes
+  continues as the main prefill. Requests of the same priority class take turns of about equal length, a better class gets a slice at every
+  yield (also during a priority hold), a worse class is not sliced into a better one. A slice is an ordinary chunk of its request; the
+  tail-layer skip (C1) is never used before a slice, and a boundary snapshot that skipped the tail layers is resumed only when the first
+  slice is in tail mode. Measured on a production deployment: a 24,639-row conversation turn waited 156 s behind a 174K read-ahead, and two
+  background jobs timed out (180 s / 300 s) behind a 300K read-ahead held by a decoding request.
+- **`HIVE_PRIORITY_SHARED=N` (new, off by default)**: every priority ≤ N is one class — such requests decode together and do not hold one
+  another's decode, admission or prefill; priorities above N keep the strict order. Under the strict order an interactive turn at 0 waited for
+  the whole of every turn at −1.
+- **Image requests whose images lie inside the reusable prefix are admitted at a layer yield (DeepSeek)**: the yield refused every request
+  with an image, also when all of them were already in the prefix the daemon resumes from (nothing to encode). Such a request now counts its
+  rows like a text request (image signatures are compared as admission compares them); a request with an image still to encode keeps waiting
+  (no encoder load in the middle of a long prefill). Families that copy every image to the device at admission keep refusing them.
+- **The graph room destroys the older half**: a destroyed graph instance's memory is not returned as free VRAM — the driver keeps it for the
+  next instantiation. Five rooms on a production deployment destroyed every graph ("0 kept") and free VRAM did not move; the fall of free VRAM
+  did slow from ~38 to ~6 MiB/h after the first (later captures reused the kept memory). A room now destroys the least recently used half
+  instead of waiting for free VRAM to rise. (The 450 MiB the earlier entry attributes to graphs is that kept memory, reused rather than leaked.)
+
 - **Image requests no longer take device memory per image at admission (DeepSeek)**: hived copied every image of a request to its own device
   buffer before the prefill, images inside the reused prefix included. A browser conversation sends its screenshots again on every turn
   (9.4–10.7 MiB each); on a production deployment that gives the expert cache all but the reserve (VRAM 100 %), 146 MiB were free with the

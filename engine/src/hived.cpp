@@ -259,12 +259,45 @@ struct Request {
   std::shared_ptr<std::atomic<bool>> cancel;  // each request has its own cancel flag (a per-session shared flag let a re-request clear the previous request's cancel)
   bool solo = false;  // a request put back after a batched-prefill exception — run alone (single path) only
   double t_recv = 0;  // time the receiver thread queued it (now_ms) — queue_ms in the request's final log line (receive -> prefill start)
+  // Image signatures (span start, end, hash of the patch bytes, token types and grid) — computed once (request_img_sig): admission and the
+  //   layer-yield rules both need them, and the hash walks every patch byte (a long agent conversation with screenshots sends 118 MB of patches per turn).
+  struct ImgSig { int start, end; uint64_t hash; };
+  std::vector<ImgSig> img_sig;
+  int img_sig_state = 0;  // 0 = not computed · 1 = computed · -1 = the payload is shorter than the images declare
 };
+// The request's image signatures (computed on the first call). nullptr = its payload is shorter than its images declare. A malformed image
+//   entry throws (json) — every call, since nothing is cached then.
+const std::vector<Request::ImgSig>* request_img_sig(Request& r) {
+  if (r.img_sig_state == 0) {
+    std::vector<Request::ImgSig> sig;
+    int state = 1;
+    const json& q = r.req;
+    if (q.contains("images") && q["images"].is_array()) {
+      size_t off = 0;
+      for (const auto& im : q["images"]) {
+        const size_t nb = im.at("nbytes").get<size_t>();
+        if (nb > r.bin.size() - off) { state = -1; sig.clear(); break; }
+        uint64_t hash = 1469598103934665603ull;
+        auto mix = [&](uint8_t b) { hash ^= b; hash *= 1099511628211ull; };
+        for (size_t b = 0; b < nb; ++b) mix(r.bin[off + b]);
+        for (const auto& t : im.at("types")) mix((uint8_t)t.get<int>());
+        for (auto key : {"n_vit_h", "n_vit_w"}) { uint32_t n = im.at(key).get<uint32_t>(); for (int b = 0; b < 4; ++b) mix((n >> (8 * b)) & 255); }
+        const int start = im.at("start").get<int>();
+        sig.push_back({start, start + (int)im.at("types").size(), hash});
+        off += nb;
+      }
+    }
+    r.img_sig = std::move(sig);
+    r.img_sig_state = state;
+  }
+  return r.img_sig_state > 0 ? &r.img_sig : nullptr;
+}
 
 // An image's patches at admission. Families whose ImageInput carries host fields (DeepSeek: hive/runtime.h, its CPU daemon) get the request's
 //   payload bytes — merge_images uploads only the images a chunk encodes, into the encoder's own buffer, so admission allocates no device memory
 //   (measured 2026-10-25, DeepSeek at VRAM 100 %: the per-image copy below failed every turn of a browser conversation, ImageInput). The other
 //   families (GLM, Qwen, Gemma, Q27) keep the device copy, held by the job until it ends. A template, so the branch a family lacks is discarded.
+template <class Img> constexpr bool kHostPatches = requires(Img& x) { x.patches_host; x.patch_bytes; };  // admission allocates no device memory for images
 template <class Img>
 void set_image_patches(Img& x, const uint8_t* bytes, size_t nb, std::vector<DevBuf>& keep) {
   if constexpr (requires { x.patches_host; x.patch_bytes; }) {
@@ -839,6 +872,34 @@ int main(int argc, char** argv) {
     const long long x = v && *v ? strtoll(v, &end, 10) : 0;
     return v && *v && end && *end == 0 && x > 0 ? (size_t)std::min<long long>(x, 1LL << 30) : (size_t)0;
   }();
+  // HIVE_LAYER_YIELD_SLICE (with HIVE_LAYER_YIELD; unset / "" / "0" / non-numeric = off · N = rows per slice, capped at max_chunk): a queued
+    //   request that no yield rule admits (too long for the short and mid rules) still starts at a layer yield — as a sliced prefill: its
+    //   chunks of at most N rows (and at most the rows the runtime parked) run at the following yields, alternating with the paused prefill,
+    //   until either finishes; the one left over continues as the main prefill. Requests of the same priority class share the time about
+    //   equally (a slice runs once the paused prefill has run as long as the last slice took); a better class gets a slice at every yield; a
+    //   worse class is not sliced into a better one. Measured 2026-10-25 20:50 (production log, DeepSeek): a 174,310-row read-ahead (priority 1)
+    //   prefilled for 218 s while a conversation turn of 24,639 new rows waited 156 s in the queue behind it, and two conversations of the
+    //   same priority read their prompts one after the other (a 298K re-read held every other conversation for 80 s) — a request waited for the
+    //   whole prefill in front of it unless it passed the short or mid rule. Schedule only: a slice is an ordinary chunk of that request
+    //   (its own tokens, positions and causal order; the tail-layer skip (C1) is not used before a slice, since its next chunk may be small).
+  const size_t ly_slice = ly_period <= 0 ? 0 : [&] {
+    const char* v = getenv("HIVE_LAYER_YIELD_SLICE");
+    char* end = nullptr;
+    const long long x = v && *v ? strtoll(v, &end, 10) : 0;
+    return v && *v && end && *end == 0 && x > 0 ? (size_t)std::min<long long>(x, (long long)max_chunk) : (size_t)0;
+  }();
+  // HIVE_PRIORITY_SHARED (optional; unset / "" / non-numeric = off): requests whose priority is <= N form one class — they decode together and
+    //   none holds another's decode, prefill or admission (the priority rules below compare classes). Priorities above N keep the strict order
+    //   (a background request still waits for the better ones). Measured 2026-10-25/26 (production log): interactive turns arrive with -1 or 0
+    //   by surface; under the strict order a 0 turn's decode and its admission were held for the whole of every -1 turn (an agent
+    //   conversation running turn after turn kept the other conversations waiting), which a single user saw as "one turn at a time".
+  static const int prio_shared = [] {
+    const char* v = getenv("HIVE_PRIORITY_SHARED");
+    char* end = nullptr;
+    const long x = v && *v ? strtol(v, &end, 10) : 0;
+    return v && *v && end && *end == 0 ? (int)std::max(-1000L, std::min(1000L, x)) : INT_MIN;
+  }();
+  auto prio_class = [](int p) { return prio_shared != INT_MIN && p <= prio_shared ? prio_shared : p; };
   // Arrival coalescing (HIVE_BATCH_COALESCE_MS, HIVE_BATCH_PREFILL path): before the first round of a batched prefill, if the head request is
     //   streaming-sized and seats/slots remain, wait until following arrivals pause (no new arrival for this many ms after the last one; cap =
     //   this many ms x prefill slots) and put them in the same forward.
@@ -1778,6 +1839,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[hived] layer yield on: every %.0f ms at layer boundaries of a long prefill · decode share %.2f · <= %d steps · admits requests with <= %zu rows to prefill (ids minus the reusable prefix)%s\n",
             ly_period, ly_share, ly_steps, ly_max,
             ly_mid > ly_max ? (" · up to " + std::to_string(ly_mid) + " rows when <= half of the paused forward's remaining rows (HIVE_LAYER_YIELD_MID)").c_str() : "");
+  if (layer_yield && ly_slice > 0) fprintf(stderr, "[hived] layer yield slices on: other prefills start at a yield and run in chunks of <= %zu rows (HIVE_LAYER_YIELD_SLICE)\n", ly_slice);
+  if (prio_shared != INT_MIN) fprintf(stderr, "[hived] priority shared: priorities <= %d are one class (HIVE_PRIORITY_SHARED)\n", prio_shared);
   // HIVE_LAYER_YIELD_MID: the forward a layer yield pauses — its rows, the rows of the request's later chunks, and the rows admitted by the mid rule
   //   during it (set by the outer admission right before rt.forward / rt.forward_multi; never from inside a yield)
   size_t ly_fwd_rows = 0, ly_rest_rows = 0, ly_mid_used = 0;
@@ -1788,7 +1851,9 @@ int main(int argc, char** argv) {
   //   many but only the new tokens are prefilled. Measured (interactive traffic on the reference machine): of the requests that waited >= 1 s behind a long
   //   prefill (2.5 % of all, median 2.4 s, up to 12.5 s), 37 of 82 were such turns (< 1024 new tokens on a >= 1024-id prompt).
   //   Cost: one token comparison over the matching prefix (json ids) per queued text request per yield point.
-  auto reuse_lower_bound = [&](const std::string& sid, const json& q) -> size_t {
+  //   rsig: the request's image signatures (request_img_sig) — an image request resumes only where the saved images up to that point are its
+  //   own (the same rule as admit_setup's images_match); nullptr = a text request.
+  auto reuse_lower_bound = [&](const std::string& sid, const json& q, const std::vector<Request::ImgSig>* rsig = nullptr) -> size_t {
     const auto ids_it = q.find("ids");
     if (ids_it == q.end() || !ids_it->is_array() || ids_it->empty()) return 0;
     const json& ids = *ids_it;
@@ -1801,25 +1866,36 @@ int main(int argc, char** argv) {
       while (k < n && ids[k].is_number_integer() && (int64_t)a[k] == ids[k].get<int64_t>()) ++k;
       return k;
     };
-    auto clear_upto = [&](const std::vector<Session::ImgSig>& sig, size_t pos) {  // text request: no saved image may end at or straddle pos
-      for (const auto& s : sig) if ((size_t)s.end <= pos || ((size_t)s.start < pos && (size_t)s.end > pos)) return false;
-      return true;
+    auto clear_upto = [&](const std::vector<Session::ImgSig>& sig, size_t pos) {  // no saved image may straddle pos; up to pos the saved images are the request's
+      std::vector<std::tuple<int, int, uint64_t>> a, b;
+      for (const auto& s : sig) {
+        if ((size_t)s.start < pos && (size_t)s.end > pos) return false;
+        if ((size_t)s.end <= pos) a.emplace_back(s.start, s.end, s.hash);
+      }
+      if (rsig)
+        for (const auto& s : *rsig) {
+          if ((size_t)s.start < pos && (size_t)s.end > pos) return false;
+          if ((size_t)s.end <= pos) b.emplace_back(s.start, s.end, s.hash);
+        }
+      std::ranges::sort(a); std::ranges::sort(b);
+      return a == b;
     };
     size_t best = 0;
     if (S->seq && !S->seq->broken && S->seq->pos == (int64_t)S->tokens.size()) {
       const size_t k = lcp(S->tokens);
       if (k == S->tokens.size() && ids.size() > k && clear_upto(S->img_sig, k)) best = k;
     }
+    if (rsig && !rsig->empty() && !image_ckpt) return best;  // admit_setup resumes an image request from its live state only (HIVE_IMAGE_CKPT off)
     if (S->ckpt) { const size_t k = lcp(S->ckpt->tokens); if (k == (size_t)S->ckpt->pos && ids.size() > k && clear_upto(S->ckpt_sig, k)) best = std::max(best, k); }
     for (const auto& f : S->history)
       if (f.image) { const size_t k = lcp(f.image->tokens); if (k == (size_t)f.image->pos && ids.size() > k && clear_upto(f.sig, k)) best = std::max(best, k); }
     if (S->live) { const size_t k = lcp(S->live->tokens); if (k == (size_t)S->live->pos && ids.size() > k && clear_upto(S->live_sig, k)) best = std::max(best, k); }
     return best;
   };
-  auto rows_to_prefill = [&](const std::string& sid, const json& q) -> size_t {
+  auto rows_to_prefill = [&](const std::string& sid, const json& q, const std::vector<Request::ImgSig>* rsig = nullptr) -> size_t {
     const auto ids_it = q.find("ids");
     const size_t rows = ids_it != q.end() && ids_it->is_array() ? ids_it->size() : 0;
-    return rows ? rows - std::min(rows, reuse_lower_bound(sid, q)) : 0;
+    return rows ? rows - std::min(rows, reuse_lower_bound(sid, q, rsig)) : 0;
   };
   std::set<std::string> prefilling_sids;  // sessions in a batched prefill (not active yet) — excluded from LRU eviction
   std::set<std::string> admitting_sids;   // sessions whose prefill runs now (excluded from the KV reclaim below)
@@ -1902,6 +1978,10 @@ int main(int argc, char** argv) {
       ~SidHold() { if (s) s->erase(sid); }
     } admit_hold;
   };
+  // HIVE_LAYER_YIELD_SLICE: prefills started at a layer yield that run chunk by chunk at the following yields (their sessions are in
+  //   prefilling_sids). The engine loop continues the one left when no other prefill runs; drain, stop and flush wait for them like for active.
+  std::vector<std::unique_ptr<PJob>> sliced;
+  double slice_credit = 0;  // see the layer-yield hooks: the paused prefill's time since the last slice minus that slice's time (ms)
   // The first image span that ends after `at` (null = the rest of the prompt is text). Chunk rules depend on the images of the chunk being cut,
   //   not on whether the request has an image somewhere: the runtime's limits are per forward (runtime.cpp — host/tiled passes and the C1 skip
   //   take only forwards whose own chunk has no image).
@@ -2039,7 +2119,9 @@ int main(int argc, char** argv) {
   };
   // admit is split into stages (per-request state = PJob, on the heap): setup -> [chunk_begin -> forward -> chunk_end]* -> finish.
     //   A single request (admit) runs them in order with the same calls. batched = called from the HIVE_BATCH_PREFILL batched path (admit_batch).
-  auto admit_setup = [&](Request&& r, bool batched) -> std::unique_ptr<PJob> {
+  // first_cap: an upper bound of the first chunk's rows (HIVE_LAYER_YIELD_SLICE — a sliced prefill's first chunk is a slice): a boundary
+  //   snapshot that skipped the tail layers is resumed only when that first chunk is in tail mode (C1 validity)
+  auto admit_setup = [&](Request&& r, bool batched, size_t first_cap = SIZE_MAX) -> std::unique_ptr<PJob> {
     auto Jp = std::make_unique<PJob>();
     PJob& J = *Jp;
     J.A = std::make_unique<Active>();
@@ -2201,18 +2283,9 @@ int main(int argc, char** argv) {
     J.admit_hold.s = &admitting_sids; J.admit_hold.sid = A->sid;
     auto& request_sig = J.request_sig;
     if (q.contains("images") && q["images"].is_array()) {
-      size_t off=0;
-      for (const auto& im : q["images"]) {
-        const size_t nb=im.at("nbytes").get<size_t>();
-        if (nb>A->r.bin.size()-off) { fail("image bytes short"); return nullptr; }
-        uint64_t hash=1469598103934665603ull;
-        auto mix=[&](uint8_t b){hash^=b;hash*=1099511628211ull;};
-        for (size_t b=0;b<nb;++b) mix(A->r.bin[off+b]);
-        for (const auto& t: im.at("types")) mix((uint8_t)t.get<int>());
-        for (auto key : {"n_vit_h", "n_vit_w"}) { uint32_t n=im.at(key).get<uint32_t>(); for(int b=0;b<4;++b) mix((n>>(8*b))&255); }
-        int start=im.at("start").get<int>();
-        request_sig.push_back({start,start+(int)im.at("types").size(),hash}); off+=nb;
-      }
+      const auto* sig = request_img_sig(A->r);
+      if (!sig) { fail("image bytes short"); return nullptr; }
+      for (const auto& s : *sig) request_sig.push_back({s.start, s.end, s.hash});
     }
     auto images_match = [&](const std::vector<Session::ImgSig>& saved, size_t pos) {
       std::vector<std::tuple<int,int,uint64_t>> a,b;
@@ -2455,7 +2528,7 @@ int main(int argc, char** argv) {
       SharedSnap* best = nullptr;
       // in a batched prefill the first chunk may shrink this round to one slot (max_chunk) or the decoders-present size (busy/budget) — measure
             // with that lower bound (tail_mode_for is monotone)
-      const size_t restore_cap = batched ? std::min({cap_now(), c1_floor_j(J), (size_t)max_chunk}) : cap_now();
+      const size_t restore_cap = std::min(first_cap, batched ? std::min({cap_now(), c1_floor_j(J), (size_t)max_chunk}) : cap_now());
       size_t best_len = common;
       for (auto& [key, e] : shared_snaps) {
         const size_t k = e.image ? (size_t)e.image->pos : 0;
@@ -2726,6 +2799,9 @@ int main(int argc, char** argv) {
   };
   // HIVE_PREFILL_YIELD yielding between chunks/rounds of a long prefill. It calls admit below, so only declared here (defined after admit).
   std::function<void(double, size_t)> yield_after_chunk;
+  // The chunk loop of one prefill (the single path): from J.i to the end of the prompt, or until a cancel / disconnect / error
+  //   false = chunk planning failed (chunk_begin answered the error) — the job ends without admit_finish
+  std::function<bool(PJob&)> run_chunks;  // defined after continue_sliced (both share it)
   // Admit one request: prefill it and put it in active (on failure or cancel: respond and drop it)
   auto admit_inner = [&](Request&& r) {
     auto Jp = admit_setup(std::move(r), false);
@@ -2739,8 +2815,29 @@ int main(int argc, char** argv) {
     struct YieldSid { std::set<std::string>* s; std::string sid; ~YieldSid() { if (s) s->erase(sid); } } yield_sid{prefill_yield || layer_yield ? &prefilling_sids : nullptr, J.A->sid};
     if (prefill_yield || layer_yield) prefilling_sids.insert(J.A->sid);
     ly_mark(J.A->sid, J.ids.size(), J.A->prio);
+    if (run_chunks(J)) admit_finish(J);
+  };
+  // HIVE_LAYER_YIELD_SLICE: a sliced prefill no other prefill is running — continued here as the main prefill (the regular chunk rules; its
+  //   own forwards yield, and the other sliced prefills get their slices there). Its session stays in prefilling_sids until it ends.
+  auto continue_sliced = [&](size_t k) {
+    std::unique_ptr<PJob> Jp = std::move(sliced[k]);
+    sliced.erase(sliced.begin() + (long)k);
+    PJob& J = *Jp;
+    const int fd = J.A->r.fd;
+    const auto flag = J.A->r.cancel;
+    const std::string sid = J.A->sid;
+    struct Erase { std::set<std::string>& s; std::string sid; ~Erase() { s.erase(sid); } } erase{prefilling_sids, sid};
+    fprintf(stderr, "[hived] %s: sliced prefill continues as the main prefill · %zu rows left (%zu → %zu)\n", sid.c_str(), J.ids.size() - J.i, J.i, J.ids.size());
+    try {
+      if (run_chunks(J)) admit_finish(J);
+    } catch (const std::exception& e) {
+      admit_error(fd, e, sid);
+    }
+    admit_epilogue(flag, sid);
+  };
+  run_chunks = [&](PJob& J) -> bool {
     while (J.i < J.ids.size()) {
-      if (!chunk_begin(J, SIZE_MAX, false)) return;
+      if (!chunk_begin(J, SIZE_MAX, false)) return false;
       const double tc0 = now_ms();
       const ly::Stats ly0 = rt.layer_yield_stats();
       if (!rt.in_layer_yield()) { ly_fwd_rows = (size_t)J.M; ly_rest_rows = J.ids.size() - J.i - (size_t)J.M; ly_mid_used = 0; }  // HIVE_LAYER_YIELD_MID
@@ -2759,7 +2856,7 @@ int main(int argc, char** argv) {
       if (J.i < J.ids.size() && prefill_yield) yield_after_chunk(tc, 1);
       else if (J.i < J.ids.size() && !active.empty()) decode_between(tc);
     }
-    admit_finish(J);
+    return true;
   };
   auto admit = [&](Request&& r) {
     const int fd = r.fd;
@@ -2785,7 +2882,7 @@ int main(int argc, char** argv) {
       const double saved_tc = last_prefill_tc;  // HIVE_PREFILL_FAIR looks at the outer admission's last prefill forward (not the short request's)
       const double t0 = now_ms();
       for (;;) {
-        if ((int)(active.size() + busy) + 1 > rt.max_batch()) break;
+        if ((int)(active.size() + sliced.size() + busy) + 1 > rt.max_batch()) break;
         Request r;
         bool got = false;
         {
@@ -2859,7 +2956,7 @@ int main(int argc, char** argv) {
     };
     auto pull = [&] {
       for (;;) {  // take more: only while seats (max_batch) and slots (at least one per request) remain and the queue head is batchable
-        if ((int)(active.size() + jobs.size()) >= rt.max_batch() || (int)jobs.size() >= rt.prefill_slots()) break;
+        if ((int)(active.size() + sliced.size() + jobs.size()) >= rt.max_batch() || (int)jobs.size() >= rt.prefill_slots()) break;
         Request r;
         bool got = false;
         {
@@ -2886,7 +2983,7 @@ int main(int argc, char** argv) {
           for (auto& Jp : jobs) if (Jp) s -= rt.slots_for((int)std::min(Jp->ids.size() - Jp->i, cap_now_j(*Jp)));
           return s;
         };
-        auto room = [&] { return !jobs.empty() && (int)(active.size() + jobs.size()) < rt.max_batch() && (int)jobs.size() < rt.prefill_slots() && slots_left() > 0; };
+        auto room = [&] { return !jobs.empty() && (int)(active.size() + sliced.size() + jobs.size()) < rt.max_batch() && (int)jobs.size() < rt.prefill_slots() && slots_left() > 0; };
         if (jobs.size() == 1 && jobs[0]->ids.size() - jobs[0]->i >= stream_floor && room()) {
           const double tw0 = now_ms(), until = batch_window_ms > 0 ? tw0 + batch_window_ms : INFINITY;
           // arrival coalescing: pause detection (last arrival + batch_quiet_ms) and cap (batch_quiet_ms x slots) — when off (0) both are infinite = plain window
@@ -3099,11 +3196,12 @@ int main(int argc, char** argv) {
     // Priority: only the best priority among the requests that can step runs this step; the others keep their pending token and logits
     //   and resume when it finishes. Measured 2026-10-08 (DeepSeek): one stream 103 tok/s, two overlapping 45.6 tok/s each (a batch of two
     //   runs without speculation) — a background request halved a conversation. Requests without the field are all 0: unchanged.
+    //   HIVE_PRIORITY_SHARED: priorities compare by class (prio_class) — the requests of one class all step.
     int best_prio = INT_MAX;
-    for (auto& A : active) if (A->client_ok && !A->cancel->load() && A->n < A->max_tokens) best_prio = std::min(best_prio, A->prio);
+    for (auto& A : active) if (A->client_ok && !A->cancel->load() && A->n < A->max_tokens) best_prio = std::min(best_prio, prio_class(A->prio));
     for (auto& A : active) {
       if (!A->client_ok || A->cancel->load() || A->n >= A->max_tokens) { if (A->cancel->load()) A->finish = "cancel"; continue; }
-      if (A->prio > best_prio) { ++A->held_steps; continue; }
+      if (prio_class(A->prio) > best_prio) { ++A->held_steps; continue; }
       int32_t tok = A->pending_tok >= 0 ? A->pending_tok : (fake_head ? sample(A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng)
                                                                     : sample_cands(A->cands, A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng));
       A->pending_tok = -1;
@@ -3570,14 +3668,24 @@ int main(int argc, char** argv) {
     //   paused forward unless it passed the mid rule, and once admitted it decoded only a few steps per 150 ms yield. Requests without the
     //   field are all 0: no request is urgent and nothing changes.
   if (layer_yield) {
-    auto paused_prio = [&] {
+    // HIVE_LAYER_YIELD_SLICE: a sliced prefill runs inside the yields of the paused one — it is not the prefill a yield pauses
+    auto is_sliced = [&](const std::string& sid) {
+      for (const auto& Jp : sliced) if (Jp && Jp->A->sid == sid) return true;
+      return false;
+    };
+    // the priority class (prio_class) of the prefill a yield pauses
+    auto paused_prio = [&, is_sliced] {
       int p = INT_MAX;
-      for (const auto& sid : prefilling_sids) { const auto it = ly_prio.find(sid); p = std::min(p, it != ly_prio.end() ? it->second : 0); }
+      for (const auto& sid : prefilling_sids) {
+        if (is_sliced(sid)) continue;
+        const auto it = ly_prio.find(sid);
+        p = std::min(p, prio_class(it != ly_prio.end() ? it->second : 0));
+      }
       return p;
     };
     auto urgent_active = [&, paused_prio] {  // paused_prio by value: this block ends before the hooks run
       const int pp = paused_prio();
-      for (auto& A : active) if (A->prio < pp && A->client_ok && !A->cancel->load() && A->n < A->max_tokens) return true;
+      for (auto& A : active) if (prio_class(A->prio) < pp && A->client_ok && !A->cancel->load() && A->n < A->max_tokens) return true;
       return false;
     };
     auto h_nested_ok = [&] { return ly_mid > ly_max && rt.in_layer_yield(); };  // in_yield from a layer yield (not HIVE_PREFILL_YIELD) with level 2 on
@@ -3587,36 +3695,86 @@ int main(int argc, char** argv) {
       const double rem = (double)ly_fwd_rows * (1.0 - p) + (double)ly_rest_rows;
       return 2.0 * (double)rows <= rem && ly_mid_used + rows <= ly_fwd_rows;
     };
-    auto ly_rows_of = [&, ly_mid_ok, paused_prio](const Request& r, size_t cap) -> size_t {
+    // Rows a queued request would prefill inside a yield (ids minus the reusable prefix — a lower bound of what the forward will hold), or 0 =
+    //   it cannot run there: its session is running or prefilling, or it has an image still to encode (the vision encoder may have to be
+    //   loaded — VRAM — in the middle of a long prefill). Images inside the reusable prefix are not encoded again, so such a request runs like
+    //   a text one on families that keep the patches on the host until they are encoded (kHostPatches — the others copy every image to the
+    //   device at admission). Measured 2026-10-25 20:51 (production log, DeepSeek): an agent conversation's turn — 12 images, all inside its
+    //   first 165K tokens, 24,639 new rows — waited 156 s behind a read-ahead prefill because every image request was refused here.
+    auto yield_rows = [&](Request& r) -> size_t {
       const json& q = r.req;
-      if (q.contains("images") && q["images"].is_array() && !q["images"].empty()) return 0;  // do not lazily load the vision encoder (VRAM) in the middle of a long prefill
       const std::string sid = q.value("session", "default");
       if (active_sids.count(sid) || prefilling_sids.count(sid)) return 0;
-      const size_t rows = rows_to_prefill(sid, q);  // ids minus the reusable prefix (lower bound): what the forward will really hold
+      const bool has_img = q.contains("images") && q["images"].is_array() && !q["images"].empty();
+      const std::vector<Request::ImgSig>* rsig = nullptr;
+      if (has_img) {
+        if constexpr (!kHostPatches<ImageInput>) return 0;
+        try { rsig = request_img_sig(r); } catch (const std::exception&) { return 0; }  // a malformed image entry: admission answers it later
+        if (!rsig) return 0;
+      }
+      const size_t rows = rows_to_prefill(sid, q, rsig);
+      if (rsig) {
+        const size_t from = q["ids"].size() - rows;  // every image must end inside the reusable prefix
+        for (const auto& s : *rsig) if ((size_t)s.end > from) return 0;
+      }
+      return rows;
+    };
+    auto ly_rows_of = [&, ly_mid_ok, paused_prio, yield_rows](Request& r, size_t cap) -> size_t {
+      const size_t rows = yield_rows(r);
       if (rows == 0 || rows > cap) return 0;
-      if (rows > ly_max && !ly_mid_ok(rows) && !(req_prio(r) < paused_prio())) return 0;
+      if (rows > ly_max && !ly_mid_ok(rows) && !(prio_class(req_prio(r)) < paused_prio())) return 0;
       return rows;
     };
     auto ly_seat = [&] { return (int)(active.size() + prefilling_sids.size()) + 1 <= rt.max_batch(); };
+    // HIVE_LAYER_YIELD_SLICE (see its comment). slice_credit = the paused prefill's time since the last slice minus that slice's time (ms):
+    //   a slice of the paused prefill's own class is due once it is >= 0 (the two take turns of about equal length).
+    auto slice_pick = [&]() -> int {  // the sliced prefill to run next: best class, then the one whose last slice is oldest (front)
+      int k = -1;
+      for (size_t i = 0; i < sliced.size(); ++i)
+        if (k < 0 || prio_class(sliced[i]->A->prio) < prio_class(sliced[(size_t)k]->A->prio)) k = (int)i;
+      return k;
+    };
+    auto slice_due = [&, paused_prio](int k, double gap_now) {
+      if (k < 0) return false;
+      const int c = prio_class(sliced[(size_t)k]->A->prio), pc = paused_prio();
+      if (c < pc) return true;    // a better class: a slice at every yield
+      if (c > pc) return false;   // a worse class waits for the paused prefill
+      return slice_credit + gap_now >= 0;
+    };
+    // a queued request that would start as a sliced prefill: no rule above takes it whole, and its class is not worse than the paused one's
+    auto slice_rows_of = [&, yield_rows, ly_rows_of, paused_prio](Request& r) -> size_t {
+      if (ly_slice == 0 || prio_class(req_prio(r)) > paused_prio()) return 0;
+      if (ly_rows_of(r, std::max(ly_max, ly_mid)) > 0) return 0;
+      return yield_rows(r);
+    };
     ly::Hooks h;
     h.period_ms = ly_period;
     // HIVE_LAYER_YIELD_MID: a mid-size prompt admitted at a yield prefills for seconds — its own forward yields once more (level 2), for decode
-    //   steps only (measured without it: the running decoder's longest stall 1.83 → 5.13 s while a 12K-row prompt was admitted into an 85K prefill)
-    h.max_depth = ly_mid > ly_max ? 2 : 1;
-    h.want = [&, ly_rows_of, ly_seat, h_nested_ok]() -> int {
-      if (in_yield) return h_nested_ok() && !active.empty() ? 1 : 0;
+    //   steps only (measured without it: the running decoder's longest stall 1.83 → 5.13 s while a 12K-row prompt was admitted into an 85K prefill).
+    //   A slice (HIVE_LAYER_YIELD_SLICE) yields the same way.
+    h.max_depth = ly_mid > ly_max || ly_slice > 0 ? 2 : 1;
+    h.want = [&, ly_rows_of, ly_seat, h_nested_ok, slice_pick, slice_due, slice_rows_of]() -> int {
+      if (in_yield) return (h_nested_ok() || (ly_slice > 0 && rt.in_layer_yield())) && !active.empty() ? 1 : 0;
       // HIVE_LAYER_YIELD_INTRA: a point inside a layer runs decode steps only — the runtime parks only the decode floor of rows there and the
       //   paused layer's staging records are held (runtime.cpp "T11b"), so nothing is admitted (requests wait for the next layer boundary)
       if (rt.layer_yield_kind() != ly::kLayer) return active.empty() ? 0 : 1;
       int need = active.empty() ? 0 : 1;
-      if (ly_max > 0 && ly_seat()) {
+      if (ly_slice > 0) {
+        const int k = slice_pick();
+        if (slice_due(k, now_ms() - rt.layer_yield_resume_ms()))
+          need = std::max(need, (int)std::min(sliced[(size_t)k]->ids.size() - sliced[(size_t)k]->i, ly_slice));
+      }
+      if ((ly_max > 0 || ly_slice > 0) && ly_seat()) {
         std::lock_guard<std::mutex> lk(mu);
         if (stop_state.load() == 0 && !sleep_asked.load())
-          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));
+          for (auto& r : queue) {
+            if (ly_max > 0) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));
+            if (const size_t x = slice_rows_of(r)) need = std::max(need, (int)std::min(x, ly_slice));
+          }
       }
       return need;
     };
-    h.run = [&, ly_rows_of, ly_seat, paused_prio, urgent_active](int R, double gap_ms) {
+    h.run = [&, ly_rows_of, ly_seat, paused_prio, urgent_active, slice_pick, slice_due, slice_rows_of](int R, double gap_ms) {
       const bool nested = in_yield;  // level 2 (inside a forward admitted by a yield): decode steps only
       const int kind = rt.layer_yield_kind();  // HIVE_LAYER_YIELD_INTRA: ≠ kLayer = a point inside a layer — decode steps only (no admission)
       struct InYield { bool& f; bool was; ~InYield() { f = was; } } in_yield_guard{in_yield, in_yield};
@@ -3632,6 +3790,8 @@ int main(int argc, char** argv) {
       fprintf(stderr, "[hived] layer yield: %s · prefill %.0f ms since resume · rows %d · active %zu%s%s%s\n", who.empty() ? "-" : who.c_str(), gap_ms, R, active.size(),
               nested ? " · level 2 (decode only)" : "", kind != ly::kLayer ? " · intra " : "", kind != ly::kLayer ? ly::kind_name(kind) : "");
       const size_t cap = nested || kind != ly::kLayer ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));
+      const bool slicing = ly_slice > 0 && !nested && kind == ly::kLayer;  // slices start and run at layer points of the main prefill only
+      if (slicing && !sliced.empty()) slice_credit += gap_ms;
       int n = 0, n_mid = 0, n_urgent = 0;
       // Admit the best-priority admissible request first (FIFO among equals) — with no priorities this is the queue order as before
       auto admit_some = [&] {
@@ -3651,11 +3811,105 @@ int main(int argc, char** argv) {
             if (pick != queue.end()) { r = std::move(*pick); queue.erase(pick); got = true; }
           }
           if (!got) break;
-          if (prio < paused_prio()) ++n_urgent;
+          if (prio_class(prio) < paused_prio()) ++n_urgent;
           else if (rows > ly_max) { ly_mid_used += rows; ++n_mid; }  // HIVE_LAYER_YIELD_MID
           admit(std::move(r));
           ++n;
         }
+      };
+      // HIVE_LAYER_YIELD_SLICE: end a sliced prefill (finish = into active, its first token at the next decode step · otherwise it already answered)
+      auto end_sliced = [&](size_t k, bool finish) {
+        std::unique_ptr<PJob> Jp = std::move(sliced[k]);
+        sliced.erase(sliced.begin() + (long)k);
+        PJob& J = *Jp;
+        const int fd = J.A->r.fd;
+        const auto flag = J.A->r.cancel;
+        const std::string sid = J.A->sid;
+        prefilling_sids.erase(sid);
+        if (finish) {
+          try { admit_finish(J); } catch (const std::exception& e) { admit_error(fd, e, sid); }
+        }
+        admit_epilogue(flag, sid);
+        if (sliced.empty()) slice_credit = 0;
+      };
+      // start the queued requests no rule above took (best class first, FIFO among equals), then run one slice when it is due. true = a slice ran
+      auto slice_turn = [&]() -> bool {
+        if (!slicing) return false;
+        bool finished = false;
+        for (size_t i = 0; i < sliced.size();) {  // cancelled or disconnected while waiting for a slice: end now (into active, which answers the cancel)
+          if (sliced[i]->A->cancel->load() || !sliced[i]->A->client_ok) { end_sliced(i, true); finished = true; }
+          else ++i;
+        }
+        while (ly_seat()) {
+          Request r;
+          bool got = false;
+          {
+            std::lock_guard<std::mutex> lk(mu);
+            if (stop_state.load() != 0 || sleep_asked.load()) break;
+            auto pick = queue.end();
+            int prio = 0;
+            for (auto it = queue.begin(); it != queue.end(); ++it)
+              if ((pick == queue.end() || prio_class(req_prio(*it)) < prio) && slice_rows_of(*it) > 0) { pick = it; prio = prio_class(req_prio(*it)); }
+            if (pick != queue.end()) { r = std::move(*pick); queue.erase(pick); got = true; }
+          }
+          if (!got) break;
+          const int fd = r.fd;
+          const auto flag = r.cancel;
+          const std::string sid = r.req.value("session", "default");
+          try {
+            auto Jp = admit_setup(std::move(r), false, ly_slice);
+            if (Jp && Jp->i < Jp->ids.size()) {
+              prefilling_sids.insert(Jp->A->sid);
+              ly_mark(Jp->A->sid, Jp->ids.size(), Jp->A->prio);
+              if (sliced.empty()) slice_credit = 0;  // the first slice runs at once
+              fprintf(stderr, "[hived] %s: sliced prefill started at a layer yield · %zu rows to prefill (%zu → %zu) · priority %d\n", sid.c_str(),
+                      Jp->ids.size() - Jp->i, Jp->i, Jp->ids.size(), Jp->A->prio);
+              sliced.push_back(std::move(Jp));
+              continue;
+            }
+            if (Jp) { admit_finish(*Jp); finished = true; }  // nothing to prefill (the same prompt again)
+          } catch (const std::exception& e) {
+            admit_error(fd, e, sid);
+          }
+          admit_epilogue(flag, sid);
+        }
+        bool ran = false;
+        const int k = slice_pick();
+        if (slice_due(k, 0)) {
+          PJob& J = *sliced[(size_t)k];
+          const size_t rem = J.ids.size() - J.i, lim = std::min((size_t)std::max(0, R), ly_slice);
+          // a slice smaller than the streaming path is not worth a forward (the runtime parked fewer rows than asked — the next yield asks again);
+          //   after a restored snapshot that skipped the tail layers the first chunk must be in tail mode (C1 validity)
+          const bool fits = lim >= std::min(rem, std::min(ly_slice, stream_floor)) &&
+                            (!J.last_upper_skipped || rt.tail_mode_for((int)chunk_rows_j(J, J.i, std::min(cap_now_j(J), lim))));
+          if (fits) {
+            bool done = false, failed = false;
+            const double ts = now_ms();
+            try {
+              if (!chunk_begin(J, lim, false)) failed = true;  // chunk_begin answered the error
+              else {
+                J.upper_needed = true;  // its next chunk may be a slice of any size: never skip the tail layers before it (C1)
+                ++prefill_epoch;
+                const ly::Stats ly0 = rt.layer_yield_stats();
+                rt.forward(*J.S->seq, J.ids.data() + J.i, J.M, J.chunk_images.empty() ? nullptr : &J.chunk_images, &J.A->logits, &J.st, true);
+                J.ly_n = rt.layer_yield_stats().yields - ly0.yields;
+                J.ly_last = 0;
+                const double tc = now_ms() - ts - (rt.layer_yield_stats().inner_ms - ly0.inner_ms);
+                done = !chunk_end(J, tc, (size_t)J.M) || J.i >= J.ids.size();
+              }
+            } catch (const std::exception& e) {
+              admit_error(J.A->r.fd, e, J.A->sid);
+              failed = true;
+            }
+            slice_credit -= now_ms() - ts;
+            ran = true;
+            if (failed) end_sliced((size_t)k, false);
+            else if (done) { end_sliced((size_t)k, true); finished = true; }
+            else std::rotate(sliced.begin() + k, sliced.begin() + k + 1, sliced.end());  // round robin within a class
+          }
+        }
+        if (finished && !active.empty()) decode_step();  // the first token of the prefills that just finished
+        return ran;
       };
       admit_some();
       const double ta = now_ms();
@@ -3667,20 +3921,24 @@ int main(int argc, char** argv) {
         const double budget = ly::decode_budget_ms(gap_ms, ly_share);
         do { decode_step(); ++steps; } while (!active.empty() && steps < ly_steps && now_ms() - ta < budget);
       }
+      int slices = slice_turn() ? 1 : 0;
       // Priority hold: while a better-priority request decodes, the yield keeps stepping it until it finishes (more urgent arrivals are
-      //   admitted between steps at a layer point); a stop or sleep request ends the hold
+      //   admitted between steps at a layer point, and sliced prefills of a better class get their slices); a stop or sleep request ends the hold
       if (!nested && urgent_active()) {
         const double th = now_ms();
         const int s0 = steps;
         while (urgent_active() && stop_state.load() == 0 && !sleep_asked.load()) {
           if (kind == ly::kLayer) admit_some();
+          const int k = slice_pick();
+          if (k >= 0 && prio_class(sliced[(size_t)k]->A->prio) < paused_prio() && slice_turn()) { ++slices; continue; }
           decode_step();
           ++steps;
         }
         fprintf(stderr, "[hived] layer yield: priority hold %d steps · %.0f ms (prefilling priority %d)\n", steps - s0, now_ms() - th, paused_prio());
       }
       last_prefill_tc = saved_tc;
-      fprintf(stderr, "[hived] layer yield done: admitted %d · decode steps %d · %.0f ms\n", n, steps, now_ms() - t0);
+      fprintf(stderr, "[hived] layer yield done: admitted %d · decode steps %d%s · %.0f ms\n", n, steps,
+              slices || !sliced.empty() ? (" · slices " + std::to_string(slices) + " (sliced " + std::to_string(sliced.size()) + ")").c_str() : "", now_ms() - t0);
     };
     rt.set_layer_yield(std::move(h));
   }
@@ -3915,8 +4173,8 @@ int main(int argc, char** argv) {
     std::vector<int> fds;
     { std::lock_guard<std::mutex> lk(mu); fds.swap(flush_q); }
     if (fds.empty()) return;
-    if (!active.empty()) {
-      for (int fd : fds) ctl_reply(fd, {{"error", "not idle"}, {"running", active.size()}, {"retryable", true}});
+    if (!active.empty() || !sliced.empty()) {  // a sliced prefill (HIVE_LAYER_YIELD_SLICE) holds a session like a running request
+      for (int fd : fds) ctl_reply(fd, {{"error", "not idle"}, {"running", active.size() + sliced.size()}, {"retryable", true}});
       return;
     }
     size_t n_sess = 0;
@@ -4071,6 +4329,8 @@ int main(int argc, char** argv) {
       { std::lock_guard<std::mutex> lk(mu); rejected.swap(queue); }
       for (auto& r : rejected) { send_json(r.fd, {{"error", "daemon shutting down"}}); finish_socket(r.fd); }
       if (stop_state.load() >= 2) for (auto& a : active) a->cancel->store(true);
+      if (stop_state.load() >= 2) for (auto& Jp : sliced) Jp->A->cancel->store(true);
+      if (!sliced.empty()) { continue_sliced(0); continue; }  // in-flight like active: run to completion, or cut at the next chunk once cancelled
       if (active.empty()) break;
       decode_step();
       continue;
@@ -4094,6 +4354,7 @@ int main(int argc, char** argv) {
       for (int fd : late) ctl_reply(fd, {{"error", "not idle"}, {"state", power_name(power.load())}, {"running", active.size()}, {"retryable", true}});
       if (!late.empty()) publish_stats(true);
       if (power.load() == kPowerDraining) {
+        if (!sliced.empty()) { continue_sliced(0); continue; }  // in-flight: a sliced prefill finishes before the sleep (it holds a session's KV)
         if (active.empty()) { do_sleep(); continue; }
         drain_running = (int)active.size();
         sweep_cancelled_queue();  // requests cancelled in the queue while waiting to sleep also finish at once (not held until wake)
@@ -4112,19 +4373,27 @@ int main(int argc, char** argv) {
     {
       Request r;
       bool got = false;
+      int cont = -1;  // HIVE_LAYER_YIELD_SLICE: the sliced prefill to continue as the main prefill
       std::unique_lock<std::mutex> lk(mu);
-      if (active.empty()) cv.wait_for(lk, std::chrono::seconds(30), [&] { return !queue.empty() || stop_state.load() != 0 || !ctl_q.empty() || !flush_q.empty() || !attach_q.empty(); });  // wake every 30 s for idle cleanup (vision encoder release)
-      if (!queue.empty() && (int)active.size() < max_batch && !sleep_asked.load()) {
-        // Priority: the best-priority queued request first (FIFO among equals), and none below a running request's priority — its
-        //   prefill would interrupt that request's decode (the decode_step rule holds it anyway). Without the field everything is 0: FIFO as before.
-        int best_active = INT_MAX;
-        for (auto& A : active) best_active = std::min(best_active, A->prio);
+      if (active.empty() && sliced.empty()) cv.wait_for(lk, std::chrono::seconds(30), [&] { return !queue.empty() || stop_state.load() != 0 || !ctl_q.empty() || !flush_q.empty() || !attach_q.empty(); });  // wake every 30 s for idle cleanup (vision encoder release)
+      // Priority: the best-priority queued request first (FIFO among equals), and none below a running request's priority — its
+      //   prefill would interrupt that request's decode (the decode_step rule holds it anyway). Without the field everything is 0: FIFO as before.
+      //   Priorities compare by class (HIVE_PRIORITY_SHARED). A sliced prefill of the best class (FIFO) goes on before a queued request of the
+      //   same class — the queued one then starts at its yields — and a sliced prefill takes a seat like a running request.
+      int best_active = INT_MAX;
+      for (auto& A : active) best_active = std::min(best_active, prio_class(A->prio));
+      int sk = -1;
+      for (size_t i = 0; i < sliced.size(); ++i) if (sk < 0 || prio_class(sliced[i]->A->prio) < prio_class(sliced[(size_t)sk]->A->prio)) sk = (int)i;
+      const int sk_prio = sk >= 0 ? prio_class(sliced[(size_t)sk]->A->prio) : INT_MAX;
+      if (!queue.empty() && (int)(active.size() + sliced.size()) < max_batch && !sleep_asked.load()) {
         auto pick = queue.begin();
         int pick_prio = req_prio(*pick);
         for (auto it = std::next(queue.begin()); it != queue.end(); ++it) { const int p = req_prio(*it); if (p < pick_prio) { pick = it; pick_prio = p; } }
-        if (pick_prio <= best_active) { r = std::move(*pick); queue.erase(pick); got = true; }
+        if (prio_class(pick_prio) <= best_active && prio_class(pick_prio) < sk_prio) { r = std::move(*pick); queue.erase(pick); got = true; }
       }
+      if (!got && sk >= 0 && sk_prio <= best_active) cont = sk;
       lk.unlock();
+      if (!got && cont >= 0) { last_prefill_tc = 0; continue_sliced((size_t)cont); }
       if (got) {
         last_prefill_tc = 0;
         if (batch_eligible(r, true)) admit_batch(std::move(r));  // HIVE_BATCH_PREFILL — when off, always the regular admit

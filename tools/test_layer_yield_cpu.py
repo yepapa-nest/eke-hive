@@ -457,7 +457,7 @@ def run_mutants(exe, td):
     # 1) park/unpark disabled in the fake runtime: the decoder (rows [0, floor)) clobbers the long forward's rows
     out.append(('fake park disabled', *mutant_case(exe, td, {**ON, 'FAKE_LY_NO_PARK': '1'}, lambda h, ck: sc_decoder(h, ck, True, 'np'))))
     # 2) hived admits beyond R: want() reports only decoders (R = floor 64) and run() ignores R → 200-row admission overwrites rows 64..199
-    want_scan = "          for (const auto& r : queue) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));"
+    want_scan = "            if (ly_max > 0) need = std::max(need, (int)std::min<size_t>(ly_rows_of(r, std::max(ly_max, ly_mid)), (size_t)INT32_MAX));"
     cap_line = "      const size_t cap = nested || kind != ly::kLayer ? 0 : std::min(std::max(ly_max, ly_mid), (size_t)std::max(0, R));"
     assert src.count(want_scan) == 1 and src.count(cap_line) == 1, 'hived T11 lines drifted'
     m2 = src.replace(want_scan, "          (void)ly_rows_of;").replace(cap_line, "      const size_t cap = nested || kind != ly::kLayer ? 0 : std::max(ly_max, ly_mid);")
@@ -502,7 +502,7 @@ def run_mutants(exe, td):
     exe5 = t.build_daemon(td, name='hived_mut_burst', hived_source=src.replace(w_line, "    bool window_done = !(batch_window_ms > 0);"))
     out.append(('no arrival coalescing', *mutant_case(exe5, td, {**ON, **t.BATCH}, lambda h, ck: sc_burst(h, ck, 'mut-burst', True))))
     # 6) no level-2 yield (HIVE_LAYER_YIELD_MID admits, but the admitted forward never yields): the decoder stalls for that whole forward
-    d_line = "    h.max_depth = ly_mid > ly_max ? 2 : 1;"
+    d_line = "    h.max_depth = ly_mid > ly_max || ly_slice > 0 ? 2 : 1;"
     assert src.count(d_line) == 1
     exe6 = t.build_daemon(td, name='hived_mut_depth', hived_source=src.replace(d_line, "    h.max_depth = 1;"))
     out.append(('no level-2 yield under the mid rule', *mutant_case(exe6, td, {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, lambda h, ck: sc_mid(h, ck, 'mut-depth'))))

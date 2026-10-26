@@ -55,6 +55,7 @@ python3 tools/test_verify_fused_cpu.py
 python3 tools/test_cache_elastic_cpu.py
 python3 tools/test_prefill_yield_cpu.py
 python3 tools/test_layer_yield_cpu.py  # HIVE_LAYER_YIELD: yield at layer boundaries inside a long prefill forward (real hived.cpp, fake layer model, lent-state comparison, 4 mutants, lent-list text contract)
+python3 tools/test_layer_yield_slice_cpu.py  # HIVE_LAYER_YIELD_SLICE · HIVE_PRIORITY_SHARED · image requests at a yield: sliced prefills by class, cancel, same session, shared decode, image in the reusable prefix, 2 mutants
 python3 tools/test_layer_yield_intra_cpu.py  # HIVE_LAYER_YIELD_INTRA: decode-only intra-layer points (real hived.cpp, real ExpertStore staging hold abort, look-ahead, exceptions), staging-writer and Work-member contracts, mutants
 python3 tools/test_stage_progress_cpu.py  # HIVE_STAGE_PROGRESS_MS: read progress inside a prefill forward for stage requests (real hived.cpp, yield on/off, multi-chunk, batch round, off switch, 1 mutant)
 python3 tools/test_cache_where_cpu.py  # {"op":"where"} / {"op":"load"} on the real hived.cpp: none / vram / ram / ssd, load into RAM then resume without a disk read, one read for two loads, budget, flush, asleep, during a long prefill

@@ -3,6 +3,7 @@
 # Copyright (c) 2026 The Eke Hive Authors
 """Production handlers + fake token source and real Unix EOF. No model/GPU."""
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -164,6 +165,28 @@ class Tests(unittest.IsolatedAsyncioTestCase):
                 out=[x async for x in s.Daemon(path).generate('test',[1],[],b'')]
             self.assertEqual(out[0], {'id':1})
             self.assertIn('error',out[-1])
+
+    async def test_actual_unix_large_payload(self):
+        # a request of >= Daemon.BLOCKING_SEND_BYTES is written by a worker thread (one blocking sendall) and then read through asyncio:
+        #   the daemon must receive the header and every payload byte in order, and the reply must still stream back
+        blob = os.urandom(3 * s.Daemon.BLOCKING_SEND_BYTES + 12345)
+        got = {}
+        async def peer(reader, writer):
+            head = json.loads(await reader.readline())
+            got['bin'] = head['bin']
+            got['blob'] = await reader.readexactly(head['bin'])
+            writer.write(b'{"id":7}\n{"done":true,"n":1}\n'); await writer.drain()
+            writer.close(); await writer.wait_closed()
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/'test.sock')
+            server=await asyncio.start_unix_server(peer,path)
+            async with server:
+                out=[x async for x in s.Daemon(path).generate('test',[1,2,3],[{'start':0}],blob)]
+        self.assertEqual(got['bin'], len(blob))
+        self.assertEqual(hashlib.sha256(got['blob']).digest(), hashlib.sha256(blob).digest())
+        self.assertEqual(out, [{'id':7}, {'done':True,'n':1}])
+        with self.assertRaises(OSError):
+            [x async for x in s.Daemon('/nonexistent-hive-test-socket').generate('test',[1],[],blob)]
 
     async def test_health(self):
         self.assertTrue((await s.health())['ok'])

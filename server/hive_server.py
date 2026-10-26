@@ -1636,14 +1636,42 @@ class Daemon:
     def __init__(self, sock_path: str):
         self.sock_path = sock_path
 
+    # A request at least this large is written by a worker thread on a blocking socket (one sendall) before the stream is handed to asyncio.
+    #   Measured 2026-10-26 (strace of this server, DeepSeek in production): the event loop wrote the payload one socket buffer (~256 KiB) per
+    #   iteration — 1 ms each when idle, so a 10 MB image request reached hived in ~40 ms, but an agent conversation's turn carries 12 images
+    #   (118 MB, ~460 iterations) and reached it 12–20 s after it was handed over (send→admit p50 16 s over 150 such turns, while the same bytes
+    #   sent by one blocking write took 0.37 s end to end and text requests 0.05 s).
+    BLOCKING_SEND_BYTES = 1 << 20
+
     async def generate(self, session: str, ids: list[int], images: list[dict], blob: bytes, rid: str = "", boundaries=None, **sampling):
         """Send a request to hived and yield token ids asynchronously; the last item is a done dict."""
-        reader, writer = await asyncio.open_unix_connection(self.sock_path)
         req = {"op": "generate", "session": session, "ids": ids, "images": images, "bin": len(blob), **sampling}
         if rid: req["rid"] = rid  # D5: so a cancel reaches only this request (hived rid_flags)
         if boundaries: req["boundaries"] = boundaries  # H5: only when enabled (a hived with it off ignores the unknown field)
+        head = (json.dumps(req) + "\n").encode()
+        if len(head) + len(blob) >= self.BLOCKING_SEND_BYTES:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            def send():
+                s.connect(self.sock_path)
+                s.sendall(head)
+                if blob:
+                    s.sendall(blob)
+            fut = asyncio.get_running_loop().run_in_executor(None, send)
+            try:
+                await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                fut.add_done_callback(lambda _f: s.close())  # the thread may still be writing: close once it is done
+                raise
+            except BaseException:
+                s.close()
+                raise
+            reader, writer = await asyncio.open_unix_connection(sock=s)
+            head = blob = b""  # already sent
+        else:
+            reader, writer = await asyncio.open_unix_connection(self.sock_path)
         try:
-            writer.write((json.dumps(req) + "\n").encode())
+            if head:
+                writer.write(head)
             if blob:
                 writer.write(blob)
             await writer.drain()

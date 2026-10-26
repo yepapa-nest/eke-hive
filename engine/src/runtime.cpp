@@ -3370,7 +3370,12 @@ void Runtime::graph_room() {
   // Back-off: when destroying every graph did not reach the floor (the memory went elsewhere), destroy again only after free VRAM fell another
   //   64 MiB below what that left — otherwise each new instance would destroy the whole working set again.
   if (graph_room_short_ && fr + ((size_t)64 << 20) > graph_room_short_) return;
-  const int n = evict_graphs(floor_bytes + vision_need);
+  // The older half only: a destroyed instance's memory does not come back as free VRAM — the driver keeps it for the next instantiation.
+  //   Measured 2026-10-26 (DeepSeek, production): five rooms destroyed every graph (1,088 · 868 · 670 · 310 · 374, "0 kept") and free VRAM did
+  //   not move (1,990 → 1,990 MiB · 104 → 104 MiB), while the fall of free VRAM slowed from ~38 to ~6 MiB/h after the first one (the
+  //   captures after it reused the kept memory). Waiting for free VRAM to rise therefore destroyed the whole working set each time.
+  const size_t live = (size_t)std::count_if(graphs_map_.begin(), graphs_map_.end(), [](const auto& e) { return e.second.exec != nullptr; });
+  const int n = evict_graphs(floor_bytes + vision_need, std::max<size_t>(32, live / 2));
   size_t fr2 = 0;
   cudaMemGetInfo(&fr2, &tot);
   graph_room_short_ = fr2 < floor_bytes + vision_need ? fr2 : 0;
@@ -3379,14 +3384,14 @@ void Runtime::graph_room() {
           (size_t)std::count_if(graphs_map_.begin(), graphs_map_.end(), [](const auto& e) { return e.second.exec != nullptr; }), graph_evicted_);
 }
 
-int Runtime::evict_graphs(size_t want_free) {
+int Runtime::evict_graphs(size_t want_free, size_t max_n) {
   std::vector<GraphEntry*> live;
   for (auto& [key, g] : graphs_map_) if (g.exec) live.push_back(&g);
   if (live.empty()) return 0;
   std::sort(live.begin(), live.end(), [](const GraphEntry* a, const GraphEntry* b) { return a->last < b->last; });
   CUDA_CHECK(cudaStreamSynchronize(st_));  // no instance is in flight when it is destroyed (its memory is returned at once)
   int n = 0;
-  for (size_t i = 0; i < live.size(); ++i) {
+  for (size_t i = 0; i < live.size() && (size_t)n < max_n; ++i) {
     cudaGraphExecDestroy(live[i]->exec);
     live[i]->exec = nullptr;
     live[i]->uses = 0;  // the next use runs eagerly, then captures again (run_graph)

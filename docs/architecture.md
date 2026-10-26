@@ -115,6 +115,10 @@ flowchart LR
   the same happens inside short prompt forwards (a few hundred new tokens of a follow-up turn, 0.5–1.5 s). A
   request is admitted during a yield by the rows it will actually prefill — its ids minus the prefix the daemon
   can resume from — so a follow-up turn of a long conversation is not held back by its prompt length.
+  With `HIVE_LAYER_YIELD_SLICE` a request too long for those rules still starts at a yield as a **sliced prefill**: its
+  chunks (at most the rows the runtime parked) run at the following yields, taking turns with the paused prefill — about
+  equal turns within a priority class, every yield for a better class — and whichever is left continues as the main
+  prefill. Images inside the reusable prefix are not encoded again, so such requests are admitted like text ones.
 - **Sessions and reuse.** If a session's previous tokens are a prefix of the new request, only the rest is
   prefilled. Otherwise the daemon resumes from the furthest matching prompt checkpoint (several per session,
   `HIVE_CKPT_HISTORY`), from an archived session in RAM, or from a cross-session snapshot taken at boundaries the

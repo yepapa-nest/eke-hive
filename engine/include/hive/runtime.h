@@ -570,13 +570,15 @@ class Runtime {
   //   lifetime, and each new combination of batch size and context length instantiates more — measured 2026-10-25 (DeepSeek service, VRAM 100 %):
   //   device free VRAM with the encoder unloaded fell 2,464 → 2,012 MiB over 12 h and 498 → 136 MiB right after loading it. Before a new graph is
   //   instantiated, graphs not launched for the longest time are destroyed until free VRAM covers the floor plus the vision encoder when it is
-  //   not loaded (a destroyed graph is captured again on later use — the same kernels; only capture time is spent).
+  //   not loaded (a destroyed graph is captured again on later use — the same kernels; only capture time is spent). A destroyed instance's
+  //   memory stays with the driver for the next instantiation (2026-10-26: free VRAM did not move after destroying 3,310 graphs, but its fall
+  //   slowed from ~38 to ~6 MiB/h), so a room destroys the older half and the back-off below keeps it from repeating at once.
   uint64_t graph_clock_ = 0;
   long graph_evicted_ = 0;
   size_t vision_bytes_ = 0;                   // device memory one encoder load took (measured at the first load; estimate before it)
   size_t graph_room_short_ = 0;               // free VRAM left by the last graph_room that could not reach the floor (0 = it did) — back-off
   void graph_room();
-  int evict_graphs(size_t want_free);         // destroys least recently launched graphs until free VRAM >= want_free (0 = all); returns how many
+  int evict_graphs(size_t want_free, size_t max_n = SIZE_MAX);  // destroys least recently launched graphs until free VRAM >= want_free (0 = all) or max_n are gone; returns how many
   void decode_front(int l, int M, int Tb, bool copy_acts);  // decode_layer graph A body (shared with the step graph)
   // HIVE_DECODE_STEP_GRAPH (env_on, constructor option block): one forward_batch step (all layers + head) as a single CUDA graph — instead of a host sync per layer,
   //   a GPU plan (hs_plan) + CPU pool dispatcher handshake (hive/decode_handshake.h, decode_dispatch.h). State is runtime.cpp's StepGraph (created on the first step when enabled —
