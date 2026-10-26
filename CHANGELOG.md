@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Read-ahead only where it saves a re-read** (`HIVE_TURN_PRERENDER`): a conversation of one user message (a background job's tool loop)
+  shows no earlier turn, and the read-ahead assumed its client drops this turn's reasoning. A client that sends it back then never sent that
+  prompt: on a production deployment 33 such read-aheads in five days read 6.6M tokens in the background and none was used (the next prompt
+  left each one at its first tool step), one of them holding the GPU for 727 s in front of two jobs. The keep/drop decision now follows
+  what the request's earlier turns show, else what the client's (user-agent's) earlier requests showed, else no read-ahead; a read-ahead is
+  skipped when the session already holds all but fewer than 4,096 of its tokens (121 of the 141 read-aheads followed by a request were
+  such appends); a conversation whose read-ahead did not match is not read ahead again, and a client habit it relied on is forgotten.
 - **Large requests reach the daemon in one write (server)**: the API server wrote a request's payload from the event loop, one socket
   buffer (~256 KiB) per loop iteration. An agent conversation that carries 12 screenshots sends 118 MB per turn (~460 iterations), and on a
   production deployment those turns reached the daemon 12–20 s after the server handed them over (p50 16 s over 150 turns; text requests

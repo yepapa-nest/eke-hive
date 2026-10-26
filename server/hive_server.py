@@ -2752,10 +2752,28 @@ PRERENDER_TEXT_MAX = 32
 PRERENDER_TEXT_LOCK = threading.Lock()  # written on the event loop, read in the request's prepare thread
 PRERENDER_SEEN: "OrderedDict[str, float]" = OrderedDict()  # conversation -> when its last request was prepared (a read-ahead that
 #   finishes after the next request arrived is not kept — it would be compared with the turn after, a false miss)
+# client (user-agent) -> whether it sends earlier turns' reasoning back, as seen in its requests that had earlier turns. A conversation of
+#   one user message (a background job's tool loop) shows no earlier turn; it takes its client's observed habit, and with none observed
+#   it is not read ahead. Before this the plan guessed "drops" there (measured 2026-10-22..26: 33 read-aheads of such rooms, 6.6M tokens
+#   read in the background, none used — the client kept the reasoning, the next prompt differed at its first tool step, and one of them
+#   held the GPU 727 s in front of two jobs that then timed out).
+PRERENDER_CLIENT_KEEPS: "OrderedDict[str, bool]" = OrderedDict()
+PRERENDER_OFF: "OrderedDict[str, bool]" = OrderedDict()  # conversations whose read-ahead did not match the next prompt: not read ahead again
+PRERENDER_BASIS: "OrderedDict[str, tuple]" = OrderedDict()  # conversation -> (client, basis) of its kept read-ahead, for a miss to correct
 
 
-def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_text: str):
-    """(ids, boundaries) of the next request's history, or None. ids end one token past the boundary (the daemon cuts inside a prompt)."""
+def _bounded_set(d: OrderedDict, k, v, cap: int = 4096) -> None:
+    d[k] = v
+    d.move_to_end(k)
+    while len(d) > cap:
+        d.popitem(last=False)
+
+
+def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_text: str, client: str = "", info: dict | None = None):
+    """(ids, boundaries) of the next request's history, or None. ids end one token past the boundary (the daemon cuts inside a prompt).
+    None also when the read-ahead would save fewer than PRERENDER_MIN tokens: the session already holds this request and its answer,
+    so a next prompt that only appends to them is continued there without it. info (optional dict) gets "basis": where the
+    keep/drop decision came from ("turns" = this request's earlier turns, "client" = the client's observed habit)."""
     try:
         parsed = parse_completion(raw_text + TOK.eos_token, thinking_mode, tools)
     except Exception:
@@ -2774,7 +2792,18 @@ def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_
     #   answer with its reasoning (the template then decides what it renders — DeepSeek's reference encoding keeps it whenever the request
     #   has tools). Dropping it here read ahead a prompt that client never sends (2026-10-22, a client replaying reasoning_content on
     #   every turn): the snapshot went unused and the whole turn was read again in the background for nothing.
-    keeps = any(isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content") for m in messages[:last_user])
+    earlier = [m for m in messages[:last_user] if isinstance(m, dict) and m.get("role") == "assistant"]
+    if earlier:
+        keeps = any(m.get("reasoning_content") for m in earlier)
+        _bounded_set(PRERENDER_CLIENT_KEEPS, client, keeps, 64)
+        basis = "turns"
+    else:
+        keeps = PRERENDER_CLIENT_KEEPS.get(client)
+        if keeps is None:
+            return None
+        basis = "client"
+    if info is not None:
+        info["basis"] = basis
     hist = []
     for i, m in enumerate(messages):
         m = dict(m)
@@ -2805,11 +2834,25 @@ def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_
         b += 1
     if b < PRERENDER_MIN or b >= len(ids):
         return None
+    # what the session holds after this turn: this prompt and the generated text. Tokens of the next prompt up to where it leaves that
+    #   are continued in the session; only the rest is what a read-ahead saves. A client that sends its reasoning back makes the next
+    #   prompt a pure append (measured 2026-10-22..26: 121 of the 141 read-aheads followed by a request were such appends).
+    try:
+        now, media_now = encode_prompt(messages, tools, thinking_mode, effort)
+    except Exception:
+        return None
+    if media_now:
+        return None
+    kept_chars = _common_prefix_len(now + raw_text, pa[:c])
+    import bisect
+    held = min(b, bisect.bisect_right(ends, kept_chars))
+    if b - held < PRERENDER_MIN:
+        return None
     hints = boundary_hints(hist + [{"role": "user", "content": "x"}], tools, thinking_mode, effort, pa, ids, ends) if env_on("HIVE_PREFIX_SHARE") else []
     return ids[: b + 1], sorted({h for h in hints if 0 < h < b} | {b}), pa[:c]
 
 
-async def turn_prerender(session: str, plan) -> None:
+async def turn_prerender(session: str, plan, basis: tuple = ("", "")) -> None:
     ids, boundaries, text = plan
     key = session + "~next"
     if key in PRERENDERING:
@@ -2833,6 +2876,7 @@ async def turn_prerender(session: str, plan) -> None:
                 PRERENDER_TEXT.move_to_end(session)
                 while len(PRERENDER_TEXT) > PRERENDER_TEXT_MAX:
                     PRERENDER_TEXT.popitem(last=False)
+                _bounded_set(PRERENDER_BASIS, session, basis, PRERENDER_TEXT_MAX)
     except Exception as e:  # noqa: BLE001 — background work: a failure only loses the snapshot
         rec["error"] = str(e)[:200]
     finally:
@@ -2841,22 +2885,33 @@ async def turn_prerender(session: str, plan) -> None:
         log_request(rec)
 
 
-def schedule_prerender(messages, tools, thinking_mode, effort, session: str, raw_text: str) -> None:
-    if not TURN_PRERENDER:
+def schedule_prerender(messages, tools, thinking_mode, effort, session: str, raw_text: str, client: str = "") -> None:
+    if not TURN_PRERENDER or session in PRERENDER_OFF:
         return
     async def go():
-        plan = await asyncio.to_thread(prerender_plan, messages, tools, thinking_mode, effort, raw_text)
+        info: dict = {}
+        plan = await asyncio.to_thread(prerender_plan, messages, tools, thinking_mode, effort, raw_text, client, info)
         if plan:
-            await turn_prerender(session, plan)
+            await turn_prerender(session, plan, (client, info.get("basis", "")))
     task = asyncio.get_running_loop().create_task(go())
     PRERENDER_TASKS.add(task)
     task.add_done_callback(PRERENDER_TASKS.discard)
+
+
+def prerender_client(request) -> str:
+    """The read-ahead's client identity: the user-agent ("" when there is none — such requests share one habit)."""
+    h = getattr(request, "headers", None)
+    try:
+        return str(h.get("user-agent") or "")[:200] if h is not None else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def prerender_match(session: str, prompt: str, ends) -> dict:
     """Request record fields: how much of this conversation's read-ahead text the prompt kept, and where it first differs (one use)."""
     with PRERENDER_TEXT_LOCK:
         pre = PRERENDER_TEXT.pop(session, None)
+        basis = PRERENDER_BASIS.pop(session, ("", ""))
         if TURN_PRERENDER:
             PRERENDER_SEEN[session] = time.time()
             PRERENDER_SEEN.move_to_end(session)
@@ -2867,6 +2922,12 @@ def prerender_match(session: str, prompt: str, ends) -> dict:
     c = _common_prefix_len(pre, prompt)
     out = {"prerender_chars": len(pre), "prerender_kept_chars": c}
     if c < len(pre):
+        # a read-ahead the next prompt left: this conversation is not read ahead again, and a client habit it relied on is forgotten
+        #   (its single-message conversations are then not read ahead until a request with earlier turns shows the habit again)
+        with PRERENDER_TEXT_LOCK:
+            _bounded_set(PRERENDER_OFF, session, True)
+            if basis[1] == "client":
+                PRERENDER_CLIENT_KEEPS.pop(basis[0], None)
         import bisect
         out["prerender_miss"] = {"at_token": bisect.bisect_right(ends, c) if ends is not None else None,
                                  "pre": pre[max(0, c - 40): c + 80], "got": prompt[max(0, c - 40): c + 80]}
@@ -3244,7 +3305,7 @@ async def chat(request: Request):
         message = {"role": "assistant", "content": parsed.get("content") or ""}
         note_cut_leak(message["content"], bool(parsed.get("tool_calls")))
         if done.get("finish") == "stop" and not parsed.get("tool_calls"):
-            schedule_prerender(messages, tools, thinking_mode, effort, session, text)  # HIVE_TURN_PRERENDER (off = nothing)
+            schedule_prerender(messages, tools, thinking_mode, effort, session, text, prerender_client(request))  # HIVE_TURN_PRERENDER (off = nothing)
         if parsed.get("reasoning_content"):
             message["reasoning_content"] = parsed["reasoning_content"]
         if parsed.get("tool_calls"):
@@ -3390,7 +3451,7 @@ async def chat(request: Request):
             req_rec["tool_args_invalid"] = bad
         note_cut_leak(content_before_tools(gen_text, thinking_mode), bool(sent))
         if finish == "stop" and not tool_buf:
-            schedule_prerender(messages, tools, thinking_mode, effort, session, strip_eos(gen_text))  # HIVE_TURN_PRERENDER (off = nothing)
+            schedule_prerender(messages, tools, thinking_mode, effort, session, strip_eos(gen_text), prerender_client(request))  # HIVE_TURN_PRERENDER (off = nothing)
         last = {'index': 0, 'delta': {}, 'finish_reason': finish, **({'stop_reason': done['stop_sequence']} if done.get('stop_sequence') and finish == 'stop' else {})}  # D11
         yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [last], 'usage': openai_usage(len(ids), done)})}\n\n"
         yield "data: [DONE]\n\n"

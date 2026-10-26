@@ -562,7 +562,7 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         a tool call (the turn goes on)."""
         calls = []
         saved = s.schedule_prerender
-        s.schedule_prerender = lambda *a: calls.append(a[-1])
+        s.schedule_prerender = lambda *a: calls.append(a[5])
         try:
             s.DSML_START = '<tool_call>'
             await self.stream([1, 2, 3, 21], False)                             # <think>hm</think>x — an answer
@@ -1153,7 +1153,9 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
     def test_turn_prerender_plan_matches_next_request(self):
         """HIVE_TURN_PRERENDER (2026-10-15): the planned ids are the next request's tokens up to where its user message starts — that
         request drops this turn's reasoning (templates that keep reasoning only after the last user message; clients that send it back
-        only within a turn) — and the boundary sits exactly there. No plan without reasoning, for a tool call, or for a short prefix."""
+        only within a turn) — and the boundary sits exactly there. No plan without reasoning, for a tool call, or for a short prefix.
+        2026-10-26: no plan either when the next prompt only appends to this request and its answer (the session holds them), and a
+        conversation of one user message takes its client's observed habit — none observed, no plan."""
         def think_encode(messages, tools, thinking_mode, effort):  # keeps reasoning only after the last user message (Qwen / DeepSeek style)
             last = max(i for i, m in enumerate(messages) if m['role'] == 'user')
             text = ''
@@ -1173,13 +1175,21 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
                 if '[call]' in c: out = {'reasoning_content': r, 'content': c.replace('[call]', ''), 'tool_calls': [{'name': 'f', 'arguments': {}}]}
                 return out
         added = {'<think>': 7, '</think>': 8}
-        MARKERS.update(added); saved = (s.encode_prompt, s.ENC, s.PRERENDER_MIN)
+        MARKERS.update(added); saved = (s.encode_prompt, s.ENC, s.PRERENDER_MIN, dict(s.PRERENDER_CLIENT_KEEPS))
         s.encode_prompt = think_encode; s.ENC = Parse(); s.PRERENDER_MIN = 16
+        s.PRERENDER_CLIENT_KEEPS.clear()
         try:
             msgs = [{'role': 'system', 'content': self.SYS}, {'role': 'user', 'content': 'fix the build'},
                     {'role': 'assistant', 'content': '', 'reasoning_content': 'look at the log', 'tool_calls': [{'id': 'c1', 'type': 'function', 'function': {'name': 'f', 'arguments': '{}'}}]},
                     {'role': 'tool', 'content': 'error at line 3'}]
-            plan = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            ans = 'line 3 needs a semicolon</think>Added the semicolon.'
+            # one user message and nothing observed of the client: no plan (measured 2026-10-22..26 — guessing "drops" there read
+            #   33 rooms again in the background for prompts their client never sent)
+            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, ans, 'dropper'))
+            s.PRERENDER_CLIENT_KEEPS['dropper'] = False                              # seen dropping earlier turns' reasoning
+            info = {}
+            plan = s.prerender_plan(msgs, None, 'thinking', None, ans, 'dropper', info)
+            self.assertEqual(info, {'basis': 'client'})
             self.assertIsNotNone(plan)
             ids, bounds, text = plan
             nxt = [dict(m) for m in msgs]
@@ -1208,36 +1218,49 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
                         text += m.get('content') or ''
                 return text + '<|assistant|><think>', []
             s.encode_prompt = keep_all
-            ids, bounds, _ = s.prerender_plan(msgs, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            ids, bounds, _ = s.prerender_plan(msgs, None, 'thinking', None, ans, 'dropper')
             nids = s.TOK.encode(keep_all(nxt, None, 'thinking', None)[0])
             b = bounds[-1]
             self.assertEqual(ids[:b], nids[:b]); self.assertEqual(nids[b - 1], MARKERS['<|user|>'])
-            # a client that sends earlier turns' reasoning back (keeps it on every turn) sends this turn's too: the plan keeps it
+            # a client that sends earlier turns' reasoning back (keeps it on every turn) sends this turn's too: with a template that keeps
+            #   it as well the next prompt only appends to this request and its answer — the session holds them, no plan
             kept = [{'role': 'system', 'content': self.SYS}, {'role': 'user', 'content': 'hello'},
                     {'role': 'assistant', 'content': 'Hi.', 'reasoning_content': 'greet back'}, *msgs[1:]]
-            ids, bounds, _ = s.prerender_plan(kept, None, 'thinking', None, 'line 3 needs a semicolon</think>Added the semicolon.')
+            info = {}
+            self.assertIsNone(s.prerender_plan(kept, None, 'thinking', None, ans, 'keeper', info))
+            self.assertEqual(info, {'basis': 'turns'}); self.assertIs(s.PRERENDER_CLIENT_KEEPS['keeper'], True)   # the habit is learned
+            # ... and its one-message conversations (a background job's tool loop) take that habit: an append again, no plan
+            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, ans, 'keeper'))
+            # a template that drops earlier turns' reasoning rewrites the turn even for that client: the plan keeps what the client sends
+            s.encode_prompt = think_encode
+            ids, bounds, _ = s.prerender_plan(kept, None, 'thinking', None, ans, 'keeper')
             nxt_kept = [*kept, {'role': 'assistant', 'content': 'Added the semicolon.', 'reasoning_content': 'line 3 needs a semicolon'},
                         {'role': 'user', 'content': 'thanks, run the tests'}]
-            nids = s.TOK.encode(keep_all(nxt_kept, None, 'thinking', None)[0])
+            nids = s.TOK.encode(think_encode(nxt_kept, None, 'thinking', None)[0])
             b = bounds[-1]
             self.assertEqual(ids[:b], nids[:b]); self.assertEqual(nids[b - 1], MARKERS['<|user|>'])
-            s.encode_prompt = think_encode
-            self.assertIsNone(s.prerender_plan(msgs[:2], None, 'thinking', None, 'Done.'))                       # no reasoning in the turn
-            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'again</think>[call]'))             # the turn goes on (a tool call)
+            # an answer whose re-read would be shorter than PRERENDER_MIN is not read ahead (what the session misses is that tail only)
+            s.PRERENDER_MIN = b - 2
+            self.assertIsNone(s.prerender_plan(kept, None, 'thinking', None, ans, 'keeper'))
+            s.PRERENDER_MIN = 16
+            self.assertIsNone(s.prerender_plan(msgs[:2], None, 'thinking', None, 'Done.', 'dropper'))            # no reasoning in the turn
+            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'again</think>[call]', 'dropper'))  # the turn goes on (a tool call)
             s.PRERENDER_MIN = 10 ** 6
-            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'r</think>Added.'))                 # too short to be worth it
+            self.assertIsNone(s.prerender_plan(msgs, None, 'thinking', None, 'r</think>Added.', 'dropper'))      # too short to be worth it
         finally:
             for k in added: MARKERS.pop(k)
-            s.encode_prompt, s.ENC, s.PRERENDER_MIN = saved
+            s.encode_prompt, s.ENC, s.PRERENDER_MIN = saved[:3]
+            s.PRERENDER_CLIENT_KEEPS.clear(); s.PRERENDER_CLIENT_KEEPS.update(saved[3])
 
     def test_prerender_match_records_where_the_next_prompt_differs(self):
         """HIVE_TURN_PRERENDER follow-up (2026-10-16): the next request of a conversation compares its prompt with the read-ahead text
         once — kept length, and on a mismatch the token position and both texts around it; a read-ahead that finishes after the next
         request arrived is not kept (it would be compared with the turn after)."""
-        saved = (s.TURN_PRERENDER, dict(s.PRERENDER_TEXT), dict(s.PRERENDER_SEEN))
+        saved = (s.TURN_PRERENDER, dict(s.PRERENDER_TEXT), dict(s.PRERENDER_SEEN), dict(s.PRERENDER_OFF), dict(s.PRERENDER_BASIS),
+                 dict(s.PRERENDER_CLIENT_KEEPS))
         s.TURN_PRERENDER = True
         try:
-            s.PRERENDER_TEXT.clear(); s.PRERENDER_SEEN.clear()
+            s.PRERENDER_TEXT.clear(); s.PRERENDER_SEEN.clear(); s.PRERENDER_OFF.clear(); s.PRERENDER_BASIS.clear()
             self.assertEqual(s.prerender_match('c', 'anything', None), {})
             s.PRERENDER_TEXT['c'] = 'sys|user a|asst ok|user '
             r = s.prerender_match('c', 'sys|user a|asst ok|user next question', None)
@@ -1249,6 +1272,17 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             r = s.prerender_match('c', prompt, ends)
             self.assertEqual((r['prerender_kept_chars'], r['prerender_miss']['at_token']), (16, 16))
             self.assertTrue(r['prerender_miss']['pre'].endswith('ok|user ') and r['prerender_miss']['got'].endswith('OK|user next'))
+            # 2026-10-26: a miss stops this conversation's read-aheads, and forgets the client habit the read-ahead relied on
+            self.assertIn('c', s.PRERENDER_OFF)
+            s.PRERENDER_CLIENT_KEEPS['ua'] = False
+            s.PRERENDER_TEXT['d'] = 'sys|user a|asst ok|user '; s.PRERENDER_BASIS['d'] = ('ua', 'client')
+            s.prerender_match('d', prompt, ends)
+            self.assertNotIn('ua', s.PRERENDER_CLIENT_KEEPS)
+            s.PRERENDER_CLIENT_KEEPS['ua'] = True                                     # a habit seen in the request's own turns stays
+            s.PRERENDER_TEXT['e'] = 'sys|user a|asst ok|user '; s.PRERENDER_BASIS['e'] = ('ua', 'turns')
+            s.prerender_match('e', prompt, ends)
+            self.assertIs(s.PRERENDER_CLIENT_KEEPS['ua'], True)
+            s.PRERENDER_OFF.clear()
             # a read-ahead started before the conversation's latest request is dropped when it finishes
             class D:
                 async def generate(self, *a, **k):
@@ -1267,12 +1301,14 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         finally:
             s.TURN_PRERENDER = saved[0]
             s.PRERENDER_TEXT.clear(); s.PRERENDER_TEXT.update(saved[1]); s.PRERENDER_SEEN.clear(); s.PRERENDER_SEEN.update(saved[2])
+            for d, v in zip((s.PRERENDER_OFF, s.PRERENDER_BASIS, s.PRERENDER_CLIENT_KEEPS), saved[3:]):
+                d.clear(); d.update(v)
 
     def test_prerender_task_is_kept_until_done(self):
         """The read-ahead task is strongly referenced until it ends (2026-10-15/16: 13 of 59 were garbage-collected mid-request)."""
         saved = (s.TURN_PRERENDER, s.prerender_plan, s.turn_prerender)
         seen = []
-        async def slow(session, plan):
+        async def slow(session, plan, basis=None):
             import gc
             gc.collect()
             await asyncio.sleep(0.05)
@@ -1290,6 +1326,15 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             asyncio.run(main())
             self.assertEqual(seen, ['c'])
             self.assertEqual(len(s.PRERENDER_TASKS), 0)
+            # a conversation whose read-ahead missed is not read ahead again (2026-10-26)
+            seen.clear(); s.PRERENDER_OFF['c'] = True
+            async def off():
+                s.schedule_prerender([], None, 'thinking', None, 'c', 'x')
+                self.assertEqual(len(s.PRERENDER_TASKS), 0)                     # no task at all
+                await asyncio.sleep(0.1)
+            asyncio.run(off())
+            self.assertEqual(seen, [])
+            s.PRERENDER_OFF.pop('c')
         finally:
             s.TURN_PRERENDER, s.prerender_plan, s.turn_prerender = saved
 
