@@ -119,6 +119,8 @@ flowchart LR
   chunks (at most the rows the runtime parked) run at the following yields, taking turns with the paused prefill — about
   equal turns within a priority class, every yield for a better class — and whichever is left continues as the main
   prefill. Images inside the reusable prefix are not encoded again, so such requests are admitted like text ones.
+  With `HIVE_PREFILL_PRIORITY_HOLD` the decode share between chunks and at yields goes only to decoders of the
+  prefilling request's priority class or better — a background job's decode waits while a conversation turn reads.
 - **Sessions and reuse.** If a session's previous tokens are a prefix of the new request, only the rest is
   prefilled. Otherwise the daemon resumes from the furthest matching prompt checkpoint (several per session,
   `HIVE_CKPT_HISTORY`), from an archived session in RAM, or from a cross-session snapshot taken at boundaries the

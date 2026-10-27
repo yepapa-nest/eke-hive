@@ -15,7 +15,11 @@ Checked (every token = the state oracle of its own prompt — scheduling only):
   * HIVE_PRIORITY_SHARED=0: a priority 0 request is admitted and decodes while a priority -1 one decodes. Control (off): it waits for it.
   * images: a follow-up turn whose image lies inside the reusable prefix is admitted at a yield (short rule) and answers before the long
     prompt; the same turn with different image bytes (nothing reusable — an image to encode) waits for the forward.
-  * negative controls (each must be DETECTED): slices that ignore the parked rows R · slices that keep the tail-layer skip (C1) on.
+  * HIVE_PREFILL_PRIORITY_HOLD: a priority 1 decoder gets no decode step while a priority -1 prompt prefills (three chunks — no decode
+    share between them nor at their layer yields), then resumes and follows its oracle; a decoder of the same class keeps its share.
+    Control (off): the priority 1 decoder steps between and inside the chunks.
+  * negative controls (each must be DETECTED): slices that ignore the parked rows R · slices that keep the tail-layer skip (C1) on ·
+    a hold that skips the layer yields.
 No GPU. Run: nice -n 19 taskset -c 4-5 python3 tools/test_layer_yield_slice_cpu.py
 """
 from pathlib import Path
@@ -154,6 +158,39 @@ def sc_shared(h, ck, on, tag):
         ck.true(f'{tag} control: the priority 0 request waits for the -1 one', first.get('D2', 0) > last.get('D1', 1e9), repr((first, last)))
 
 
+def sc_prefill_hold(h, ck, on, tag, dp=1):
+    """A decoder (priority dp) is streaming; a priority -1 prompt of three chunks arrives. Counts the decoder's tokens while that prompt
+    prefills (from its first chunk line to its first token)."""
+    D, L = t.tokens(100, 2061), t.tokens(2000, 2062)
+    res, stamps, first = {}, [], {}
+    n0 = len(ly.lines(h))
+    a = t.launch(h, tag + 'D', D, 1900, res, 'D', on_token=lambda k: stamps.append(time.monotonic()), priority=dp)
+    deadline = time.monotonic() + 10 * SLOW
+    while len(stamps) < 5 and time.monotonic() < deadline:
+        time.sleep(.01)
+    t0 = time.monotonic()
+    b = t.launch(h, tag + 'L', L, 3, res, 'L', on_token=lambda k: first.setdefault('L', time.monotonic()), priority=-1)
+    b.join(60 * SLOW)
+    h.cancel(tag + 'D')
+    a.join(60 * SLOW)
+    t.done_ok(ck, f'{tag} prompt (priority -1)', res['L'], L, 3, 0)
+    ck.true(f'{tag}: decoder ended by cancel', (res['D'].get('done') or {}).get('finish') == 'cancel', repr(res['D'].get('done')))
+    ck.eq(f'{tag}: decoder tokens follow its oracle', res['D']['tokens'], t.oracle(D, len(res['D']['tokens'])))
+    lc = chunk_lines(h, tag + 'L')
+    ck.eq(f'{tag}: prompt chunk sizes unchanged', [m for _, m in lc], [768, 768, 464])
+    during = sum(1 for x in stamps if t0 + .2 * SLOW < x < first.get('L', 0))
+    held = sum(1 for l in ly.lines(h)[n0:] if l.startswith('[hived] decode share held: prefilling priority -1'))
+    held_ly = sum(1 for l in ly.lines(h)[n0:] if l.startswith('[hived] layer yield done:') and l.find(' · held by priority') > 0)
+    if on and dp > -1:
+        ck.true(f'{tag}: the worse-class decoder waits for the whole prefill', during == 0, f'{during} tokens during the prefill')
+        ck.eq(f'{tag}: decode share held between the chunks', held, 2)
+        ck.true(f'{tag}: layer yields hold it too', held_ly > 0, f'{held_ly} held yields')
+        ck.true(f'{tag}: it resumes after the prompt', any(x > first.get('L', 1e9) for x in stamps), '')
+    else:
+        ck.true(f'{tag} control: the decoder steps during the prefill', during >= 10, f'{during} tokens during the prefill')
+        ck.eq(f'{tag} control: nothing held', (held, held_ly), (0, 0))
+
+
 def sc_image_prefix(h, ck, tag):
     P = t.tokens(300, 2051)
     im = t.image(50, 3, 3, 2052)
@@ -196,12 +233,15 @@ def run(exe, td):
         ('shared-on', {**ly.ON, 'HIVE_PRIORITY_SHARED': '0'}, lambda h: sc_shared(h, ck, True, 'p1')),
         ('shared-off', ly.ON, lambda h: sc_shared(h, ck, False, 'p0')),
         ('image-prefix', ly.ON, lambda h: sc_image_prefix(h, ck, 'ip')),
+        ('hold-on', {**ly.ON, 'HIVE_PREFILL_PRIORITY_HOLD': '1'}, lambda h: (sc_prefill_hold(h, ck, True, 'ph'), sc_prefill_hold(h, ck, True, 'pq', dp=-1))),
+        ('hold-off', ly.ON, lambda h: sc_prefill_hold(h, ck, False, 'p_')),
     )
     for name, env, fn in cases:
         h = t.Hived(exe, td, env, args=TILE3, name='lys' + name)
         try:
             fn(h)
             ck.true(f'{name}: slices startup line iff switch on', ('[hived] layer yield slices on:' in h.tail(100000)) == ('HIVE_LAYER_YIELD_SLICE' in env), '')
+            ck.true(f'{name}: hold startup line iff switch on', ('[hived] prefill priority hold on:' in h.tail(100000)) == ('HIVE_PREFILL_PRIORITY_HOLD' in env), '')
             ck.true(f'{name}: no fake-state error in the log', 'fake state' not in h.tail(100000), '')
         finally:
             t.stop_clean(h, ck)
@@ -239,6 +279,11 @@ def run_mutants(exe, td):
     m2 = src.replace(mark, "              ly_mark(Jp->A->sid, Jp->ids.size(), Jp->A->prio);\n              if (sliced.empty()) slice_credit = 0;")
     exe2 = t.build_daemon(td, name='hived_mut_slice_mark', hived_source=m2)
     out.append(('sliced session not marked prefilling', *mutant(exe2, td, SLICE_ON, lambda h, ck: sc_same_session(h, ck, 'mm'))))
+    # 3) HIVE_PREFILL_PRIORITY_HOLD only between chunks: the layer yields still give the worse-class decoder its share
+    ly_hold = "      if (!active.empty() && !held) {"
+    assert src.count(ly_hold) == 1, 'layer-yield hold drifted'
+    exe3 = t.build_daemon(td, name='hived_mut_hold_ly', hived_source=src.replace(ly_hold, "      if (!active.empty()) {"))
+    out.append(('hold skips the layer yields', *mutant(exe3, td, {**ly.ON, 'HIVE_PREFILL_PRIORITY_HOLD': '1'}, lambda h, ck: sc_prefill_hold(h, ck, True, 'mh'))))
     return out
 
 

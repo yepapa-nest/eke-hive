@@ -900,6 +900,13 @@ int main(int argc, char** argv) {
     return v && *v && end && *end == 0 ? (int)std::max(-1000L, std::min(1000L, x)) : INT_MIN;
   }();
   auto prio_class = [](int p) { return prio_shared != INT_MIN && p <= prio_shared ? prio_shared : p; };
+  // HIVE_PREFILL_PRIORITY_HOLD (optional, env_on, default off): while a request prefills, decoders of a worse priority class get no time from it —
+    //   no decode_share between its chunks or rounds and no decode share at its layer yields. Decoders of its class or better keep their share
+    //   as before. It extends the decode_step rule (a better request steps alone) to a better request that is still prefilling.
+    //   Measured 2026-10-24..28 (production log, DeepSeek): 131 conversation-turn prefills (priority -1) ran while only background requests
+    //   (priority 1) decoded; giving those decoders 34 % between chunks and 20 % at layer yields cost the turns 368 s, 39 % of their prefill time
+    //   (10-28 06:40:55: a 78,747-row re-read computed in 13.8 s and answered after 25.9 s). Schedule only: chunks, forwards and tokens are unchanged.
+  static const bool prefill_prio_hold = env_on("HIVE_PREFILL_PRIORITY_HOLD");
   // Arrival coalescing (HIVE_BATCH_COALESCE_MS, HIVE_BATCH_PREFILL path): before the first round of a batched prefill, if the head request is
     //   streaming-sized and seats/slots remain, wait until following arrivals pause (no new arrival for this many ms after the last one; cap =
     //   this many ms x prefill slots) and put them in the same forward.
@@ -1841,6 +1848,7 @@ int main(int argc, char** argv) {
             ly_mid > ly_max ? (" · up to " + std::to_string(ly_mid) + " rows when <= half of the paused forward's remaining rows (HIVE_LAYER_YIELD_MID)").c_str() : "");
   if (layer_yield && ly_slice > 0) fprintf(stderr, "[hived] layer yield slices on: other prefills start at a yield and run in chunks of <= %zu rows (HIVE_LAYER_YIELD_SLICE)\n", ly_slice);
   if (prio_shared != INT_MIN) fprintf(stderr, "[hived] priority shared: priorities <= %d are one class (HIVE_PRIORITY_SHARED)\n", prio_shared);
+  if (prefill_prio_hold) fprintf(stderr, "[hived] prefill priority hold on: decoders of a worse class get no share of a prefill (HIVE_PREFILL_PRIORITY_HOLD)\n");
   // HIVE_LAYER_YIELD_MID: the forward a layer yield pauses — its rows, the rows of the request's later chunks, and the rows admitted by the mid rule
   //   during it (set by the outer admission right before rt.forward / rt.forward_multi; never from inside a yield)
   size_t ly_fwd_rows = 0, ly_rest_rows = 0, ly_mid_used = 0;
@@ -2728,10 +2736,22 @@ int main(int argc, char** argv) {
     return true;
   };
   // Between chunks: give running decoders their decode_share (tc = wall clock of the forward just run)
-  auto decode_between = [&](double tc) {
+  // HIVE_PREFILL_PRIORITY_HOLD: true = every decoder is of a worse class than the prefill (pclass = the best class being prefilled) — they wait
+    //   for it. A cancelled, disconnected or finished decoder still needs a decode_step to be answered, so any of those lets the step run.
+  auto held_by_prefill = [&](int pclass) {
+    if (!prefill_prio_hold || active.empty()) return false;
+    for (auto& A : active)
+      if (!A->client_ok || A->cancel->load() || A->n >= A->max_tokens || prio_class(A->prio) <= pclass) return false;
+    return true;
+  };
+  auto decode_between = [&](double tc, int pclass) {
       // Give running decoders decode_share of the wall clock between chunks (measured: 8 concurrent 8K prompts with one step per chunk starved
             //   decoding at 0.2 tok/s). share 0.34 = ~2.9 s of decode per 5.6 s prefill chunk (steps of ~40-300 ms, several times). 0 = one step.
       const double budget = decode_share > 0 && decode_share < 1 ? tc * decode_share / (1.0 - decode_share) : 0;
+      if (held_by_prefill(pclass)) {
+        fprintf(stderr, "[hived] decode share held: prefilling priority %d · %zu decoders of a worse class wait · %.0f ms kept\n", pclass, active.size(), budget);
+        return;
+      }
       const double td0 = now_ms();
       do { decode_step(); } while (!active.empty() && now_ms() - td0 < budget);
   };
@@ -2798,7 +2818,7 @@ int main(int argc, char** argv) {
     }
   };
   // HIVE_PREFILL_YIELD yielding between chunks/rounds of a long prefill. It calls admit below, so only declared here (defined after admit).
-  std::function<void(double, size_t)> yield_after_chunk;
+  std::function<void(double, size_t, int)> yield_after_chunk;  // (tc, busy, best class being prefilled)
   // The chunk loop of one prefill (the single path): from J.i to the end of the prompt, or until a cancel / disconnect / error
   //   false = chunk planning failed (chunk_begin answered the error) — the job ends without admit_finish
   std::function<bool(PJob&)> run_chunks;  // defined after continue_sliced (both share it)
@@ -2853,8 +2873,8 @@ int main(int argc, char** argv) {
       const double tc = tend - tc0 - (rt.layer_yield_stats().inner_ms - ly0.inner_ms);
       last_prefill_tc = tc;
       if (!chunk_end(J, tc, (size_t)J.M)) break;
-      if (J.i < J.ids.size() && prefill_yield) yield_after_chunk(tc, 1);
-      else if (J.i < J.ids.size() && !active.empty()) decode_between(tc);
+      if (J.i < J.ids.size() && prefill_yield) yield_after_chunk(tc, 1, prio_class(J.A->prio));
+      else if (J.i < J.ids.size() && !active.empty()) decode_between(tc, prio_class(J.A->prio));
     }
     return true;
   };
@@ -2874,7 +2894,7 @@ int main(int argc, char** argv) {
     //   Admits every short request it can take from the queue in FIFO order via the single path (requests that are not short or whose session
     //   is busy are skipped and keep their place).
   bool in_yield = false;
-  yield_after_chunk = [&](double tc, size_t busy) {
+  yield_after_chunk = [&](double tc, size_t busy, int pclass) {
     const bool had_active = !active.empty();
     int n = 0;
     if (!in_yield) {
@@ -2906,7 +2926,7 @@ int main(int argc, char** argv) {
       if (n) fprintf(stderr, "[hived] prefill yield: %d short request%s admitted in %.0f ms (active %zu · prefilling %zu)\n", n, n > 1 ? "s" : "", now_ms() - t0,
                      active.size(), busy);
     }
-    if (had_active) decode_between(tc);        // decoders were already running: their decode_share as usual
+    if (had_active) decode_between(tc, pclass);  // decoders were already running: their decode_share as usual
     else if (n && !active.empty()) decode_step();  // only the first token of the newly admitted short requests — no new decode_share on top of the long prefill
   };
   // HIVE_BATCH_PREFILL: run several queued text prefills per round in one rt.forward_multi — sharing the expert transfer per layer.
@@ -3150,8 +3170,10 @@ int main(int argc, char** argv) {
       std::sort(ended.begin(), ended.end());  // put into active in request order
       for (auto [j, fin] : ended) end_job(j, fin);
       jobs.erase(std::remove(jobs.begin(), jobs.end(), nullptr), jobs.end());
-      if (!jobs.empty() && prefill_yield) yield_after_chunk(tc_round, jobs.size());  // HIVE_PREFILL_YIELD: admit short requests separately before the next round (pull)
-      else if (!jobs.empty() && !active.empty()) decode_between(tc_round);
+      int pclass = INT_MAX;  // the best class still prefilling (HIVE_PREFILL_PRIORITY_HOLD)
+      for (auto& Jp : jobs) pclass = std::min(pclass, prio_class(Jp->A->prio));
+      if (!jobs.empty() && prefill_yield) yield_after_chunk(tc_round, jobs.size(), pclass);  // HIVE_PREFILL_YIELD: admit short requests separately before the next round (pull)
+      else if (!jobs.empty() && !active.empty()) decode_between(tc_round, pclass);
     }
   };
 
@@ -3917,7 +3939,8 @@ int main(int argc, char** argv) {
                      active.size(), prefilling_sids.size(), n_mid ? (" · " + std::to_string(n_mid) + " by the mid rule").c_str() : "",
                      n_urgent ? (" · " + std::to_string(n_urgent) + " by priority").c_str() : "");
       int steps = 0;
-      if (!active.empty()) {
+      const bool held = held_by_prefill(paused_prio());  // HIVE_PREFILL_PRIORITY_HOLD: no share for decoders of a worse class than the paused prefill
+      if (!active.empty() && !held) {
         const double budget = ly::decode_budget_ms(gap_ms, ly_share);
         do { decode_step(); ++steps; } while (!active.empty() && steps < ly_steps && now_ms() - ta < budget);
       }
@@ -3937,8 +3960,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[hived] layer yield: priority hold %d steps · %.0f ms (prefilling priority %d)\n", steps - s0, now_ms() - th, paused_prio());
       }
       last_prefill_tc = saved_tc;
-      fprintf(stderr, "[hived] layer yield done: admitted %d · decode steps %d%s · %.0f ms\n", n, steps,
-              slices || !sliced.empty() ? (" · slices " + std::to_string(slices) + " (sliced " + std::to_string(sliced.size()) + ")").c_str() : "", now_ms() - t0);
+      fprintf(stderr, "[hived] layer yield done: admitted %d · decode steps %d%s%s · %.0f ms\n", n, steps,
+              slices || !sliced.empty() ? (" · slices " + std::to_string(slices) + " (sliced " + std::to_string(sliced.size()) + ")").c_str() : "",
+              held ? " · held by priority" : "", now_ms() - t0);
     };
     rt.set_layer_yield(std::move(h));
   }
@@ -4402,7 +4426,7 @@ int main(int argc, char** argv) {
         if (prefill_fair && last_prefill_tc > 0 && !active.empty()) {
           bool more = false;
           { std::lock_guard<std::mutex> lk2(mu); more = !queue.empty() && (int)active.size() < max_batch && stop_state.load() == 0 && !sleep_asked.load(); }
-          if (more) decode_between(last_prefill_tc);
+          if (more) decode_between(last_prefill_tc, INT_MAX);  // between two prefills: no prefill is running, so nothing to hold for
         }
       }
     }

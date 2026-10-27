@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`HIVE_PREFILL_PRIORITY_HOLD` (new, off by default)**: a request that is still prefilling holds the decoders of a worse priority class,
+  as a decoding one already did. Between the chunks of a prefill the running decoders got `--decode-share` (34 %) of the wall clock and at
+  its layer yields another share, whatever their priority — on a production deployment, conversation turns that prefilled while only
+  background jobs decoded lost 368 s in five days (39 % of their prefill time; a 78,747-row re-read computed in 13.8 s answered after
+  25.9 s). With the switch on those decoders wait until the prefill ends; decoders of the same class or better keep their share.
 - **A prompt that ends in an image keeps its shared boundary**: the generation-suffix hints step one token back when the next turn may
   tokenize the last token differently. When the last message ended in an image, that check re-tokenized the image placeholder's text, never
   found the image token, always stepped back into the image and the hint was moved to the image's start — the deepest boundary, so the extra
