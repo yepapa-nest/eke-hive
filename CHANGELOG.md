@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **A prompt that ends in an image keeps its shared boundary**: the generation-suffix hints step one token back when the next turn may
+  tokenize the last token differently. When the last message ended in an image, that check re-tokenized the image placeholder's text, never
+  found the image token, always stepped back into the image and the hint was moved to the image's start — the deepest boundary, so the extra
+  cut went there instead of to the shared leading block. On a production deployment every look at a sign-in screen
+  ([system rules] [user: fixed line] [user: question + screenshot]) cached 0 (about 5 s to the first token). An image token never merges with
+  text, so there is no step back after it, and a generation-suffix hint moved out of an image far from the prompt's end is dropped.
+- **A dropped non-streaming request stops (server)**: the API-key check ran as Starlette's `@app.middleware("http")`, and behind it a
+  non-streaming request never saw its client disconnect. On a production deployment a batch client gave up after 15 minutes and its request
+  went on to generate 982K tokens over two hours; requests a service client had dropped after 300 s stayed queued for 18–100 minutes and
+  were computed anyway, holding decode rows. The check is now a plain ASGI middleware (same rules: `HIVE_API_KEY`, `/health` open), so the
+  endpoint's disconnect watch sees the client leave and cancels the request as it already did for streams.
+- **Boundaries at every leading user block**: a boundary ended only the first user message of a leading run of user messages (a fixed
+  block before the conversation). A client that put a short fixed note before a large per-owner block ([system] [user: note]
+  [user: index] [user: item]) got a boundary after the note only, and every item re-read the index (production: prefill median 3.9 → 6.8 s).
+  Each block of the run now ends a boundary, up to `HINT_LEAD_BLOCKS` (4); the run's last user message is still the question.
 - **Read-ahead only where it saves a re-read** (`HIVE_TURN_PRERENDER`): a conversation of one user message (a background job's tool loop)
   shows no earlier turn, and the read-ahead assumed its client drops this turn's reasoning. A client that sends it back then never sent that
   prompt: on a production deployment 33 such read-aheads in five days read 6.6M tokens in the background and none was used (the next prompt

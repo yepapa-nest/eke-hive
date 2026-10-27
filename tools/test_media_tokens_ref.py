@@ -111,6 +111,28 @@ def main():
     s.MEDIATOK = s.MediaTokens()
     print(f"mutants caught: {caught}/2", flush=True)
 
+    # 2026-10-27: a look at a screen ends its prompt with the screenshot — [system rules] [user: fixed line] [user: question + image].
+    #   The generation-suffix hints must stay at the prompt's tail (after the image) and never move to the image's start: there the
+    #   question differs on every look, and as the deepest boundary it took the extra cut from the shared fixed line (cached 0 per look).
+    os.environ["HIVE_PREFIX_SHARE"] = "1"
+    look_bad = 0
+    for mode in ("chat", "thinking"):
+        for q in ("Which field holds the user id? Answer as JSON.", "Is there an error message? Answer as JSON."):
+            m = [{"role": "system", "content": text(3000)}, {"role": "user", "content": "The screen and the question follow."},
+                 {"role": "user", "content": [{"type": "text", "text": q}, img()]}]
+            prompt, media = s.encode_prompt(json.loads(json.dumps(m)), None, mode, None)
+            ids, ends, metas, blob, spans, pos = s.MEDIATOK.prepare("look-" + mode + q[:4], prompt, media)
+            hints = s.boundary_hints_finish(s.boundary_hints_start(m, None, mode, None, prompt, gen_cut=True), ids, ends, spans)
+            p2, _ = s.encode_prompt(json.loads(json.dumps(m[:2] + [{"role": "user", "content": "x"}])), None, mode, None)
+            fixed_end = max(h for h in hints if prompt[:ends[h - 1]] == p2[:ends[h - 1]])  # deepest boundary the next look shares
+            body = [h for h in hints if len(ids) - h > s.GEN_TAIL_MAX]
+            ok = spans[-1][0] not in hints and body and max(body) == fixed_end and any(len(ids) - h <= s.GEN_TAIL_MAX for h in hints)
+            look_bad += not ok
+            if not ok:
+                print("LOOK", mode, len(ids), spans, hints, flush=True)
+    print(f"screen looks: deepest body boundary = the shared fixed line, tail hints after the image: {4 - look_bad}/4", flush=True)
+    bad += look_bad
+
     if a.big:
         m = [{"role": "system", "content": "sys"}]
         while len(json.dumps(m)) < a.big * 3.2:

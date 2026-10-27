@@ -283,6 +283,8 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
 - **Sessions.** The session key is a hash of the conversation head mixed with the client's conversation key
   (`prompt_cache_key`, `session_id`, `X-Session-ID` or `user`), or `hive_session_id`; concurrent requests
   of the same conversation get auxiliary sessions. Tokenisation and image preprocessing run off the event loop.
+  A client that disconnects has its request cancelled, streaming or not, also while it is still queued (the
+  `HIVE_API_KEY` check is a plain ASGI middleware, so the endpoint sees the disconnect).
 - **Boundary hints.** With `HIVE_PREFIX_SHARE`, the server finds the exact token offsets where the system/tools
   block and recent assistant turns end (by rendering the prefix with the same template and comparing) and sends
   them to the daemon as snapshot points. A boundary stops where the next message's content starts (a second render
@@ -291,11 +293,14 @@ layers 20+: only the last decoder-tail rows (2688, or the 128-row window with --
   in a reasoning-start token the next turn does not have); the daemon cuts that tail of a few tokens on the short path,
   so every turn leaves a shared snapshot the next one resumes from exactly. When the whole prompt is a text prefix of
   the next turn but its last token is not (Qwen ends the prompt in `<think>\n`, and the next turn merges that newline
-  into `\n\n`), the hint sits one token before the end.
+  into `\n\n`), the hint sits one token before the end. An image token never merges with text, so a prompt that ends
+  in an image gets no such step back, and a generation-suffix hint that falls inside an image is dropped rather than
+  moved to the image's start (where it would become the deepest boundary and take the extra cut from a shared one).
   A client's fixed first user message (per-account instructions ahead of the conversation) ends at a boundary when
   another user message follows, or when system messages follow that are in turn followed by a user message (a per-room
   notice between the block and the conversation) — then the end of those notices is a boundary too, so rooms of one
-  person share the block and rooms with the same notice share the notice.
+  person share the block and rooms with the same notice share the notice. A run of such blocks (a short fixed note, then
+  a large per-owner block, then the item) ends a boundary at every block, up to `HINT_LEAD_BLOCKS` (4).
   With `HIVE_PREFIX_ADAPTIVE` it also asks for one extra boundary chunk
   on a conversation whose tail is replaced between turns (the previous request is not a prefix of the new one
   but shares a boundary), on a conversation with earlier turns that it has not seen yet (after a restart), or on one

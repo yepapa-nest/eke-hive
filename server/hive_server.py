@@ -34,6 +34,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.datastructures import Headers
 
 app = FastAPI()
 
@@ -51,15 +52,29 @@ def _err(message: str, kind: str = "invalid_request_error") -> dict:
     return {"error": {"message": message, "type": kind}}
 
 
-@app.middleware("http")
-async def api_key_guard(request, call_next):
-    if API_KEY and request.url.path != "/health":
-        h = request.headers
-        auth = h.get("authorization", "")
-        key = auth[7:] if auth.lower().startswith("bearer ") else h.get("x-api-key", "")
-        if not hmac.compare_digest(key.encode(), API_KEY.encode()):
-            return JSONResponse(_err("invalid API key", "authentication_error"), status_code=401)
-    return await call_next(request)
+class ApiKeyGuard:
+    """HIVE_API_KEY check as a plain ASGI middleware: the endpoint gets the server's own `receive`, so request.is_disconnected() sees
+    the client leave. Measured 2026-10-27 (production deployment and the same image with a probe app): behind Starlette's
+    @app.middleware("http") (BaseHTTPMiddleware) a non-streaming request never saw its client disconnect — a batch client gave up
+    after 15 minutes and the request generated 982K tokens for two hours; service requests the client had dropped after 300 s
+    stayed queued for 18-100 minutes and were computed anyway. The probe app saw the disconnect after 2.0 s without that
+    middleware and never with it. Streaming requests noticed it only because a send failed."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if API_KEY and scope.get("type") == "http" and scope.get("path") != "/health":
+            h = Headers(scope=scope)
+            auth = h.get("authorization", "")
+            key = auth[7:] if auth.lower().startswith("bearer ") else h.get("x-api-key", "")
+            if not hmac.compare_digest(key.encode(), API_KEY.encode()):
+                await JSONResponse(_err("invalid API key", "authentication_error"), status_code=401)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(ApiKeyGuard)
 
 
 async def read_body(request):
@@ -1096,6 +1111,7 @@ class SeenPrefixes:
 SEEN = SeenPrefixes()
 
 
+HINT_LEAD_BLOCKS = 4  # leading fixed user blocks (each followed by another user message) that end a boundary
 HINT_TURNS = 4  # only the last few completed assistant-turn ends (the daemon only uses boundaries inside the newly prefilled span — earlier ones were recorded on earlier turns)
 
 
@@ -1266,7 +1282,8 @@ def _render_worker_task(path: str, seq: int, cut: int, suffix: list):
 
 
 # Renders boundary_hints may need for one request: the generation-suffix pair and the further-message render (3), plus a probe pair for each
-#   boundary it can probe — the system/tool block, the leading user block and its notice, and the last HINT_TURNS turn ends. A follow-up turn
+#   boundary it can probe — the system/tool block, the leading user block and its notice, and the last HINT_TURNS turn ends. (More leading
+#   blocks — HINT_LEAD_BLOCKS — only queue behind these; the pool size stays.) A follow-up turn
 #   whose older boundaries are in the probe cache needs the 3 plus the newest turn end's pair.
 HINT_MAX_RENDERS = 3 + 2 * (3 + HINT_TURNS)
 HINT_FOLLOWUP_RENDERS = 3 + 2
@@ -1431,7 +1448,7 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     the ids actually sent, emit nothing.
     Results are always prefix positions of ids (a wrong boundary only loses a reuse opportunity — the daemon compares the
     token prefix itself). Image requests emit nothing, since text offsets do not match the placeholder expansion.
-    Cost: two template renders per boundary (<= 1 + HINT_TURNS) + string compares, plus one extra full-prompt tokenization
+    Cost: two template renders per boundary (<= 1 + 2 * HINT_LEAD_BLOCKS + HINT_TURNS) + string compares, plus one extra full-prompt tokenization
     unless the caller passes the token end offsets of ids (`ends`, from TokenCache) — only when enabled. With HIVE_HINT_CACHE
     (HintProbeCache) a boundary whose messages were probed on an earlier request costs a compare instead of its renders.
     All renders of a request are listed first and rendered together (render_probes_* — in parallel with HIVE_HINT_PARALLEL), each
@@ -1459,14 +1476,23 @@ def boundary_hints_start(messages: list[dict], tools, thinking_mode: str, effort
     #   chat client: [system + tools] [user: per-person block] [system: this room's client-tool notice] [user: ...] — the boundary at the end
     #   of the person's block was missing, so rooms of the same person shared only the system/tools block, 15.8K tokens). Then both the
     #   block's end (every room of that person) and the notice's end (that person's rooms with the same notice) are boundaries.
-    if n < len(messages) - 1 and messages[n].get("role") == "user":
-        m = n + 1
+    #   The leading run may hold several such blocks, each followed by another user message (measured 2026-10-27, an analysis client:
+    #   [system] [user: a fixed one-line note] [user: the owner's index, ~24K] [user: the item] — the note keeps one conversation key per
+    #   owner, but only its end (4,576) was a boundary, so every item re-read the owner's index: prefill median 3.9 → 6.8 s, 58 requests
+    #   in 16 hours). Every block of the run ends a boundary, up to HINT_LEAD_BLOCKS; the run's last user message is the question.
+    u = n
+    for _ in range(HINT_LEAD_BLOCKS):
+        if not (u < len(messages) - 1 and messages[u].get("role") == "user"):
+            break
+        m = u + 1
         while m < len(messages) and messages[m].get("role") in ("system", "developer"):
             m += 1
-        if m < len(messages) and messages[m].get("role") == "user":
-            probes.append(messages[: n + 1])
-            if m > n + 1:
-                probes.append(messages[:m])
+        if not (m < len(messages) and messages[m].get("role") == "user"):
+            break
+        probes.append(messages[: u + 1])
+        if m > u + 1:
+            probes.append(messages[:m])
+        u = m
     turn_ends = [k for k in range(len(messages) - 1) if messages[k].get("role") == "assistant"]
     for k in turn_ends[-HINT_TURNS:]:
         probes.append(messages[: k + 1])
@@ -1539,6 +1565,7 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
         return []  # non-monotonic mapping (unknown tokenizer) — no boundaries
     import bisect
     out = set()
+    gen_hints = set()  # the generation-suffix hints among out (before they are moved out of image spans)
     rendered = render_probes_finish(pending)
     if gen:
         # Where the next turn's prompt leaves this one: the generation prompt ends in a reasoning-start token (DeepSeek
@@ -1556,7 +1583,7 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
             #   next turn diverged one token before the prompt end, so neither the prompt checkpoint nor any snapshot matched and every
             #   follow-up turn after a long one re-read it all (62K tokens, 15.4 s). Cut one token earlier — only when the next turn
             #   really tokenizes that place differently (a few dozen characters re-tokenized from the start of the last token).
-            if t == len(ids) and c >= len(prompt) and len(ids) >= 2:
+            if t == len(ids) and c >= len(prompt) and len(ids) >= 2 and not _in_span(t - 1, spans):
                 try:
                     s0 = ends[-2]
                     enc = TOK(_probe_slice(prompt, r_done, s0, s0 + 64), return_offsets_mapping=True)
@@ -1566,7 +1593,7 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
                 except Exception:
                     pass
             if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
-                out.add(t)
+                out.add(t); gen_hints.add(t)
         # Where a request that adds a message without this answer leaves this one: the end of the last message, before the generation
         #   prompt. Measured 2026-10-18/19 (DeepSeek, chat mode): a background job sent each item twice — the second prompt was the first
         #   one up to "<｜Assistant｜></think>" plus ~52 tokens of a further user message. The prompt-end checkpoint sat 2 tokens past the
@@ -1580,7 +1607,12 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
             # The last token before that point can merge with what the further message brings (measured 2026-10-19, DeepSeek: a second
             #   user message is joined to the first with "\n\n", the first one's closing "." merged with it, and the request parted one
             #   token before the hint) — cut one token earlier when the further rendering tokenizes that place differently.
-            if 2 <= t < len(ids):
+            #   Not after an image: its tokens never merge with text, but re-tokenizing the placeholder's text never gives the image token
+            #   either, so the step back always fired and landed inside the span — moved to the image's start, that hint became the deepest
+            #   boundary and took the extra cut (measured 2026-10-27, DeepSeek, a sign-in screen look [system rules] [user: fixed line]
+            #   [user: question + screenshot]: the cut went to the screenshot's start (4,264-5,858, a new question each time) and the
+            #   3,264 shared leading tokens were never saved — every look cached 0, ~5 s to the first token).
+            if 2 <= t < len(ids) and not _in_span(t - 1, spans):
                 try:
                     s0 = ends[t - 2]
                     enc = TOK(_probe_slice(prompt, r_more, s0, s0 + 64), return_offsets_mapping=True)
@@ -1590,7 +1622,7 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
                 except Exception:
                     pass
             if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
-                out.add(t)
+                out.add(t); gen_hints.add(t)
     for p in plan:
         if p[0] == "hit":
             kept = p[1]
@@ -1618,8 +1650,18 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
         if 0 < t < len(ids):
             out.add(t)
     if spans:
-        out = {t for t in (_out_of_spans(t, spans) for t in out) if 0 < t < len(ids)}
+        # a generation-suffix hint moved out of an image is no longer a free tail cut — it would only take the extra cut from a shared boundary
+        out = {u for t in out if 0 < (u := _out_of_spans(t, spans)) < len(ids) and (t not in gen_hints or len(ids) - u <= GEN_TAIL_MAX)}
     return sorted(out)
+
+
+def _in_span(t: int, spans) -> bool:
+    """Token t is an image token (inside one of the spans (start, length)); False without spans."""
+    if not spans:
+        return False
+    import bisect
+    j = bisect.bisect_right(spans, (t, float("inf"))) - 1
+    return j >= 0 and spans[j][0] <= t < spans[j][0] + spans[j][1]
 
 
 def _out_of_spans(t: int, spans: list) -> int:

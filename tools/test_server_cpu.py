@@ -1048,6 +1048,29 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         _, _, h5=self.hints_for(msgs[:3]+[{'role':'assistant','content':'a'}])
         self.assertEqual(h5, [sys_end])
 
+    def test_several_leading_user_blocks(self):
+        """2026-10-27: an analysis client sent [system] [user: fixed note] [user: owner's index] [user: item] — only the note's end was a
+        boundary, so every item of the owner re-read the index (prefill median 3.9 → 6.8 s)."""
+        msgs=[{'role':'system','content':self.SYS}, {'role':'user','content':'note'}, {'role':'user','content':'owner index'},
+              {'role':'user','content':'item one'}]
+        prompt, ids, hints=self.hints_for(msgs)
+        sys_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>'))
+        note_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>note<|user|>'))
+        index_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>note<|user|>owner index<|user|>'))
+        self.assertEqual(hints, [sys_end, note_end, index_end])
+        # the next item of the same owner resumes at the index's end; another owner (another index) at the note's end
+        _, ids2, h2=self.hints_for(msgs[:3]+[{'role':'user','content':'item two'}])
+        self.assertIn(index_end, h2); self.assertEqual(ids2[:index_end], ids[:index_end])
+        _, ids3, h3=self.hints_for(msgs[:2]+[{'role':'user','content':'other index'}, {'role':'user','content':'item'}])
+        self.assertIn(note_end, h3); self.assertEqual(ids3[:note_end], ids[:note_end])
+        # a run ending in its answer: blocks before the last user message keep their boundaries, the question gets none
+        _, _, h4=self.hints_for(msgs+[{'role':'assistant','content':'a'}])
+        self.assertEqual(h4, [sys_end, note_end, index_end])
+        # at most HINT_LEAD_BLOCKS blocks
+        many=[{'role':'system','content':self.SYS}]+[{'role':'user','content':'b%d'%i} for i in range(s.HINT_LEAD_BLOCKS+3)]
+        _, _, h5=self.hints_for(many)
+        self.assertEqual(len(h5), 1+s.HINT_LEAD_BLOCKS)
+
     def test_boundary_stops_where_the_next_content_starts(self):
         """2026-10-08: a next message starting with "<" (a per-turn "<info-msg>" block) shared "<" with the empty probe's
         "<|assistant|>" and the boundary took that token — the next turn (user's words there) could not resume it."""
@@ -1796,6 +1819,81 @@ class ExposureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msgs[1]["content"], "thanks")
 
 
+class ImageSpanHintTests(unittest.TestCase):
+    def test_in_span(self):
+        spans = [(10, 5), (40, 3)]
+        self.assertEqual([t for t in range(50) if s._in_span(t, spans)], [10, 11, 12, 13, 14, 40, 41, 42])
+        self.assertFalse(s._in_span(12, None)); self.assertFalse(s._in_span(12, []))
+        self.assertEqual([s._out_of_spans(t, spans) for t in (10, 12, 15, 41)], [10, 10, 15, 40])
+
+
+class DisconnectTests(unittest.IsolatedAsyncioTestCase):
+    """2026-10-27: behind Starlette's @app.middleware("http") a non-streaming request never saw its client leave (a dropped batch
+    request generated 982K tokens for two hours). ApiKeyGuard is a plain ASGI middleware: the endpoint gets the server's receive."""
+
+    async def _run(self, wrap, path="/probe", headers=()):
+        from fastapi import FastAPI, Request as FRequest
+        inner = FastAPI()
+        seen = {}
+
+        @inner.post("/probe")
+        @inner.post("/health")
+        async def probe(request: FRequest):
+            await request.json()
+            for _ in range(50):
+                if await request.is_disconnected():
+                    seen["disconnect"] = True
+                    break
+                await asyncio.sleep(.01)
+            return s.JSONResponse({})
+        app = wrap(inner)
+        msgs = [{"type": "http.request", "body": b"{}", "more_body": False}]
+        gone = time.monotonic() + .05   # the client leaves 50 ms after its body
+
+        async def receive():   # like uvicorn's: returns at once once the client is gone, else waits (is_disconnected cancels the wait)
+            if msgs:
+                return msgs.pop(0)
+            while time.monotonic() < gone:
+                await asyncio.sleep(.01)
+            return {"type": "http.disconnect"}
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1", "method": "POST",
+                 "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+                 "headers": [(b"content-type", b"application/json"), *headers], "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 80)}
+        await app(scope, receive, send)
+        return seen.get("disconnect", False), next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+
+    async def test_guard_passes_the_disconnect(self):
+        saved = s.API_KEY
+        try:
+            for key in (None, "k1"):
+                s.API_KEY = key
+                hdr = ((b"authorization", b"Bearer k1"),) if key else ()
+                seen, _ = await self._run(s.ApiKeyGuard, headers=hdr)
+                self.assertTrue(seen, key)
+        finally:
+            s.API_KEY = saved
+
+    async def test_guard_rejects_a_wrong_key(self):
+        saved = s.API_KEY
+        try:
+            s.API_KEY = "k1"
+            self.assertEqual((await self._run(s.ApiKeyGuard))[1], 401)
+            self.assertEqual((await self._run(s.ApiKeyGuard, headers=((b"x-api-key", b"nope"),)))[1], 401)
+            self.assertEqual((await self._run(s.ApiKeyGuard, headers=((b"x-api-key", b"k1"),)))[1], 200)
+            self.assertEqual((await self._run(s.ApiKeyGuard, path="/health"))[1], 200)
+        finally:
+            s.API_KEY = saved
+
+    def test_server_app_uses_the_guard(self):
+        self.assertTrue(any(getattr(m, "cls", None) is s.ApiKeyGuard for m in s.app.user_middleware))
+        from starlette.middleware.base import BaseHTTPMiddleware
+        self.assertFalse(any(getattr(m, "cls", None) is BaseHTTPMiddleware for m in s.app.user_middleware))
+
+
 def bpe_tokenizer():
     """A small real fast tokenizer (byte-level BPE trained on the fly) with role markers as added special tokens — the
     structure TokenCache relies on, without any model files."""
@@ -1968,7 +2066,7 @@ class AnnouncedToolsTests(unittest.TestCase):
 
 # ---------------------------------------------------------------------------------------------------------- HIVE_HINT_PARALLEL
 # boundary_hints as it was before the renders were listed first and handed to the render pool (main ec451e3, verbatim) — the
-#   reference the pooled and the serial path are compared with
+#   reference the pooled and the serial path are compared with (the leading-block rule follows the server's: several leading user blocks, 2026-10-27)
 OLD_BOUNDARY_HINTS = r'''
 def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prompt: str, ids: list[int], ends=None,
                    gen_cut: bool = False) -> list[int]:
@@ -2013,14 +2111,23 @@ def boundary_hints(messages: list[dict], tools, thinking_mode: str, effort, prom
     #   chat client: [system + tools] [user: per-person block] [system: this room's client-tool notice] [user: ...] — the boundary at the end
     #   of the person's block was missing, so rooms of the same person shared only the system/tools block, 15.8K tokens). Then both the
     #   block's end (every room of that person) and the notice's end (that person's rooms with the same notice) are boundaries.
-    if n < len(messages) - 1 and messages[n].get("role") == "user":
-        m = n + 1
+    #   The leading run may hold several such blocks, each followed by another user message (measured 2026-10-27, an analysis client:
+    #   [system] [user: a fixed one-line note] [user: the owner's index, ~24K] [user: the item] — the note keeps one conversation key per
+    #   owner, but only its end (4,576) was a boundary, so every item re-read the owner's index: prefill median 3.9 → 6.8 s, 58 requests
+    #   in 16 hours). Every block of the run ends a boundary, up to HINT_LEAD_BLOCKS; the run's last user message is the question.
+    u = n
+    for _ in range(HINT_LEAD_BLOCKS):
+        if not (u < len(messages) - 1 and messages[u].get("role") == "user"):
+            break
+        m = u + 1
         while m < len(messages) and messages[m].get("role") in ("system", "developer"):
             m += 1
-        if m < len(messages) and messages[m].get("role") == "user":
-            probes.append(messages[: n + 1])
-            if m > n + 1:
-                probes.append(messages[:m])
+        if not (m < len(messages) and messages[m].get("role") == "user"):
+            break
+        probes.append(messages[: u + 1])
+        if m > u + 1:
+            probes.append(messages[:m])
+        u = m
     turn_ends = [k for k in range(len(messages) - 1) if messages[k].get("role") == "assistant"]
     for k in turn_ends[-HINT_TURNS:]:
         probes.append(messages[: k + 1])
