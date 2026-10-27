@@ -171,6 +171,9 @@ def sc_prefill_hold(h, ck, on, tag, dp=1):
     t0 = time.monotonic()
     b = t.launch(h, tag + 'L', L, 3, res, 'L', on_token=lambda k: first.setdefault('L', time.monotonic()), priority=-1)
     b.join(60 * SLOW)
+    deadline = time.monotonic() + 10 * SLOW  # let the decoder step once after the prompt (cancelling at once raced it on a slow runner)
+    while not any(x > first.get('L', 1e9) for x in stamps) and time.monotonic() < deadline:
+        time.sleep(.01)
     h.cancel(tag + 'D')
     a.join(60 * SLOW)
     t.done_ok(ck, f'{tag} prompt (priority -1)', res['L'], L, 3, 0)
