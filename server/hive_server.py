@@ -618,8 +618,8 @@ class TokenCache:
     """HIVE_TOKEN_CACHE (default on; "0" = off): tokenize only the changed tail of a conversation's prompt.
     Each turn of a conversation re-sends the whole prompt, and the server tokenized it whole, with an offset mapping, twice
     (ids, then boundary hints): 232 + 305 ms for a 159K-token GLM conversation (prep_bench, 2026-10-06; service log p50
-    676 ms per request at 131K+). Per conversation the last prompt, its ids and token end offsets are kept (LRU,
-    HIVE_TOKEN_CACHE_SESSIONS, default 64). A new prompt is cut at the last special token (role marker) that starts inside
+    676 ms per request at 131K+). Per conversation the last prompt, its ids and token end offsets are kept (LRU, bounded by the
+    tokens kept — limits()). A new prompt is cut at the last special token (role marker) that starts inside
     the common prefix with the kept prompt: the tokens before it are reused, the rest is tokenized without the template's
     added tokens. A fast tokenizer splits added special tokens out of the text before anything else, so the pieces on
     either side of one are tokenized independently and the result equals a whole-prompt tokenization. Only special tokens
@@ -630,6 +630,7 @@ class TokenCache:
     def __init__(self):
         import collections, threading
         self.entries = collections.OrderedDict()
+        self.kept_tokens = 0  # token ids held by entries (limits())
         self.lock = threading.Lock()
         self.tok = None
         self.cut_ids = frozenset()
@@ -650,7 +651,7 @@ class TokenCache:
 
     def _bind(self, tok) -> None:
         """Per tokenizer: cut-point ids, the leading added tokens, and whether the template appends anything at the end."""
-        self.tok, self.entries = tok, type(self.entries)()
+        self.tok, self.entries, self.kept_tokens = tok, type(self.entries)(), 0
         try:
             full = list(tok("x")["input_ids"])
             bare = list(tok("x", add_special_tokens=False)["input_ids"])
@@ -735,12 +736,30 @@ class TokenCache:
                 self._verify_later(prompt, list(ids))
             cuts = cut[5][:bisect.bisect_left(cut[5], p)] + array("l", [x + p for (x, _), v in zip(offs, tail) if v in self.cut_ids])
         with self.lock:
+            old = self.entries.get(key)
+            if old is not None:
+                self.kept_tokens -= len(old[1])
             self.entries[key] = (prompt, array("l", ids), ends, starts, cuts)
             self.entries.move_to_end(key)
-            cap = int(os.environ.get("HIVE_TOKEN_CACHE_SESSIONS", "64") or 64)
-            while len(self.entries) > max(1, cap):
-                self.sent_len.pop(self.entries.popitem(last=False)[0], None)
+            self.kept_tokens += len(ids)
+            cap, budget = self.limits()
+            while len(self.entries) > 1 and (len(self.entries) > cap or self.kept_tokens > budget):
+                k, gone = self.entries.popitem(last=False)
+                self.kept_tokens -= len(gone[1])
+                self.sent_len.pop(k, None)
         return ids, ends
+
+    @staticmethod
+    def limits() -> tuple[int, int]:
+        """(conversations, tokens) kept. By tokens (HIVE_TOKEN_CACHE_TOKENS, default 32M — ~1.2 GB at ~38 bytes a token: three int64
+        arrays and the prompt text); HIVE_TOKEN_CACHE_SESSIONS caps the count only when set (it also caps MediaTokens and MessageTrail,
+        default 64 there). Why: a count of 64 let short requests push the long conversations out — measured 2026-10-28 12:52-16:54
+        (production deployment, DeepSeek): 211 conversations, 140 of them under 8K tokens and 50 at 64K+ (12.3M tokens together); 181 of
+        the 234 read-ahead requests at 64K+ tokenized whole (p50 705 ms) although 136 of them had been tokenized earlier in the same process."""
+        n = os.environ.get("HIVE_TOKEN_CACHE_SESSIONS", "")
+        cap = max(1, int(n)) if n.strip() else 4096
+        budget = int(os.environ.get("HIVE_TOKEN_CACHE_TOKENS", "") or 32_000_000)
+        return cap, max(1, budget)
 
     def _verify_later(self, prompt: str, ids: list[int]) -> None:
         import threading
@@ -773,7 +792,7 @@ class MediaTokens:
     2026-10-21, production deployment: tokenize 1,302-1,611 ms at 580-659K prompt tokens, against 6-44 ms for text-only conversations), no boundary hints, no
     prev_prompt_tokens / diverge_at.
     Images: preprocessed once per distinct image (keyed by the SHA-256 of its bytes and the vision arguments) and kept while a recent
-    conversation's last request uses it — as many conversations as TokenCache keeps (HIVE_TOKEN_CACHE_SESSIONS).
+    conversation's last request uses it — HIVE_TOKEN_CACHE_SESSIONS conversations (default 64: they hold the patch bytes).
     Absorbed: anything that raises here, or a family adapter (its own prepare_inputs), takes tokenize_with_images as before. Every
     HIVE_TOKEN_CACHE_VERIFY-th request (the token cache's own cadence) is prepared again by tokenize_with_images on a background thread; a
     difference turns this path off for the process (logged)."""
@@ -802,8 +821,9 @@ class MediaTokens:
             e = [raw, n_vit_h, n_vit_w, types.tolist(), 0]
         return key, e
 
-    def prepare(self, key: str, prompt: str, media: list):
-        """(ids, ends, images_meta, blob, spans, placeholder positions in the prompt tokens) — spans = (start, length) per image."""
+    def prepare(self, key: str, prompt: str, media: list, keys_out: list | None = None):
+        """(ids, ends, images_meta, blob, spans, placeholder positions in the prompt tokens) — spans = (start, length) per image.
+        keys_out (a list) receives each image's content key in order (DaemonImages — the source bytes and the vision arguments)."""
         from array import array
         image_id = ARGS.image_token_id
         ph = TOK.convert_tokens_to_ids(ENC.IMAGE_PLACEHOLDER)
@@ -833,6 +853,8 @@ class MediaTokens:
             ids += [image_id] * n
             ends.extend([text_ends[i]] * n)
             used.append((k, e))
+            if keys_out is not None:
+                keys_out.append(hashlib.sha256(k[0] + repr(k[1]).encode()).hexdigest()[:32])
             prev = i + 1
         ids += text_ids[prev:]
         ends.extend(text_ends[prev:])
@@ -889,6 +911,56 @@ class MediaTokens:
 MEDIATOK = MediaTokens()
 
 
+class DaemonImages:
+    """HIVE_IMAGE_HOLD (default on; "0" = off): leave out the patch bytes of images hived already has.
+    Each image of a request MediaTokens prepared goes with its content key (MediaTokens.prepare keys_out); hived records the hash of the
+    patch bytes of every image it receives with a key, and an image sent as {"key", "held": true} without bytes gets the same signature from
+    that record. Held = an image this process sent in a request hived accepted, lying inside the part of the prompt shared with the
+    conversation's previous request (diverge_at) — the part the daemon resumes from, so it does not encode the image again. When hived lacks a
+    held image (a restart) or would have to encode it (its reuse ends before the image), it answers "images missing" before anything else and
+    the request is sent again with every image's bytes.
+    Why: an agent conversation with screenshots re-sent all of them every turn (measured 2026-10-26..28, production: 50-300 MB of patches per
+    turn, send → admitted p50 298 ms at 50-100 MB and 797 ms at 200-300 MB, 312 s over two days of interactive turns)."""
+
+    def __init__(self, cap: int = 65536):
+        self.known: OrderedDict = OrderedDict()  # keys hived accepted, least recently used first
+        self.cap = cap
+        self.resent = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("HIVE_IMAGE_HOLD", "1") != "0"
+
+    def plan(self, images: list, blob: bytes, keys: list, diverge_at) -> tuple:
+        """(image entries to send, payload, number held). keys = one per image; diverge_at = None holds nothing."""
+        metas, parts, held, off = [], [], 0, 0
+        view = memoryview(blob)
+        for m, k in zip(images, keys):
+            nb = int(m["nbytes"])
+            if diverge_at is not None and m["start"] + len(m["types"]) <= diverge_at and k in self.known:
+                metas.append({**m, "key": k, "held": True})
+                self.known.move_to_end(k)
+                held += 1
+            else:
+                metas.append({**m, "key": k})
+                parts.append(view[off:off + nb])
+            off += nb
+        return metas, (b"".join(parts) if held else blob), held
+
+    def learn(self, keys: list) -> None:
+        for k in keys:
+            self.known[k] = True
+            self.known.move_to_end(k)
+        while len(self.known) > self.cap:
+            self.known.popitem(last=False)
+
+    def forget(self) -> None:
+        self.known.clear()
+
+
+DAEMON_IMAGES = DaemonImages()
+
+
 def _message_text(m) -> str:
     """The text a message starts with, for the divergence record's prefix hash: its content (text parts joined), else the message as JSON."""
     c = m.get("content") if isinstance(m, dict) else None
@@ -939,7 +1011,7 @@ class MessageTrail:
     conversation key, hashed). A request whose messages are not an extension of the kept ones records msg_diverge: the first changed
     message (`at`), the previous and new message counts, the roles there and the prefix hashes there; a request under a new session key
     whose conversation identity was seen under another key is compared with that one (`from_session`). Kept for as many conversations as
-    TokenCache (HIVE_TOKEN_CACHE_SESSIONS) — the same set of recent conversations."""
+    HIVE_TOKEN_CACHE_SESSIONS (default 64) — the most recent of the conversations TokenCache keeps."""
 
     PREFIX_CHARS = 80  # the prefix hashed per message (as asked for the record: enough to tell two messages apart, no content kept)
 
@@ -3001,6 +3073,7 @@ async def chat(request: Request):
                 else _short_hash("key:" + conv_key) if conv_key else None)
         head = _short_hash(session_head(messages))
         diverge: dict = {"head": head, **({"conv": conv} if conv else {})}  # request record: divergence fields (TokenCache, MessageTrail)
+        image_keys: list = []  # content keys of the images when MediaTokens prepared them (DaemonImages), else empty
         def prepare():
             t0 = time.perf_counter()
             with ENCODE_LOCK:
@@ -3047,9 +3120,11 @@ async def chat(request: Request):
                         r = None
                         if media_tok:  # images: the prompt through TokenCache, each placeholder expanded (MediaTokens)
                             try:
-                                r = MEDIATOK.prepare(session, prompt, media)
+                                image_keys.clear()
+                                r = MEDIATOK.prepare(session, prompt, media, image_keys)
                             except Exception:  # noqa: BLE001 — the image path below decides (and raises what it raises)
                                 r = None
+                                image_keys.clear()
                         with TOKCACHE.lock:
                             prev = TOKCACHE.last_diverge.pop(session, None)
                             prev_len = TOKCACHE.sent_len.get(session)
@@ -3060,6 +3135,7 @@ async def chat(request: Request):
                                                diverge_at=MediaTokens.sent_pos(prev[1], pos, spans))
                             diverge.update(prerender_match(session, prompt, ends))
                         else:
+                            image_keys.clear()
                             ids, images, blob = tokenize_with_images(prompt, media)
                             if hint_job is not None:
                                 render_probes_drop(hint_job[-1])
@@ -3211,6 +3287,37 @@ async def chat(request: Request):
         if has_tools and req_rec.get("think_forced") and CUT_LEAKS.note(content):
             req_rec["cut_leak_noted"] = True
 
+    async def daemon_source():
+        """DAEMON.generate — with images MediaTokens prepared, those hived already has go without their bytes (DaemonImages), and once more
+        with every image's bytes if hived answers "images missing"."""
+        extra = {"boundaries": hints} if hints else {}
+        if not (images and len(image_keys) == len(images) and DaemonImages.enabled()):
+            async with aclosing(DAEMON.generate(session, ids, images, blob, rid=daemon_rid, **extra, **sampling)) as src:
+                async for m in src:
+                    yield m
+            return
+        metas, payload, held = DAEMON_IMAGES.plan(images, blob, image_keys, diverge.get("diverge_at"))
+        if held:
+            req_rec.update(images_held=held, image_bytes=len(payload))
+        while True:
+            missing = accepted = False
+            async with aclosing(DAEMON.generate(session, ids, metas, payload, rid=daemon_rid, **extra, **sampling)) as src:
+                async for m in src:
+                    if not accepted:
+                        if held and m.get("error") == "images missing":
+                            missing = True
+                            break
+                        if not m.get("error"):
+                            DAEMON_IMAGES.learn(image_keys)
+                        accepted = True
+                    yield m
+            if not missing:
+                return
+            DAEMON_IMAGES.forget()  # it does not have them (a restart) or needs them: send everything; learn again from the answer
+            DAEMON_IMAGES.resent += 1
+            metas, payload, held = [{**m, "key": k} for m, k in zip(images, image_keys)], blob, 0
+            req_rec.update(images_resent=True, image_bytes=len(blob))
+
     async def run():
         det = Detok()
         stage_text = StageText(thinking_mode == "thinking") if STAGE_STATUS else None
@@ -3236,7 +3343,7 @@ async def chat(request: Request):
                    if hasattr(request, 'is_disconnected') else None)
         try:
             req_rec["t_send"] = time.time() * 1000.0  # with t_admit (the daemon's admitted line): where the time before the prefill goes
-            async with aclosing(DAEMON.generate(session, ids, images, blob, rid=daemon_rid, **({"boundaries": hints} if hints else {}), **sampling)) as source:
+            async with aclosing(daemon_source()) as source:
                 async for msg in source:
                     if "id" in msg:
                         if req_rec["t_first"] is None:

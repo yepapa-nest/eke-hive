@@ -1017,6 +1017,47 @@ def sc_image_turns(h, ck, image_ckpt):
     done_ok(ck, 'M3 turn5 exact regen', h.generate('m', ids4, 5, [im2, im3]), ids4, 5, len(ids4) if image_ckpt else 0, [im2, im3])
 
 
+def keyed(im, key):
+    """An image sent with its bytes and a content key (the API server's DaemonImages): hived records the hash of its bytes."""
+    return ({**im[0], 'key': key}, im[1])
+
+
+def held(im, key):
+    """The same image sent without its bytes ("held"): hived takes its signature from the record of that key."""
+    return ({**im[0], 'key': key, 'held': True}, b'')
+
+
+def sc_held_images(h, ck, image_ckpt):
+    """Held images: an image inside the reused prefix sent as {key, held} without bytes gets the signature its bytes gave, so the turn
+    resumes exactly as when the bytes are sent; an unknown key, a size other than the recorded one, or a held image the reuse does not
+    cover (it would have to be encoded) fails with "images missing" before anything else, and the same request with the bytes succeeds."""
+    P = tokens(300, 170)
+    im1 = image(50, 3, 3, 171)
+    r = h.generate('hk0', P, 5, [held(im1, 'k-unknown')])
+    ck.eq('held: unknown key', (r['error'], r['tokens']), ('images missing', []))
+    done_ok(ck, 'held turn1 (bytes + key)', h.generate('hk', P, 5, [keyed(im1, 'k1')]), P, 5, 0, [im1])
+    ids2 = P + tokens(600, 172)
+    r = h.generate('hk', ids2, 5, [held(im1, 'k1')])
+    if not image_ckpt:  # image requests do not resume from a prompt checkpoint: the held image would be encoded
+        ck.eq('held turn2 without image checkpoints', r['error'], 'images missing')
+        done_ok(ck, 'held turn2 again with the bytes', h.generate('hk', ids2, 5, [keyed(im1, 'k1')]), ids2, 5, 0, [im1])
+        return
+    done_ok(ck, 'held turn2: image inside the reused prefix without bytes', r, ids2, 5, 300, [im1])
+    bad = ({**im1[0], 'key': 'k1', 'held': True, 'nbytes': im1[0]['nbytes'] + 16}, b'')
+    ck.eq('held: size differs from the record', h.generate('hk', ids2, 5, [bad])['error'], 'images missing')
+    r = h.generate('hk2', ids2, 5, [held(im1, 'k1')])
+    ck.eq('held: another session (no reuse) needs the bytes', (r['error'], r['tokens']), ('images missing', []))
+    done_ok(ck, 'held: the same request with the bytes', h.generate('hk2', ids2, 5, [keyed(im1, 'k1')]), ids2, 5, 0, [im1])
+    im3 = image(len(ids2) + 20, 3, 3, 173)
+    ids4 = ids2 + tokens(40, 174)
+    done_ok(ck, 'held + a new image after the prefix', h.generate('hk', ids4, 5, [held(im1, 'k1'), keyed(im3, 'k3')]), ids4, 5, len(ids2), [im1, im3])
+    done_ok(ck, 'exact regen with the bytes: same signatures', h.generate('hk', ids4, 5, [keyed(im1, 'k1'), keyed(im3, 'k3')]), ids4, 5, len(ids4), [im1, im3])
+    other = (im1[0], random.Random(175).randbytes(len(im1[1])))
+    done_ok(ck, 'held: another picture recorded under its own key', h.generate('hx', P, 5, [keyed(other, 'kb')]), P, 5, 0, [other])
+    r = h.generate('hk', ids4, 5, [held(other, 'kb'), held(im3, 'k3')])
+    ck.eq('held: a different picture at the same place is not reused', (r['error'], r['tokens']), ('images missing', []))
+
+
 def sc_pending(h, ck):
     P = tokens(700, 160)
     done_ok(ck, 'M7 multi-chunk prefill', h.generate('p1', P, 3), P, 3, 0)
@@ -1121,6 +1162,7 @@ def run_round2(exe, td):
         h = Hived(exe, td, {'HIVE_IMAGE_CKPT': '1' if on else '0'}, args=('--prefill-tile', '2'), name='m3')
         try:
             sc_image_turns(h, ck, on)
+            sc_held_images(h, ck, on)
         finally:
             stop_clean(h, ck)
     h = Hived(exe, td, {'FAKE_FAIL_TOKEN': '7'}, name='pend')

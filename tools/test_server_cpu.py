@@ -1917,7 +1917,7 @@ class TokenCacheTests(unittest.TestCase):
         self.tok_before = s.TOK
         s.TOK = bpe_tokenizer()
         self.cache = s.TokenCache()
-        self.env = {k: os.environ.pop(k, None) for k in ('HIVE_TOKEN_CACHE', 'HIVE_TOKEN_CACHE_VERIFY')}
+        self.env = {k: os.environ.pop(k, None) for k in ('HIVE_TOKEN_CACHE', 'HIVE_TOKEN_CACHE_VERIFY', 'HIVE_TOKEN_CACHE_SESSIONS', 'HIVE_TOKEN_CACHE_TOKENS')}
     def tearDown(self):
         s.TOK = self.tok_before
         for k, v in self.env.items():
@@ -1965,6 +1965,38 @@ class TokenCacheTests(unittest.TestCase):
         h1 = self.cache.hits
         self.check('short-key', self.render([('user', 'unrelated and short')]))   # below the 4,096-character floor: whole
         self.assertEqual(self.cache.hits, h1)
+
+    def test_short_conversations_do_not_push_out_long_ones(self):
+        """2026-10-28: kept by tokens, not by count — 200 short conversations after a long one leave the long one in the cache (its next
+        turn reuses the prefix); the token budget evicts the least recently used once exceeded; the kept-token count stays exact."""
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        long_turns = [('user', 'the engine streams experts over PCIe ' * 300), ('assistant', 'ok')]
+        n_long = len(self.check('long', self.render(long_turns + [('user', 'q1')])))
+        for k in range(200):
+            self.check(f'short{k}', self.render([('user', f'caption {k}')]))
+        self.assertIn('long', self.cache.entries)
+        h0 = self.cache.hits
+        self.check('long', self.render(long_turns + [('user', 'q1'), ('assistant', 'a1'), ('user', 'q2')]))
+        self.assertEqual(self.cache.hits, h0 + 1)
+        self.assertEqual(self.cache.kept_tokens, sum(len(e[1]) for e in self.cache.entries.values()))
+        # budget: just above the long conversation — the next long one evicts it (least recently used first), short ones go first
+        os.environ['HIVE_TOKEN_CACHE_TOKENS'] = str(n_long + 600)
+        self.check('long2', self.render([('user', 'another talk ' * 100)]))
+        self.assertNotIn('long', self.cache.entries)
+        self.assertIn('long2', self.cache.entries)
+        self.assertLessEqual(self.cache.kept_tokens, n_long + 600)
+        self.assertEqual(self.cache.kept_tokens, sum(len(e[1]) for e in self.cache.entries.values()))
+        # a single conversation larger than the budget is still kept (one entry always stays)
+        os.environ['HIVE_TOKEN_CACHE_TOKENS'] = '10'
+        self.check('long3', self.render(long_turns + [('user', 'q3')]))
+        self.assertEqual(list(self.cache.entries), ['long3'])
+        # HIVE_TOKEN_CACHE_SESSIONS set: a count cap again
+        os.environ.pop('HIVE_TOKEN_CACHE_TOKENS')
+        os.environ['HIVE_TOKEN_CACHE_SESSIONS'] = '3'
+        for k in range(5):
+            self.check(f'c{k}', self.render([('user', f'short {k}')]))
+        self.assertEqual(list(self.cache.entries), ['c2', 'c3', 'c4'])
+        self.assertEqual(s.TokenCache.limits(), (3, 32_000_000))
 
     def test_divergence_record(self):
         """last_diverge: the previous prompt's length and how many of its tokens this prompt keeps (tools/reread_report.py) — only
@@ -2716,6 +2748,117 @@ class InertPlaceholderTests(unittest.TestCase):
         s.ENC = type("E", (), {})()
         msgs = [{"role": "user", "content": self.PH}]
         self.assertIs(s.inert_image_placeholders(msgs, None)[0], msgs)
+
+
+class HeldMedia:
+    """MediaTokens stand-in: the image request of a conversation with 1 or 2 images (one-token spans, so text and sent positions agree);
+    the second request extends the first (diverge_at = its length), as TokenCache records it."""
+    def __init__(self): self.calls = 0
+    def usable(self): return True
+    def prepare(self, key, prompt, media, keys_out=None):
+        self.calls += 1
+        n = len(media)
+        L = 40 if n == 1 else 60
+        ids = list(range(1000, 1000 + L))
+        metas = [{'start': 10, 'n_vit_h': 1, 'n_vit_w': 1, 'types': [1], 'nbytes': 4}]
+        if n == 2:
+            metas.append({'start': 45, 'n_vit_h': 1, 'n_vit_w': 1, 'types': [1], 'nbytes': 4})
+            with s.TOKCACHE.lock:
+                s.TOKCACHE.last_diverge[key] = (40, 40)
+        if keys_out is not None:
+            keys_out.extend(['key-a', 'key-b'][:n])
+        return ids, array('l', range(1, L + 1)), metas, b'AAAABBBB'[:4 * n], [(m['start'], 1) for m in metas], [m['start'] for m in metas]
+
+
+class HoldDaemon(Daemon):
+    """Records what each generate call carried; with missing=True a request holding an image is answered "images missing"."""
+    def __init__(self, missing=False): super().__init__(); self.missing = missing; self.calls = []
+    async def generate(self, session, ids, images, blob, **kw):
+        self.calls.append(([dict(m) for m in images], bytes(blob)))
+        if self.missing and any(m.get('held') for m in images):
+            yield {'error': 'images missing'}
+            return
+        async for m in super().generate(session, ids, images, blob, **kw): yield m
+
+
+class HeldImageTests(unittest.IsolatedAsyncioTestCase):
+    """HIVE_IMAGE_HOLD (DaemonImages): images hived accepted earlier and lying inside the part shared with the conversation's previous
+    request go without their bytes; "images missing" sends the request again with every image's bytes; "0" = the images as before."""
+    IMG = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}
+
+    def setUp(self):
+        self.saved = (s.TOK, s.ENC, s.DAEMON, s.log_request, s.encode_prompt, s.MEDIATOK, s.TOKCACHE, s.DAEMON_IMAGES)
+        s.TOK = Tokenizer(); s.ENC = Encoder(); s.INFLIGHT.clear()
+        s.encode_prompt = lambda m, *a: ('prompt', [{'image': 1}] * sum(isinstance(x['content'], list) for x in m))
+        s.MEDIATOK = HeldMedia(); s.TOKCACHE = s.TokenCache(); s.DAEMON_IMAGES = s.DaemonImages()
+        self.recs = []; s.log_request = lambda rec: self.recs.append(dict(rec))
+        self.env = {k: os.environ.pop(k, None) for k in ('HIVE_PREFIX_SHARE', 'HIVE_IMAGE_HOLD')}
+
+    def tearDown(self):
+        s.TOK, s.ENC, s.DAEMON, s.log_request, s.encode_prompt, s.MEDIATOK, s.TOKCACHE, s.DAEMON_IMAGES = self.saved
+        for k, v in self.env.items():
+            os.environ.pop(k, None)
+            if v is not None: os.environ[k] = v
+
+    def msgs(self, n):
+        m = [{'role': 'user', 'content': [self.IMG, {'type': 'text', 'text': 'look'}]}]
+        if n == 2:
+            m += [{'role': 'assistant', 'content': 'seen'}, {'role': 'user', 'content': [self.IMG, {'type': 'text', 'text': 'and this'}]}]
+        return m
+
+    async def ask(self, n):
+        r = await s.chat(Request({'messages': self.msgs(n), 'reasoning_effort': 'none', 'prompt_cache_key': 'room'}))
+        return r, self.recs[-1]
+
+    async def test_held_then_resent(self):
+        s.DAEMON = HoldDaemon()
+        r, rec = await self.ask(1)
+        self.assertEqual(r['choices'][0]['message']['content'], 'abc')
+        (metas, blob), = s.DAEMON.calls
+        self.assertEqual([(m.get('key'), m.get('held')) for m in metas], [('key-a', None)])   # first request: bytes + key
+        self.assertEqual(blob, b'AAAA')
+        self.assertIn('key-a', s.DAEMON_IMAGES.known)
+        r, rec = await self.ask(2)
+        metas, blob = s.DAEMON.calls[-1]
+        self.assertEqual([(m['key'], m.get('held', False)) for m in metas], [('key-a', True), ('key-b', False)])
+        self.assertEqual(blob, b'BBBB')                                  # only the new image's bytes
+        self.assertEqual((rec.get('images_held'), rec.get('image_bytes'), rec.get('images')), (1, 4, 2))
+        # hived lacks a held image: the same request once more with every image's bytes, the answer unchanged
+        s.DAEMON = HoldDaemon(missing=True)
+        r, rec = await self.ask(2)
+        self.assertEqual(r['choices'][0]['message']['content'], 'abc')
+        (m1, b1), (m2, b2) = s.DAEMON.calls
+        self.assertEqual(([x.get('held', False) for x in m1], b1), ([True, False], b'BBBB'))
+        self.assertEqual(([(x['key'], x.get('held', False)) for x in m2], b2), ([('key-a', False), ('key-b', False)], b'AAAABBBB'))
+        self.assertTrue(rec.get('images_resent'))
+        self.assertEqual(rec.get('image_bytes'), 8)
+        self.assertEqual(list(s.DAEMON_IMAGES.known), ['key-a', 'key-b'])  # forgotten, then learned again from the accepted request
+
+    async def test_nothing_held_before_accepted(self):
+        s.DAEMON = HoldDaemon()
+        s.DAEMON_IMAGES.known.clear()
+        await self.ask(2)  # diverge_at 40, but hived has not accepted key-a from this process: its bytes go along
+        metas, blob = s.DAEMON.calls[-1]
+        self.assertEqual(([m.get('held', False) for m in metas], blob), ([False, False], b'AAAABBBB'))
+
+    async def test_off(self):
+        os.environ['HIVE_IMAGE_HOLD'] = '0'
+        s.DAEMON = HoldDaemon()
+        await self.ask(1); await self.ask(2)
+        for metas, blob in s.DAEMON.calls:
+            self.assertTrue(all('key' not in m and 'held' not in m for m in metas))
+        self.assertEqual(s.DAEMON.calls[-1][1], b'AAAABBBB')
+
+    def test_plan_bounds(self):
+        d = s.DaemonImages(cap=2)
+        d.learn(['a', 'b', 'c'])
+        self.assertEqual(list(d.known), ['b', 'c'])                     # least recently used dropped past the cap
+        im = [{'start': 0, 'types': [1, 1], 'nbytes': 2}, {'start': 5, 'types': [1], 'nbytes': 3}]
+        metas, payload, held = d.plan(im, b'xxyyy', ['b', 'c'], 6)
+        self.assertEqual((held, payload), (2, b''))
+        metas, payload, held = d.plan(im, b'xxyyy', ['b', 'c'], 5)   # the second image ends at 6 > 5: sent
+        self.assertEqual((held, payload, [m.get('held', False) for m in metas]), (1, b'yyy', [True, False]))
+        self.assertEqual(d.plan(im, b'xxyyy', ['b', 'c'], None)[1:], (b'xxyyy', 0))
 
 
 if __name__=='__main__': unittest.main()

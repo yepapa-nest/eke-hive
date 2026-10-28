@@ -187,6 +187,7 @@ class Runtime {
                      ForwardStats* stats);
   bool tail_mode_for(int) const { return false; }
   bool has_vision() const { return opt_.vision && model_.eng().has_vision(); }
+  bool vision_loaded() const { return has_vision(); }  // as hive/runtime.h (no device here: the encoder is always there when it exists)
   void ensure_vision() {}
   void release_vision_if_idle() {}
   int max_batch() const { return opt_.max_batch; }

@@ -11,7 +11,8 @@ requests (first token inside the long forward) and gives running decoders steps.
   * a short request sent during a one-chunk long prefill gets its first token before the long one, within ~period + layer (control: after),
   * a running decoder's longest token gap during the long prefill is ~one layer (control: the whole forward),
   * the long forward's state (fake Work rows [0, R)) survives every yield (park/unpark — the fake checks its rows after each yield),
-  * size limit (HIVE_LAYER_YIELD_MAX ∩ runtime rows R), busy/same session, image requests, max_batch are respected,
+  * size limit (HIVE_LAYER_YIELD_MAX ∩ runtime rows R), busy/same session, image requests, max_batch are respected — an image to
+    encode waits unless the encoder is loaded (FAKE_VISION_LOADED=1: admitted mid-forward, both oracles kept),
   * H3 batch path (forward_multi with two long prompts) yields too; MTP decoder (FAKE_MTP) steps inside yields keep their oracle,
   * switch parsing (period/share/steps/max) absorbs junk values,
   * negative controls (each must be DETECTED): fake park disabled (FAKE_LY_NO_PARK) · hived admits beyond R (want under-reports and
@@ -273,7 +274,7 @@ def sc_limits(h, ck, tag, admit_200):
     ck.true(f'{tag}: same-session follower = session busy or its own oracle', f['error'] == 'session busy' or
             (f['error'] is None and f['tokens'] == t.oracle(Q, 3)), repr(f))
     ck.eq(f'{tag}: same-session request not admitted mid-forward', n_admits(h) - a1, 0)
-    # image request: waits (vision lazy load would allocate VRAM mid-prefill in production)
+    # image request with the encoder not loaded (the default fake): waits (a lazy load would allocate VRAM mid-prefill in production)
     a2 = n_admits(h)
     L4 = t.tokens(700, 1134)
     im = t.image(2, 2, 3, 1135)
@@ -282,6 +283,20 @@ def sc_limits(h, ck, tag, admit_200):
     t.done_ok(ck, f'{tag} long (image follower)', res['L4'], L4, 3, 0)
     t.done_ok(ck, f'{tag} image request', res['I'], I, 3, 0, images=[im])
     ck.eq(f'{tag}: image request not admitted mid-forward', n_admits(h) - a2, 0)
+
+
+def sc_image_loaded(h, ck, tag):
+    """FAKE_VISION_LOADED=1 (the encoder is on the device): a request with an image to encode is admitted at a layer yield and answers before
+    the long prompt; both keep their oracle (the image request's tokens depend on its patch bytes)."""
+    a0 = n_admits(h)
+    L, I = t.tokens(700, 1137), t.tokens(30, 1138)
+    im = t.image(2, 2, 3, 1139)
+    res, first, sent = staggered(h, L, [('I', I, {'images': [im]})], long_sid='L5')
+    t.done_ok(ck, f'{tag} long (image follower)', res['L5'], L, 3, 0)
+    t.done_ok(ck, f'{tag} image request', res['I'], I, 3, 0, images=[im])
+    ck.true(f'{tag}: image request admitted mid-forward', n_admits(h) - a0 >= 1, repr(n_admits(h) - a0))
+    ck.true(f'{tag}: image request first token before the long one', first.get('I', 1e18) < first.get('L5', 0), repr(first))
+    return {'image_first_s': round(first.get('I', 0) - sent['I'], 3), 'long_first_s': round(first.get('L5', 0) - sent['L5'], 3)}
 
 
 def sc_batch(h, ck, tag):
@@ -407,6 +422,7 @@ def run(exe, td):
         ('small-off', {**ON, 'FAKE_PREFILL_SHORT_MS': str(FWD_MS * SLOW)}, TILE3, lambda h: sc_small_fwd(h, ck, False, 'small-off')),
         ('single-off', BASE, TILE3, lambda h: (sc_short(h, ck, False, 'single-off'), sc_decoder(h, ck, False, 'single-off'))),
         ('max300', {**ON, 'HIVE_LAYER_YIELD_MAX': '300'}, TILE3, lambda h: sc_limits(h, ck, 'max300', True)),
+        ('vision-loaded', {**ON, 'FAKE_VISION_LOADED': '1'}, TILE3, lambda h: sc_image_loaded(h, ck, 'vision')),
         ('mid300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: (sc_mid(h, ck, 'mid'), sc_short(h, ck, True, 'mid+short'))),
         ('prio300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: sc_prio(h, ck, 'prio')),
         ('batch-on', {**ON, **batch}, TILE3, lambda h: (sc_short(h, ck, True, 'batch'), sc_batch(h, ck, 'batch'), sc_decoder(h, ck, True, 'batch'))),
@@ -506,6 +522,11 @@ def run_mutants(exe, td):
     assert src.count(d_line) == 1
     exe6 = t.build_daemon(td, name='hived_mut_depth', hived_source=src.replace(d_line, "    h.max_depth = 1;"))
     out.append(('no level-2 yield under the mid rule', *mutant_case(exe6, td, {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, lambda h, ck: sc_mid(h, ck, 'mut-depth'))))
+    # 7) the encoder check dropped (an image to encode always taken): the default fake (encoder not loaded) admits it mid-forward
+    v_line = "      if (rsig && !(encode_ok && rt_vision_loaded(rt))) {"
+    assert src.count(v_line) == 1
+    exe7 = t.build_daemon(td, name='hived_mut_vision', hived_source=src.replace(v_line, "      if (rsig && !encode_ok) {"))
+    out.append(('image encoded mid-forward without a loaded encoder', *mutant_case(exe7, td, ON, lambda h, ck: sc_limits(h, ck, 'mut-vision', False))))
     return out
 
 

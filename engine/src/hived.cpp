@@ -26,6 +26,9 @@
 //     reads the session's stored prompt checkpoint (HIVE_SESSION_STORE) on a loader thread and attaches it as an archived (RAM) session; a
 //     session already in VRAM or RAM is left as it is and its place returned
 //   (optional) generate's "history":true — the conversation already has a turn (enables the long re-read boundary snapshot; HIVE_PREFIX_SHARE only).
+//   (optional) an image entry's "key":"<content key>" (the daemon records the hash of that image's patch bytes) and "held":true (no bytes in "bin"
+//     for that image: its signature comes from the record; "nbytes" still states its size). A held image the daemon does not know, or one the reuse
+//     does not cover, fails the request with {"error":"images missing"} before anything else (see HeldImage).
 //   (optional) generate's "prefix_extra":N — per-request extra-chunk budget for boundary cuts (overrides HIVE_PREFIX_EXTRA_CHUNKS; HIVE_PREFIX_SHARE only).
 // Sessions: if a session's previous token sequence is a prefix of the new request, only the remainder is prefilled (conversation cache).
 // If the prefix breaks, resume from whichever of the prompt-end checkpoint and the RAM-held states reaches furthest.
@@ -56,6 +59,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "hive/cache_reserve.h"
@@ -166,6 +170,10 @@ template <class R, class S> void rt_trim_seq(R& r, S& q) { if constexpr (RtHasTr
 template <class R, class S> concept RtHasRewind = requires(const R& r, S& q) { { r.rewind(q, size_t{}) } -> std::convertible_to<bool>; };
 template <class R, class S> bool rt_rewind(const R& r, S& q, size_t n) { if constexpr (RtHasRewind<R, S>) return r.rewind(q, n); else return false; }
 template <class R> void rt_set_kv_reclaim(R& r, std::function<bool()> f) { if constexpr (RtHasKvReclaim<R>) r.set_kv_reclaim(std::move(f)); }
+// Whether the vision encoder is on the device now (DeepSeek loads it on the first image and releases it when idle). Families without the
+//   member: false — a layer yield never takes a request with an image to encode there.
+template <class R> concept RtHasVisionLoaded = requires(const R& r) { { r.vision_loaded() } -> std::convertible_to<bool>; };
+template <class R> bool rt_vision_loaded(const R& r) { if constexpr (RtHasVisionLoaded<R>) return r.vision_loaded(); else return false; }
 // false = trimming this sequence frees no device KV (it holds only what every pooled sequence keeps): evicting its session would cost a
 //   restore later for nothing. Families without the member: every idle sequence is a candidate.
 template <class R, class S> bool rt_kv_reclaimable(const R& r, const S& q) { if constexpr (RtHasKvReclaimable<R, S>) return r.kv_reclaimable(q); else return true; }
@@ -263,10 +271,24 @@ struct Request {
   //   layer-yield rules both need them, and the hash walks every patch byte (a long agent conversation with screenshots sends 118 MB of patches per turn).
   struct ImgSig { int start, end; uint64_t hash; };
   std::vector<ImgSig> img_sig;
-  int img_sig_state = 0;  // 0 = not computed · 1 = computed · -1 = the payload is shorter than the images declare
+  int img_sig_state = 0;  // 0 = not computed · 1 = computed · -1 = the payload is shorter than the images declare · -2 = a held image this daemon does not know
 };
-// The request's image signatures (computed on the first call). nullptr = its payload is shorter than its images declare. A malformed image
-//   entry throws (json) — every call, since nothing is cached then.
+// Held images (the request's image entry "key" + "held": true). The API server names each image by a content key (its source bytes and the
+//   vision arguments) and leaves the patch bytes of an image out once this daemon has received them — the daemon needs them only to encode an
+//   image after the reused prefix; an image inside it is compared by signature alone. Every image received with a key records the hash of its
+//   patch bytes here, so a held image's signature is the same value as when its bytes are sent. A held image this daemon does not know (a
+//   restart), or one that would have to be encoded (the reuse ends before it), fails the request with "images missing" and the server sends it
+//   again with every image's bytes. Measured 2026-10-26..28 (production, an agent conversation with screenshots): every turn re-sent 50-300 MB
+//   of patches already in its reused prefix — send → admitted p50 298 ms at 50-100 MB, 797 ms at 200-300 MB (transfer ~400 MB/s, then the
+//   byte-wise hash below ~800 MB/s), 312 s over two days of interactive turns.
+struct HeldImage { uint64_t bytes_hash; size_t nbytes; double used; };
+std::mutex held_images_mu;
+std::unordered_map<std::string, HeldImage> held_images;
+constexpr size_t kHeldImagesMax = 65536;  // entries (key + 24 bytes each); the least recently used are dropped past this
+bool image_held(const json& im) { return im.contains("held") && im["held"].is_boolean() && im["held"].get<bool>(); }
+std::string image_key(const json& im) { return im.contains("key") && im["key"].is_string() ? im["key"].get<std::string>() : std::string(); }
+// The request's image signatures (computed on the first call). nullptr = its payload is shorter than its images declare, or a held image is
+//   unknown (img_sig_state -2). A malformed image entry throws (json) — every call, since nothing is cached then.
 const std::vector<Request::ImgSig>* request_img_sig(Request& r) {
   if (r.img_sig_state == 0) {
     std::vector<Request::ImgSig> sig;
@@ -276,15 +298,34 @@ const std::vector<Request::ImgSig>* request_img_sig(Request& r) {
       size_t off = 0;
       for (const auto& im : q["images"]) {
         const size_t nb = im.at("nbytes").get<size_t>();
-        if (nb > r.bin.size() - off) { state = -1; sig.clear(); break; }
+        const bool held = image_held(im);
+        const std::string key = image_key(im);
         uint64_t hash = 1469598103934665603ull;
         auto mix = [&](uint8_t b) { hash ^= b; hash *= 1099511628211ull; };
-        for (size_t b = 0; b < nb; ++b) mix(r.bin[off + b]);
+        if (held) {
+          std::lock_guard<std::mutex> lk(held_images_mu);
+          auto it = key.empty() ? held_images.end() : held_images.find(key);
+          if (it == held_images.end() || it->second.nbytes != nb) { state = -2; sig.clear(); break; }
+          hash = it->second.bytes_hash;
+          it->second.used = now_ms();
+        } else {
+          if (nb > r.bin.size() - off) { state = -1; sig.clear(); break; }
+          for (size_t b = 0; b < nb; ++b) mix(r.bin[off + b]);
+          off += nb;
+          if (!key.empty()) {
+            std::lock_guard<std::mutex> lk(held_images_mu);
+            held_images[key] = {hash, nb, now_ms()};
+            if (held_images.size() > kHeldImagesMax) {
+              auto old = held_images.begin();
+              for (auto jt = held_images.begin(); jt != held_images.end(); ++jt) if (jt->second.used < old->second.used) old = jt;
+              held_images.erase(old);
+            }
+          }
+        }
         for (const auto& t : im.at("types")) mix((uint8_t)t.get<int>());
         for (auto key : {"n_vit_h", "n_vit_w"}) { uint32_t n = im.at(key).get<uint32_t>(); for (int b = 0; b < 4; ++b) mix((n >> (8 * b)) & 255); }
         const int start = im.at("start").get<int>();
         sig.push_back({start, start + (int)im.at("types").size(), hash});
-        off += nb;
       }
     }
     r.img_sig = std::move(sig);
@@ -1446,7 +1487,8 @@ int main(int argc, char** argv) {
   // Multiplex partial headers/images: a slow upload cannot block cancel/stats.
   std::thread acceptor([&] {
     ::fcntl(lfd, F_SETFL, ::fcntl(lfd, F_GETFL) | O_NONBLOCK);  // non-blocking so accept can loop until EAGAIN (accepted fds do not inherit it — recv/send use MSG_DONTWAIT)
-    struct Incoming { std::string bytes; json req; size_t bin=0; bool header=false; };
+    // bytes = the request line until it is complete (scanned = how far it was searched for the newline), then payload = the binary part
+    struct Incoming { std::string bytes; json req; size_t bin=0; bool header=false; size_t scanned=0; std::vector<uint8_t> payload; };
     std::map<int, Incoming> incoming;
     const size_t nfixed = stop_pipe[0] >= 0 ? 2 : 1;  // [lfd, (graceful-stop pipe)] then the accepted connections
     double stop_deadline = 0;
@@ -1486,17 +1528,28 @@ int main(int argc, char** argv) {
           writer.add(fd); incoming.emplace(fd, Incoming{});
         }
       }
-      char buf[65536];
+      static std::vector<char> buf((size_t)1 << 20);
       for (size_t fi=nfixed; fi<fds.size(); ++fi) {
         if (!fds[fi].revents) continue;
         const int fd=fds[fi].fd;
         auto& in=incoming.at(fd);
-        const ssize_t n=::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)) continue;
-        if (n<=0) { finish_socket(fd); incoming.erase(fd); continue; }
-        in.bytes.append(buf, (size_t)n);
+        // Read what the socket holds, up to 16 MiB per wakeup (then the other connections — cancel, stats — get their turn). One 64 KiB recv per
+        //   poll capped a request with images at ~400 MB/s (measured 2026-10-26..28, production: 200-300 MB of patches took 530 ms from send to queue).
+        size_t got = 0; ssize_t n = 0; int err = 0;
+        while (got < ((size_t)16 << 20)) {
+          n=::recv(fd, buf.data(), buf.size(), MSG_DONTWAIT);
+          if (n<=0) { err = errno; break; }
+          if (in.header) in.payload.insert(in.payload.end(), buf.data(), buf.data() + n);
+          else in.bytes.append(buf.data(), (size_t)n);
+          got += (size_t)n;
+        }
+        if (got == 0) {
+          if (n<0 && (err==EAGAIN || err==EWOULDBLOCK || err==EINTR)) continue;
+          finish_socket(fd); incoming.erase(fd); continue;
+        }
         if (!in.header) {
-          const size_t end=in.bytes.find('\n');
+          const size_t end=in.bytes.find('\n', in.scanned);
+          in.scanned = end==std::string::npos ? in.bytes.size() : end;
           // A header line that never ends (or a declared binary payload beyond what the vision budget can use) must not grow the buffer
           //   without bound: 64 MiB covers a full-context id list; the patch payload is at most vision_max_patches patches of 3·p·p bf16.
           if (end==std::string::npos) { if (in.bytes.size() > kMaxHeaderBytes) { send_json(fd, {{"error","request too large"}}); finish_socket(fd); incoming.erase(fd); } continue; }
@@ -1509,7 +1562,9 @@ int main(int argc, char** argv) {
           for (auto key : {"op", "session", "rid"}) if (in.req.contains(key) && !in.req[key].is_string()) in.req.erase(key);
           in.bin = in.req.contains("bin") && in.req["bin"].is_number_unsigned() ? in.req["bin"].get<size_t>() : 0;
           if (in.bin > kMaxBinBytes) { send_json(fd, {{"error","request too large"}}); finish_socket(fd); incoming.erase(fd); continue; }
-          in.bytes.erase(0,end+1); in.header=true;
+          in.payload.reserve(in.bin);
+          in.payload.assign(in.bytes.begin()+end+1, in.bytes.end());
+          in.bytes.clear(); in.bytes.shrink_to_fit(); in.header=true;
         }
         json& j=in.req;
         std::string op=j.value("op", "generate");
@@ -1599,12 +1654,13 @@ int main(int argc, char** argv) {
         cv.notify_all();
         continue;
       }
-      if (in.bytes.size() < in.bin) continue;
+      if (in.payload.size() < in.bin) continue;
       j["session"]=j.value("session","default");
       Request r;
       r.fd = fd;
       r.req = j;
-      r.bin.assign(in.bytes.begin(), in.bytes.begin()+in.bin);
+      in.payload.resize(in.bin);
+      r.bin = std::move(in.payload);
       {
         std::lock_guard<std::mutex> lk(mu);
         r.cancel = std::make_shared<std::atomic<bool>>(false);
@@ -2292,7 +2348,7 @@ int main(int argc, char** argv) {
     auto& request_sig = J.request_sig;
     if (q.contains("images") && q["images"].is_array()) {
       const auto* sig = request_img_sig(A->r);
-      if (!sig) { fail("image bytes short"); return nullptr; }
+      if (!sig) { fail(A->r.img_sig_state == -2 ? "images missing" : "image bytes short"); return nullptr; }
       for (const auto& s : *sig) request_sig.push_back({s.start, s.end, s.hash});
     }
     auto images_match = [&](const std::vector<Session::ImgSig>& saved, size_t pos) {
@@ -2454,6 +2510,7 @@ int main(int argc, char** argv) {
     auto& all_images = J.all_images;
     auto& patch_bufs = J.patch_bufs;
     auto& req_sig = J.req_sig;
+    std::vector<size_t> held_ends;  // span ends of the held images (sent without bytes)
     if (q.contains("images") && q["images"].is_array()) {
       size_t off = 0;
       for (auto& im : q["images"]) {
@@ -2470,8 +2527,14 @@ int main(int argc, char** argv) {
         const int64_t max_patches = vision_max_patches > 0 ? vision_max_patches : (int64_t)c.vision_max_tokens * c.vision_downsample * c.vision_downsample;  // as the runtime
         if (x.n_vit_h <= 0 || x.n_vit_w <= 0 || npatch > max_patches || (int64_t)nb != npatch * pbytes ||
             x.start < 0 || (size_t)x.start >= ids.size() || x.types.empty()) { fail("image geometry invalid"); return nullptr; }
-        if (off + nb > A->r.bin.size()) { fail("image bytes short"); return nullptr; }
         req_sig.push_back(request_sig[req_sig.size()]);
+        if (image_held(im)) {  // no bytes (held images): never encoded — checked once the reuse is decided (held_ends below)
+          if constexpr (!kHostPatches<ImageInput>) { fail("images missing"); return nullptr; }  // families that copy every image at admission need the bytes
+          held_ends.push_back((size_t)x.start + x.types.size());
+          all_images.push_back(std::move(x));
+          continue;
+        }
+        if (off + nb > A->r.bin.size()) { fail("image bytes short"); return nullptr; }
         // DeepSeek: the patches stay in the request's payload (A->r.bin lives until the request ends) — set_image_patches
         set_image_patches(x, A->r.bin.data() + off, nb, patch_bufs);
         off += nb;
@@ -2587,6 +2650,8 @@ int main(int argc, char** argv) {
         all_images = std::move(suffix);
       }
     }
+    // A held image the reuse does not cover would have to be encoded without its bytes: the server sends the request again with them
+    for (const size_t e : held_ends) if (e > common) { fail("images missing"); return nullptr; }
     A->common = common;
     A->prompt_len = ids.size();
     // "stages": true (the API server's HIVE_STAGE_STATUS — the engine status of a request): one line once the reuse is decided, before the
@@ -3667,7 +3732,7 @@ int main(int argc, char** argv) {
   // ---- HIVE_LAYER_YIELD yield body (called by the runtime at layer boundaries of a long prefill forward — runtime.cpp, hive/layer_yield.h) ----
   //   want(): is there work — 1 if decoders are running · the prompt id count (largest) of admissible short text requests · otherwise 0 (the runtime then does not hand over).
   //   run(R, gap): (1) admit — from the queue head (FIFO; inadmissible requests are skipped and keep their place) requests with prompt id count
-    //     <= min(ly_max, R), no images, session not running/prefilling, a free seat (active + prefilling + 1 <= max_batch), no stop/sleep request
+    //     <= min(ly_max, R), no image to encode unless the encoder is loaded (yield_rows), session not running/prefilling, a free seat (active + prefilling + 1 <= max_batch), no stop/sleep request
     //     -> single-path admit (prefill = forward rows <= R — the runtime lent only the first R Work rows of the outer prefill, so no larger forward
     //     is called). (2) decode — if decoders are running, decode_step at least once, up to the budget (preceding prefill gap x share/(1-share))
     //     and the cap (ly_steps). The first token of newly admitted requests also leaves here.
@@ -3718,12 +3783,16 @@ int main(int argc, char** argv) {
       return 2.0 * (double)rows <= rem && ly_mid_used + rows <= ly_fwd_rows;
     };
     // Rows a queued request would prefill inside a yield (ids minus the reusable prefix — a lower bound of what the forward will hold), or 0 =
-    //   it cannot run there: its session is running or prefilling, or it has an image still to encode (the vision encoder may have to be
-    //   loaded — VRAM — in the middle of a long prefill). Images inside the reusable prefix are not encoded again, so such a request runs like
-    //   a text one on families that keep the patches on the host until they are encoded (kHostPatches — the others copy every image to the
-    //   device at admission). Measured 2026-10-25 20:51 (production log, DeepSeek): an agent conversation's turn — 12 images, all inside its
-    //   first 165K tokens, 24,639 new rows — waited 156 s behind a read-ahead prefill because every image request was refused here.
-    auto yield_rows = [&](Request& r) -> size_t {
+    //   it cannot run there: its session is running or prefilling, or it has an image still to encode while the vision encoder is not on the
+    //   device (loading it — VRAM — in the middle of a long prefill). Images inside the reusable prefix are not encoded again, so such a request
+    //   runs like a text one on families that keep the patches on the host until they are encoded (kHostPatches — the others copy every image
+    //   to the device at admission). Measured 2026-10-25 20:51 (production log, DeepSeek): an agent conversation's turn — 12 images, all inside
+    //   its first 165K tokens, 24,639 new rows — waited 156 s behind a read-ahead prefill because every image request was refused here.
+    //   encode_ok (whole admission at a layer point, not a slice): an image to encode is taken too once the encoder is loaded — it encodes into
+    //   its own buffers and the shared img_rows/img_types, which the paused forward consumed before its first layer (is_image_h is parked).
+    //   Measured 2026-10-28 (production log, DeepSeek, 10-25 → 10-28): 456 image requests of priority 0 or better waited > 0.5 s for admission, 3.0 ks
+    //   together; 422 of them (2.6 ks) came within 110 s of another image request — the encoder (released after 120 s idle) was still loaded.
+    auto yield_rows = [&](Request& r, bool encode_ok) -> size_t {
       const json& q = r.req;
       const std::string sid = q.value("session", "default");
       if (active_sids.count(sid) || prefilling_sids.count(sid)) return 0;
@@ -3735,14 +3804,14 @@ int main(int argc, char** argv) {
         if (!rsig) return 0;
       }
       const size_t rows = rows_to_prefill(sid, q, rsig);
-      if (rsig) {
+      if (rsig && !(encode_ok && rt_vision_loaded(rt))) {
         const size_t from = q["ids"].size() - rows;  // every image must end inside the reusable prefix
         for (const auto& s : *rsig) if ((size_t)s.end > from) return 0;
       }
       return rows;
     };
     auto ly_rows_of = [&, ly_mid_ok, paused_prio, yield_rows](Request& r, size_t cap) -> size_t {
-      const size_t rows = yield_rows(r);
+      const size_t rows = yield_rows(r, true);
       if (rows == 0 || rows > cap) return 0;
       if (rows > ly_max && !ly_mid_ok(rows) && !(prio_class(req_prio(r)) < paused_prio())) return 0;
       return rows;
@@ -3767,7 +3836,7 @@ int main(int argc, char** argv) {
     auto slice_rows_of = [&, yield_rows, ly_rows_of, paused_prio](Request& r) -> size_t {
       if (ly_slice == 0 || prio_class(req_prio(r)) > paused_prio()) return 0;
       if (ly_rows_of(r, std::max(ly_max, ly_mid)) > 0) return 0;
-      return yield_rows(r);
+      return yield_rows(r, false);
     };
     ly::Hooks h;
     h.period_ms = ly_period;

@@ -1410,6 +1410,8 @@ void Runtime::ensure_vision() {
   vision_last_use_ = now_ms();
 }
 
+bool Runtime::vision_loaded() const { return vision_ != nullptr; }
+
 void Runtime::release_vision_if_idle() {
   if (!vision_ || !opt_.vision_lazy) return;
   if (now_ms() - vision_last_use_ < opt_.vision_idle_ms) return;
@@ -3104,6 +3106,7 @@ void Runtime::merge_images(int M, const std::vector<ImageInput>& images) {
     const int span = (int)im.types.size();
     HIVE_CHECK(span <= c.vision_max_tokens + 64, "image span too long");
     // host patches (hived): uploaded into the encoder's patch buffer here, one image at a time — no device memory per image (ImageInput)
+    HIVE_CHECK(im.patches_dev || im.patches_host, "image patches missing");  // a held image (hived, sent without bytes) is never encoded
     const bf16* patches = im.patches_dev ? im.patches_dev : vision_->upload_patches(im.patches_host, im.patch_bytes);
     std::vector<int32_t> row_of(span, 0);
     int rows = 0;

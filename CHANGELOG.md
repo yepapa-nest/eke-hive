@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **An image request no longer waits for a long prefill when the vision encoder is loaded**: at a layer yield the daemon refused every
+  request with an image still to encode, because the encoder (loaded lazily, released after two idle minutes) might need its VRAM in the
+  middle of the forward. On a production deployment 456 image requests waited more than half a second for admission over three days
+  (3.0 ks together; p90 2.0 s for an agent's screen checks behind a background prefill), and 422 of them came within two
+  minutes of another image request — the encoder was still on the device. Such a request is now admitted at a layer yield like a text
+  one when the family reports the encoder loaded (`vision_loaded`, DeepSeek); a slice and a family without the member keep the old rule.
+- **The token cache keeps conversations by tokens** (`HIVE_TOKEN_CACHE_TOKENS`, default 32M; `HIVE_TOKEN_CACHE_SESSIONS` now caps the
+  count only when set): with a count of 64, short requests pushed the long conversations out. On a production deployment 140 of 211
+  conversations in four hours were under 8K tokens, and 181 of 234 read-ahead requests at 64K+ tokens tokenized their whole prompt (p50
+  705 ms) although most had been tokenized before in the same process.
+
+- **Images the daemon already has are not sent again** (`HIVE_IMAGE_HOLD`, on): a conversation with screenshots sent the patches of every
+  image on every turn, although the images inside the reused prefix are never encoded again. On a production deployment that was 50–300 MB
+  per turn of an agent conversation: send → admitted p50 298 ms at 50–100 MB and 797 ms at 200–300 MB (312 s over two days of interactive
+  turns), half of it the transfer and half the daemon hashing every patch byte. Each image now carries a content key; the daemon records the
+  hash of the bytes it receives under that key, and the server leaves out the bytes of images the daemon accepted before and that lie in the
+  part shared with the conversation's previous request (`held`). A held image the daemon does not know or would have to encode fails the
+  request with `images missing` before anything else, and the server sends it again with every image's bytes. Signatures are the same
+  values as before, so stored checkpoints and snapshots keep matching.
+- **The daemon reads a request's bytes in one go**: the receiver read 64 KiB per `poll` wakeup, which capped a request with images at about
+  400 MB/s; it now reads what the socket holds (up to 16 MiB before the other connections get their turn) straight into the request's
+  payload, without the extra copy, and scans a long request line for its end only once.
+
 - **`HIVE_PREFILL_PRIORITY_HOLD` (new, off by default)**: a request that is still prefilling holds the decoders of a worse priority class,
   as a decoding one already did. Between the chunks of a prefill the running decoders got `--decode-share` (34 %) of the wall clock and at
   its layer yields another share, whatever their priority — on a production deployment, conversation turns that prefilled while only

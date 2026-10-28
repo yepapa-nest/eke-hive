@@ -120,6 +120,9 @@ std::unique_ptr<Seq> Runtime::new_seq() const {
 }
 void Runtime::ensure_vision() {}
 void Runtime::release_vision_if_idle() {}
+// FAKE_VISION_LOADED=1: the encoder counts as loaded (production: lazily loaded on the first image, released after vision_idle_ms) — a layer
+//   yield then takes a request with an image to encode (hived yield_rows); default: not loaded, such a request waits for the forward.
+bool Runtime::vision_loaded() const { return fake_env("FAKE_VISION_LOADED", 0) > 0; }
 int Runtime::warm_cache() { return 0; }
 int Runtime::image_patch_bytes() const { return 16; }  // the CPU harness sends 16-byte fake patches (test_daemon_cpu PATCH_BYTES)
 void Runtime::warm_defer(int per_step) { warm_left_ = opt_.warm_cap; warm_step_ = std::max(1, per_step); warm_steps_ = 0; warm_done_ = 0; }  // HIVE_WARM_DEFER: quota only (the fake store has no slots)

@@ -191,6 +191,7 @@ class Runtime {
   //   (tail layers have no KV of their own and their ring is absorbed by the next chunk's "may be dirty" tail span; only the last chunk's logits and MTP hidden are used)
   bool tail_mode_for(int M) const;
   bool has_vision() const { return vision_can_; }  // can image requests be accepted (lazy load uploads on the first one)
+  bool vision_loaded() const;      // the encoder is on the device now (hived: a layer yield may encode an image)
   void ensure_vision();             // load the encoder (if not loaded yet)
   void release_vision_if_idle();    // unload if unused for more than vision_idle_ms — called by the daemon loop between steps
   // Batched decode: one token each for B sequences (<= max_batch). next[b] = argmax, logits (if requested) per row.
