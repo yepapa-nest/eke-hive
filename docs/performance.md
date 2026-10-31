@@ -211,6 +211,34 @@ On the GPU side the resident-expert kernel itself has headroom: `bench_gemv` (GP
 matrix at about 1.0 TB/s for M=1 even though the 5.9 MB matrix sits in L2, while the grouped six-expert path reaches 1.8–2.4 TB/s
 and the VRAM peak is 1.79 TB/s — the single-expert GEMV is latency-bound, not bandwidth-bound.
 
+### Where the time goes now (2026-10-31, current build, 96 GB)
+
+A lossless-only review of the current build, from two days of production request logs (5,349 requests), an nsys capture of
+real-chat decode (`--cuda-graph-trace=node`, 3 s windows at c1 and c8) and the cache replay tool. Nothing in it was adopted; it
+records where the remaining time sits so the next attempt does not repeat these measurements.
+
+- **Decode, c1.** The GPU is busy 79.5 % of the wall time. Of the time no other kernel overlaps: routed experts
+  (`moe_decode_fused3`) 25.7 %, the dense decode GEMVs (`a2_gemv`: q_b, wo_b, shared expert) 21.5 %, the vocabulary head 8.0 %,
+  attention 7.6 %, the FP8 `wo_a` GEMV 5.6 %. Against the bytes they read, the expert kernel runs at about the VRAM peak, the dense
+  GEMVs at ~79 % of it and the head (1.32 GB, bf16) at ~87 %. Sinkhorn overlaps other streams completely. The 20.5 % idle time is
+  mostly the wait for CPU experts at the end of a layer (~6 % of the wall) and host turnarounds at layer ends and step boundaries
+  (~4 %).
+- **CPU experts.** One CPU expert job (one row, 18.8 MB) takes 0.143 ms on average over 351 M jobs — about 132 GB/s, the DRAM
+  bandwidth of both NUMA nodes together; each job is already split across the two nodes' half records. A verify step's GPU part
+  grows from ~18 ms (2 rows) to ~26 ms (6 rows), and every further CPU job adds ~0.13 ms.
+- **Short prefills (≤ 2K new tokens).** The GPU expert path (resident experts plus copies at ~20 GB/s over PCIe) and the CPU path
+  run side by side and both take about the same time per layer; the attention/front part is ~1.8 ms of 20 layers — overlapping it
+  would gain almost nothing.
+- **GPU power limit.** The official real-chat cell at 450 W vs 600 W: c1 84.4 vs 85.0, c4 122.9 vs 123.6, c8 172.5 vs 173.1,
+  c16 170.7 vs 172.4 tok/s; first token after 8K / 32K / 64K tokens 3.78 / 6.55 / 11.80 vs 3.80 / 6.52 / 11.67 s — within the
+  noise floor. DeepSeek is bound by memory, PCIe and DRAM, not by the GPU clock.
+
+| Idea (lossless) | Result |
+| --- | --- |
+| Snapshots between the interval points of a long re-read (cut a 90K-token chunk into 32K pieces) | A chunk costs a fixed ~2 s (chunk time vs rows over a service day: 3K rows 2.4 s, 22K 5.6 s, 93K 17.1 s → ~0.16 ms per row + ~2 s). A conversation compacted later re-reads from the last snapshot (one case: 85K tokens, 67 s), but the extra cuts would cost ~2 s on every long re-read; over two service days the two roughly cancel |
+| Reduced-vocabulary head for the draft only (the verify head stays full, so the output is unchanged) | The draft head is ~0.84 ms of a ~38 ms step; a 64K-token copy of the head needs another 0.65 GB of VRAM, which the expert cache would lose (~35 slots) |
+| Fewer concurrent sequences (session pool 8 → 6, +98 cache slots) | Cache replay of a service trace: decode miss jobs per step 59.3 → 57.1 (−3.7 %), about +0.6 % decode; lending the whole idle pool (+300 slots) would give 53.0 (−10.7 %, about +1.9 %) |
+
 ## GLM-5.3-Flash
 
 GLM-5.3-Flash came second and reuses the DeepSeek machinery that is not model-specific (the expert cache and its promotion,
