@@ -96,14 +96,18 @@ std::vector<double> group_key_ref(const Seq& S, int G, const std::vector<uint16_
   return head_ref(m.data(), DI, w, &S.rope_h[(size_t)(4 * G) * 3]);
 }
 
-// counts of bf16-step differences
+// counts of bf16-step differences. scale = the largest |reference| of the vector the value belongs to: a value that is tiny against its
+//   vector (a rotary pair that nearly cancels) is judged by the absolute error — one bf16 step of the vector's scale — not by its own
+//   relative error, which the fp32 kernel cannot meet against a double reference (2026-10-31: 2-7 of 6-10 M q values at rel 1e-2..1e-1,
+//   99.999 % identical otherwise; the kernels were unchanged since the test last passed).
 struct Cmp { size_t n = 0, same = 0, over1 = 0; double maxrel = 0; };
-void cmp_vals(Cmp& c, double got, double want) {
+double vmax(const double* y, int n) { double m = 0; for (int i = 0; i < n; ++i) m = std::max(m, std::fabs(y[i])); return m; }
+void cmp_vals(Cmp& c, double got, double want, double scale = 0) {
   ++c.n;
   if (got == want) { ++c.same; return; }
   const double rel = std::fabs(got - want) / std::max(std::fabs(want), 1e-30);
   c.maxrel = std::max(c.maxrel, rel);
-  if (rel > 1.0 / 128 + 1e-12) ++c.over1;   // more than one bf16 step (8 mantissa bits incl. the implicit one → ≤ 2^-7 relative)
+  if (rel > 1.0 / 128 + 1e-12 && std::fabs(got - want) > scale / 128) ++c.over1;   // more than one bf16 step of the value (8 mantissa bits incl. the implicit one → ≤ 2^-7 relative) and more than two steps of the vector's scale
 }
 void report(const char* what, const Cmp& c) {
   printf("  %-10s %zu values · identical %.3f %% · > 1 bf16 step %zu · max rel %.2e\n", what, c.n, 100.0 * c.same / std::max<size_t>(c.n, 1), c.over1, c.maxrel);
@@ -189,26 +193,26 @@ int main() {
       const int32_t* co = &S.rope_h[(size_t)p * 3];
       for (int h = 0; h < kQsaHeads; ++h) {
         const auto y = head_ref(pr + (size_t)h * 2 * D, D, wq, co);
-        for (int d = 0; d < D; ++d) cmp_vals(cq, b2f(qh[((size_t)r * kQsaHeads + h) * D + d]), y[d]);
+        { const double sc = vmax(y.data(), D); for (int d = 0; d < D; ++d) cmp_vals(cq, b2f(qh[((size_t)r * kQsaHeads + h) * D + d]), y[d], sc); }
       }
       const std::vector<uint16_t> kc = down((const uint16_t*)S.k + (size_t)p * 2 * D, 2 * D);
       const std::vector<uint16_t> vc = down((const uint16_t*)S.v + (size_t)p * 2 * D, 2 * D);
       const std::vector<uint16_t> ikc = down((const uint16_t*)S.ik + (size_t)p * DI, DI);
       for (int g = 0; g < 2; ++g) {
         const auto y = head_ref(pr + kQsaKOff + (size_t)g * D, D, wk, co);
-        for (int d = 0; d < D; ++d) cmp_vals(ck, b2f(kc[(size_t)g * D + d]), y[d]);
+        { const double sc = vmax(y.data(), D); for (int d = 0; d < D; ++d) cmp_vals(ck, b2f(kc[(size_t)g * D + d]), y[d], sc); }
       }
       for (int i = 0; i < 2 * D; ++i) copy_bad += vc[i] != pr[kQsaVOff + i];
       for (int i = 0; i < DI; ++i) copy_bad += ikc[i] != pr[kQsaIkOff + i];
       for (int h = 0; h < kQsaIdxHeads; ++h) {
         const auto y = head_ref(pr + kQsaIqOff + (size_t)h * DI, DI, wiq, co);
-        for (int d = 0; d < DI; ++d) cmp_vals(ciq, b2f(iqh[((size_t)r * kQsaIdxHeads + h) * DI + d]), y[d]);
+        { const double sc = vmax(y.data(), DI); for (int d = 0; d < DI; ++d) cmp_vals(ciq, b2f(iqh[((size_t)r * kQsaIdxHeads + h) * DI + d]), y[d], sc); }
       }
       if ((p & 3) == 3) {
         const int G = p >> 2;
         const auto y = group_key_ref(S, G, wik);
         const std::vector<uint16_t> g = down((const uint16_t*)S.gk + (size_t)G * DI, DI);
-        for (int d = 0; d < DI; ++d) cmp_vals(cgk, b2f(g[d]), y[d]);
+        { const double sc = vmax(y.data(), DI); for (int d = 0; d < DI; ++d) cmp_vals(cgk, b2f(g[d]), y[d], sc); }
       }
     }
     report("q", cq); report("k", ck); report("iq", ciq);

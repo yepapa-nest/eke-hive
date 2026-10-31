@@ -129,8 +129,9 @@ class Tests(unittest.TestCase):
         for daemon_fails in (True,False):
             fail="python3 -c 'import time,sys;time.sleep(.05);sys.exit(7)'"
             wait="python3 -c 'import time;time.sleep(60)'"
-            # the daemon line runs "$BIN_DIR/$BIN" (BIN = HIVE_DAEMON_BIN: hived, or hived_glm for the GLM family)
-            src=re.sub(r'^"\$BIN_DIR/\$BIN"[^\n]+? >>',lambda _: (fail if daemon_fails else wait)+' >>',original,flags=re.M)
+            # the daemon line runs "$BIN_DIR/$BIN" (BIN = HIVE_DAEMON_BIN: hived, or hived_glm for the GLM family), optionally behind
+            # the HIVE_DAEMON_WRAP words ("${WRAP[@]}", empty by default — a profiler in front of the daemon for measurements)
+            src=re.sub(r'^(?:"\$\{WRAP\[@\]\}" )?"\$BIN_DIR/\$BIN"[^\n]+? >>',lambda _: (fail if daemon_fails else wait)+' >>',original,flags=re.M)
             self.assertNotEqual(src,original,'daemon line not found in hive-entrypoint.sh')
             src=re.sub(r'^python3 /hive/server/[^\n]+? >>',lambda _: (wait if daemon_fails else fail)+' >>',src,flags=re.M)
             with tempfile.TemporaryDirectory() as td:

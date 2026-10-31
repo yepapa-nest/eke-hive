@@ -3595,7 +3595,21 @@ int main(int argc, char** argv) {
       }
       for (int s = 0; s < S; ++s)  // thinking cap: per-request draft cap (accepted drafts must not exceed the cap — the next token is forced above)
         if (stepping[s]->think_cap > 0 && stepping[s]->in_think) rem[s] = std::min(rem[s], std::max(0, stepping[s]->think_cap - stepping[s]->think_n));
-      const mtpg::BatchChoice ch = mtpg::choose_batch(gate_b, S, smp, cfp, nd, mtp_max, mtp_conf, rem, rt.mtp_batch_rows());
+      mtpg::BatchChoice ch = mtpg::choose_batch(gate_b, S, smp, cfp, nd, mtp_max, mtp_conf, rem, rt.mtp_batch_rows());
+      // HIVE_MTP_BATCH_FULL (measurement, default off): verify every draft the chain made (up to --mtp-max, the request's remaining budget and
+      //   the confidence threshold) instead of the gate's choice — the C8 profile 2026-10-31 (31.7 of 40 rows per step, 2.1 accepted per
+      //   sequence against 2.84 at C1 with 4 drafts) asks whether the batch gate trims drafts that would have paid
+      static const bool batch_full = env_on("HIVE_MTP_BATCH_FULL");
+      if (batch_full && S + 1 <= rt.mtp_batch_rows()) {
+        int K = 0; double e = S;
+        for (int s = 0; s < S; ++s) {
+          int k = std::min(nd[s], std::min(mtp_max, rem[s]));
+          while (k > 0 && cfp[s][k - 1] < mtp_conf) --k;
+          while (S + K + k > rt.mtp_batch_rows()) --k;
+          ch.k[s] = k; K += k; e += k > 0 ? 1.0 : 0.0;
+        }
+        if (K > 0) { ch.K = K; ch.e = e; ch.ms = gate_b.cost(S + K); }
+      }
       if (ch.K == 0) {
         back_b.on_decline(tv - td, !mtpg::can_profit_batch(gate_b, S, any_sampled, mtp_max, rt.mtp_batch_rows()));
         if (trace_mtp) fprintf(stderr, "[mtp] batch S %d draft %.1f ms · no draft (T(S) %.1f · T(S+1) %.1f ms · skip %d)\n", S, tv - td, gate_b.cost(S), gate_b.cost(S + 1), back_b.skip);
