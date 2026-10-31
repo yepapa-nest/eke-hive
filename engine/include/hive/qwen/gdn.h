@@ -61,5 +61,11 @@ struct GdnRowsPart {
   __nv_bfloat16* out; int snap_init; float* const* snap_conv0;
 };
 void gdn_decode_rows_multi(const GdnParams& p, int ld, int P, const GdnRowsPart* parts, cudaStream_t st);
+// gdn_decode_rows_multi with the parts' rows in device memory — vpt: int pairs (first row, rows ≤ 8) per part, P ≤ 16 — and the per-part
+//   arguments derived from bases: part p reads proj / out rows from its first row, conv_state / state = the row pointer tables + first row,
+//   its snapshot pointers at snap + p · snap_stride (conv 0..6 · conv window before the verify 7 · state 8..), replay snapshots (snap_init)
+//   for parts ≥ replay_from. Same arithmetic per block as gdn_decode_rows_multi (bit-identical); a captured graph stays valid for any split.
+void gdn_decode_rows_multi_dyn(const GdnParams& p, int ld, int P, const int* vpt, const __nv_bfloat16* proj, float* const* conv_state,
+                               float* const* state, float* const* snap, int snap_stride, int replay_from, __nv_bfloat16* out, cudaStream_t st);
 
 }  // namespace hive::qwen

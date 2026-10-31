@@ -23,6 +23,19 @@ __global__ void ple_dequant_kernel(const uint8_t* __restrict__ rows, int M, floa
   e[i] = __float2bfloat16(rbf(float(v)) * scale);
 }
 
+__global__ void ple_dequant_nv_kernel(const uint8_t* __restrict__ rows, int M, float scale2, bf16* __restrict__ e) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)M * kPleRow) return;
+  const uint8_t* slot = rows + (i / kPleHeadDim) * kPleHeadDim;   // one head row of 160 values
+  const int d = (int)(i % kPleHeadDim);
+  const uint8_t b = slot[d >> 1];
+  const uint8_t nib = (d & 1) ? (b >> 4) : (b & 15);
+  const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  const float v = (nib & 8) ? -mag[nib & 7] : mag[nib & 7];
+  __nv_fp8_e4m3 sc; sc.__x = slot[kPleHeadDim / 2 + d / 16];
+  e[i] = __float2bfloat16(v * (float(sc) * scale2));
+}
+
 __device__ __forceinline__ float block_sum(float v, float* red) {
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
   const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -35,7 +48,10 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 }
 
 // block = (row m, copy c)
-__global__ void ple_gate_kernel(const bf16* __restrict__ key, const bf16* __restrict__ h, const bf16* __restrict__ nk, const bf16* __restrict__ nq,
+__device__ __forceinline__ float wf(bf16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float wf(float v) { return v; }
+template <typename WT>
+__global__ void ple_gate_kernel(const bf16* __restrict__ key, const bf16* __restrict__ h, const WT* __restrict__ nk, const WT* __restrict__ nq,
                                 const bf16* __restrict__ value, int hc, int dim, float eps, bf16* __restrict__ gv) {
   __shared__ float red[32];
   const int m = blockIdx.x, c = blockIdx.y;
@@ -51,8 +67,8 @@ __global__ void ple_gate_kernel(const bf16* __restrict__ key, const bf16* __rest
   const float rq = rsqrtf(block_sum(sq, red) / (float)dim + eps);
   float dot = 0.f;
   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-    const float kn = rbf(__bfloat162float(kr[i]) * rk * (1.f + __bfloat162float(nk[(size_t)c * dim + i])));
-    const float qn = rbf(__bfloat162float(hr[i]) * rq * (1.f + __bfloat162float(nq[(size_t)c * dim + i])));
+    const float kn = rbf(__bfloat162float(kr[i]) * rk * (1.f + wf(nk[(size_t)c * dim + i])));
+    const float qn = rbf(__bfloat162float(hr[i]) * rq * (1.f + wf(nq[(size_t)c * dim + i])));
     dot += rbf(kn * qn);
   }
   float g = rbf(rbf(block_sum(dot, red)) * rsqrtf((float)dim));
@@ -140,6 +156,35 @@ __global__ void ple_conv_rows_kernel(const bf16* __restrict__ gv, const bf16* __
   for (int k = 0; k < kPleConvState; ++k) state[(size_t)k * C + ch] = st[k];
 }
 
+// ple_conv_rows of P parts in one launch, the parts' (first row, rows) from device memory (vpt) — grid.y = part
+__global__ void ple_conv_rows_dyn_kernel(const bf16* __restrict__ gv, const bf16* __restrict__ gvn, const float* __restrict__ w, int C,
+                                         const int* __restrict__ vpt, float* const* __restrict__ state_base, float* const* __restrict__ snap_base,
+                                         int snap_stride, bf16* __restrict__ h) {
+  const int p = blockIdx.y, ch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ch >= C) return;
+  const int r0 = vpt[2 * p], R = vpt[2 * p + 1];
+  float* state = state_base[p];
+  float* const* snap = R > 1 ? snap_base + (size_t)p * snap_stride : nullptr;
+  gv += (size_t)r0 * C; gvn += (size_t)r0 * C; h += (size_t)r0 * C;
+  float st[kPleConvState];
+#pragma unroll
+  for (int k = 0; k < kPleConvState; ++k) st[k] = state[(size_t)k * C + ch];
+  for (int r = 0; r < R; ++r) {
+    const size_t i = (size_t)r * C + ch;
+    const float xt = __bfloat162float(gvn[i]);
+    const float y = conv4(w + (size_t)ch * 4, st[0], st[3], st[6], xt);
+    h[i] = __float2bfloat16(ple_out(__bfloat162float(gv[i]), y, __bfloat162float(h[i])));
+#pragma unroll
+    for (int k = 0; k + 1 < kPleConvState; ++k) st[k] = st[k + 1];
+    st[kPleConvState - 1] = xt;
+    if (snap && r + 1 < R)
+#pragma unroll
+      for (int k = 0; k < kPleConvState; ++k) snap[r][(size_t)k * C + ch] = st[k];
+  }
+#pragma unroll
+  for (int k = 0; k < kPleConvState; ++k) state[(size_t)k * C + ch] = st[k];
+}
+
 unsigned blocks_for(size_t n, int t = 256) { return (unsigned)std::max<size_t>(1, (n + t - 1) / t); }
 
 }  // namespace
@@ -149,11 +194,22 @@ void ple_dequant(const uint8_t* rows, int M, float scale, bf16* e, cudaStream_t 
   ple_dequant_kernel<<<blocks_for((size_t)M * kPleRow), 256, 0, st>>>(rows, M, scale, e);
   CUDA_CHECK(cudaGetLastError());
 }
+void ple_dequant_nvfp4(const uint8_t* rows, int M, float scale2, bf16* e, cudaStream_t st) {
+  if (M <= 0) return;
+  ple_dequant_nv_kernel<<<blocks_for((size_t)M * kPleRow), 256, 0, st>>>(rows, M, scale2, e);
+  CUDA_CHECK(cudaGetLastError());
+}
 
 void ple_gate(const bf16* key, const bf16* h, const bf16* norm_key, const bf16* norm_query, const bf16* value, int M, int hc, int dim, float eps, bf16* gv,
               cudaStream_t st) {
   if (M <= 0) return;
-  ple_gate_kernel<<<dim3(M, hc), 256, 0, st>>>(key, h, norm_key, norm_query, value, hc, dim, eps, gv);
+  ple_gate_kernel<bf16><<<dim3(M, hc), 256, 0, st>>>(key, h, norm_key, norm_query, value, hc, dim, eps, gv);
+  CUDA_CHECK(cudaGetLastError());
+}
+void ple_gate(const bf16* key, const bf16* h, const float* norm_key, const float* norm_query, const bf16* value, int M, int hc, int dim, float eps,
+              bf16* gv, cudaStream_t st) {
+  if (M <= 0) return;
+  ple_gate_kernel<float><<<dim3(M, hc), 256, 0, st>>>(key, h, norm_key, norm_query, value, hc, dim, eps, gv);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -173,6 +229,13 @@ void ple_conv_batch(const bf16* gv, const bf16* gvn, const float* conv_w, int M,
 void ple_conv_rows(const bf16* gv, const bf16* gvn, const float* conv_w, int R, int C, float* const* state, float* const* snap, bf16* h, cudaStream_t st) {
   if (R <= 0) return;
   ple_conv_rows_kernel<<<blocks_for((size_t)C), 256, 0, st>>>(gv, gvn, conv_w, R, C, state, snap, h);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void ple_conv_rows_dyn(const bf16* gv, const bf16* gvn, const float* conv_w, int P, const int* vpt, int C, float* const* state_base,
+                       float* const* snap_base, int snap_stride, bf16* h, cudaStream_t st) {
+  if (P <= 0) return;
+  ple_conv_rows_dyn_kernel<<<dim3(blocks_for((size_t)C), P), 256, 0, st>>>(gv, gvn, conv_w, C, vpt, state_base, snap_base, snap_stride, h);
   CUDA_CHECK(cudaGetLastError());
 }
 

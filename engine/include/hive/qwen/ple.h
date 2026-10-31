@@ -9,6 +9,11 @@
 //   Table placement (HIVE_QWEN_PLE): "ram" (default) — pinned host memory, read in place · "ssd" — rows read on demand from the checkpoint
 //   file with O_DIRECT through a row cache (PleSsd below; hive/engram_ssd.h's design: thread-pool pread, CLOCK cache, read-ahead).
 //   Both give the same bytes.
+//   NVIDIA's FP4-Local checkpoint stores the table in NVFP4 instead (`ple_embedding_dtype` "nvfp4"): per shard `.weight` U8 [rows, 80]
+//   (E2M1 pairs, low nibble first) + `.weight_scale` F8_E4M3 [rows, 10] (one per 16 values) and one fp32 `ngram_embedding.weight_scale_2`;
+//   value = bf16(e2m1 · (e4m3 · scale_2)). A gathered row then holds the 80 data bytes followed by the 10 scale bytes in its 160-byte slot
+//   (the same [n, 16, 160] buffer). RAM mode only: 26.8 GiB (28.8 GB) pinned (90 B per row). Checked against the NVFP4 checkpoint's FP8 table
+//   2026-10-31: the same rows dequantized both ways agree to cos 0.994–0.996 (QAD retrained the table), the high-nibble-first reading to ≈ 0.
 //   Block (GPU, ple_* below): key = key_proj(e) [hc·hidden], value = value_proj(e) [hidden]; per copy c:
 //     gate_c = Σ_d norm_key(key)_c,d · norm_query(h)_c,d / sqrt(hidden); gate_c = sigmoid(sign·sqrt(max(|gate_c|, 1e-6)));
 //     gv_c,d = gate_c · value_d; y = gv + silu(conv(norm_conv(gv))) with a depthwise causal conv of 4 taps at dilation 3 over the
@@ -66,16 +71,23 @@ class PleTable {
   virtual size_t host_bytes() const = 0;
   virtual const char* kind() const = 0;
 };
-// Opens the table from the checkpoint (mode from HIVE_QWEN_PLE: ram | ssd), reads the hash buffers and the weight scale.
-std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, PleHash& hash, float& weight_scale);
+// Opens the table from the checkpoint (mode from HIVE_QWEN_PLE: ram | ssd), reads the hash buffers and the weight scale (FP8: the bf16
+//   per-table scale; NVFP4: scale_2). nvfp4 (optional): set to whether the table is NVFP4; a caller that passes nullptr gets an error for
+//   an NVFP4 table.
+std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, PleHash& hash, float& weight_scale, bool* nvfp4 = nullptr);
 
 // ---- Block (GPU) -----------------------------------------------------------------------------------------------------------------------------
 // e[m, :] = bf16(fp8(rows[m, :]) · scale) — rows uint8 [M, 2560] (may be pinned host memory, UVA), e bf16 [M, 2560]
 void ple_dequant(const uint8_t* rows, int M, float scale, __nv_bfloat16* e, cudaStream_t st);
+// the NVFP4 table's rows (each 160-byte slot = 80 data bytes + 10 E4M3 scales): e = bf16(e2m1 · (e4m3 · scale2))
+void ple_dequant_nvfp4(const uint8_t* rows, int M, float scale2, __nv_bfloat16* e, cudaStream_t st);
 // gv[m, c, d] = bf16(gate(m, c) · value[m, d]) with gate from norm_key(key) · norm_query(h) (both (1 + w) grouped per dim) as above.
 //   key, h bf16 [M, hc·dim] · value bf16 [M, dim] · gv bf16 [M, hc·dim]
 void ple_gate(const __nv_bfloat16* key, const __nv_bfloat16* h, const __nv_bfloat16* norm_key, const __nv_bfloat16* norm_query,
               const __nv_bfloat16* value, int M, int hc, int dim, float eps, __nv_bfloat16* gv, cudaStream_t st);
+// the same with fp32 norm weights (FP4-Local)
+void ple_gate(const __nv_bfloat16* key, const __nv_bfloat16* h, const float* norm_key, const float* norm_query, const __nv_bfloat16* value, int M,
+              int hc, int dim, float eps, __nv_bfloat16* gv, cudaStream_t st);
 // One sequence, T consecutive rows: h[t, :] += bf16( gv[t] + silu(conv(gvn)[t]) ) with the conv state (fp32 [9, C], oldest first) read
 //   and updated in place. gvn = norm_conv(gv) (bf16 [T, C]); C = hc·dim.
 void ple_conv_seq(const __nv_bfloat16* gv, const __nv_bfloat16* gvn, const float* conv_w, int T, int C, float* state, __nv_bfloat16* h,
@@ -86,5 +98,9 @@ void ple_conv_batch(const __nv_bfloat16* gv, const __nv_bfloat16* gvn, const flo
                     cudaStream_t st);
 void ple_conv_rows(const __nv_bfloat16* gv, const __nv_bfloat16* gvn, const float* conv_w, int R, int C, float* const* state, float* const* snap,
                    __nv_bfloat16* h, cudaStream_t st);
+// ple_conv_rows for P parts in one launch: part p = rows [vpt[2p], vpt[2p] + vpt[2p + 1]) (device int pairs), state through state_base[p],
+//   snapshots (parts of more than one row) at snap_base + p · snap_stride — the same per-element arithmetic
+void ple_conv_rows_dyn(const __nv_bfloat16* gv, const __nv_bfloat16* gvn, const float* conv_w, int P, const int* vpt, int C, float* const* state_base,
+                       float* const* snap_base, int snap_stride, __nv_bfloat16* h, cudaStream_t st);
 
 }  // namespace hive::qwen

@@ -153,6 +153,29 @@ void prefill(const Weights& w, const bf16* d_proj, int T, DevSeq& s, bf16* d_out
 int main() {
   std::mt19937 rng(20261009);
   const Weights w = make_weights(rng);
+  if (getenv("GDN_BENCH")) {   // timing only: one 8,192-token prefill call (HIVE_QWEN_GDN_CHUNK picks the path)
+    const int T = 8192;
+    const std::vector<bf16> proj = make_proj(rng, T);
+    bf16* d_proj = dev_upload(proj);
+    bf16* d_out = nullptr; CUDA_CHECK(cudaMalloc(&d_out, (size_t)T * kGdnVWidth * 2));
+    DevSeq s;
+    const size_t wsb = gdn_workspace_bytes(T);
+    void* ws = nullptr;
+    CUDA_CHECK(cudaMalloc(&ws, wsb));
+    cudaEvent_t a, b;
+    CUDA_CHECK(cudaEventCreate(&a)); CUDA_CHECK(cudaEventCreate(&b));
+    float best = 1e9f;
+    for (int it = 0; it < 5; ++it) {
+      CUDA_CHECK(cudaEventRecord(a));
+      gdn_forward_seq(w.params(), d_proj, LD, T, s.conv, s.state, d_out, ws, wsb, 0);
+      CUDA_CHECK(cudaEventRecord(b));
+      CUDA_CHECK(cudaEventSynchronize(b));
+      float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+      best = std::min(best, ms);
+    }
+    printf("gdn_forward_seq T=%d: %.3f ms (best of 5)\n", T, best);
+    return 0;
+  }
   // 1. prefill vs host reference. Tolerances: the GPU recurrence is fp32 (state and reductions) against fp64 here; the outputs are
   //    rounded to bf16 at two points (o and the gated norm), so a ±1 bf16 step (2^-8 relative) on a minority of elements is expected.
   //    rel-L2 < 4e-3 bounds that; the fp32 state must agree to ~1e-5 relative (300 steps of fp32 rounding).
@@ -287,8 +310,40 @@ int main() {
       gdn_decode_rows(w.params(), pj[p], LD, Rs[p], dev_ptrs({b[p].conv}), dev_ptrs({b[p].state}), ptrs(sb, p, true), ptrs(sb, p, false), ob[p], 0,
                       init[p], init[p] ? dev_ptrs({c0b[p].conv}) : nullptr);
     }
+    // the same parts through gdn_decode_rows_multi_dyn (rows of all parts contiguous, per-row pointer tables, part rows from device memory)
+    std::vector<DevSeq> d(P), sd(P * 16), c0d(P);
+    for (int p = 0; p < P; ++p) d[p].copy_from(a[p]);
+    int Rt = 0, r0s[P];
+    for (int p = 0; p < P; ++p) { r0s[p] = Rt; Rt += Rs[p]; }
+    bf16 *pjd = nullptr, *od = nullptr;
+    CUDA_CHECK(cudaMalloc(&pjd, (size_t)Rt * LD * 2)); CUDA_CHECK(cudaMalloc(&od, (size_t)Rt * kGdnVWidth * 2));
+    for (int p = 0; p < P; ++p) CUDA_CHECK(cudaMemcpy(pjd + (size_t)r0s[p] * LD, pj[p], (size_t)Rs[p] * LD * 2, cudaMemcpyDeviceToDevice));
+    std::vector<float*> rcs, rst, snp;
+    for (int p = 0; p < P; ++p) for (int r = 0; r < Rs[p]; ++r) { rcs.push_back(d[p].conv); rst.push_back(d[p].state); }
+    for (int p = 0; p < P; ++p) {   // [conv 0..6 | conv window before the verify (replay parts) | state 0..7]
+      for (int r = 0; r < 7; ++r) snp.push_back(sd[p * 16 + r].conv);
+      snp.push_back(c0d[p].conv);
+      for (int r = 0; r < 8; ++r) snp.push_back(sd[p * 16 + 8 + r].state);
+    }
+    std::vector<int> vpt;
+    for (int p = 0; p < P; ++p) { vpt.push_back(r0s[p]); vpt.push_back(Rs[p]); }
+    int* dvpt = nullptr;
+    CUDA_CHECK(cudaMalloc(&dvpt, vpt.size() * 4)); CUDA_CHECK(cudaMemcpy(dvpt, vpt.data(), vpt.size() * 4, cudaMemcpyHostToDevice));
     gdn_decode_rows_multi(w.params(), LD, P, parts.data(), 0);
+    gdn_decode_rows_multi_dyn(w.params(), LD, P, dvpt, pjd, dev_ptrs(rcs), dev_ptrs(rst), dev_ptrs(snp), 16, 2, od, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
+    bool dok = true;
+    for (int p = 0; p < P; ++p) {
+      dok = dok && same_bytes(dev_download(oa[p], (size_t)Rs[p] * kGdnVWidth), dev_download(od + (size_t)r0s[p] * kGdnVWidth, (size_t)Rs[p] * kGdnVWidth)) &&
+            same_bytes(dev_download(a[p].state, kGdnStateFloats), dev_download(d[p].state, kGdnStateFloats)) &&
+            same_bytes(dev_download(a[p].conv, kGdnConvStateFloats), dev_download(d[p].conv, kGdnConvStateFloats));
+      for (int r = 0; r < Rs[p] - 1 && !init[p]; ++r)
+        dok = dok && same_bytes(dev_download(sa[p * 8 + r].state, kGdnStateFloats), dev_download(sd[p * 16 + 8 + r].state, kGdnStateFloats)) &&
+              same_bytes(dev_download(sa[p * 8 + r].conv, kGdnConvStateFloats), dev_download(sd[p * 16 + r].conv, kGdnConvStateFloats));
+      if (init[p]) dok = dok && same_bytes(dev_download(sa[p * 8].state, kGdnStateFloats), dev_download(sd[p * 16 + 8].state, kGdnStateFloats)) &&
+                         same_bytes(dev_download(c0a[p].conv, kGdnConvStateFloats), dev_download(c0d[p].conv, kGdnConvStateFloats));
+    }
+    verdict("verify rows multi, parts from device memory == per-part arguments", dok, "(outputs, states, conv, snapshots bit-identical)");
     bool ok = true;
     for (int p = 0; p < P; ++p) {
       ok = ok && same_bytes(dev_download(oa[p], (size_t)Rs[p] * kGdnVWidth), dev_download(ob[p], (size_t)Rs[p] * kGdnVWidth)) &&

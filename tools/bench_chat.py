@@ -40,6 +40,7 @@ P.add_argument("--long", default="17000,42000,54000", help="approximate prompt s
 P.add_argument("--effort", default="none", help="reasoning_effort of every request (none = thinking off, the published numbers; low / medium / high = the thinking traffic a chat client sends)")
 P.add_argument("--temperature", type=float, default=0.0, help="sampling temperature of every request (0 = greedy, the published numbers; chat clients usually send 1.0)")
 P.add_argument("--top-p", type=float, default=None, help="top_p of every request (default: not sent = the server's default, as in the published numbers; 1.0 = no nucleus, what some chat clients send)")
+P.add_argument("--long-salt", default="", help="text put in front of each long prompt (a fresh value per run keeps a server's kept prompt prefixes from a previous run out of the prefill numbers; empty = the published prompts)")
 P.add_argument("--long-timeout", type=float, default=0, help="seconds; a long prompt with no first token by then is recorded as a timeout and the longer ones are not sent (0 = no cap; the published VRAM-size tables use 600 s)")
 A = P.parse_args()
 
@@ -112,7 +113,7 @@ if A.long.strip():
             print(f"long ~{T}: not sent - the shorter ~{capped} prompt already exceeded {A.long_timeout:.0f} s", flush=True)
             continue
         try:
-            r = stream("Read the following and then summarize its first section in two sentences.\n\n" + corpus[: int(T * 3.5)], 256, A.long_timeout or 3600)
+            r = stream((f"[{A.long_salt}] " if A.long_salt else "") + "Read the following and then summarize its first section in two sentences.\n\n" + corpus[: int(T * 3.5)], 256, A.long_timeout or 3600)
         except OSError as e:  # socket timeout (TimeoutError is an OSError)
             if not A.long_timeout:
                 raise

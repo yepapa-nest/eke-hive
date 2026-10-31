@@ -69,6 +69,8 @@ QwenEngine::QwenEngine(QwenModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(
   al(mlp_out_f32_, R * H * 4); al(shared_out_, R * H * 2); al(sh_gu_, R * 2 * c.shared_inter * 2); al(sh_y_, R * c.shared_inter * 2);
   al(router_, R * (c.n_experts + 1) * 4); al(rids_, R * c.n_act * 4); al(rw_, R * c.n_act * 4);
   ws_bytes_ = std::max(gdn_workspace_bytes(max_chunk), qsa_select_ws_bytes(64, (int)std::min<int64_t>(c.max_position, 1 << 20)));
+  if (getenv("HIVE_QWEN_QSA_MR") && atoi(getenv("HIVE_QWEN_QSA_MR")) > 0)   // opt-in multi-row prefill attention: the union lists of a chunk
+    ws_bytes_ = std::max(ws_bytes_, qsa_attention_mr_ws_bytes(max_chunk));
   al(ws_, ws_bytes_);
   al(logits_dev_, (size_t)64 * c.vocab * 4); al(xfin_, 64 * H * 2);
   al(gemv_ws_, std::max({fn_gemv_ws_bytes(c.hc_rank + c.hc, (int)HC, kDecRows), fn_gemv_ws_bytes(c.n_experts + 1 + 2 * c.shared_inter, (int)H, kDecRows),
@@ -82,15 +84,32 @@ QwenEngine::QwenEngine(QwenModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(
   al(qrows_dev_, (size_t)qrows_cap_ * sizeof(QsaRow));   // device copy the kernels read (attn_layer / mtp_kv upload it)
   gdn_ptr_pin_ = pinned<float*>((size_t)n_lin_ * 2 * kDecRows);   // per linear layer: kDecRows conv then kDecRows state pointers
   ple_ptr_pin_ = pinned<float*>(kDecRows);
+  vpt_pin_ = pinned<int>(2 * kDecRows);
+  al(vpt_dev_, 2 * kDecRows * sizeof(int));
   ptr_gdn_n_ = (size_t)n_lin_ * 2 * kDecRows;
   al(ptr_dev_, (ptr_gdn_n_ + kDecRows + (size_t)(kDecRows / 2) * (n_lin_ * 16 + 8)) * sizeof(float*));
+  // answer-span token filter list (hive/token_mask.h; tools/build_cjk_mask.py) — ids outside the vocabulary are dropped (absorbed)
+  if (const char* tm = getenv("HIVE_QWEN_TOKEN_MASK"); tm && *tm && strcmp(tm, "0") != 0) {
+    if (FILE* f = fopen(tm, "rb")) { int32_t v; while (fread(&v, 4, 1, f) == 1) if (v >= 0 && v < c.vocab) mask_host_.push_back(v); fclose(f); }
+    std::sort(mask_host_.begin(), mask_host_.end());
+    mask_host_.erase(std::unique(mask_host_.begin(), mask_host_.end()), mask_host_.end());
+    if (!mask_host_.empty()) {
+      al(mask_ids_, mask_host_.size() * 4);
+      CUDA_CHECK(cudaMemcpy(mask_ids_.p, mask_host_.data(), mask_host_.size() * 4, cudaMemcpyHostToDevice));
+      mask_flags_ = mapped<float>(64);
+      std::memset(mask_flags_, 0, 64 * sizeof(float));
+      CUDA_CHECK(cudaHostGetDevicePointer((void**)&mask_flags_d_, mask_flags_, 0));
+    }
+    fprintf(stderr, "[qwen] answer-span token filter: %zu tokens listed (%s)%s\n", mask_host_.size(), tm,
+            mask_host_.empty() ? " — none usable, requests asking for it are served unfiltered" : "");
+  }
   rids_h_ = mapped<int32_t>((size_t)64 * c.n_act);
   rw_h_ = mapped<float>((size_t)64 * c.n_act);
   rope_inv_freq_.alloc(64 * 4); rope_axis_.alloc(64 * 4);
   qsa_rope_tables(c.rope_theta, c.mrope_section.data(), c.mrope_interleaved, rope_inv_freq_.as<float>(), rope_axis_.as<int32_t>(), stream_);
   if (m_.ple_layer() >= 0) {
     ple_hash_.ngram = c.ngram; ple_hash_.heads_per = c.heads_per_ngram; ple_hash_.eos = c.eos_id; ple_hash_.vocab = c.vocab;
-    ple_ = ple_open(m_.ckpt(), "model.language_model.layers." + std::to_string(m_.ple_layer()) + ".ple.", ple_hash_, ple_scale_);
+    ple_ = ple_open(m_.ckpt(), "model.language_model.layers." + std::to_string(m_.ple_layer()) + ".ple.", ple_hash_, ple_scale_, &ple_nv_);
   }
   // device routing table and the decode MoE workspace (glm::moe_decode's v0 path for these shapes: any H, I multiple of 32)
   rec_tab_.alloc((size_t)ex_.n_moe_layers() * ex_.n_experts() * sizeof(void*));
@@ -125,7 +144,35 @@ QwenEngine::QwenEngine(QwenModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(
   }
   // HIVE_QWEN_DENSE8 with the bf16 originals freed: the expansion scratch of the prefill GEMMs, and the shared gate|up rows of the fused
   //   router GEMV (rs_) expanded from the 8-bit copy
-  if (m.dense8() && m.dense8_max()) al(dq_, m.dense8_max() * 2);
+  if ((m.dense8() || m.mx8()) && m.dense8_max()) al(dq_, m.dense8_max() * 2);
+  // (MXFP8 checkpoint matrices — QMat fmt8 3, the FP4-Local checkpoint — are taken as stored: no weight conversion per GEMM, only their
+  //   ue8m0 bytes are laid out in cuBLASLt's scale tiles)
+  // 2026-10-31 review: only for checkpoint MXFP8 matrices (fmt8 3). The earlier INT8-copy re-quantization path (fmt8 2 → e4m3) was a double
+  //   loss (quality gate FAIL 166, docs/qwen.md) and, with the switch left on for an NVFP4 checkpoint, logged "prefill dense GEMMs in MXFP8"
+  //   while running bf16 — the switch now means one thing: read the checkpoint's MXFP8 as stored.
+  if (m.mx8() && getenv("HIVE_QWEN_DENSE_MX") && atoi(getenv("HIVE_QWEN_DENSE_MX")) > 0) {
+    mx_ = std::make_unique<FnMx>(stream_);
+    if (!mx_->ok()) mx_.reset();
+    else {
+      if (const char* mr = getenv("HIVE_QWEN_DENSE_MX_ROWS"); mr && atoi(mr) > 0) mx_rows_ = std::max(1, atoi(mr));   // see lin()
+      if (mx_rows_ <= kDecRows) fprintf(stderr, "[qwen] MXFP8 dense GEMMs from %d rows up (HIVE_QWEN_DENSE_MX_ROWS): batched verify rows included\n", mx_rows_);
+      mx_kcap_ = std::max(c.lin_v_width(), c.q_width());   // the widest input among the 8-bit copies a prefill GEMM uses (o_proj / out_proj)
+      al(mxa_, (size_t)max_chunk * mx_kcap_); al(mxas_, fn_mx_scale_bytes(max_chunk, mx_kcap_));
+      // the weight scratch for the largest 8-bit matrix a prefill GEMM can take this way (not dense8_max: that is lm_head, 636 MB)
+      size_t smax = 0;   // the largest MXFP8 matrix a prefill GEMM can take this way (its scales need smax / 32 bytes in tiles)
+      auto take = [&](const QMat& W) {
+        if (W.fmt8 == 3 && W.in <= mx_kcap_) smax = std::max(smax, (size_t)W.out * W.in);
+      };
+      auto layer = [&](const LayerW& L) {
+        take(L.att.in); take(L.att.out); take(L.lin.in); take(L.lin.out); take(L.moe.sh_gu); take(L.moe.sh_down);
+        take(L.hc_attn.up); take(L.hc_mlp.up); take(L.plew.key); take(L.plew.value);
+      };
+      for (int l = 0; l < c.n_layers; ++l) layer(m.layer(l));
+      if (m.mtp()) layer(m.mtp()->layer);
+      al(mxws_, smax / 32 + (1u << 17));
+      fprintf(stderr, "[qwen] prefill dense GEMMs in MXFP8 (HIVE_QWEN_DENSE_MX): activations e4m3 / ue8m0 per 32 · weights as stored in the checkpoint\n");
+    }
+  }
   auto sh_gu_bf16 = [&](const QMat& W, uint8_t* dst) {
     if (W.p()) CUDA_CHECK(cudaMemcpy(dst, W.p(), (size_t)W.out * W.in * 2, cudaMemcpyDeviceToDevice));
     else { fn_dequant8(W.q8.as<uint8_t>(), W.s8.as<float>(), W.fmt8, W.gs8, W.out, W.in, reinterpret_cast<bf16*>(dst), stream_); CUDA_CHECK(cudaStreamSynchronize(stream_)); }
@@ -136,7 +183,15 @@ QwenEngine::QwenEngine(QwenModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(
     mtp_rs_.alloc(a + b);
     CUDA_CHECK(cudaMemcpy(mtp_rs_.p, w.router.p(), a, cudaMemcpyDeviceToDevice));
     sh_gu_bf16(w.sh_gu, mtp_rs_.as<uint8_t>() + a);
-    mtp_tab_ = glm::glm_moe_fp8_table_create(m.mtp()->experts.data()->data(), (int)m.mtp()->experts.size(), c.hidden, c.moe_inter);
+    if (m.mtp()->nvfp4) {   // NVFP4 records (FP4-Local): the main layers' decode kernels over a table of the 512 record addresses
+      std::vector<const uint8_t*> t(c.n_experts);
+      for (int e = 0; e < c.n_experts; ++e) t[e] = m.mtp()->expert_arena.as<uint8_t>() + (size_t)e * m.mtp()->rec_bytes;
+      mtp_nv_tab_.alloc(t.size() * sizeof(void*));
+      CUDA_CHECK(cudaMemcpy(mtp_nv_tab_.p, t.data(), t.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    } else {
+      mtp_tab_ = glm::glm_moe_fp8_table_create(m.mtp()->experts.data()->data(), (int)m.mtp()->experts.size(), c.hidden, c.moe_inter);
+    }
+    mtp_dev_ = true;
   }
   if (fuse_) {
     rs_.resize(m.gpu_layers());
@@ -166,6 +221,10 @@ QwenEngine::QwenEngine(QwenModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(
   // default 4 drafts (hived's gate still picks k ≤ 4 per step): c1 600 W hived, 48 requests — k 3 TPOT 4.66 ms / accept 2.50, k 4 4.51 / 2.68,
   //   k 5 4.54 / 2.77 (2026-10-10). Drafts are verified by the full model: outputs do not depend on k
   mtp_k_ = m_.mtp() ? (getenv("HIVE_QWEN_MTP_K") ? std::max(0, std::min(7, atoi(getenv("HIVE_QWEN_MTP_K")))) : 4) : 0;
+  if (mtp_k_ > 0 && m_.mtp()->nvfp4 && !mtp_dev_) {   // NVFP4 MTP experts run only on the fused device path
+    fprintf(stderr, "[qwen] ⚠️MTP off: the checkpoint's NVFP4 MTP experts need the fused decode MoE (HIVE_QWEN_FUSE / HIVE_QWEN_FN_MOE)\n");
+    mtp_k_ = 0;
+  }
   if (m_.mtp()) {
     al(fh_, R * HC * 2);
     mtp_emb_pin_ = pinned<bf16>(R * H);
@@ -228,7 +287,7 @@ QwenEngine::~QwenEngine() {
   clear_graphs();
   if (mtp_tab_) glm::glm_moe_fp8_table_free(mtp_tab_);
   for (void* p : {(void*)emb_pin_, (void*)ple_rows_pin_, (void*)rope_pin_, (void*)rope_dst_pin_, (void*)qrows_pin_, (void*)gdn_ptr_pin_,
-                  (void*)ple_ptr_pin_, (void*)rids_h_, (void*)rw_h_, (void*)snap_ptr_pin_, (void*)mtp_emb_pin_, (void*)tail_pin_, (void*)hyb_x_, (void*)hyb_y_})
+                  (void*)ple_ptr_pin_, (void*)rids_h_, (void*)rw_h_, (void*)snap_ptr_pin_, (void*)mtp_emb_pin_, (void*)tail_pin_, (void*)hyb_x_, (void*)hyb_y_, (void*)mask_flags_})
     if (p) cudaFreeHost(p);
   for (auto e : hyb_ev_) cudaEventDestroy(e);
   if (hyb_st_) cudaStreamDestroy(hyb_st_);
@@ -376,6 +435,17 @@ void QwenEngine::lin(const QMat& W, const bf16* A, int lda, int rows, bf16* C, i
     fn_gemv8(W.q8.as<uint8_t>(), W.s8.as<float>(), W.fmt8, W.gs8, W.out, W.in, A, lda, rows, C, ldc, stream_);
     return;
   }
+  // HIVE_QWEN_DENSE_MX — the checkpoint's MXFP8 (fmt8 3): the weight bytes as stored, only the scales laid out in tiles (falls through to the
+  //   bf16 GEMM when a shape does not qualify). The INT8-copy re-quantization branch was removed 2026-10-31 (double loss, see the constructor).
+  // HIVE_QWEN_DENSE_MX_ROWS (2026-10-31, C8 profile): batched verify rows too — at 32 rows fn_gemv8 streams the MXFP8 matrices at 790-980 GB/s
+  //   (bench_fn_gemv32: gdn_in 44.5 µs, attn_in 43 µs, outs 20.6 µs) where the block-scaled GEMM reads them once at the card's bandwidth; the
+  //   activations of those rows are then quantized to MXFP8 as in a prefill chunk (quality gate before adopting; ≤ 8-row decode is untouched)
+  if (mx_ && rows >= mx_rows_ && W.fmt8 == 3 && W.out % 16 == 0 && W.in % 32 == 0 && W.in <= mx_kcap_ && lda % 8 == 0 && ldc % 8 == 0 &&
+      ((uintptr_t)A & 15) == 0 && ((uintptr_t)C & 15) == 0 && fn_mx_scale_bytes(W.out, W.in) <= mxws_.n) {
+    fn_mx_tile_scales(W.s8.as<uint8_t>(), W.out, W.in, mxws_.as<uint8_t>(), stream_);
+    fn_mx_quant_bf16(A, lda, rows, W.in, mxa_.as<uint8_t>(), mxas_.as<uint8_t>(), stream_);
+    if (mx_->gemm(mxa_.as<uint8_t>(), mxas_.as<uint8_t>(), W.q8.as<uint8_t>(), mxws_.as<uint8_t>(), rows, W.out, W.in, C, ldc)) return;
+  }
   const bf16* Wp = W.p();
   if (!Wp) {   // 8-bit only (the bf16 original was freed): expand it for this GEMM
     HIVE_CHECK(W.fmt8 && (size_t)W.out * W.in * 2 <= dq_.n, "qwen: an 8-bit-only matrix without the expansion scratch");
@@ -405,7 +475,7 @@ void QwenEngine::lin(const QMat& W, const bf16* A, int lda, int rows, bf16* C, i
 
 void QwenEngine::hc_mix(const HcW& w, const bf16* h, int rows, bf16* x, bool normed) {
   const int H = c_.hidden, HC = c_.hcw(), rk = c_.hc_rank, nd = w.down_inj.out;
-  if (!normed) gemma_rmsnorm(h, HC, w.norm.as<bf16>(), rows, HC, H, c_.rms_eps, hn_.as<bf16>(), HC, stream_);   // (normed: hc_combine_norm did it)
+  if (!normed) gemma_rmsnorm(h, HC, w.norm, rows, HC, H, c_.rms_eps, hn_.as<bf16>(), HC, stream_);   // (normed: hc_combine_norm did it)
   if (fuse_ && rows <= kDecRows && w.down_inj.fmt8 && (size_t)fn_gemv8_split_parts(nd, HC, w.down_inj.gs8) * rows * nd * 4 <= gemv_ws_.n) {
     FnEpi e; e.mode = 2; e.y = dl_.as<bf16>(); e.ldy = nd; e.s = hs_.as<bf16>(); e.rank = rk; e.inv_hc = 1.f / c_.hc;
     fn_gemv8_epi(w.down_inj.q8.as<uint8_t>(), w.down_inj.s8.as<float>(), w.down_inj.fmt8, w.down_inj.gs8, nd, HC, hn_.as<bf16>(), HC, rows, e,
@@ -429,7 +499,7 @@ void QwenEngine::combine_mlp(int l, bf16* h, int rows, bool may_fuse) {
   const HcW& w = m_.layer(l).hc_mlp;
   if (hc_fuse() && may_fuse && l + 1 < m_.gpu_layers() && !m_.layer(l + 1).ple) {
     hc_combine_norm(h, y_.as<bf16>(), c_.hidden, dl_.as<bf16>(), w.down_inj.out, c_.hc_rank, rows, c_.hc, c_.hidden,
-                    m_.layer(l + 1).hc_attn.norm.as<bf16>(), c_.rms_eps, hn_.as<bf16>(), stream_);
+                    m_.layer(l + 1).hc_attn.norm, c_.rms_eps, hn_.as<bf16>(), stream_);
     pre_normed_ = true;
   } else {
     hc_combine_(w, h, y_.as<bf16>(), rows, dl_.as<bf16>());
@@ -517,13 +587,18 @@ void QwenEngine::ple_block(const std::vector<RowInfo>& rows, const int32_t* ids,
   bf16* val = y_.as<bf16>();
   bf16* gv = hn_.as<bf16>();
   bf16* gvn = proj_.as<bf16>();
-  ple_dequant(ple_rows_pin_, R, ple_scale_, e, stream_);   // pinned rows read directly (UVA)
+  if (ple_nv_) ple_dequant_nvfp4(ple_rows_pin_, R, ple_scale_, e, stream_);   // pinned rows read directly (UVA)
+  else ple_dequant(ple_rows_pin_, R, ple_scale_, e, stream_);
   lin(w.key, e, c.ple_dim, R, key, HC);
   lin(w.value, e, c.ple_dim, R, val, H);
-  ple_gate(key, h, w.norm_key.as<bf16>(), w.norm_query.as<bf16>(), val, R, c.hc, H, c.rms_eps, gv, stream_);
-  gemma_rmsnorm(gv, HC, w.norm_conv.as<bf16>(), R, HC, H, c.rms_eps, gvn, HC, stream_);
+  if (w.norm_key.f32) ple_gate(key, h, w.norm_key.buf.as<float>(), w.norm_query.buf.as<float>(), val, R, c.hc, H, c.rms_eps, gv, stream_);
+  else ple_gate(key, h, w.norm_key.buf.as<bf16>(), w.norm_query.buf.as<bf16>(), val, R, c.hc, H, c.rms_eps, gv, stream_);
+  gemma_rmsnorm(gv, HC, w.norm_conv, R, HC, H, c.rms_eps, gvn, HC, stream_);
   if (prefill) {
     ple_conv_seq(gv, gvn, w.conv_w.as<float>(), R, HC, rows[0].s->ple_state.as<float>(), h, stream_);
+  } else if (verify_ && vdyn_) {
+    ple_conv_rows_dyn(gv, gvn, w.conv_w.as<float>(), (int)vparts_.size(), vpt_dev_.as<int>(), HC, dev_ptr(ple_ptr_pin_),
+                      dev_ptr(snap_ptr_pin_ + (size_t)snap_parts_ * n_lin_ * 16), 8, h, stream_);
   } else if (verify_) {
     const int kmax = std::max(1, mtp_k_);
     for (size_t pi = 0; pi < vparts_.size(); ++pi) {
@@ -553,6 +628,12 @@ void QwenEngine::lin_layer(int l, const std::vector<RowInfo>& rows, bool prefill
       CUDA_CHECK(cudaMemcpyAsync(proj_save_.as<bf16>() + (size_t)li * kDecRows * kGdnProjWidth, proj, (size_t)R * kGdnProjWidth * 2,
                                  cudaMemcpyDeviceToDevice, stream_));
     float** dptr = dev_ptr(gdn_ptr_pin_ + (size_t)li * 2 * kDecRows);   // row r → its part's sequence
+    if (vdyn_) {
+      gdn_decode_rows_multi_dyn(p, kGdnProjWidth, (int)vparts_.size(), vpt_dev_.as<int>(), proj, dptr, dptr + kDecRows, dev_ptr(snap_ptr_pin_ + (size_t)li * 16),
+                                n_lin_ * 16, snap_replay_ ? 1 : (1 << 30), o, stream_);
+      lin(w.out, o, kGdnVWidth, R, out, H);
+      return;
+    }
     GdnRowsPart gparts[kDecRows];
     for (size_t pi = 0; pi < vparts_.size(); ++pi) {
       const VPart& vp = vparts_[pi];
@@ -592,12 +673,13 @@ void QwenEngine::attn_layer(int l, const std::vector<RowInfo>& rows, const bf16*
   CUDA_CHECK(cudaMemcpyAsync(qd, qr, (size_t)R * sizeof(QsaRow), cudaMemcpyHostToDevice, stream_));
   qr = qd;
   qsa_prep(qw, rope, qr, R, proj, kQsaProjWidth, q_.as<bf16>(), iq_.as<bf16>(), stream_);
-  qsa_select(qr, R, max_pos, iq_.as<bf16>(), idx_.as<int32_t>(), ws_.p, ws_bytes_, stream_, gphase_ ? graph_ctx_ : 0,
-             [&] { for (const RowInfo& r : rows) if (r.s != rows[0].s) return false; return true; }());
+  const bool one_seq = [&] { for (const RowInfo& r : rows) if (r.s != rows[0].s) return false; return true; }();
+  qsa_select(qr, R, max_pos, iq_.as<bf16>(), idx_.as<int32_t>(), ws_.p, ws_bytes_, stream_, gphase_ ? graph_ctx_ : 0, one_seq);
   if (qsa_split_ > 1 && R <= kDecRows)   // decode / verify rows: split-KV tensor-core attention (HIVE_QWEN_QSA_SPLIT)
     qsa_attention_split(qr, R, q_.as<bf16>(), proj, kQsaProjWidth, idx_.as<int32_t>(), attn_out_.as<bf16>(), qsa_split_,
                         qsa_split_ws_.p, stream_);   // the same split for every row count: a row's output does not depend on the batch
-  else
+  else if (!(one_seq && qsa_attention_mr(qr, R, max_pos, q_.as<bf16>(), proj, kQsaProjWidth, idx_.as<int32_t>(), attn_out_.as<bf16>(), ws_.p,
+                                          ws_bytes_, stream_)))   // prefill chunk: several rows per block (falls back when it cannot run)
     qsa_attention(qr, R, q_.as<bf16>(), proj, kQsaProjWidth, idx_.as<int32_t>(), attn_out_.as<bf16>(), stream_);
   lin(w.out, attn_out_.as<bf16>(), c_.q_width(), R, out, H);
 }
@@ -652,6 +734,7 @@ void QwenEngine::upload_ptr_tables() {
   CUDA_CHECK(cudaMemcpyAsync(d + ptr_gdn_n_ * sizeof(float*), ple_ptr_pin_, kDecRows * sizeof(float*), cudaMemcpyHostToDevice, stream_));
   if (snap_ptr_pin_ && ptr_snap_n_)
     CUDA_CHECK(cudaMemcpyAsync(d + (ptr_gdn_n_ + kDecRows) * sizeof(float*), snap_ptr_pin_, ptr_snap_n_ * sizeof(float*), cudaMemcpyHostToDevice, stream_));
+  if (vdyn_) CUDA_CHECK(cudaMemcpyAsync(vpt_dev_.p, vpt_pin_, 2 * vparts_.size() * sizeof(int), cudaMemcpyHostToDevice, stream_));
 }
 float** QwenEngine::dev_ptr(float** pin) const {
   float** d = ptr_dev_.as<float*>();
@@ -762,11 +845,11 @@ void QwenEngine::moe_layer(int l, int rows, bool prefill, const bf16* x, bf16* o
   if (prefill && pf_dev_) {   // FN grouped prefill: routing stays on the device, out = Σ_k part·w (fn_moe_pf.cu)
     router_softmax_topk(lg, ld, rows, E, K, c_.norm_topk, rids_.as<int32_t>(), rw_.as<float>(), nullptr, nullptr, stream_);
     moe_shared(w, x, rows, shared_out_.as<bf16>());
+    const FnPfCombine cmb{shared_out_.as<bf16>(), lg, ld, E, out};   // the reduce writes the combined output (bit-identical to moe_combine)
     fn_moe_prefill(ex_.layout(), reinterpret_cast<const uint8_t* const*>(rec_tab_.p), li, E, rids_.as<int32_t>(), rw_.as<float>(), rows, K, x, H,
-                   c_.moe_inter, acc, pf_ws_.p, pf_rows_, stream_);
+                   c_.moe_inter, acc, pf_ws_.p, pf_rows_, stream_, &cmb);
     GlmCacheStats& cs = ex_.stats();
     cs.routed += (uint64_t)rows * K; cs.hit += (uint64_t)rows * K;
-    moe_combine(acc, shared_out_.as<bf16>(), lg, ld, E, rows, H, out, stream_);
     return;
   }
   CUDA_CHECK(cudaMemsetAsync(acc, 0, (size_t)rows * H * 4, stream_));
@@ -814,7 +897,17 @@ void QwenEngine::head(const bf16* h, int rows, float* logits_host) {
     fn_gemv_tc(W.p(), c_.vocab, c_.hidden, xfin_.as<bf16>(), c_.hidden, rows, nullptr, c_.vocab, logits_dev_.as<float>(), stream_);
   else
     blas_.gemm_bf16_f32out(xfin_.as<bf16>(), W.p(), logits_dev_.as<float>(), rows, c_.vocab, c_.hidden);
+  if (mask_armed_ && mask_flags_d_)
+    mask_logits(logits_dev_.as<float>(), rows, c_.vocab, mask_flags_d_, mask_ids_.as<int32_t>(), (int)mask_host_.size(), stream_);
   if (logits_host) CUDA_CHECK(cudaMemcpyAsync(logits_host, logits_dev_.p, (size_t)rows * c_.vocab * 4, cudaMemcpyDeviceToHost, stream_));
+}
+
+void QwenEngine::arm_mask(const float* pen, int rows) {
+  if (!mask_flags_) return;
+  HIVE_CHECK(rows >= 0 && rows <= 64, "qwen: token mask rows");
+  std::memset(mask_flags_, 0, 64 * sizeof(float));
+  if (pen && rows > 0) std::memcpy(mask_flags_, pen, (size_t)rows * sizeof(float));
+  mask_armed_ = true;
 }
 
 // ---- forward ----------------------------------------------------------------------------------------------------------------------------
@@ -828,7 +921,7 @@ void QwenEngine::layer_front(int l, const std::vector<RowInfo>& rows, const int3
   else lin_layer(l, rows, prefill, x_.as<bf16>(), y_.as<bf16>());
   // the attention side's combine and the MLP side's input norm in one launch (bit-identical; HIVE_QWEN_HC_FUSE=0: two launches)
   if (hc_fuse()) {
-    hc_combine_norm(h, y_.as<bf16>(), c_.hidden, dl_.as<bf16>(), L.hc_attn.down_inj.out, c_.hc_rank, R, c_.hc, c_.hidden, L.hc_mlp.norm.as<bf16>(),
+    hc_combine_norm(h, y_.as<bf16>(), c_.hidden, dl_.as<bf16>(), L.hc_attn.down_inj.out, c_.hc_rank, R, c_.hc, c_.hidden, L.hc_mlp.norm,
                     c_.rms_eps, hn_.as<bf16>(), stream_);
     hc_mix(L.hc_mlp, h, R, x_.as<bf16>(), true);
   } else {
@@ -864,6 +957,11 @@ void QwenEngine::forward(const std::vector<RowInfo>& rows, const int32_t* ids, b
   map_now_ = dr_now_ && nonres_now_ > 0;   // (hybrid too: route_note / route_bookkeeping feed the cache's scores and promotions)
   pf_dev_ = prefill && fn_pf_ && device_route_ready() && refresh_rec_table();
   if (!prefill) { if (dr_now_) ++st_.device_route_steps; else ++st_.host_route_steps; if (hyb_now_) ++st_.hybrid_route_steps; }
+  // HIVE_QWEN_GRAPH_TRACE (measurement only): every 500 decode / verify forwards, how many replayed a captured graph
+  static const bool gtrace = getenv("HIVE_QWEN_GRAPH_TRACE") && atoi(getenv("HIVE_QWEN_GRAPH_TRACE")) > 0;
+  if (gtrace && !prefill && ++gstat_n_ % 500 == 0)
+    fprintf(stderr, "[qwen-graph] %ld forwards: replayed %ld · captured %ld · first-seen eager %ld · %zu graphs\n", gstat_n_, gstat_replay_,
+            gstat_capture_, gstat_first_, graphs_.size());
   if (!prefill && graph_forward(rows, ids, logits_host, all_logits)) {
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     route_bookkeeping();
@@ -883,7 +981,9 @@ void QwenEngine::forward(const std::vector<RowInfo>& rows, const int32_t* ids, b
     if (l > 0 && layer_inject) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_inject(l, h, R); }
     layer_front(l, rows, ids, prefill, h);
     moe_layer(l, R, prefill, x_.as<bf16>(), y_.as<bf16>());
-    combine_mlp(l, h, R, !layer_hook && !layer_inject && !(prefill && layer_boundary && layer_boundary_yields));
+    // (prefill with a yielding boundary hook: fused unless the boundary may yield now — measured 2026-10-30, 16K-token prefill: the unfused
+    //   combine + separate norm cost 30 ms of 1.12 s of kernels, 118 ms at 64K)
+    combine_mlp(l, h, R, !layer_hook && !layer_inject && !(prefill && layer_boundary && layer_boundary_yields && (!yield_due || yield_due())));
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, h, R); }
     if (prefill && layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);
   }
@@ -986,7 +1086,8 @@ bool QwenEngine::graph_forward(const std::vector<RowInfo>& rows, const int32_t* 
   const int ctx = scoring ? (max_pos + 1 + 4095) / 4096 * 4096 : 0;
   std::string key = std::to_string(R) + (verify_ ? "v" : "d") + std::to_string(scoring) + ":" + std::to_string(ctx) + ":" + std::to_string(all_logits) + ":" +
                     std::to_string((uintptr_t)logits_host) + ":" + std::to_string((uintptr_t)hb());
-  if (verify_) for (const VPart& vp : vparts_) key += "," + std::to_string(vp.M) + "@" + std::to_string(vp.r0);
+  if (verify_ && vdyn_) key += ",P" + std::to_string(vparts_.size());   // the split is read from vpt_dev_
+  else if (verify_) for (const VPart& vp : vparts_) key += "," + std::to_string(vp.M) + "@" + std::to_string(vp.r0);
   if (map_now_) key += ":map";   // with the routing D2H nodes
   if (hyb_now_) key += ":hyb";   // with the CPU host nodes
   graph_ctx_ = ctx;
@@ -1004,7 +1105,8 @@ bool QwenEngine::graph_forward(const std::vector<RowInfo>& rows, const int32_t* 
   auto it = graphs_.find(key);
   if (it == graphs_.end()) {
     // first use of a shape: eager (lazy initialisation, attribute calls), second: capture
-    if (graph_seen_[key]++ < 1) return false;
+    if (graph_seen_[key]++ < 1) { ++gstat_first_; return false; }
+    ++gstat_capture_;
     gphase_ = 2;
     cudaGraph_t g = nullptr;
     CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
@@ -1028,6 +1130,7 @@ bool QwenEngine::graph_forward(const std::vector<RowInfo>& rows, const int32_t* 
   }
   graph_used(key);
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
+  ++gstat_replay_;
   return true;
 }
 

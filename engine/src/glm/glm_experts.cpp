@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstring>
 
+#include "hive/ckpt_quant.h"
 #include "hive/cublas_ops.h"
 #include "hive/devmem.h"
 #include "hive/grow_buf.h"
@@ -215,9 +216,12 @@ void GlmExperts::build_halves(int threads) {
 void GlmExperts::load_all(int threads) {
   Checkpoint& ck = *spec_.ckpt;
   const double t0 = now_ms();
-  struct Src { const uint8_t* p[9]; size_t n[9]; };
+  // csf: the projection's block scales are stored compressed (NVIDIA FP4-Local, hive/ckpt_quant.h) — decoded straight into the record;
+  //   the decoded matrix is the same [rows, K/16] E4M3 bytes a plain `weight_scale` tensor holds, so the record format is unchanged
+  struct Src { const uint8_t* p[9]; size_t n[9]; const TensorInfo* cf[3]; const TensorInfo* ce[3]; int rows[3]; };
   std::vector<Src> src(n_keys());
   const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+  int n_csf = 0;
   for (int li = 0; li < n_moe_; ++li) {
     const int l = spec_.moe_layers[li];
     for (int e = 0; e < E_; ++e) {
@@ -225,29 +229,56 @@ void GlmExperts::load_all(int threads) {
       for (int j = 0; j < 3; ++j) {
         const std::string b = spec_.prefix + std::to_string(l) + ".mlp.experts." + std::to_string(e) + "." + proj[j] + ".";
         const TensorInfo& tw = ck.get(b + "weight");
-        const TensorInfo& ts = ck.get(b + "weight_scale");
         const TensorInfo& tg = ck.get(b + "weight_scale_2");
-        HIVE_CHECK(tw.dtype == "U8" && ts.dtype == "F8_E4M3" && tg.dtype == "F32", "GLM: expert must be NVFP4: " + b);
-        s.p[j * 3] = tw.data; s.n[j * 3] = tw.nbytes; s.p[j * 3 + 1] = ts.data; s.n[j * 3 + 1] = ts.nbytes; s.p[j * 3 + 2] = tg.data; s.n[j * 3 + 2] = 4;
+        s.cf[j] = s.ce[j] = nullptr; s.rows[j] = tw.shape.empty() ? 0 : (int)tw.shape[0];
+        if (ckq::has_csf(ck, b)) {
+          s.cf[j] = &ck.get(b + "weight_scale.nvfp4_csf_fixed"); s.ce[j] = &ck.get(b + "weight_scale.nvfp4_csf_exceptions");
+          HIVE_CHECK(tw.dtype == "U8" && tg.dtype == "F32" && s.cf[j]->dtype == "U8" && s.ce[j]->dtype == "U32", "experts: CSF expert must be NVFP4: " + b);
+          s.p[j * 3 + 1] = nullptr; s.n[j * 3 + 1] = (size_t)tw.nbytes / 8;   // [rows, K/16] from the packed [rows, K/2] bytes
+          ++n_csf;
+        } else {
+          const TensorInfo& ts = ck.get(b + "weight_scale");
+          HIVE_CHECK(tw.dtype == "U8" && ts.dtype == "F8_E4M3" && tg.dtype == "F32", "GLM: expert must be NVFP4: " + b);
+          s.p[j * 3 + 1] = ts.data; s.n[j * 3 + 1] = ts.nbytes;
+        }
+        s.p[j * 3] = tw.data; s.n[j * 3] = tw.nbytes; s.p[j * 3 + 2] = tg.data; s.n[j * 3 + 2] = 4;
       }
       HIVE_CHECK(s.n[0] == L_.s1 - L_.w1 && s.n[1] == L_.w3 - L_.s1 && s.n[6] == L_.s2 - L_.w2, "GLM: expert tensor sizes vs record layout");
     }
   }
   std::atomic<int> next{0};
   std::vector<std::thread> th;
+  std::vector<std::string> errs(std::max(1, threads));
   for (int t = 0; t < std::max(1, threads); ++t)
-    th.emplace_back([&] {
-      for (int k; (k = next.fetch_add(1)) < n_keys();) {
-        uint8_t* r = host_ + (size_t)k * L_.total;
-        const Src& s = src[k];
-        std::memcpy(r + L_.w1, s.p[0], s.n[0]); std::memcpy(r + L_.s1, s.p[1], s.n[1]);
-        std::memcpy(r + L_.w3, s.p[3], s.n[3]); std::memcpy(r + L_.s3, s.p[4], s.n[4]);
-        std::memcpy(r + L_.w2, s.p[6], s.n[6]); std::memcpy(r + L_.s2, s.p[7], s.n[7]);
-        float g[3]; std::memcpy(&g[0], s.p[2], 4); std::memcpy(&g[1], s.p[5], 4); std::memcpy(&g[2], s.p[8], 4);
-        std::memcpy(r + L_.g, g, 12);
-      }
+    th.emplace_back([&, t] {
+      try {
+        for (int k; (k = next.fetch_add(1)) < n_keys();) {
+          uint8_t* r = host_ + (size_t)k * L_.total;
+          const Src& s = src[k];
+          const size_t so[3] = {L_.s1, L_.s3, L_.s2};
+          for (int j = 0; j < 3; ++j) {
+            if (!s.cf[j]) { std::memcpy(r + so[j], s.p[j * 3 + 1], s.n[j * 3 + 1]); continue; }
+            const TensorInfo& f = *s.cf[j];
+            const TensorInfo& e = *s.ce[j];
+            std::vector<uint32_t> ex((size_t)e.numel());
+            std::memcpy(ex.data(), e.data, e.nbytes);   // unaligned in the mmap
+            const int R = s.rows[j], C = R > 0 ? (int)(s.n[j * 3 + 1] / R) : 0;
+            std::string err;
+            if (!ckq::csf_decode(f.data, f.shape.size() == 2 ? f.shape[0] : -1, f.shape.size() == 2 ? f.shape[1] : -1, ex.data(), ex.size(), R, C,
+                                 r + so[j], &err))
+              throw std::runtime_error(err + " (" + f.name + ")");
+          }
+          std::memcpy(r + L_.w1, s.p[0], s.n[0]);
+          std::memcpy(r + L_.w3, s.p[3], s.n[3]);
+          std::memcpy(r + L_.w2, s.p[6], s.n[6]);
+          float g[3]; std::memcpy(&g[0], s.p[2], 4); std::memcpy(&g[1], s.p[5], 4); std::memcpy(&g[2], s.p[8], 4);
+          std::memcpy(r + L_.g, g, 12);
+        }
+      } catch (const std::exception& e) { errs[t] = e.what(); next = n_keys(); }
     });
   for (auto& t : th) t.join();
+  for (const auto& e : errs) HIVE_CHECK(e.empty(), "experts: damaged compressed block scales — " + e);
+  if (n_csf) fprintf(stderr, "[experts] %d projections with compressed (CSF) block scales decoded\n", n_csf);   // shared store: GLM / Qwen families
   const double t1 = now_ms();
   CUDA_CHECK(cudaHostRegister(host_, host_bytes_, cudaHostRegisterDefault));
   if (split_) build_halves(threads);

@@ -9,12 +9,23 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "hive/devbuf.h"
+
 namespace hive::qwen {
+
+// A (1 + w) norm weight: bf16, or fp32 when the checkpoint stores it so (NVIDIA FP4-Local keeps the hyper-connection and PLE norms in fp32 —
+//   rounding them to bf16 moved the QAD-trained values by up to 2^-9 relative); the kernels compute 1 + w in fp32 either way.
+struct NormW {
+  DevBuf buf;
+  bool f32 = false;
+};
 
 // out[m, i] = bf16( x · rsqrt(mean_{group of i}(x²) + eps) · (1 + w[i]) )  — fp32 math, one rounding.
 //   x bf16 [M, K] (row stride ldx), w bf16 [K], group | K (group = K for a whole-row norm), out bf16 [M, K] (row stride ldo).
 void gemma_rmsnorm(const __nv_bfloat16* x, int ldx, const __nv_bfloat16* w, int M, int K, int group, float eps, __nv_bfloat16* out, int ldo,
                    cudaStream_t st);
+void gemma_rmsnorm(const __nv_bfloat16* x, int ldx, const float* w, int M, int K, int group, float eps, __nv_bfloat16* out, int ldo, cudaStream_t st);
+void gemma_rmsnorm(const __nv_bfloat16* x, int ldx, const NormW& w, int M, int K, int group, float eps, __nv_bfloat16* out, int ldo, cudaStream_t st);
 
 // ---- Hyper-connections (gated residual) --------------------------------------------------------------------------------------------------
 // The engine runs a mix as: hn = gemma_rmsnorm(h, group = hidden) → dl = GEMM(hn, down_inj) [M, rank (+ hc)] → hc_mix_act(dl) → s [M, rank]
@@ -28,8 +39,13 @@ void hc_combine(__nv_bfloat16* h, const __nv_bfloat16* y, int ldy, const __nv_bf
 // hc_combine, then gemma_rmsnorm(h, group = dim) with weight w into hn [M, hc·dim] — one launch, bit-identical to the two
 void hc_combine_norm(__nv_bfloat16* h, const __nv_bfloat16* y, int ldy, const __nv_bfloat16* dl, int ld, int rank, int M, int hc, int dim,
                      const __nv_bfloat16* w, float eps, __nv_bfloat16* hn, cudaStream_t st);
+void hc_combine_norm(__nv_bfloat16* h, const __nv_bfloat16* y, int ldy, const __nv_bfloat16* dl, int ld, int rank, int M, int hc, int dim,
+                     const NormW& w, float eps, __nv_bfloat16* hn, cudaStream_t st);
 // h[m, c, :] = x[m, :] for every copy c (embedding → hidden stream). x may be pinned host memory (UVA).
 void hc_expand(const __nv_bfloat16* x, int M, int hc, int dim, __nv_bfloat16* h, cudaStream_t st);
+// answer-span token penalty (hive/token_mask.h): logits[r, ids[j]] −= pen[r] for every row r with pen[r] != 0 (∞ → −inf; pen: device-readable,
+//   e.g. mapped pinned memory written by the host before the launch — so a captured graph reads the current values)
+void mask_logits(float* logits, int rows, int V, const float* pen, const int32_t* ids, int n, cudaStream_t st);
 
 // ---- MoE ---------------------------------------------------------------------------------------------------------------------------------
 // Router: logits fp32 [M, ld] (columns 0..E-1 = router; the GEMM's fp32 output, rounded to bf16 here like the reference's bf16 linear),

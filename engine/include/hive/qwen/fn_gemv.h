@@ -29,7 +29,8 @@ struct FnEpi {
 };
 void fn_gemv_epi(const __nv_bfloat16* W, int N, int K, const __nv_bfloat16* x, int ldx, int M, const FnEpi& e, float* ws, cudaStream_t st);
 
-// 8-bit dense weights: fmt 1 = FP8 e4m3, 2 = INT8; W[n, k] = q[n, k] · s[n, k / gs] (s fp32 [N, ceil(K/gs)]); y = bf16(x · Wᵀ)
+// 8-bit dense weights: fmt 1 = FP8 e4m3, 2 = INT8; W[n, k] = q[n, k] · s[n, k / gs] (s fp32 [N, ceil(K/gs)]); y = bf16(x · Wᵀ).
+//   fmt 3 = MXFP8 (gs 32): q e4m3, S points to ue8m0 BYTES [N, K/32] (W = q · 2^(s − 127)) — the FP4-Local checkpoint's own dense format
 bool fn_gemv8_ok(int N, int K, int gs, int M);
 void fn_quant8(const __nv_bfloat16* w, int N, int K, int fmt, int gs, uint8_t* q, float* s, cudaStream_t st);
 // yf (optional): fp32 output instead of y (the verify head's logits, HIVE_QWEN_DENSE8_HEAD)

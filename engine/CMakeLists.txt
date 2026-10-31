@@ -31,6 +31,7 @@ add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;-Xc
 
 add_library(hive_core STATIC
   src/safetensors.cpp
+  src/ckpt_quant.cpp
   src/cpu/expert_cpu.cpp
   src/kernels/quant.cu
   src/kernels/gemm.cu
@@ -115,6 +116,9 @@ foreach(t test_qwen_gdn test_qwen_qsa)
   add_executable(${t} tests/${t}.cu)
   target_link_libraries(${t} hive_qwen)
 endforeach()
+# checkpoint formats (CSF block scales, MXFP8 / NVFP4 dense — hive/ckpt_quant.h); CPU only, also run by tools/test_cpu.sh
+add_executable(test_ckpt_quant_cpu tests/test_ckpt_quant_cpu.cpp src/ckpt_quant.cpp src/safetensors.cpp)
+target_include_directories(test_ckpt_quant_cpu PRIVATE include third_party)
 add_executable(test_qwen_ple_cpu tests/test_qwen_ple_cpu.cpp)
 target_include_directories(test_qwen_ple_cpu PRIVATE include third_party)
 target_link_libraries(test_qwen_ple_cpu CUDA::cudart)
@@ -126,7 +130,7 @@ target_link_libraries(qwen_check hive_qwen)
 # CPU-only builds (no CUDA): the shared CPU backend and the CPU-only daemons. engine/cpu_shim provides CUDA stand-in headers (device
 #   memory = host memory) so hived.cpp and the family code compile unchanged; the real libnuma is used.
 file(GLOB HIVE_CPU_SRC CONFIGURE_DEPENDS src/cpu/cpu_*.cpp)
-add_library(hive_cpu STATIC ${HIVE_CPU_SRC} src/cpu/expert_cpu.cpp src/cpu/expert_cpu_nvfp4.cpp src/safetensors.cpp src/engram_hash.cpp)
+add_library(hive_cpu STATIC ${HIVE_CPU_SRC} src/cpu/expert_cpu.cpp src/cpu/expert_cpu_nvfp4.cpp src/safetensors.cpp src/ckpt_quant.cpp src/engram_hash.cpp)
 target_include_directories(hive_cpu BEFORE PUBLIC cpu_shim)
 target_include_directories(hive_cpu PUBLIC include third_party)
 target_link_libraries(hive_cpu PUBLIC ${NUMA_LIB} Threads::Threads)
@@ -239,6 +243,8 @@ target_include_directories(test_grouped_plan_cpu PRIVATE include)
 
 add_executable(bench_gemv tests/bench_gemv.cu)
 target_link_libraries(bench_gemv hive_core)
+add_executable(bench_fn_gemv32 tests/bench_fn_gemv32.cu)  # FN dense projections at the batched-verify row counts (2026-10-31 C8 profile)
+target_link_libraries(bench_fn_gemv32 hive_qwen)
 
 add_executable(test_dma tests/test_dma.cu)
 target_link_libraries(test_dma hive_core)

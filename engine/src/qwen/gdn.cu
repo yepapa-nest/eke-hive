@@ -43,7 +43,7 @@ constexpr int kChunk = 1024;               // tokens per internal prefill chunk 
 constexpr int kSB = 16;                    // tokens per shared-memory stage in the recurrence
 constexpr int kGS = 36;                    // padded stride of one ksub group (32 rows + 4) — keeps the 4 groups on distinct banks
 constexpr int kRowS = 4 * kGS;             // 144 floats per token for q / k
-constexpr int kRecurWarps = 8;             // warps per recurrence block (8 columns each) — 2 column tiles per value head
+constexpr int kRecurWarps = 4;             // warps per recurrence block (8 columns each) — 4 column tiles per value head
 // (kept from the KDA measurements on the RTX PRO 6000 — 8 warps were fastest for 64 heads; not re-measured for 48 heads)
 constexpr float kQScale = 0.08838834764831845f;   // 1/sqrt(128)
 constexpr float kL2Eps = 1e-6f;
@@ -492,9 +492,7 @@ __global__ void __launch_bounds__(512) gdn_decode_rows2_multi_kernel(const __gri
 }
 struct TailPart { const bf16* proj; int R; float* const* cs; float* const* snap; float* const* snap0; };
 struct TailMulti { TailPart a[kMultiParts]; };
-__global__ void gdn_conv_tail_multi_kernel(const __grid_constant__ TailMulti m, int ld) {
-  pdl_wait();
-  const TailPart& t = m.a[blockIdx.y];
+__device__ __forceinline__ void tail_body(const TailPart& t, int ld) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
   float* cs = t.cs[0];
@@ -511,6 +509,27 @@ __global__ void gdn_conv_tail_multi_kernel(const __grid_constant__ TailMulti m, 
     }
   const float n0 = in(R - 3), n1 = in(R - 2), n2 = in(R - 1);
   cs[c] = n0; cs[(size_t)C + c] = n1; cs[(size_t)2 * C + c] = n2;
+}
+__global__ void gdn_conv_tail_multi_kernel(const __grid_constant__ TailMulti m, int ld) {
+  pdl_wait();
+  tail_body(m.a[blockIdx.y], ld);
+}
+// The same launch pair with the parts' (first row, rows) read from device memory (vpt: int pairs): one captured verify graph then serves any
+//   split of its rows over the P sequences (the per-part arguments of the kernels above are baked into a graph)
+struct RowsDyn { DecodeArgs base; float* const* snap; int snap_stride, replay_from; };
+__global__ void __launch_bounds__(512) gdn_decode_rows2_dyn_kernel(const __grid_constant__ RowsDyn m, const int* __restrict__ vpt) {
+  pdl_wait();
+  const int p = blockIdx.x, r0 = vpt[2 * p], R = vpt[2 * p + 1];
+  DecodeArgs a = m.base;
+  a.proj += (size_t)r0 * a.ld; a.conv_states += r0; a.states += r0; a.out += (size_t)r0 * kGdnVWidth;
+  float* const* sp = m.snap + (size_t)p * m.snap_stride;
+  rows2_body(DecodeRowsArgs{a, sp + 8, R, p >= m.replay_from ? 1 : 0});
+}
+__global__ void gdn_conv_tail_dyn_kernel(const __grid_constant__ RowsDyn m, int ld, const int* __restrict__ vpt) {
+  pdl_wait();
+  const int p = blockIdx.y, r0 = vpt[2 * p];
+  float* const* sp = m.snap + (size_t)p * m.snap_stride;
+  tail_body(TailPart{m.base.proj + (size_t)r0 * ld, vpt[2 * p + 1], m.base.conv_states + r0, sp, p >= m.replay_from ? sp + 7 : nullptr}, ld);
 }
 
 struct WsLayout { size_t qp, kp, vw, rec, ow, total; };
@@ -537,10 +556,16 @@ void gdn_forward_seq(const GdnParams& p, const bf16* proj, int ld, int T, float*
   HIVE_CHECK(ws_bytes >= gdn_workspace_bytes(T), "gdn_forward_seq: workspace too small");
   HIVE_CHECK(((uintptr_t)workspace & 255) == 0, "gdn_forward_seq: workspace must be 256-byte aligned");
   HIVE_CHECK(ld >= kGdnProjWidth && ld % 8 == 0, "gdn_forward_seq: projection row stride");
-  constexpr size_t kSmem = RecurSmem<kRecurWarps>::kBytes;
+  // warps per recurrence block (HIVE_QWEN_GDN_WARPS, 2 / 4 / 8; default kRecurWarps): a column's arithmetic does not depend on it (bit-identical
+  //   outputs). Measured 2026-10-30, 16K-token prefill (36 layers): 8 warps (96 blocks, half the SMs idle) 166 ms · 4 warps (192 blocks) 154 ms ·
+  //   2 warps 272 ms. A chunked form (the in-chunk part as a triangular solve, the chunk recurrence on CUDA cores or 3xTF32 tensor cores) was
+  //   slower end to end on this card: 8,192 tokens 3.5–4.2 ms against 2.84 ms here (its extra prep kernels alone cost 1.3 ms).
+  static const int warps = [] { const char* e = getenv("HIVE_QWEN_GDN_WARPS"); const int w = e ? atoi(e) : kRecurWarps; return w == 2 || w == 8 ? w : 4; }();
   static bool attr_set = false;
   if (!attr_set) {
-    CUDA_CHECK(cudaFuncSetAttribute(gdn_recur_kernel<kRecurWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
+    CUDA_CHECK(cudaFuncSetAttribute(gdn_recur_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RecurSmem<8>::kBytes));
+    CUDA_CHECK(cudaFuncSetAttribute(gdn_recur_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RecurSmem<4>::kBytes));
+    CUDA_CHECK(cudaFuncSetAttribute(gdn_recur_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RecurSmem<2>::kBytes));
     attr_set = true;
   }
   const WsLayout L = ws_layout(std::min(T, kChunk));
@@ -552,7 +577,9 @@ void gdn_forward_seq(const GdnParams& p, const bf16* proj, int ld, int T, float*
     a.t0 = t0;
     a.n = std::min(kChunk, T - t0);
     gdn_prep_kernel<<<dim3(a.n, HK + HV), D, 0, st>>>(a);
-    gdn_recur_kernel<kRecurWarps><<<dim3(D / (8 * kRecurWarps), HV), 32 * kRecurWarps, kSmem, st>>>(a);
+    if (warps == 2) gdn_recur_kernel<2><<<dim3(D / 16, HV), 64, RecurSmem<2>::kBytes, st>>>(a);
+    else if (warps == 8) gdn_recur_kernel<8><<<dim3(D / 64, HV), 256, RecurSmem<8>::kBytes, st>>>(a);
+    else gdn_recur_kernel<4><<<dim3(D / 32, HV), 128, RecurSmem<4>::kBytes, st>>>(a);
     gdn_norm_kernel<<<(a.n * HV + 7) / 8, 256, 0, st>>>(a);
   }
   // the prep kernels read the conv state of the call start for every chunk; it is shifted only now
@@ -579,6 +606,16 @@ void gdn_decode_rows(const GdnParams& p, const bf16* proj, int ld, int R, float*
   if (R <= kPrepRows && !legacy) launch_pdl(gdn_decode_rows2_kernel, dim3(dim3(1, HV)), dim3(512), 0, st, a);
   else launch_pdl(gdn_decode_rows_kernel, dim3(dim3(1, HV)), dim3(512), 0, st, a);
   launch_pdl(gdn_conv_tail_kernel, dim3(dim3((C + 255) / 256, 1)), dim3(256), 0, st, proj, ld, R, nullptr, conv_state, snap_conv, snap_conv0);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void gdn_decode_rows_multi_dyn(const GdnParams& p, int ld, int P, const int* vpt, const bf16* proj, float* const* conv_state, float* const* state,
+                               float* const* snap, int snap_stride, int replay_from, bf16* out, cudaStream_t st) {
+  if (P <= 0) return;
+  HIVE_CHECK(P <= kMultiParts && ld >= kGdnProjWidth && ld % 8 == 0, "gdn_decode_rows_multi_dyn");
+  const RowsDyn m{{p.conv_w, p.A_log, p.dt_bias, p.norm_w, p.norm_eps, proj, ld, conv_state, state, out}, snap, snap_stride, replay_from};
+  launch_pdl(gdn_decode_rows2_dyn_kernel, dim3(dim3(P, HV)), dim3(512), 0, st, m, vpt);
+  launch_pdl(gdn_conv_tail_dyn_kernel, dim3(dim3((C + 255) / 256, P)), dim3(256), 0, st, m, ld, vpt);
   CUDA_CHECK(cudaGetLastError());
 }
 

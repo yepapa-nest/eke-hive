@@ -47,10 +47,18 @@ void fn_quant_fp8b(const __nv_bfloat16* w, int N, int K, uint8_t* q, float* s, c
 //   (fp32, overwritten) — grouped W4A16 GEMMs (src/qwen/fn_moe_pf.cu). Rows are processed in sub-chunks of S; ws ≥ fn_moe_prefill_ws_bytes(S, ...).
 bool fn_moe_prefill_supported(int H, int I);
 // gate|up block width of the short-prompt tiles (64 default; 128 = HIVE_QWEN_MOE_PF_GN) — tests compare the two bit for bit
+// W4A4 (HIVE_QWEN_MOE_A4=1, or the setter): activations quantized to NVFP4 per row, FP4 tensor-core GEMMs (fn_moe_pf.cu) — lossy
+void fn_moe_prefill_set_a4(bool on);
+void fn_moe_prefill_set_v2(bool on);     // tests: false = the first W4A16 kernels (v2 must equal them bit for bit)
+void fn_moe_prefill_set_a4v2(bool on);   // tests: false = the v1 W4A4 kernels (v2 must equal them bit for bit)
+bool fn_moe_prefill_a4();
 void fn_moe_prefill_set_gn(int gn, int dn = 128);   // + down block rows (128 default; 256 = HIVE_QWEN_MOE_PF_DN)
 size_t fn_moe_prefill_ws_bytes(int S, int K, int E, int H, int I);
+// cmb (optional): write the combined MoE output instead (moe_combine's arithmetic, bit-identical): cmb->out bf16 [M, H] =
+//   bf16(bf16(routed) + bf16(bf16(sigmoid(bf16(lg[m·ld + col]))) · shared[m])) — out (fp32) is then not touched
+struct FnPfCombine { const __nv_bfloat16* shared; const float* lg; int ld, col; __nv_bfloat16* out; };
 void fn_moe_prefill(const glm::ExpertRecLayout& L, const uint8_t* const* tab, int li, int E, const int32_t* ids, const float* w, int M, int K,
-                    const __nv_bfloat16* x, int H, int I, float* out, void* ws, int S, cudaStream_t st);
+                    const __nv_bfloat16* x, int H, int I, float* out, void* ws, int S, cudaStream_t st, const FnPfCombine* cmb = nullptr);
 
 // draft token of one bf16 logit row: id = argmax (lowest index on ties; map[id] when map != null), conf = {max, Σexp(l − max)} (the
 //   row_max_sumexp pair) — two small kernels (fixed-order combine) instead of a bf16→fp32 copy + argmax + max/sum over the fp32 row.

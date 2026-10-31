@@ -67,6 +67,14 @@ void qsa_select(const QsaRow* rows, int n, int max_pos, const __nv_bfloat16* iq,
 void qsa_attention(const QsaRow* rows, int n, const __nv_bfloat16* q, const __nv_bfloat16* proj, int ld, const int32_t* idx,
                    __nv_bfloat16* out, cudaStream_t st);
 
+// Prefill rows of ONE sequence (consecutive positions, ascending), n > 64: several rows per block over the union of their selected groups
+//   (qsa.cu qsa_attn_mr_kernel) — the same math as qsa_attention, fp32 sums in another order. max_pos = the largest row position.
+//   Returns false (nothing launched) unless switched on (HIVE_QWEN_QSA_MR=1), n ≤ 64 or the workspace is too small; the caller then runs
+//   qsa_attention. ws ≥ qsa_attention_mr_ws_bytes(n).
+size_t qsa_attention_mr_ws_bytes(int n);
+bool qsa_attention_mr(const QsaRow* rows, int n, int max_pos, const __nv_bfloat16* q, const __nv_bfloat16* proj, int ld, const int32_t* idx,
+                      __nv_bfloat16* out, void* ws, size_t ws_bytes, cudaStream_t st);
+
 // Decode / verify rows: the tensor-core attention with the selected positions split over `splits` blocks per (row, kv head) (2..32) and a
 //   fixed-order combine — a 4-row verify otherwise runs on 8 blocks. ws ≥ qsa_attention_split_ws_bytes(n, splits).
 size_t qsa_attention_split_ws_bytes(int n, int splits);

@@ -118,12 +118,16 @@ def _user(content):
     return [{"role": "user", "content": content}]
 
 
+SAMPLING: dict = {}   # --sampling (sampled quality runs)
+
+
 def openai_call(h, messages, max_tokens, seed, stream=True, tools=None, extra=None):
     """→ dict(status, content, reasoning, tool_calls, finish, latency, ttft, prompt_tokens, completion_tokens, hive, error, n_chunks)."""
     body = {"model": "hive", "messages": messages, "max_tokens": max_tokens, "temperature": 0.0, "seed": seed, "stream": stream}
     if tools:
         body["tools"] = tools
     body.update(extra if extra is not None else NOTHINK)
+    body.update(SAMPLING)
     if extra is None and THINK_EXTRA[0]:
         body["max_tokens"] = max_tokens + THINK_EXTRA[0]
     out = {"content": "", "reasoning": "", "tool_calls": [], "finish": None, "ttft": None, "prompt_tokens": None,
@@ -189,6 +193,7 @@ def openai_call(h, messages, max_tokens, seed, stream=True, tools=None, extra=No
 
 def anthropic_call(h, messages, max_tokens, stream=True, thinking=False, tools=None, system=None):
     body = {"model": "hive", "messages": messages, "max_tokens": max_tokens, "temperature": 0.0, "stream": stream}
+    body.update({k: v for k, v in SAMPLING.items() if k in ("temperature", "top_p", "top_k")})
     if not thinking:
         body["thinking"] = {"type": "disabled"}
     if tools:
@@ -1117,9 +1122,13 @@ def main(argv=None):
     cli.add_argument("--timeout", type=float, default=1800)
     cli.add_argument("--effort", default="none", help="thinking level (none|low|medium|xhigh) — none = previous behaviour (thinking off)")
     cli.add_argument("--think-budget", type=int, default=0, help="thinking cap max_thinking_tokens (0 = not sent = unlimited)")
+    cli.add_argument("--sampling", default="", help='JSON merged into every OpenAI request (and temperature / top_p / top_k into the Anthropic ones) — '
+                     'sampled quality runs, e.g. {"temperature": 0.6, "top_p": 0.95, "top_k": 20}; empty = greedy (default)')
     cli.add_argument("--think-extra", type=int, default=32768, help="extra max_tokens per item when thinking is on (with a budget: budget+1024)")
     a = cli.parse_args(argv)
     global NOTHINK
+    if a.sampling:
+        SAMPLING.update(json.loads(a.sampling))
     if a.effort and a.effort != "none":
         NOTHINK = {"reasoning_effort": a.effort, **({"max_thinking_tokens": a.think_budget} if a.think_budget > 0 else {})}
         THINK_EXTRA[0] = (a.think_budget + 1024) if a.think_budget > 0 else a.think_extra
@@ -1134,7 +1143,7 @@ def main(argv=None):
         print(m, flush=True)
 
     t_start = time.time()
-    meta = {"label": a.label, "effort": a.effort, "think_budget": a.think_budget, "base": a.base, "seed": a.seed, "suites": suites, "started": dt.datetime.now().isoformat(timespec="seconds"),
+    meta = {"label": a.label, "effort": a.effort, "think_budget": a.think_budget, "sampling": SAMPLING, "base": a.base, "seed": a.seed, "suites": suites, "started": dt.datetime.now().isoformat(timespec="seconds"),
             "corpus": a.corpus, "image": a.image, "ruler_lengths": lengths, "sandbox": sandbox_mode() if "code" in suites else None}
     try:
         st, body = h.get("/health")

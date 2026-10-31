@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "hive/ckpt_quant.h"
 #include "hive/glm/glm_kernels.h"
 
 namespace hive::qwen {
@@ -106,8 +107,22 @@ constexpr int kQTile = 1024;
 
 }  // namespace
 
+// BF16 tensors are copied. The FP4-Local checkpoint quantizes the linear weights (attention qkv / proj MXFP8, MLP and merger NVFP4 W4A16):
+//   they are expanded to bf16 here (MXFP8 exactly, NVFP4 with one rounding — hive/ckpt_quant.h), so the encoder's kernels are unchanged.
 DevBuf QwenVision::load(QwenModel& m, const std::string& name, size_t expect_elems) {
   const TensorInfo& t = m.ckpt().get(name);
+  if (t.dtype != "BF16" && name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+    const std::string base = name.substr(0, name.size() - 6);
+    const ckq::Dense f = ckq::dense_format(m.ckpt(), base);
+    if (f == ckq::Dense::MXFP8 || f == ckq::Dense::NVFP4) {
+      const std::vector<uint16_t> h = ckq::expand_bf16(m.ckpt(), base, 8);
+      HIVE_CHECK(h.size() == expect_elems, "Qwen vision: unexpected tensor size " + name);
+      DevBuf b(h.size() * 2);
+      CUDA_CHECK(cudaMemcpy(b.p, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+      bytes_ += h.size() * 2;
+      return b;
+    }
+  }
   HIVE_CHECK(t.dtype == "BF16" && (size_t)t.numel() == expect_elems, "Qwen vision: unexpected tensor " + name + " (" + t.dtype + ")");
   DevBuf b(t.nbytes);
   CUDA_CHECK(cudaMemcpy(b.p, t.data, t.nbytes, cudaMemcpyHostToDevice));

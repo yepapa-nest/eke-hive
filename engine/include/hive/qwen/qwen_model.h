@@ -25,6 +25,7 @@
 #include "hive/common.h"
 #include "hive/devbuf.h"
 #include "hive/glm/fp8b.h"
+#include "hive/qwen/qwen_kernels.h"
 #include "hive/safetensors.h"
 
 namespace hive::qwen {
@@ -74,7 +75,9 @@ struct QMat {
   DevBuf buf;
   int out = 0, in = 0;
   const bf16* p() const { return buf.as<bf16>(); }
-  // HIVE_QWEN_DENSE8: an 8-bit copy for the decode GEMV (fn_gemv8: fmt 1 = FP8 e4m3, 2 = INT8; scales per row and group of gs columns)
+  // HIVE_QWEN_DENSE8: an 8-bit copy for the decode GEMV (fn_gemv8: fmt 1 = FP8 e4m3, 2 = INT8; scales per row and group of gs columns).
+  //   fmt 3 = MXFP8 straight from the checkpoint (NVIDIA FP4-Local: e4m3 [out, in] + ue8m0 bytes [out, in/32] in s8, gs8 32) — the only
+  //   copy of the weight (no bf16 buf); prefill expands it exactly or runs it as MXFP8 (HIVE_QWEN_DENSE_MX)
   DevBuf q8, s8;
   int fmt8 = 0, gs8 = 0;
 };
@@ -84,7 +87,7 @@ struct QMat {
 struct HcW {
   QMat down_inj;     // [hc_rank + hc, hc·hidden] — rows 0..hc_rank-1 = input_mix_weight_down, then block_inject_weight (absent for the final mixer)
   QMat up;           // [hc·hidden, hc_rank]
-  DevBuf norm;       // bf16 [hc·hidden] (grouped per hidden, 1 + w)
+  NormW norm;        // [hc·hidden] (grouped per hidden, 1 + w) — bf16, or fp32 as stored (FP4-Local)
   bool inject = false;
 };
 
@@ -108,7 +111,7 @@ struct MoeW {
 };
 struct PleW {
   QMat key, value;   // key_proj [10240, 2560] · value_proj [2560, 2560]
-  DevBuf norm_key, norm_query, norm_conv;  // bf16 [10240] (grouped per hidden, 1 + w)
+  NormW norm_key, norm_query, norm_conv;   // [10240] (grouped per hidden, 1 + w) — bf16, or fp32 as stored (FP4-Local)
   DevBuf conv_w;     // fp32 [10240, 4] (dilation = ngram)
 };
 struct LayerW {
@@ -126,6 +129,10 @@ struct MtpW {
   // routed experts: FP8 e4m3 with 128×128 block scales (stored as bf16 "weight_scale_inv", converted to fp32), all in VRAM
   DevBuf expert_arena;
   std::vector<std::array<glm::Fp8BMat, 3>> experts;   // gate [640, 2560] · up [640, 2560] · down [2560, 640]
+  // or NVFP4 (W4A16, NVIDIA FP4-Local): one glm::ExpertRecLayout record per expert in expert_arena (the main layers' record format —
+  //   fn_moe_decode_routed runs them); experts stays empty then
+  bool nvfp4 = false;
+  size_t rec_bytes = 0;                                // ExpertRecLayout::make(hidden, moe_inter).total
 };
 
 class QwenModel {
@@ -135,7 +142,8 @@ class QwenModel {
   QwenModel(const std::string& ckpt_dir, bool load_mtp = true, int gpu_layers = -1);
   int gpu_layers() const { return gpu_layers_; }
   int dense8() const { return dense8_; }
-  size_t dense8_max() const { return dense8_max_; }   // elements of the largest 8-bit matrix (the engine's expansion scratch)   // 0 = bf16 decode GEMVs, 1 = FP8, 2 = INT8 (HIVE_QWEN_DENSE8)
+  size_t dense8_max() const { return dense8_max_; }
+  int mx8() const { return mx8_; }                     // matrices kept as the checkpoint's MXFP8 (QMat fmt8 3)   // elements of the largest 8-bit matrix (the engine's expansion scratch)   // 0 = bf16 decode GEMVs, 1 = FP8, 2 = INT8 (HIVE_QWEN_DENSE8)
   const QwenConfig& cfg() const { return cfg_; }
   Checkpoint& ckpt() { return ckpt_; }
   const LayerW& layer(int l) const { return layers_[l]; }
@@ -151,6 +159,7 @@ class QwenModel {
   QMat mat(const std::string& name);
   QMat stack(const std::vector<std::string>& names);              // rows of several BF16 matrices with the same input width
   DevBuf vec_bf16(const std::string& name);
+  NormW vec_norm(const std::string& name);                         // BF16 as is; F32 kept fp32 (HIVE_QWEN_NORM_BF16=1: rounded to bf16)
   DevBuf vec_f32(const std::string& name);                         // F32 or BF16 → fp32 on the device
   DevBuf conv_f32(const std::string& name, int channels);          // [C, 1, k] BF16 → fp32 [C, k]
   void load_hc(const std::string& p, HcW& w, bool inject);
@@ -168,6 +177,7 @@ class QwenModel {
   int gpu_layers_ = 0;
   int dense8_ = 0;
   size_t dense8_max_ = 0;
+  int mx8_ = 0, f32_rounded_ = 0, f32_kept_ = 0;
   void make_dense8();
   size_t free_at_load_ = 0;
 };

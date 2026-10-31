@@ -95,6 +95,24 @@ def encode_messages(messages: list[dict], thinking_mode: str = "thinking", reaso
             tools = m.pop("tools")
         if m.get("role") == "system" and not _content_text(m.get("content")) and tools is not None and len(msgs) == 0:
             continue  # the server's tool carrier (empty system message) — the template takes tools as an argument
+        if m.get("role") == "system" and msgs:
+            # The template takes a system message only at the start (it raises "System message must be at the beginning."); a
+            #   later one — a client's mid-conversation notice, e.g. a tool announcement whose tools encode_prompt already moved
+            #   to the head — becomes a user note at its place, as clients do on wires without mid-conversation system messages.
+            c = m.get("content")
+            if isinstance(c, list):   # keep image / video parts (the template takes them in a user message); prefix the note to the first text
+                parts = [dict(p) if isinstance(p, dict) else {"type": "text", "text": str(p)} for p in c]
+                texts = [p for p in parts if p.get("type") in ("text", "input_text")]
+                if texts:
+                    texts[0]["text"] = "[system] " + (texts[0].get("text") or "")
+                else:
+                    parts.insert(0, {"type": "text", "text": "[system]"})
+                m = {"role": "user", "content": parts}
+            else:
+                text = _content_text(c).strip()
+                if not text:
+                    continue   # an empty notice carries nothing — the template would get a bare "[system]" line
+                m = {"role": "user", "content": "[system] " + text}
         if isinstance(m.get("content"), list):
             if any(isinstance(p, dict) and p.get("type") in MEDIA_TYPES for p in m["content"]):
                 # keep the list: the template writes one vision placeholder per image / video part (expanded in prepare_inputs)
@@ -440,10 +458,31 @@ def span_metas(ids: list[int], spans: list, kinds: list[int]) -> list[dict]:
     return metas
 
 
-def prepare_inputs(prompt: str, media: list[dict], tok):
-    """Prompt with expanded placeholders → (token ids, hived image metas, bf16 patch bytes) — the server's tokenize_with_images."""
+def _bf16_bytes(patches) -> bytes:
     import torch
 
+    return torch.from_numpy(patches).to(torch.bfloat16).contiguous().view(torch.int16).numpy().tobytes()
+
+
+# ---- one image at a time (the server's MediaTokens: prompt through its token cache, each image preprocessed once per content) ----
+def image_part_bytes(p: dict) -> bytes:
+    """The encoded bytes of an image part (data: or http(s) URL)."""
+    return _fetch(_part_url(p))
+
+
+def image_part_patches(data: bytes) -> tuple[bytes, int, int]:
+    """(bf16 patch bytes, gh, gw) of one image — the same bytes prepare_inputs sends for it; its span = gh·gw / 4 image pads."""
+    (patches, gh, gw), _ = _image_spans(data)[0]
+    return _bf16_bytes(patches), gh, gw
+
+
+def image_cache_key():
+    """What besides the image bytes decides its patches (part of the server's per-image cache key)."""
+    return ("qwen", image_max_pixels())
+
+
+def prepare_inputs(prompt: str, media: list[dict], tok):
+    """Prompt with expanded placeholders → (token ids, hived image metas, bf16 patch bytes) — the server's tokenize_with_images."""
     spans_by_part, kinds = [], []
     img_id, vid_id = tok.convert_tokens_to_ids(IMAGE_PAD), tok.convert_tokens_to_ids(VIDEO_PAD)
     for p in media:
@@ -457,7 +496,7 @@ def prepare_inputs(prompt: str, media: list[dict], tok):
     metas = span_metas(ids, flat, kinds)
     blobs = []
     for m, ((patches, _, _), _) in zip(metas, flat):
-        raw = torch.from_numpy(patches).to(torch.bfloat16).contiguous().view(torch.int16).numpy().tobytes()
+        raw = _bf16_bytes(patches)
         m["nbytes"] = len(raw)
         blobs.append(raw)
     return ids, metas, b"".join(blobs)

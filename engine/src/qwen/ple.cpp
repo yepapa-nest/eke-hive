@@ -34,6 +34,7 @@ namespace {
 
 struct Shards {
   std::vector<const TensorInfo*> t;   // valid only while the checkpoint is open (hived releases it after startup — the RAM copy is made before)
+  std::vector<const TensorInfo*> sc;  // NVFP4 table: each shard's E4M3 block scales [rows, 10] (empty for the FP8 table)
   std::vector<uint64_t> off;          // file offset of each shard's data (kept: the SSD reader needs it after the release)
   std::vector<int64_t> start;   // first global row of each shard
   int64_t rows = 0;
@@ -84,6 +85,62 @@ class PleRam final : public PleTable {
   int64_t rows_;
   size_t bytes_ = 0;
   uint8_t* data_ = nullptr;
+};
+
+// ---- RAM, NVFP4 (FP4-Local) ----------------------------------------------------------------------------------------------------------------
+//   two pinned arrays (data [rows, 80] · scales [rows, 10], 26.8 GiB (28.8 GB)) copied shard by shard; a lookup copies 80 + 10 bytes into the row's
+//   160-byte slot (ple_dequant_nvfp4 reads them there)
+class PleRamNv final : public PleTable {
+ public:
+  explicit PleRamNv(const Shards& s) : rows_(s.rows) {
+    bytes_ = (size_t)rows_ * (kNvData + kNvScale);
+    CUDA_CHECK(cudaHostAlloc(&data_, (size_t)rows_ * kNvData, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&scale_, (size_t)rows_ * kNvScale, cudaHostAllocDefault));
+    const double t0 = hive::mono_ms();
+    std::atomic<size_t> next{0};
+    const int nt = std::max(8, std::min(32, (int)std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (int k = 0; k < nt; ++k)
+      th.emplace_back([&] {
+        for (size_t i; (i = next.fetch_add(1)) < s.t.size();) {
+          std::memcpy(data_ + (size_t)s.start[i] * kNvData, s.t[i]->data, s.t[i]->nbytes);
+          std::memcpy(scale_ + (size_t)s.start[i] * kNvScale, s.sc[i]->data, s.sc[i]->nbytes);
+        }
+      });
+    for (auto& x : th) x.join();
+    fprintf(stderr, "[qwen] PLE table in RAM (NVFP4): %lld rows · %.1f GiB pinned in %.1f s\n", (long long)rows_, bytes_ / 1073741824.0,
+            (hive::mono_ms() - t0) / 1000);
+  }
+  ~PleRamNv() override { if (data_) cudaFreeHost(data_); if (scale_) cudaFreeHost(scale_); }
+  void gather(const int64_t* rows, int n, uint8_t* dst) override {
+    auto run = [&](int a, int b) {
+      for (int i = a; i < b; ++i)
+        for (int j = 0; j < kPleHeads; ++j) {
+          const int64_t r = rows[(size_t)i * kPleHeads + j];
+          if (!(r >= 0 && r < rows_)) throw std::runtime_error("PLE row range");
+          uint8_t* d = dst + ((size_t)i * kPleHeads + j) * kPleHeadDim;
+          std::memcpy(d, data_ + (size_t)r * kNvData, kNvData);
+          std::memcpy(d + kNvData, scale_ + (size_t)r * kNvScale, kNvScale);
+        }
+    };
+    if (n < 4096) { run(0, n); return; }
+    const int nt = std::min(16, n / 2048);
+    std::vector<std::thread> th;
+    std::vector<std::string> err(nt);
+    for (int k = 0; k < nt; ++k)
+      th.emplace_back([&, k] { try { run((int)((int64_t)n * k / nt), (int)((int64_t)n * (k + 1) / nt)); } catch (const std::exception& e) { err[k] = e.what(); } });
+    for (auto& x : th) x.join();
+    for (auto& e : err) if (!e.empty()) throw std::runtime_error(e);
+  }
+  size_t host_bytes() const override { return bytes_; }
+  const char* kind() const override { return "ram"; }
+
+ private:
+  static constexpr int kNvData = kPleHeadDim / 2, kNvScale = kPleHeadDim / 16;
+  int64_t rows_;
+  size_t bytes_ = 0;
+  uint8_t* data_ = nullptr;
+  uint8_t* scale_ = nullptr;
 };
 
 // ---- SSD ----------------------------------------------------------------------------------------------------------------------------------
@@ -253,7 +310,7 @@ int64_t i64_scalar(const TensorInfo& t, size_t i) {
 
 }  // namespace
 
-std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, PleHash& hash, float& weight_scale) {
+std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, PleHash& hash, float& weight_scale, bool* nvfp4) {
   const std::string e = prefix + "ple_embedding.";
   const TensorInfo& lm = ck.get(e + "layer_multipliers");
   const TensorInfo& vs = ck.get(e + "ngram_heads_vocab_sizes");
@@ -270,7 +327,15 @@ std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, Pl
   // token ids are < vocab, so x·m fits int64 when m ≤ INT64_MAX / vocab (the bound the multipliers are drawn under)
   HIVE_CHECK(hash.vocab > 0, "PLE: vocabulary size not set");
   for (int64_t m : hash.mult) HIVE_CHECK(m > 0 && m <= INT64_MAX / hash.vocab, "PLE: multiplier outside the no-overflow bound");
-  {
+  // FP8 table (one bf16 scale) or NVFP4 table (FP4-Local: per-16 E4M3 scales + one fp32 scale_2)
+  const bool nv = !ck.has(e + "ngram_embedding.weight_scale") && ck.has(e + "ngram_embedding.weight_scale_2");
+  if (nvfp4) *nvfp4 = nv;
+  HIVE_CHECK(!nv || nvfp4, "PLE: this engine does not read an NVFP4 n-gram table (" + e + ")");
+  if (nv) {
+    const TensorInfo& ws = ck.get(e + "ngram_embedding.weight_scale_2");
+    HIVE_CHECK(ws.dtype == "F32" && ws.numel() == 1, "PLE: weight_scale_2 must be one F32 value");
+    std::memcpy(&weight_scale, ws.data, 4);
+  } else {
     const TensorInfo& ws = ck.get(e + "ngram_embedding.weight_scale");
     HIVE_CHECK(ws.dtype == "BF16" && ws.numel() == 1, "PLE: weight_scale must be one BF16 value");
     weight_scale = bf2f(*reinterpret_cast<const bf16*>(ws.data));
@@ -280,7 +345,15 @@ std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, Pl
     const std::string n = e + "ngram_embedding.shard_" + std::to_string(i) + ".weight";
     if (!ck.has(n)) break;
     const TensorInfo& t = ck.get(n);
-    HIVE_CHECK(t.dtype == "F8_E4M3" && t.shape.size() == 2 && t.shape[1] == kPleHeadDim, "PLE: shard must be FP8 [rows, 160]: " + n);
+    if (nv) {
+      const TensorInfo& sc = ck.get(e + "ngram_embedding.shard_" + std::to_string(i) + ".weight_scale");
+      HIVE_CHECK(t.dtype == "U8" && t.shape.size() == 2 && t.shape[1] == kPleHeadDim / 2 && sc.dtype == "F8_E4M3" && sc.shape.size() == 2 &&
+                     sc.shape[0] == t.shape[0] && sc.shape[1] == kPleHeadDim / 16,
+                 "PLE: NVFP4 shard must be U8 [rows, 80] + F8_E4M3 [rows, 10]: " + n);
+      s.sc.push_back(&sc);
+    } else {
+      HIVE_CHECK(t.dtype == "F8_E4M3" && t.shape.size() == 2 && t.shape[1] == kPleHeadDim, "PLE: shard must be FP8 [rows, 160]: " + n);
+    }
     s.t.push_back(&t); s.off.push_back(t.offset); s.start.push_back(s.rows); s.rows += t.shape[0];
   }
   HIVE_CHECK(!s.t.empty(), "PLE: no ngram_embedding shards under " + e);
@@ -289,6 +362,10 @@ std::unique_ptr<PleTable> ple_open(Checkpoint& ck, const std::string& prefix, Pl
   hash.rows = s.rows;
   const char* mode = getenv("HIVE_QWEN_PLE");
   const bool ssd = mode && (std::string(mode) == "ssd" || std::string(mode) == "1");
+  if (nv) {   // the NVFP4 table's data and scales sit in two tensors per shard over several files: the SSD reader does not handle that yet
+    if (ssd) fprintf(stderr, "[qwen] ⚠️HIVE_QWEN_PLE=ssd: the NVFP4 n-gram table is read into RAM (26.8 GiB (28.8 GB)) — SSD mode reads FP8 tables only\n");
+    return std::make_unique<PleRamNv>(s);
+  }
   if (!ssd) return std::make_unique<PleRam>(s);
   // every shard must sit in one file for the SSD reader (the NVIDIA checkpoint keeps them in model-fp8-mtp-ple.safetensors)
   const std::string path = ck.shard_for(e + "ngram_embedding.shard_0.weight").path();

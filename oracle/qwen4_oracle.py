@@ -47,7 +47,8 @@ def bf(x: torch.Tensor) -> torch.Tensor:
 # ----------------------------------------------------------------------------------------------
 # Checkpoint (own minimal safetensors reader: header json + memmap; no conversion of tensors that are never read)
 # ----------------------------------------------------------------------------------------------
-_NP = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32, "I64": np.int64, "I32": np.int32, "U8": np.uint8, "F8_E4M3": np.uint8, "I8": np.int8}
+_NP = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32, "I64": np.int64, "I32": np.int32, "U8": np.uint8, "F8_E4M3": np.uint8, "I8": np.int8,
+       "U32": np.uint32}
 
 
 class Ckpt:
@@ -95,8 +96,14 @@ class Ckpt:
         return self.meta(name)[1]["dtype"]
 
     def f32(self, name: str) -> torch.Tensor:
-        """Any float tensor → fp32 torch tensor (copy)."""
+        """Any float tensor → fp32 torch tensor (copy). An MXFP8 weight (NVIDIA FP4-Local: F8_E4M3 + a U8 ue8m0 `<name>_scale` per 32
+        columns) or an NVFP4 dense weight (U8 + F8_E4M3 `_scale` per 16 + F32 `_scale_2`) comes back dequantized."""
         dt, a = self.dtype(name), self.raw(name)
+        if dt == "F8_E4M3" and self.has(name + "_scale") and self.dtype(name + "_scale") == "U8":
+            s = torch.from_numpy(np.ascontiguousarray(self.raw(name + "_scale")).astype(np.int32) - 127).to(torch.float32)
+            return fp8_rows_to_f32(a) * torch.exp2(s).repeat_interleave(32, dim=1)
+        if dt == "U8" and name.endswith(".weight") and self.has(name + "_scale_2"):
+            return nvfp4_dequant(self, name[: -len("weight")])
         if dt == "BF16":
             return torch.from_numpy((np.ascontiguousarray(a).astype(np.uint32) << 16).view(np.float32))
         if dt == "F8_E4M3":
@@ -113,10 +120,29 @@ def fp8_rows_to_f32(a: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(a)).view(torch.float8_e4m3fn).to(torch.float32)
 
 
+def csf_scales(ck: Ckpt, base: str, R: int, C: int) -> np.ndarray:
+    """Compressed NVFP4 block scales (NVIDIA FP4-Local, engine/include/hive/ckpt_quant.h): per 16 rows, 16 base code bytes then 16·C
+    4-bit deltas row-major (even position = low nibble); code = base + delta; U32 exceptions = (code << 24) | flat index."""
+    fx = np.ascontiguousarray(ck.raw(base + "weight_scale.nvfp4_csf_fixed"))
+    ex = np.ascontiguousarray(ck.raw(base + "weight_scale.nvfp4_csf_exceptions"))
+    G = R // 16
+    body = fx[:, 16:]
+    nib = np.empty((G, body.shape[1] * 2), np.int64)
+    nib[:, 0::2] = body & 15
+    nib[:, 1::2] = body >> 4
+    codes = (fx[:, :16].astype(np.int64)[:, :, None] + nib.reshape(G, 16, C)).reshape(-1)
+    codes[(ex & 0xFFFFFF).astype(np.int64)] = (ex >> 24).astype(np.int64)
+    assert codes.max() <= 0x7E and codes.min() >= 0, base
+    return codes.astype(np.uint8).reshape(R, C)
+
+
 def nvfp4_dequant(ck: Ckpt, base: str) -> torch.Tensor:
     """ModelOpt NVFP4 matrix base+{weight, weight_scale, weight_scale_2} → fp32 [N, K]: low nibble = even column."""
     w = torch.from_numpy(np.ascontiguousarray(ck.raw(base + "weight")))            # uint8 [N, K/2]
-    s = fp8_rows_to_f32(ck.raw(base + "weight_scale"))                              # e4m3 [N, K/16]
+    if ck.has(base + "weight_scale"):
+        s = fp8_rows_to_f32(ck.raw(base + "weight_scale"))                          # e4m3 [N, K/16]
+    else:
+        s = fp8_rows_to_f32(csf_scales(ck, base, w.shape[0], w.shape[1] * 2 // 16))
     g = float(ck.f32(base + "weight_scale_2").reshape(-1)[0])
     N, K2 = w.shape
     lo = E2M1[(w & 0xF).long()]
@@ -276,11 +302,14 @@ class Ple:
         e = self.p + "ple_embedding."
         self.hash = PleHash(ck.i64(e + "layer_multipliers"), ck.i64(e + "ngram_heads_vocab_sizes"), ck.i64(e + "ngram_heads_offsets"),
                             cfg.ngram, cfg.heads_per, cfg.eos)
-        self.scale = float(ck.f32(e + "ngram_embedding.weight_scale").reshape(-1)[0])
-        self.shards = []
+        self.nv = not ck.has(e + "ngram_embedding.weight_scale")   # FP4-Local: NVFP4 rows (per-16 e4m3 scales, fp32 scale_2)
+        self.scale = float(ck.f32(e + ("ngram_embedding.weight_scale_2" if self.nv else "ngram_embedding.weight_scale")).reshape(-1)[0])
+        self.shards, self.sshards = [], []
         i = 0
         while ck.has(f"{e}ngram_embedding.shard_{i}.weight"):
             self.shards.append(ck.raw(f"{e}ngram_embedding.shard_{i}.weight"))
+            if self.nv:
+                self.sshards.append(ck.raw(f"{e}ngram_embedding.shard_{i}.weight_scale"))
             i += 1
         assert self.shards, "PLE shards not found"
         self.per = self.shards[0].shape[0]
@@ -290,6 +319,10 @@ class Ple:
 
     def row(self, r: int) -> torch.Tensor:
         sh = r // self.per
+        if self.nv:   # value = e2m1 · e4m3 (the scale_2 product is applied with self.scale, as the FP8 table's scale)
+            w = torch.from_numpy(np.ascontiguousarray(self.shards[sh][r - sh * self.per]))
+            v = torch.stack([E2M1[(w & 0xF).long()], E2M1[(w >> 4).long()]], dim=-1).reshape(-1)
+            return v * fp8_rows_to_f32(self.sshards[sh][r - sh * self.per]).repeat_interleave(16)
         return fp8_rows_to_f32(self.shards[sh][r - sh * self.per])
 
     def __call__(self, ids: list[int], h: torch.Tensor) -> torch.Tensor:
@@ -498,7 +531,8 @@ class Oracle:
             self.blocks.append((attn, core, ple, Moe(self.ck, self.W, cfg, f"{P}layers.{l}.mlp.", False)))
         self.mtp = None
         if mtp:
-            self.mtp = (Attn(self.W, cfg, self.rope, "mtp.layers.0.self_attn."), Moe(self.ck, self.W, cfg, "mtp.layers.0.mlp.", True, 64))
+            fp8 = self.ck.dtype("mtp.layers.0.mlp.experts.0.gate_proj.weight") == "F8_E4M3"   # FP4-Local: NVFP4 MTP experts
+            self.mtp = (Attn(self.W, cfg, self.rope, "mtp.layers.0.self_attn."), Moe(self.ck, self.W, cfg, "mtp.layers.0.mlp.", fp8, 64))
         self.pos = 0
         self.dumps: list = []
 

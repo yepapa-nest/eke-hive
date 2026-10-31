@@ -27,7 +27,11 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 }
 
 // block = (row m, group g): out = x · rsqrt(mean(x²) + eps) · (1 + w)
-__global__ void gemma_rmsnorm_kernel(const bf16* __restrict__ x, int ldx, const bf16* __restrict__ w, int group, float eps, bf16* __restrict__ out,
+// norm weights: bf16, or fp32 as the FP4-Local checkpoint stores the hyper-connection / PLE norms (wf: the same arithmetic on the fp32 value)
+__device__ __forceinline__ float wf(bf16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float wf(float v) { return v; }
+template <typename WT>
+__global__ void gemma_rmsnorm_kernel(const bf16* __restrict__ x, int ldx, const WT* __restrict__ w, int group, float eps, bf16* __restrict__ out,
                                      int ldo) {
   pdl_wait();
   __shared__ float red[32];
@@ -37,9 +41,9 @@ __global__ void gemma_rmsnorm_kernel(const bf16* __restrict__ x, int ldx, const 
   for (int i = threadIdx.x; i < group; i += blockDim.x) { const float v = __bfloat162float(xr[i]); ss = fmaf(v, v, ss); }
   const float r = rsqrtf(block_sum(ss, red) / (float)group + eps);
   bf16* o = out + (size_t)m * ldo + (size_t)g * group;
-  const bf16* wg = w + (size_t)g * group;
+  const WT* wg = w + (size_t)g * group;
   for (int i = threadIdx.x; i < group; i += blockDim.x)
-    o[i] = __float2bfloat16(__bfloat162float(xr[i]) * r * (1.f + __bfloat162float(wg[i])));
+    o[i] = __float2bfloat16(__bfloat162float(xr[i]) * r * (1.f + wf(wg[i])));
 }
 
 __global__ void hc_mix_act_kernel(const bf16* __restrict__ dl, int ld, int M, int rank, float inv_hc, bf16* __restrict__ s) {
@@ -119,8 +123,9 @@ __global__ void hc_combine8_kernel(bf16* __restrict__ h, const bf16* __restrict_
 
 // hc_combine fused with the gemma_rmsnorm that follows it (the next mix's input norm, group = dim per copy): block = (row, copy), the
 //   rmsnorm kernel's thread count and loop order, so h and hn are bit-identical to hc_combine_kernel → gemma_rmsnorm_kernel
+template <typename WT>
 __global__ void hc_combine_norm_kernel(bf16* __restrict__ h, const bf16* __restrict__ y, int ldy, const bf16* __restrict__ dl, int ld, int rank, int hc,
-                                       int dim, float inv_hc, const bf16* __restrict__ w, float eps, bf16* __restrict__ hn) {
+                                       int dim, float inv_hc, const WT* __restrict__ w, float eps, bf16* __restrict__ hn) {
   pdl_wait();
   __shared__ float red[32];
   const int m = blockIdx.x, c = blockIdx.y;
@@ -137,8 +142,8 @@ __global__ void hc_combine_norm_kernel(bf16* __restrict__ h, const bf16* __restr
   }
   const float r = rsqrtf(block_sum(ss, red) / (float)dim + eps);
   bf16* o = hn + ((size_t)m * hc + c) * dim;
-  const bf16* wg = w + (size_t)c * dim;
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = __float2bfloat16(__bfloat162float(hr[i]) * r * (1.f + __bfloat162float(wg[i])));
+  const WT* wg = w + (size_t)c * dim;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = __float2bfloat16(__bfloat162float(hr[i]) * r * (1.f + wf(wg[i])));
 }
 
 __global__ void hc_expand_kernel(const bf16* __restrict__ x, int M, int hc, int dim, bf16* __restrict__ h) {
@@ -263,8 +268,18 @@ static_assert(sizeof(MoePairDev) == sizeof(glm::MoePair) && alignof(MoePairDev) 
 void gemma_rmsnorm(const bf16* x, int ldx, const bf16* w, int M, int K, int group, float eps, bf16* out, int ldo, cudaStream_t st) {
   if (M <= 0) return;
   HIVE_CHECK(group > 0 && K % group == 0, "gemma_rmsnorm: group must divide K");
-  launch_pdl(gemma_rmsnorm_kernel, dim3(M, K / group), dim3(group >= 1024 ? 512 : 256), 0, st, x, ldx, w, group, eps, out, ldo);
+  launch_pdl(gemma_rmsnorm_kernel<bf16>, dim3(M, K / group), dim3(group >= 1024 ? 512 : 256), 0, st, x, ldx, w, group, eps, out, ldo);
   CUDA_CHECK(cudaGetLastError());
+}
+void gemma_rmsnorm(const bf16* x, int ldx, const float* w, int M, int K, int group, float eps, bf16* out, int ldo, cudaStream_t st) {
+  if (M <= 0) return;
+  HIVE_CHECK(group > 0 && K % group == 0, "gemma_rmsnorm: group must divide K");
+  launch_pdl(gemma_rmsnorm_kernel<float>, dim3(M, K / group), dim3(group >= 1024 ? 512 : 256), 0, st, x, ldx, w, group, eps, out, ldo);
+  CUDA_CHECK(cudaGetLastError());
+}
+void gemma_rmsnorm(const bf16* x, int ldx, const NormW& w, int M, int K, int group, float eps, bf16* out, int ldo, cudaStream_t st) {
+  if (w.f32) gemma_rmsnorm(x, ldx, w.buf.as<float>(), M, K, group, eps, out, ldo, st);
+  else gemma_rmsnorm(x, ldx, w.buf.as<bf16>(), M, K, group, eps, out, ldo, st);
 }
 
 void hc_mix_act(const bf16* dl, int ld, int M, int rank, int hc, bf16* s, cudaStream_t st) {
@@ -292,7 +307,28 @@ void hc_combine(bf16* h, const bf16* y, int ldy, const bf16* dl, int ld, int ran
 void hc_combine_norm(bf16* h, const bf16* y, int ldy, const bf16* dl, int ld, int rank, int M, int hc, int dim, const bf16* w, float eps, bf16* hn,
                      cudaStream_t st) {
   if (M <= 0) return;
-  launch_pdl(hc_combine_norm_kernel, dim3(M, hc), dim3(dim >= 1024 ? 512 : 256), 0, st, h, y, ldy, dl, ld, rank, hc, dim, 1.f / hc, w, eps, hn);
+  launch_pdl(hc_combine_norm_kernel<bf16>, dim3(M, hc), dim3(dim >= 1024 ? 512 : 256), 0, st, h, y, ldy, dl, ld, rank, hc, dim, 1.f / hc, w, eps, hn);
+  CUDA_CHECK(cudaGetLastError());
+}
+void hc_combine_norm(bf16* h, const bf16* y, int ldy, const bf16* dl, int ld, int rank, int M, int hc, int dim, const NormW& w, float eps, bf16* hn,
+                     cudaStream_t st) {
+  if (!w.f32) { hc_combine_norm(h, y, ldy, dl, ld, rank, M, hc, dim, w.buf.as<bf16>(), eps, hn, st); return; }
+  if (M <= 0) return;
+  launch_pdl(hc_combine_norm_kernel<float>, dim3(M, hc), dim3(dim >= 1024 ? 512 : 256), 0, st, h, y, ldy, dl, ld, rank, hc, dim, 1.f / hc,
+             w.buf.as<float>(), eps, hn);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void mask_logits_kernel(float* __restrict__ lg, int V, const float* __restrict__ pen, const int32_t* __restrict__ ids, int n) {
+  const int r = blockIdx.y;
+  const float p = pen[r];
+  if (p == 0.f) return;
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < n) { float* x = lg + (size_t)r * V + ids[j]; *x = isinf(p) ? -INFINITY : *x - p; }
+}
+void mask_logits(float* logits, int rows, int V, const float* pen, const int32_t* ids, int n, cudaStream_t st) {
+  if (rows <= 0 || n <= 0) return;
+  mask_logits_kernel<<<dim3((unsigned)((n + 255) / 256), rows), 256, 0, st>>>(logits, V, pen, ids, n);
   CUDA_CHECK(cudaGetLastError());
 }
 

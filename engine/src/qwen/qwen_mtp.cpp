@@ -134,6 +134,9 @@ void QwenEngine::mtp_kv(QwenSeq& s, int64_t pos0, int n, const bf16* h_rows, con
     apply_embed_override(mtp_emb_.as<bf16>(), ov_row, n);
     emb = mtp_emb_.as<bf16>();
   }
+  // (HIVE_QWEN_DENSE_MX: the MTP layer's prompt entries keep the bf16 GEMMs — with MXFP8 here the drafts after a 16K / 64K prompt were
+  //   accepted 19/85 and 25/72 against 56/99 without it, 2026-10-31; the entries feed every later draft)
+  struct NoMx { std::unique_ptr<FnMx>& m; std::unique_ptr<FnMx> keep; ~NoMx() { m = std::move(keep); } } nomx{mx_, std::move(mx_)};
   mtp_input(emb, h_rows, n, hc);
   hc_mix(w.layer.hc_attn, hc, n, x_.as<bf16>());
   const AttnW& a = w.layer.att;
@@ -203,18 +206,22 @@ void QwenEngine::mtp_kv_multi(const MtpKvPart* parts, int P) {
 
 // MoE of the MTP layer for one row: the router on the device, the 10 chosen FP8 experts as GEMVs (the ids come to the host once).
 void QwenEngine::mtp_moe(const MoeW& w, const bf16* x, int rows, bf16* out) {
-  HIVE_CHECK(rows == 1 || (mtp_tab_ && rows <= kDraftRows), "qwen MTP MoE: one row (several only on the device path)");
+  HIVE_CHECK(rows == 1 || (mtp_dev_ && rows <= kDraftRows), "qwen MTP MoE: one row (several only on the device path)");
   const MtpW& mt = *m_.mtp();
   const int H = c_.hidden, E = c_.n_experts, K = c_.n_act, I = c_.moe_inter, ld = E + 1;
   float* lg = router_.as<float>();
   float* acc = mlp_out_f32_.as<float>();
-  if (mtp_tab_) {   // device path (fused router + shared gate|up, FN FP8 expert kernels with the combine): no host round trip
+  if (mtp_dev_) {   // device path (fused router + shared gate|up, FN FP8 / NVFP4 expert kernels with the combine): no host round trip
     const int SI = c_.shared_inter;
     FnEpi e; e.mode = 3; e.yf = lg; e.ldyf = ld; e.nr = ld; e.I = SI; e.ys = sh_y_.as<bf16>();
     fn_gemv_epi(mtp_rs_.as<bf16>(), ld + 2 * SI, H, x, H, rows, e, gemv_ws_.as<float>(), stream_);
     router_softmax_topk(lg, ld, rows, E, K, c_.norm_topk, rids_.as<int32_t>(), rw_.as<float>(), nullptr, nullptr, stream_);
     lin(w.sh_down, sh_y_.as<bf16>(), SI, rows, shared_out_.as<bf16>(), H);
-    fn_moe_fp8_routed(mtp_tab_, E, rids_.as<int32_t>(), rw_.as<float>(), rows, K, x, H, I, shared_out_.as<bf16>(), lg, ld, E, out, moe_ws_.p, stream_);
+    if (mt.nvfp4)
+      fn_moe_decode_routed(glm::ExpertRecLayout::make(H, I), rids_.as<int32_t>(), rw_.as<float>(), rows, K,
+                           reinterpret_cast<const uint8_t* const*>(mtp_nv_tab_.p), 0, E, x, H, I, shared_out_.as<bf16>(), lg, ld, E, out, moe_ws_.p, stream_);
+    else
+      fn_moe_fp8_routed(mtp_tab_, E, rids_.as<int32_t>(), rw_.as<float>(), rows, K, x, H, I, shared_out_.as<bf16>(), lg, ld, E, out, moe_ws_.p, stream_);
     (void)mt; (void)acc;
     return;
   }
@@ -313,7 +320,7 @@ int QwenEngine::mtp_draft(QwenSeq& s, int32_t tok, int k, int32_t* drafts, float
   // CUDA graph of the draft chain (needs the device MoE path): host part, then capture once per shape / replay
   static const bool graphs = [] { const char* v = getenv("HIVE_QWEN_GRAPH"); return !(v && strcmp(v, "0") == 0); }();
   bool done = false;
-  if (graphs && mtp_tab_ && !layer_hook && !layer_inject) {
+  if (graphs && mtp_dev_ && !layer_hook && !layer_inject) {
     const bool scoring = (p + k) / kQsaRatio > kQsaTopBlocks;
     const int ctx = scoring ? (int)((p + k + 4095) / 4096 * 4096) : 0;
     const std::string key = "mtp" + std::to_string(k) + ":" + std::to_string(scoring) + ":" + std::to_string(ctx) + ":" + std::to_string((uintptr_t)s.h_last.p);
@@ -408,7 +415,7 @@ void QwenEngine::mtp_draft_batch(QwenSeq* const* seqs, const int32_t* toks, int 
     if (!s.h_last_valid || p < 0 || p + k + 1 > s.cap) continue;
     use.push_back(b);
   }
-  if (!draft_q_.p || !mtp_tab_ || use.size() < 2) {
+  if (!draft_q_.p || !mtp_dev_ || use.size() < 2) {
     for (int b : use) n_out[b] = mtp_draft(*seqs[b], toks[b], k, drafts + (size_t)b * k, conf + (size_t)b * k);
     return;
   }
@@ -425,18 +432,56 @@ void QwenEngine::mtp_draft_batch(QwenSeq* const* seqs, const int32_t* toks, int 
     const int HC = c_.hcw();
     bf16* hb0 = mtpb_h_.as<bf16>();   // [0]: the sequences' h_last rows, [1] / [2]: step outputs
     for (int r = 0; r < n; ++r) CUDA_CHECK(cudaMemcpyAsync(hb0 + (size_t)r * HC, sq[r]->h_last.p, (size_t)HC * 2, cudaMemcpyDeviceToDevice, stream_));
-    for (int i = 0; i < k; ++i) {
-      std::vector<int64_t> pp(n);
-      for (int r = 0; r < n; ++r) pp[r] = p0[r] + i;
-      const bf16* hin = i == 0 ? hb0 : hb0 + (size_t)(1 + ((i - 1) & 1)) * kDraftRows * HC;
-      bf16* hout = hb0 + (size_t)(1 + (i & 1)) * kDraftRows * HC;
-      int max_pos = 0;
-      for (int r = 0; r < n; ++r) max_pos = std::max<int>(max_pos, (int)pp[r]);
-      const bool scoring = (max_pos + 1) / kQsaRatio > kQsaTopBlocks;
-      graph_ctx_ = scoring ? (max_pos + 1 + 4095) / 4096 * 4096 : 0;
+    // the k-step chain; HIVE_QWEN_GRAPH (default on): captured once per (sequences, k, context bucket) and replayed like mtp_draft's —
+    //   eager, the batched drafts cost 2.8-2.9 ms per step at 8 sequences (2026-10-31, C8 coding), about a tenth of a verify step
+    int max_last = 0;
+    for (int r = 0; r < n; ++r) max_last = std::max<int>(max_last, (int)(p0[r] + k - 1));
+    const bool scoring_all = (max_last + 1) / kQsaRatio > kQsaTopBlocks;
+    const int ctx_all = scoring_all ? (max_last + 1 + 4095) / 4096 * 4096 : 0;
+    static const bool graphs = [] { const char* v = getenv("HIVE_QWEN_GRAPH"); return !(v && strcmp(v, "0") == 0); }() &&
+                               !(getenv("HIVE_QWEN_DRAFT_GRAPH") && strcmp(getenv("HIVE_QWEN_DRAFT_GRAPH"), "0") == 0);
+    auto chain = [&](bool fixed_ctx) {
+      for (int i = 0; i < k; ++i) {
+        std::vector<int64_t> pp(n);
+        for (int r = 0; r < n; ++r) pp[r] = p0[r] + i;
+        const bf16* hin = i == 0 ? hb0 : hb0 + (size_t)(1 + ((i - 1) & 1)) * kDraftRows * HC;
+        bf16* hout = hb0 + (size_t)(1 + (i & 1)) * kDraftRows * HC;
+        if (!fixed_ctx) {
+          int max_pos = 0;
+          for (int r = 0; r < n; ++r) max_pos = std::max<int>(max_pos, (int)pp[r]);
+          const bool scoring = (max_pos + 1) / kQsaRatio > kQsaTopBlocks;
+          graph_ctx_ = scoring ? (max_pos + 1 + 4095) / 4096 * 4096 : 0;
+        }
+        mtp_step_rows(sq.data(), n, i, tk.data(), pp.data(), hin, hout);
+      }
+    };
+    bool done = false;
+    if (graphs && !layer_hook && !layer_inject) {
+      const std::string key = "mtpb" + std::to_string(n) + ":" + std::to_string(k) + ":" + std::to_string(scoring_all) + ":" + std::to_string(ctx_all);
+      graph_ctx_ = ctx_all;
+      CUDA_CHECK(cudaStreamSynchronize(stream_));   // the host part rewrites pinned buffers earlier work may still read
+      gphase_ = 1;
+      chain(true);
       gphase_ = 0;
-      mtp_step_rows(sq.data(), n, i, tk.data(), pp.data(), hin, hout);
+      auto it = graphs_.find(key);
+      if (it == graphs_.end() && graph_seen_[key]++ >= 1) {
+        gphase_ = 2;
+        cudaGraph_t g = nullptr;
+        CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+        try { chain(true); } catch (...) {
+          cudaGraph_t bad = nullptr; cudaStreamEndCapture(stream_, &bad); if (bad) cudaGraphDestroy(bad); cudaGetLastError(); gphase_ = 0; throw;
+        }
+        gphase_ = 0;
+        CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+        cudaGraphExec_t ex = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&ex, g, 0));
+        CUDA_CHECK(cudaGraphDestroy(g));
+        it = graph_put(key, ex);
+      }
+      if (it != graphs_.end()) { graph_used(key); CUDA_CHECK(cudaGraphLaunch(it->second, stream_)); done = true; }
     }
+    gphase_ = 0;
+    if (!done) chain(false);
     std::vector<int32_t> ids((size_t)k * kDraftRows);
     std::vector<float> ms((size_t)2 * k * kDraftRows);
     CUDA_CHECK(cudaMemcpyAsync(ids.data(), mtpb_ids_d_.p, ids.size() * 4, cudaMemcpyDeviceToHost, stream_));
@@ -474,6 +519,10 @@ void QwenEngine::verify_batch(QwenSeq* const* seqs, const int* Ms, int S, const 
     R += M;
   }
   verify_ids_.assign(ids, ids + R);
+  static const bool dyn = !(getenv("HIVE_QWEN_VERIFY_DYN") && strcmp(getenv("HIVE_QWEN_VERIFY_DYN"), "0") == 0);
+  vdyn_ = dyn && S <= 16;   // (gdn_decode_rows_multi_dyn: ≤ 16 parts of ≤ 8 rows — M ≤ mtp_k + 1)
+  for (const VPart& vp : vparts_) vdyn_ = vdyn_ && vp.M <= 8;
+  if (vdyn_) for (int p = 0; p < S; ++p) { vpt_pin_[2 * p] = vparts_[p].r0; vpt_pin_[2 * p + 1] = vparts_[p].M; }
   verify_ = true;
   try {
     forward(rows, ids, false, logits_host, true);

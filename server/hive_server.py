@@ -351,6 +351,64 @@ def think_token_ids():
     return _THINK_IDS[1], _THINK_IDS[2]
 
 
+# Answer-span Han / kana filter — an opt-in option (Qwen3.8-Flash-Next only — engine/include/hive/token_mask.h, docs/qwen.md): with
+#   "hanja_filter": true in the body (also inside chat_template_kwargs) or the header x-hanja-filter: 1 the daemon lowers the logits of its
+#   token list (multi-ideograph and kana tokens, tools/build_cjk_mask.py → HIVE_QWEN_TOKEN_MASK) in the answer span by "hanja_penalty"
+#   (a positive number; absent = ∞, never sampled). Off unless asked — measured 2026-10-31, the default behaviour is left to the sampling
+#   settings (docs/qwen.md "Han / kana in Korean answers"). Values that are not booleans, 0 / 1 or "true" / "false" count as absent.
+
+
+def _penalty(v, default):
+    if isinstance(v, bool) or v is None:
+        return default
+    if isinstance(v, str) and v.strip().lower() in ("inf", "infinity"):
+        return float("inf")
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return x if x > 0 and x == x else default
+
+
+def _flag(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("1", "0", "true", "false", "on", "off"):
+        return v.strip().lower() in ("1", "true", "on")
+    return None
+
+
+def hanja_filter_mode(body: dict, headers) -> tuple:
+    """("on", Δ) when the request asks for the filter, else ("off", why)"""
+    if FAMILY != "qwen4_exp":
+        return ("off", "family")
+    kw = body.get("chat_template_kwargs") if isinstance(body.get("chat_template_kwargs"), dict) else {}
+    for v in (body.get("hanja_filter"), kw.get("hanja_filter"), headers.get("x-hanja-filter") if headers is not None else None):
+        f = _flag(v)
+        if f is not None:
+            return ("on", _penalty(body.get("hanja_penalty", kw.get("hanja_penalty")), float("inf"))) if f else ("off", "request")
+    return ("off", "default")
+
+
+def hanja_filter_wanted(body: dict, headers) -> bool:
+    return hanja_filter_mode(body, headers)[0] == "on"
+
+
+def think_open_at_end(ids: list, t_start) -> bool:
+    """The prompt ends inside an open thinking block: its last token is <think>, or <think> followed only by whitespace tokens
+    (Qwen3.8-Flash-Next's template ends the prompt with "<think>\\n" — with only ids[-1] checked the cap never armed for it)."""
+    if not ids or t_start is None:
+        return False
+    for k in range(len(ids) - 1, max(-1, len(ids) - 4), -1):
+        if ids[k] == t_start:
+            return True
+        if TOK.decode([ids[k]]).strip():
+            return False
+    return False
+
+
 # Thinking-cap exit phrase: when the cap is reached, hived forces this phrase's tokens before </think> (hived.cpp Active::think_exit).
 #   Rationale (measured on vLLM): forcing only </think> left 3.7% (6/162) of answers continuing to think inside the
 #   answer, exposing the reasoning; adding a transition phrase ("I have enough reasoning. I will now write the final
@@ -793,7 +851,14 @@ class MediaTokens:
     prev_prompt_tokens / diverge_at.
     Images: preprocessed once per distinct image (keyed by the SHA-256 of its bytes and the vision arguments) and kept while a recent
     conversation's last request uses it — HIVE_TOKEN_CACHE_SESSIONS conversations (default 64: they hold the patch bytes).
-    Absorbed: anything that raises here, or a family adapter (its own prepare_inputs), takes tokenize_with_images as before. Every
+    Family adapters (GLM / Qwen) take this path when the adapter preprocesses one image at a time (image_part_bytes · image_part_patches ·
+    image_cache_key, server/families/qwen.py) and the placeholder expands to a run of one pad token: the prompt's pad token becomes the
+    image's run of pads, the patches come from the per-image cache. Measured 2026-10-30 (Qwen3.8-Flash-Next, production, the first day it served
+    the assistant deployment): a 21-image assistant turn spent 2,893 ms tokenizing (the whole prompt and every image again), and image requests got no boundary
+    hints — a sign-in look whose screenshot changes every step (diverging at ~3.3K tokens) cached 0 each time. Video parts (the expansion writes
+    "<t seconds>" text that tokenizes with its neighbours) and the image bytes held by DaemonImages (this family copies every image at
+    admission — hived kHostPatches) stay as before: no content keys go out, so every image's bytes are sent.
+    Absorbed: anything that raises here, or a family adapter without those functions, takes tokenize_with_images as before. Every
     HIVE_TOKEN_CACHE_VERIFY-th request (the token cache's own cadence) is prepared again by tokenize_with_images on a background thread; a
     difference turns this path off for the process (logged)."""
 
@@ -805,7 +870,12 @@ class MediaTokens:
         self.served = 0
 
     def usable(self) -> bool:
-        return (not self.disabled and not adapter_family() and IMG is not None and ARGS is not None and ENC is not None
+        if self.disabled or ENC is None:
+            return False
+        if adapter_family():
+            return all(callable(getattr(ENC, n, None)) for n in ("image_part_bytes", "image_part_patches", "image_cache_key")) \
+                and isinstance(getattr(ENC, "IMAGE_PAD", None), str) and TOKCACHE.usable()
+        return (IMG is not None and ARGS is not None
                 and all(hasattr(IMG, n) for n in ("load_image", "load_image_bytes", "image_token_types")) and TOKCACHE.usable())
 
     def _image(self, record, args_key):
@@ -825,6 +895,8 @@ class MediaTokens:
         """(ids, ends, images_meta, blob, spans, placeholder positions in the prompt tokens) — spans = (start, length) per image.
         keys_out (a list) receives each image's content key in order (DaemonImages — the source bytes and the vision arguments)."""
         from array import array
+        if adapter_family():
+            return self._prepare_adapter(key, prompt, media)
         image_id = ARGS.image_token_id
         ph = TOK.convert_tokens_to_ids(ENC.IMAGE_PLACEHOLDER)
         if ph is not None and ph != TOK.unk_token_id and ph != image_id:
@@ -858,6 +930,53 @@ class MediaTokens:
             prev = i + 1
         ids += text_ids[prev:]
         ends.extend(text_ends[prev:])
+        return self._finish(key, prompt, media, used, ids, ends, metas, blobs, spans, pos)
+
+    def _prepare_adapter(self, key: str, prompt: str, media: list):
+        """prepare() for a family adapter (class docstring): no content keys (DaemonImages stays off for these families)."""
+        from array import array
+        if any(isinstance(p, dict) and p.get("type") in ("video", "video_url") for p in media):
+            raise ValueError("video parts take the family path")
+        pad = TOK.convert_tokens_to_ids(ENC.IMAGE_PAD)
+        if pad is None or pad == TOK.unk_token_id:
+            raise ValueError("no image pad token")
+        text_ids, text_ends = TOKCACHE.tokenize(key, prompt)
+        pos, i = [], -1
+        while True:
+            try:
+                i = text_ids.index(pad, i + 1)
+            except ValueError:
+                break
+            pos.append(i)
+        if len(pos) != len(media):
+            raise ValueError("image placeholders / images")
+        args_key = ENC.image_cache_key()
+        ids, ends, metas, blobs, spans, used = [], array("l"), [], [], [], []
+        prev = 0
+        for i, part in zip(pos, media):
+            data = ENC.image_part_bytes(part)
+            k = (hashlib.sha256(data).digest(), args_key)
+            with self.lock:
+                e = self.images.get(k)
+            if e is None:
+                raw, gh, gw = ENC.image_part_patches(data)
+                e = [raw, gh, gw, [1] * (gh * gw // 4), 0]
+            ids += text_ids[prev:i]
+            ends.extend(text_ends[prev:i])
+            n = len(e[3])
+            metas.append({"start": len(ids), "n_vit_h": e[1], "n_vit_w": e[2], "types": list(e[3]), "nbytes": len(e[0])})
+            blobs.append(e[0])
+            spans.append((len(ids), n))
+            ids += [pad] * n
+            ends.extend([text_ends[i]] * n)
+            used.append((k, e))
+            prev = i + 1
+        ids += text_ids[prev:]
+        ends.extend(text_ends[prev:])
+        return self._finish(key, prompt, media, used, ids, ends, metas, blobs, spans, pos)
+
+    def _finish(self, key, prompt, media, used, ids, ends, metas, blobs, spans, pos):
+        """Keep the images this conversation's request uses (per-conversation reference counts), verify every N-th request."""
         with self.lock:
             for k, e in used:
                 self.images.setdefault(k, e)
@@ -3213,6 +3332,9 @@ async def chat(request: Request):
         "top_p": _num(body.get("top_p"), family_default("top_p", 0.95)),
         "top_k": int(_num(body.get("top_k"), family_default("top_k", 0))),
         "min_p": _num(body.get("min_p"), 0.0),
+        # presence_penalty (OpenAI: −2..2, subtracted from the logit of every token already in this response — the daemon applies it at every
+        #   sampled row, verify rows included; Qwen3.8-Flash-Next only, the other families keep ignoring it as before)
+        **({"presence_penalty": max(-2.0, min(2.0, float(pp)))} if FAMILY == "qwen4_exp" and (pp := _num(body.get("presence_penalty"), 0.0)) else {}),
         "seed": int(_num(body.get("seed"), 0)) if abs(_num(body.get("seed"), 0)) < 2 ** 62 else 0,
         # ignore_eos (benchmark harnesses measure throughput at a fixed output length): no stop token, run to max_tokens
         "stop_ids": [] if body.get("ignore_eos") else stop_ids(),
@@ -3227,9 +3349,15 @@ async def chat(request: Request):
         if t_end is None:
             think_cap = None  # the tokenizer has no single </think> token — feature off (absorbed)
         else:
-            sampling.update({"think_cap": think_cap, "think_end_id": t_end, "think_open": bool(ids) and t_start is not None and ids[-1] == t_start,
+            sampling.update({"think_cap": think_cap, "think_end_id": t_end, "think_open": think_open_at_end(ids, t_start),
                              **({"think_start_id": t_start} if t_start is not None else {}),
                              **({"think_exit_ids": ex} if (ex := think_exit_ids()) else {})})
+    hanja_mode = hanja_filter_mode(body, getattr(request, "headers", None))
+    if hanja_mode[0] == "on":
+        t_start, t_end = think_token_ids()
+        sampling.update({"token_mask": True, **({"mask_penalty": hanja_mode[1]} if math.isfinite(hanja_mode[1]) else {}),
+                         **({"mask_think_end": t_end, "mask_in_think": think_open_at_end(ids, t_start)} if t_end is not None else {}),
+                         **({"mask_think_start": t_start} if t_start is not None else {})})
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     if STAGE_STATUS:  # GET /v1/hive/requests/{rid} (stage_status) — the daemon adds its "admitted" line only to requests that ask
@@ -3279,6 +3407,9 @@ async def chat(request: Request):
                "thinking_mode": thinking_mode, "effort": effort,
                # thinking cap as received (null if none) — whether it was forced is done.think_forced (daemon), also lifted to the top level below
                "think_cap": think_cap,
+               # requested mode — whether the daemon actually served the filter is done.token_mask, lifted to "hanja_filter_served" where the
+               #   done message is read (a request asking for the filter on a daemon without HIVE_QWEN_TOKEN_MASK is served unfiltered; 2026-10-31 review)
+               **({"hanja_filter": f"on:{hanja_mode[1]:g}"} if hanja_mode[0] == "on" else {}),
                **({"prefix_extra": 1} if prefix_extra else {}),
                **({"cut_leaks_stripped": cut_leaks} if cut_leaks else {})}  # HIVE_CUT_LEAK_STRIP: preambles rendered empty in this prompt
 
@@ -3379,6 +3510,8 @@ async def chat(request: Request):
                         if "think_forced" in msg:  # only requests with a thinking cap (the daemon sends it only then) — also at the record's top level for aggregation
                             req_rec["think_forced"] = bool(msg["think_forced"])
                             req_rec["think_tokens"] = msg.get("think_tokens")
+                        if "hanja_filter" in req_rec:  # answer-span filter: served only when the daemon has a token list (done.token_mask) — else unfiltered
+                            req_rec["hanja_filter_served"] = bool(msg.get("token_mask"))
                         tail = stop_text.finish()
                         if tail: yield ('delta', tail)
                         if msg.get("finish") == "cancel":

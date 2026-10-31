@@ -20,6 +20,7 @@
 #include "hive/cublas_ops.h"
 #include "hive/grow_buf.h"
 #include "hive/glm/glm_experts.h"
+#include "hive/qwen/fn_mx.h"
 #include "hive/qwen/gdn.h"
 #include "hive/qwen/ple.h"
 #include "hive/qwen/qsa.h"
@@ -76,6 +77,12 @@ class QwenEngine {
   std::function<bool()> kv_reclaim_;
   void reset_seq(QwenSeq& s);
   const float* logits_dev() const { return logits_dev_.as<float>(); }
+  // answer-span token filter (hive/token_mask.h): the list from HIVE_QWEN_TOKEN_MASK (int32 ids); arm_mask(flags, rows) makes the next
+  //   decode / verify heads lower the listed logits of rows with a non-zero shift (the runtime arms every decode / verify call while a list is loaded,
+  //   so captured graphs always hold the masking kernel); prefill heads are never masked (the host masks that row)
+  const std::vector<int32_t>& token_mask() const { return mask_host_; }
+  void arm_mask(const float* pen, int rows);
+  void disarm_mask() { mask_armed_ = false; }
   const int32_t* route_ids_dev() const { return rids_.as<int32_t>(); }   // the last MoE layer's top-k ids [rows, k] (validation)
   // KV / rope memory follows use (cap only reserves addresses); growth takes VRAM above HIVE_CACHE_RESERVE_MB (within the budget), giving
   //   back expert-cache tail slots when needed. Throws if even that is not enough.
@@ -126,6 +133,11 @@ class QwenEngine {
   // false = the hook only reports read progress (layer_yield.h Progress) and never runs another forward — the combine + next-norm fusion
   //   (combine_mlp may_fuse) stays on, so a progress-only hook costs nothing on the GPU side
   bool layer_boundary_yields = true;
+  // With a yielding hook: true when the coming boundary may yield (the yield's period has passed and hived has work) — only then is the
+  //   combine + next-norm fusion turned off for the prefill layer (the inner forwards reuse hn_ / dl_). Unset = always may yield. A boundary
+  //   reached with the fusion pending (pre_normed()) does not yield; the next one does (layer_yield_point is skipped there).
+  std::function<bool()> yield_due;
+  bool pre_normed() const { return pre_normed_; }
   // Where the running sub-forward sits in the prefill call: prefill() runs a long chunk as several forwards (max_chunk rows, or
   //   layer-major spans), each over all layers — a layer index alone restarted at 0 for every one of them, so read progress jumped to
   //   ~98 % of a 65,536-row chunk within 2.5 s and then stood still for 6.5 s (measured 2026-10-15). Fraction of the call =
@@ -198,6 +210,11 @@ class QwenEngine {
   // work buffers (rows ≤ max_chunk)
   DevBuf h_, x_, y_, hn_, dl_, hs_, hu_, proj_, q_, iq_, idx_, attn_out_, gdn_out_, mlp_out_f32_, shared_out_, sh_gu_, sh_y_, router_, rids_, rw_;
   DevBuf ws_, logits_dev_, xfin_, gemv_ws_;
+  std::vector<int32_t> mask_host_;
+  DevBuf mask_ids_;
+  float* mask_flags_ = nullptr;       // mapped pinned [64]: per-row shift
+  float* mask_flags_d_ = nullptr;
+  bool mask_armed_ = false;
   size_t ws_bytes_ = 0;
   // PLE
   uint8_t* ple_rows_pin_ = nullptr;   // pinned [max_chunk, 2560] FP8 rows of the lookup (read by ple_dequant through UVA)
@@ -205,6 +222,7 @@ class QwenEngine {
   std::unique_ptr<PleTable> ple_;
   PleHash ple_hash_;
   float ple_scale_ = 1.f;
+  bool ple_nv_ = false;               // NVFP4 table (FP4-Local): rows = 80 data + 10 scale bytes per 160-byte slot
   // attention row tables: a ring in pinned memory (a call's table stays untouched until the stream passed it — qrows_alloc)
   QsaRow* qrows_pin_ = nullptr;
   int qrows_cap_ = 0;
@@ -240,9 +258,18 @@ class QwenEngine {
   float** rb_pin_ = nullptr;
   int rb_parts_ = 0;   // parts rb_pin_ / rb_dev_ hold a section for
   DevBuf dq_;                             // bf16 expansion of an 8-bit-only matrix for a prefill GEMM (HIVE_QWEN_DENSE8)
+  // HIVE_QWEN_DENSE_MX (off by default): prefill GEMMs of the checkpoint's MXFP8 matrices on the block-scaled FP8 path (hive/qwen/fn_mx.h) —
+  //   the weight bytes as stored, their ue8m0 scales laid out into mxws_, the activation rows quantized into mxa_ / mxas_ (K ≤ mx_kcap_).
+  //   Lossless against the quality gate on FP4-Local (169, the N4 mix); no effect on a checkpoint without MXFP8 matrices.
+  std::unique_ptr<FnMx> mx_;
+  int mx_rows_ = kDecRows + 1;   // HIVE_QWEN_DENSE_MX_ROWS: the smallest row count a lin() call takes the MXFP8 GEMM for (default: prefill chunks only)
+  DevBuf mxa_, mxas_, mxws_;   // activations e4m3 + ue8m0 scales · weight scales laid out in cuBLASLt tiles (the weight bytes are the checkpoint's)
+  int mx_kcap_ = 0;
   std::vector<DevBuf> rs_;            // fused decode: per layer [router 513 | shared gate 640 | shared up 640] rows (bf16)
   DevBuf mtp_rs_;                     // the same for the MTP layer
   glm::Fp8BMat* mtp_tab_ = nullptr;   // device table of the MTP layer's FP8 experts (fn_moe_fp8_routed)
+  DevBuf mtp_nv_tab_;                 // or: the MTP layer's NVFP4 record addresses (fn_moe_decode_routed, FP4-Local checkpoint)
+  bool mtp_dev_ = false;              // the MTP MoE runs on the device (either table)
   int mtp_slot_ = 0;                  // draft step: the attention row-table slot in graph phases
   std::vector<const uint8_t*> rec_host_, rec_up_;   // the table built for this step · the one on the device
   // allow_host: experts that are not resident get the address of their record in pinned host memory (mapped device routing) ·
@@ -287,6 +314,12 @@ class QwenEngine {
   bool verify_ = false;
   struct VPart { QwenSeq* s; int64_t pos0; int M, r0; };
   std::vector<VPart> vparts_;
+  // HIVE_QWEN_VERIFY_DYN (default on): the parts' (first row, rows) go to device memory (vpt_pin_ → vpt_dev_ with the pointer tables) and the
+  //   GDN / PLE verify kernels read them there, so one captured graph per (rows, parts) serves every split of the rows over the sequences —
+  //   with the split baked in, batched verify steps at 8 sequences almost never met a captured graph (the gate varies each sequence's drafts)
+  int* vpt_pin_ = nullptr;
+  DevBuf vpt_dev_;
+  bool vdyn_ = false;
   std::vector<int32_t> verify_ids_;
   int mtp_k_ = 0, snap_parts_ = 1, snap_live_ = 0, snap_idle_ = 0;
   static constexpr int kSnapIdle = 256;   // single-part verify steps before parts 1.. are freed
@@ -319,6 +352,7 @@ class QwenEngine {
   //   the cache fell 2797 → 1354 → 331 slots over the c4 / c8 / 64K steps against 2797 → 1181 on the host route (no graphs) — the batched
   //   verify keys (rows, part layout, context bucket) and per-sequence draft keys accumulate without bound. Cap 128 → 32 at 48 GB:
   //   c1 / c4 / c8 129.8 / 181.9 / 230.0 → 131.4 / 186.5 / 248.4 tok/s; 64K TTFT at 32 GB 20.2 s (no cap) → 15.0 (host route 14.8).
+  long gstat_n_ = 0, gstat_replay_ = 0, gstat_capture_ = 0, gstat_first_ = 0;   // HIVE_QWEN_GRAPH_TRACE
   std::map<std::string, uint64_t> graph_tick_;
   uint64_t graph_clock_ = 0;
   size_t graph_cap_ = 0;

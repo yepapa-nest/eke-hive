@@ -211,7 +211,7 @@ def server_checks():
     class Tok:
         eos_token_id = 99
         eos_token = '<EOS>'
-        VOC = {1: 'a', 2: 'b', 5: '</think>', 6: '<think>', 99: '<EOS>'}
+        VOC = {1: 'a', 2: 'b', 5: '</think>', 6: '<think>', 7: '\n', 10: 'x', 11: 'y', 99: '<EOS>'}
 
         def decode(self, ids, **kw):
             return ''.join(self.VOC[i] for i in ids)
@@ -257,6 +257,11 @@ def server_checks():
     recs = []
     s.log_request = lambda r: recs.append(r)
     s.TOK, s.ENC = Tok(), Enc()
+    # a prompt ending in "<think>\n" (Qwen3.8-Flash-Next's template) is inside an open thinking block too
+    check('server: think_open <think> last', s.think_open_at_end([10, 11, 6], 6) is True)
+    check('server: think_open <think> + newline', s.think_open_at_end([10, 6, 7], 6) is True)
+    check('server: think_open text after <think>', s.think_open_at_end([10, 6, 1], 6) is False)
+    check('server: think_open no <think> id', s.think_open_at_end([10, 6], None) is False and s.think_open_at_end([], 6) is False)
     s.encode_prompt = lambda *a: ('prompt', [])
     s.tokenize_with_images = lambda *a: ([10, 11, 6], [], b'')
     s.daemon_max_ctx = lambda: asyncio.sleep(0, result=0)

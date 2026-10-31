@@ -23,7 +23,9 @@ BIN_TS=$( { stat -c %y "$BIN_DIR/$BIN" 2>/dev/null | cut -c1-19; } || true)
 msg="[supervisor] build dir=$BIN_DIR binary=$BIN_DIR/$BIN sha256=${BIN_ID:-?} elf-build-id=${BIN_ELF:-?} mtime=${BIN_TS:-?}${HIVE_BUILD:+ (HIVE_BUILD=$HIVE_BUILD)}"
 [ "${HIVE_BUILD:-build}" = build ] || msg="$msg (not the default engine/build)"
 echo "$msg" >&2; echo "$msg" >> /out/logs/hived.log
-"$BIN_DIR/$BIN" "$@" >> /out/logs/hived.log 2>&1 &
+# HIVE_DAEMON_WRAP (measurement only): a command put in front of the daemon, e.g. "nsys launch --session-new=hive --trace=cuda,nvtx"
+read -r -a WRAP <<< "${HIVE_DAEMON_WRAP:-}"
+"${WRAP[@]}" "$BIN_DIR/$BIN" "$@" >> /out/logs/hived.log 2>&1 &
 daemon_pid=$!
 python3 /hive/server/hive_server.py --ckpt "${HIVE_CKPT_MOUNT:-/model}" --sock /out/hive.sock --host "${HIVE_BIND:-127.0.0.1}" --port "${HIVE_PORT:-8430}" >> /out/logs/server.log 2>&1 &
 server_pid=$!

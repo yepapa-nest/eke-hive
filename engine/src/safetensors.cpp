@@ -18,9 +18,9 @@ using json = nlohmann::json;
 
 size_t dtype_size(const std::string& d) {
   if (d == "F8_E4M3" || d == "F8_E8M0" || d == "I8" || d == "U8" || d == "BOOL") return 1;
-  if (d == "BF16" || d == "F16" || d == "I16") return 2;
-  if (d == "F32" || d == "I32") return 4;
-  if (d == "F64" || d == "I64") return 8;
+  if (d == "BF16" || d == "F16" || d == "I16" || d == "U16") return 2;
+  if (d == "F32" || d == "I32" || d == "U32") return 4;   // U32: CSF exception words (hive/ckpt_quant.h)
+  if (d == "F64" || d == "I64" || d == "U64") return 8;
   throw std::runtime_error("unknown safetensors dtype: " + d);
 }
 

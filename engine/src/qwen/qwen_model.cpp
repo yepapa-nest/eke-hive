@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 The Eke Hive Authors
 #include "hive/qwen/qwen_model.h"
+#include "hive/ckpt_quant.h"
+#include "hive/glm/glm_moe.h"
 #include "hive/qwen/fn_gemv.h"
 
 #include <algorithm>
@@ -59,9 +61,15 @@ void QwenModel::make_dense8() {
     conv(L.moe.sh_gu); conv(L.moe.sh_down);
     conv(L.plew.key); conv(L.plew.value);
   };
-  for (LayerW& L : layers_) layer(L);
-  hc(mixer_);
-  if (mtp_) { conv(mtp_->fc_emb); conv(mtp_->fc_hidden); layer(mtp_->layer); hc(mtp_->mixer); }
+  // HIVE_QWEN_DENSE8_SCOPE=head: only lm_head gets the 8-bit copy (with HIVE_QWEN_DENSE8_HEAD=1). FP4-Local, 2026-10-31: its dense projections
+  //   are MXFP8 as stored (fmt8 3, not touched here); INT8 copies of the remaining bf16 ones (hyper-connection up, PLE key / value, the MTP
+  //   layer) failed the quality gate twice (164 · 166 against 168; the same with them bf16: 169)
+  const char* scope = getenv("HIVE_QWEN_DENSE8_SCOPE");
+  if (!(scope && !strcmp(scope, "head"))) {
+    for (LayerW& L : layers_) layer(L);
+    hc(mixer_);
+    if (mtp_) { conv(mtp_->fc_emb); conv(mtp_->fc_hidden); layer(mtp_->layer); hc(mtp_->mixer); }
+  }
   if (getenv("HIVE_QWEN_DENSE8_HEAD") && atoi(getenv("HIVE_QWEN_DENSE8_HEAD")) > 0) conv(lm_head_, true);   // bf16 kept: prefill head, the draft head's copy
   CUDA_CHECK(cudaDeviceSynchronize());
   vram_bytes_ = vram_bytes_ + bytes - dropped;
@@ -71,33 +79,95 @@ void QwenModel::make_dense8() {
                : " beside the bf16 originals (prefill)");
 }
 
+// Rows of several matrices with the same input width. BF16 parts are copied. When every part is MXFP8 (NVIDIA FP4-Local: e4m3 + ue8m0 per
+//   32 columns) the stack keeps that format as the QMat's only copy (fmt8 3, hive/qwen/fn_gemv.h) — exact, half the bytes of bf16, and the
+//   decode GEMV / prefill MXFP8 GEMM read it as stored. Any other mix (or HIVE_QWEN_MX_EXPAND=1, for A/B) is expanded to bf16 on the host:
+//   exact for MXFP8, one rounding for NVFP4 (hive/ckpt_quant.h).
 QMat QwenModel::stack(const std::vector<std::string>& names) {
   int rows = 0, in = -1;
+  bool all_bf16 = true, all_mx = true;
   for (const auto& n : names) {
-    const TensorInfo& t = ckpt_.get(n);
-    HIVE_CHECK(t.dtype == "BF16" && t.shape.size() == 2, "qwen: expected a BF16 matrix: " + n + " (" + t.dtype + ")");
-    HIVE_CHECK(in < 0 || in == (int)t.shape[1], "qwen: stacked matrices differ in width: " + n);
-    in = (int)t.shape[1]; rows += (int)t.shape[0];
+    HIVE_CHECK(n.size() > 6 && n.compare(n.size() - 6, 6, "weight") == 0, "qwen: stack expects .weight tensors: " + n);
+    const std::string base = n.substr(0, n.size() - 6);
+    const ckq::Dense f = ckq::dense_format(ckpt_, base);
+    HIVE_CHECK(f != ckq::Dense::Other, "qwen: unsupported matrix format: " + n + " (" + ckpt_.get(n).dtype + ")");
+    all_bf16 = all_bf16 && f == ckq::Dense::BF16;
+    all_mx = all_mx && f == ckq::Dense::MXFP8;
+    int64_t N = 0, K = 0;
+    ckq::dense_shape(ckpt_, base, N, K);
+    HIVE_CHECK(in < 0 || in == (int)K, "qwen: stacked matrices differ in width: " + n);
+    in = (int)K; rows += (int)N;
   }
+  static const bool mx_expand = getenv("HIVE_QWEN_MX_EXPAND") && atoi(getenv("HIVE_QWEN_MX_EXPAND")) > 0;
   QMat m; m.out = rows; m.in = in;
+  if (all_mx && !mx_expand && in % 64 == 0) {
+    m.q8.alloc((size_t)rows * in); m.s8.alloc((size_t)rows * (in / 32));
+    size_t oq = 0, os = 0;
+    for (const auto& n : names) {
+      const uint8_t *q = nullptr, *sc = nullptr;
+      int64_t N = 0, K = 0;
+      ckq::mxfp8_parts(ckpt_, n.substr(0, n.size() - 6), q, sc, N, K);
+      CUDA_CHECK(cudaMemcpy(m.q8.as<uint8_t>() + oq, q, (size_t)N * K, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(m.s8.as<uint8_t>() + os, sc, (size_t)N * (K / 32), cudaMemcpyHostToDevice));
+      oq += (size_t)N * K; os += (size_t)N * (K / 32);
+    }
+    m.fmt8 = 3; m.gs8 = 32;
+    vram_bytes_ += oq + os;
+    dense8_max_ = std::max(dense8_max_, (size_t)rows * in);
+    ++mx8_;
+    return m;
+  }
   m.buf.alloc((size_t)rows * in * 2);
   size_t off = 0;
   for (const auto& n : names) {
     const TensorInfo& t = ckpt_.get(n);
-    CUDA_CHECK(cudaMemcpy(m.buf.as<uint8_t>() + off, t.data, t.nbytes, cudaMemcpyHostToDevice));
-    off += t.nbytes;
+    if (all_bf16 || t.dtype == "BF16") {
+      CUDA_CHECK(cudaMemcpy(m.buf.as<uint8_t>() + off, t.data, t.nbytes, cudaMemcpyHostToDevice));
+      off += t.nbytes;
+    } else {
+      const std::vector<uint16_t> h = ckq::expand_bf16(ckpt_, n.substr(0, n.size() - 6), 16);
+      CUDA_CHECK(cudaMemcpy(m.buf.as<uint8_t>() + off, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+      off += h.size() * 2;
+    }
   }
   vram_bytes_ += off;
   return m;
 }
 
+// bf16 vector. F32 (the FP4-Local checkpoint keeps the hyper-connection and PLE norms in fp32) is rounded to bf16 — the kernels take bf16
+//   norm weights; the NVFP4 checkpoint stores these norms in bf16 already.
 DevBuf QwenModel::vec_bf16(const std::string& name) {
   const TensorInfo& t = ckpt_.get(name);
-  HIVE_CHECK(t.dtype == "BF16", "qwen: expected BF16: " + name);
+  HIVE_CHECK(t.dtype == "BF16" || t.dtype == "F32", "qwen: expected BF16 or F32: " + name);
+  if (t.dtype == "F32") {
+    const std::vector<float> f = ckq::vec_f32(ckpt_, name);
+    std::vector<uint16_t> h(f.size());
+    for (size_t i = 0; i < f.size(); ++i) h[i] = ckq::f32_bf16(f[i]);
+    DevBuf b(h.size() * 2);
+    CUDA_CHECK(cudaMemcpy(b.p, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+    vram_bytes_ += h.size() * 2;
+    ++f32_rounded_;
+    return b;
+  }
   DevBuf b(t.nbytes);
   CUDA_CHECK(cudaMemcpy(b.p, t.data, t.nbytes, cudaMemcpyHostToDevice));
   vram_bytes_ += t.nbytes;
   return b;
+}
+
+// (1 + w) norm weight: an F32 tensor (FP4-Local's hyper-connection and PLE norms — QAD-trained values that are not bf16 numbers) stays fp32
+//   unless HIVE_QWEN_NORM_BF16=1 (A/B: the bf16 rounding)
+NormW QwenModel::vec_norm(const std::string& name) {
+  static const bool to_bf16 = getenv("HIVE_QWEN_NORM_BF16") && atoi(getenv("HIVE_QWEN_NORM_BF16")) > 0;
+  NormW w;
+  if (ckpt_.get(name).dtype == "F32" && !to_bf16) {
+    w.buf = vec_f32(name);
+    w.f32 = true;
+    ++f32_kept_;
+  } else {
+    w.buf = vec_bf16(name);
+  }
+  return w;
 }
 
 DevBuf QwenModel::vec_f32(const std::string& name) {
@@ -123,7 +193,7 @@ void QwenModel::load_hc(const std::string& p, HcW& w, bool inject) {
   if (inject) rows.push_back(p + "block_inject_weight.weight");
   w.down_inj = stack(rows);
   w.up = mat(p + "input_mix_weight_up.weight");
-  w.norm = vec_bf16(p + "hc_norm.weight");
+  w.norm = vec_norm(p + "hc_norm.weight");
   w.inject = inject;
   HIVE_CHECK(w.down_inj.in == cfg_.hcw() && w.down_inj.out == cfg_.hc_rank + (inject ? cfg_.hc : 0) && w.up.out == cfg_.hcw() && w.up.in == cfg_.hc_rank,
              "qwen: hyper-connection shapes " + p);
@@ -177,8 +247,9 @@ QwenModel::QwenModel(const std::string& dir, bool load_mtp, int gpu_layers) : cf
       L.ple = true;
       const std::string q = p + "ple.";
       L.plew.key = mat(q + "key_proj.weight"); L.plew.value = mat(q + "value_proj.weight");
-      L.plew.norm_key = vec_bf16(q + "norm_key.weight"); L.plew.norm_query = vec_bf16(q + "norm_query.weight");
-      L.plew.norm_conv = vec_bf16(q + "norm_conv.weight");
+      L.plew.norm_key = vec_norm(q + "norm_key.weight"); L.plew.norm_query = vec_norm(q + "norm_query.weight");
+      L.plew.norm_conv = vec_norm(q + "norm_conv.weight");
+      HIVE_CHECK(L.plew.norm_key.f32 == L.plew.norm_query.f32, "qwen: PLE key / query norms in different precisions");
       L.plew.conv_w = conv_f32(q + "conv1d.weight", c.hcw());
       HIVE_CHECK(L.plew.key.out == c.hcw() && L.plew.key.in == c.ple_dim && L.plew.value.out == c.hidden, "qwen: PLE projection shapes");
     }
@@ -214,14 +285,41 @@ QwenModel::QwenModel(const std::string& dir, bool load_mtp, int gpu_layers) : cf
     }
     load_moe(p, L.moe);
     load_hc("mtp.hyper_connection_mixer.", w.mixer, false);
-    // FP8 experts: weight e4m3 [N, K] + weight_scale_inv BF16 [N/128, K/128] → fp32 scales (glm::Fp8BMat), one arena in VRAM
     const int E = c.n_experts, I = c.moe_inter, H = c.hidden;
+    const char* names[3] = {"gate_proj", "up_proj", "down_proj"};
+    if (ckpt_.get(p + "mlp.experts.0.gate_proj.weight").dtype == "U8") {
+      // NVFP4 experts (NVIDIA FP4-Local: W4A16, plain E4M3 block scales + fp32 global): records in the main layers' format
+      //   (glm::ExpertRecLayout — gate weights, scales, up weights, scales, down weights, scales, the three globals), one arena in VRAM
+      const glm::ExpertRecLayout RL = glm::ExpertRecLayout::make(H, I);
+      w.nvfp4 = true; w.rec_bytes = RL.total;
+      w.expert_arena.alloc((size_t)E * RL.total);
+      std::vector<uint8_t> rec(RL.total);
+      for (int e = 0; e < E; ++e) {
+        std::fill(rec.begin(), rec.end(), 0);
+        const size_t wo[3] = {RL.w1, RL.w3, RL.w2}, so[3] = {RL.s1, RL.s3, RL.s2};
+        float g[3];
+        for (int j = 0; j < 3; ++j) {
+          const std::string b = p + "mlp.experts." + std::to_string(e) + "." + names[j] + ".";
+          const TensorInfo& tw = ckpt_.get(b + "weight");
+          const TensorInfo& tg = ckpt_.get(b + "weight_scale_2");
+          const int N = (int)tw.shape[0], K = (int)tw.shape[1] * 2;
+          HIVE_CHECK(tw.dtype == "U8" && tg.dtype == "F32" && ((j < 2 && N == I && K == H) || (j == 2 && N == H && K == I)), "qwen: MTP NVFP4 expert shape " + b);
+          std::memcpy(rec.data() + wo[j], tw.data, tw.nbytes);
+          ckq::nvfp4_scales(ckpt_, b, N, K / 16, rec.data() + so[j]);
+          std::memcpy(&g[j], tg.data, 4);
+        }
+        std::memcpy(rec.data() + RL.g, g, 12);
+        CUDA_CHECK(cudaMemcpy(w.expert_arena.as<uint8_t>() + (size_t)e * RL.total, rec.data(), RL.total, cudaMemcpyHostToDevice));
+      }
+      vram_bytes_ += (size_t)E * RL.total;
+      fprintf(stderr, "[qwen] MTP: NextN layer loaded · %d routed experts NVFP4 in VRAM (%.2f GiB)\n", E, (double)E * RL.total / 1073741824.0);
+    } else {
+    // FP8 experts: weight e4m3 [N, K] + weight_scale_inv BF16 [N/128, K/128] → fp32 scales (glm::Fp8BMat), one arena in VRAM
     const size_t wgu = (size_t)I * H, sgu = (size_t)((I + 127) / 128) * ((H + 127) / 128) * 4;
     const size_t wd = (size_t)H * I, sd = (size_t)((H + 127) / 128) * ((I + 127) / 128) * 4;
     const size_t per = (wgu * 2 + wd + 255) / 256 * 256 + (sgu * 2 + sd + 255) / 256 * 256 + 1024;
     w.expert_arena.alloc((size_t)E * per);
     uint8_t* base = w.expert_arena.as<uint8_t>();
-    const char* names[3] = {"gate_proj", "up_proj", "down_proj"};
     std::vector<float> sc;
     for (int e = 0; e < E; ++e) {
       uint8_t* q = base + (size_t)e * per;
@@ -248,10 +346,14 @@ QwenModel::QwenModel(const std::string& dir, bool load_mtp, int gpu_layers) : cf
     }
     vram_bytes_ += (size_t)E * per;
     fprintf(stderr, "[qwen] MTP: NextN layer loaded · %d routed experts FP8 in VRAM (%.2f GiB)\n", E, (double)E * per / 1073741824.0);
+    }
   } else if (load_mtp) {
     fprintf(stderr, "[qwen] no MTP layer in the checkpoint — speculative decoding off\n");
   }
   make_dense8();
+  if (mx8_ || f32_rounded_ || f32_kept_)
+    fprintf(stderr, "[qwen] checkpoint formats: %d dense matrices kept as MXFP8 (e4m3 + ue8m0 / 32)%s · fp32 norms: %d kept fp32, %d rounded to bf16\n",
+            mx8_, mx8_ ? " — decode GEMV and prefill read them as stored" : "", f32_kept_, f32_rounded_);
   const int n_attn = (int)std::count(c.is_attn.begin(), c.is_attn.end(), true);
   fprintf(stderr, "[qwen] model loaded: %d layers (%d linear · %d full attention) · PLE at layer %d · non-expert VRAM %.2f GiB · MTP %s%s\n", c.n_layers,
           c.n_layers - n_attn, n_attn, ple_layer_, vram_bytes_ / 1073741824.0, mtp_ ? "on" : "off",

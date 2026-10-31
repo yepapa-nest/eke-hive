@@ -657,6 +657,230 @@ __global__ void __launch_bounds__(128) qsa_attn_tc_kernel(const QsaRow* __restri
     }
   }
 }
+// ---- attention, several query rows per block (prefill chunks of one sequence) ---------------------------------------------------------
+// qsa_attn_tc_kernel runs one block per (row, kv head): the 12 query heads fill 12 of the 16 mma rows, every row gathers its 2,051 K / V
+//   rows on its own, and one warp runs the softmax while the others wait — nsys 2026-10-30: 246 ms of a 16K-token prefill (1.51 s of
+//   kernels), 1.01 s of a 64K one (6.0 s), ~40 TFLOP/s. Consecutive rows of a chunk select mostly the same groups, so here a block takes
+//   kMrRows rows (48 mma rows = 3 m16 tiles) and walks the union of their selected groups once:
+//   qsa_union_kernel  per row group: the selected groups of its rows (group = position / 4 of every idx entry) in a bitmap → the sorted
+//                     union list and, per union group, the bit mask of the rows that selected it. Token t of group G belongs to row ρ's
+//                     selection iff ρ's bit is set and t ≤ pos_ρ — the same set as the row's idx (selected groups are complete groups,
+//                     the open group and the dense rows' groups end at pos).
+//   qsa_attn_mr_kernel block = (row group, kv head), 6 warps = (m16 tile, half of the 256 output dims); 32 tokens (8 union groups) per tile,
+//                     K / V gathered with cp.async (double buffered, tokens past the last row zero-filled), S = Q·Kᵀ with Q fragments in
+//                     registers (both warps of an m tile compute the same S), masked, online softmax in registers (FA2 layout: the S
+//                     accumulators become the P operand), O += P·V for the warp's 128 dims. Same math as the per-row kernel; the fp32
+//                     sums run in another order and P is rounded to bf16 against another running max.
+constexpr int kMrRows = 4, kMrM = kMrRows * kHeadsPerKv;   // 48 mma rows
+constexpr int kMrCap = kMrRows * (kQsaTopBlocks + 1);       // union groups per row group (a dense row selects ≤ 513 groups)
+constexpr int kMrTT = 32, kMrG = kMrTT / kQsaRatio;          // tokens / groups per tile
+constexpr int kMrThreads = 192;
+struct MrSmem {
+  bf16 k[2][kMrTT * kQS];
+  bf16 v[2][kMrTT * kQS];
+  int grp[2][kMrG];
+  unsigned msk[2][kMrG];
+  float sx[kMrM / 16][16][kMrTT + 4];   // S of an m tile: each warp of the pair computes half of the tile's tokens and reads the other half
+};
+static_assert(sizeof(bf16) * kMrM * kQS <= sizeof(bf16) * 2 * kMrTT * kQS * 2, "Q staging fits the K / V buffers");
+
+// block = row group (rows r0 .. r0 + kMrRows − 1 of one sequence); dynamic smem: bitmap + prefix (2 · W words) + masks (kMrCap words)
+__global__ void __launch_bounds__(256) qsa_union_kernel(const QsaRow* __restrict__ rows, int n, const int32_t* __restrict__ idx, int W,
+                                                        int32_t* __restrict__ ulist, uint8_t* __restrict__ umask, int32_t* __restrict__ ucnt) {
+  extern __shared__ unsigned un_sm[];
+  unsigned* bm = un_sm;
+  unsigned* pre = un_sm + W;
+  unsigned* ms = un_sm + 2 * W;
+  __shared__ unsigned wsum[8];
+  const int rg = blockIdx.x, r0 = rg * kMrRows, nr = min(kMrRows, n - r0), tid = threadIdx.x;
+  for (int w = tid; w < W; w += blockDim.x) bm[w] = 0u;
+  for (int i = tid; i < kMrCap; i += blockDim.x) ms[i] = 0u;
+  __syncthreads();
+  for (int i = tid; i < nr * kQsaSel; i += blockDim.x) {
+    const int p = idx[(size_t)(r0 + i / kQsaSel) * kQsaSel + i % kQsaSel];
+    if (p >= 0) { const int G = p / kQsaRatio; atomicOr(&bm[G >> 5], 1u << (G & 31)); }
+  }
+  __syncthreads();
+  // exclusive prefix of the popcounts: each thread a contiguous run of words, then the 256 run totals
+  const int per = (W + blockDim.x - 1) / blockDim.x, w0 = tid * per, w1 = min(W, w0 + per);
+  unsigned run = 0;
+  for (int w = w0; w < w1; ++w) run += __popc(bm[w]);
+  unsigned inc = run;
+  const int lane = tid & 31, warp = tid >> 5;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) { const unsigned v = __shfl_up_sync(0xffffffffu, inc, o); if (lane >= o) inc += v; }
+  if (lane == 31) wsum[warp] = inc;
+  __syncthreads();
+  unsigned base = 0;
+  for (int k = 0; k < warp; ++k) base += wsum[k];
+  unsigned acc = base + inc - run;
+  for (int w = w0; w < w1; ++w) { pre[w] = acc; acc += __popc(bm[w]); }
+  __syncthreads();
+  if (tid == blockDim.x - 1) ucnt[rg] = (int)acc;
+  int32_t* ul = ulist + (size_t)rg * kMrCap;
+  for (int w = tid; w < W; w += blockDim.x) {
+    unsigned b = bm[w], k = pre[w];
+    while (b) { const int bit = __ffs(b) - 1; b &= b - 1; ul[k++] = w * 32 + bit; }
+  }
+  for (int i = tid; i < nr * kQsaSel; i += blockDim.x) {
+    const int p = idx[(size_t)(r0 + i / kQsaSel) * kQsaSel + i % kQsaSel];
+    if (p < 0) continue;
+    const int G = p / kQsaRatio, w = G >> 5;
+    const unsigned rank = pre[w] + __popc(bm[w] & ((1u << (G & 31)) - 1u));
+    atomicOr(&ms[rank], 1u << (i / kQsaSel));
+  }
+  __syncthreads();
+  const int cnt = (int)(pre[W - 1] + __popc(bm[W - 1]));
+  for (int i = tid; i < cnt; i += blockDim.x) umask[(size_t)rg * kMrCap + i] = (uint8_t)ms[i];
+}
+
+__global__ void __launch_bounds__(kMrThreads, 1) qsa_attn_mr_kernel(const QsaRow* __restrict__ rows, int n, const bf16* __restrict__ q,
+                                                                   const bf16* __restrict__ proj, int ld, const int32_t* __restrict__ ulist,
+                                                                   const uint8_t* __restrict__ umask, const int32_t* __restrict__ ucnt,
+                                                                   bf16* __restrict__ out) {
+  extern __shared__ __align__(16) unsigned char mr_raw[];
+  MrSmem& S = *reinterpret_cast<MrSmem*>(mr_raw);
+  const int rg = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int r0 = rg * kMrRows, nr = min(kMrRows, n - r0);
+  const int mt = warp >> 1, dh = warp & 1;
+  const QsaRow row0 = rows[r0];
+  int pos[kMrRows];
+  int maxpos = 0;
+#pragma unroll
+  for (int i = 0; i < kMrRows; ++i) { pos[i] = i < nr ? rows[r0 + i].pos : -1; maxpos = max(maxpos, pos[i]); }
+  const bf16* kb = row0.c.k + (size_t)g * D;
+  const bf16* vb = row0.c.v + (size_t)g * D;
+  // Q staging (in the K buffers): mma row f = ρ·12 + h
+  bf16* qs = &S.k[0][0];
+  for (int i = tid; i < kMrM * (D / 8); i += kMrThreads) {
+    const int f = i / (D / 8), c = (i % (D / 8)) * 8, rho = f / kHeadsPerKv, h = f % kHeadsPerKv;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (rho < nr) v = *reinterpret_cast<const uint4*>(q + ((size_t)(r0 + rho) * kQsaHeads + g * kHeadsPerKv + h) * D + c);
+    *reinterpret_cast<uint4*>(qs + f * kQS + c) = v;
+  }
+  __syncthreads();
+  unsigned qa[16][4];
+#pragma unroll
+  for (int ks = 0; ks < 16; ++ks) tc_ldm4(qa[ks], qs + (mt * 16 + (lane & 15)) * kQS + ks * 16 + (lane >> 4) * 8);
+  __syncthreads();   // the staging area becomes K / V tiles
+  const int cnt = ucnt[rg], ntiles = (cnt + kMrG - 1) / kMrG;
+  const int32_t* ul = ulist + (size_t)rg * kMrCap;
+  const uint8_t* um = umask + (size_t)rg * kMrCap;
+  auto issue = [&](int t, int buf) {
+    const int k0 = t * kMrG;
+    if (tid < kMrG) { const int k = k0 + tid; S.grp[buf][tid] = k < cnt ? ul[k] : -1; S.msk[buf][tid] = k < cnt ? um[k] : 0u; }
+    for (int i = tid; i < kMrTT * 64; i += kMrThreads) {
+      const int tok = i >> 6, part = (i >> 5) & 1, c = (i & 31) * 8, k = k0 + tok / kQsaRatio;
+      const int G = k < cnt ? __ldg(ul + k) : -1, p = G * kQsaRatio + tok % kQsaRatio;
+      const bool ok = G >= 0 && p <= maxpos;
+      tc_cp16((part ? S.v[buf] : S.k[buf]) + tok * kQS + c, (part ? vb : kb) + (size_t)(ok ? p : 0) * kKvW + c, ok);
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+  };
+  const int gq = lane >> 2, tq = lane & 3;
+  const int f0 = mt * 16 + gq, f1 = f0 + 8, rho0 = f0 / kHeadsPerKv, rho1 = f1 / kHeadsPerKv;
+  const int p0 = pos[rho0], p1 = pos[rho1];   // −1: a padding row (no valid token)
+  float o[16][4];
+#pragma unroll
+  for (int a = 0; a < 16; ++a)
+#pragma unroll
+    for (int b = 0; b < 4; ++b) o[a][b] = 0.f;
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+  if (ntiles > 0) issue(0, 0);
+  for (int t = 0; t < ntiles; ++t) {
+    const int buf = t & 1;
+    if (t + 1 < ntiles) { issue(t + 1, buf ^ 1); asm volatile("cp.async.wait_group 1;\n" ::); }
+    else asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+    // S = Q·Kᵀ: this warp computes tokens 16·dh … +15 of the tile, the other warp of its m tile the rest (exchanged through sx)
+    float sc[4][4];
+#pragma unroll
+    for (int h2 = 0; h2 < 2; ++h2) {
+      const int nt = dh * 2 + h2;
+#pragma unroll
+      for (int c = 0; c < 4; ++c) sc[nt][c] = 0.f;
+      const bf16* kt = S.k[buf] + (size_t)(nt * 8) * kQS;
+#pragma unroll
+      for (int ks = 0; ks < 16; ks += 2) {
+        unsigned b[4];
+        tc_ldm4(b, kt + (lane & 7) * kQS + (ks + (lane >> 4)) * 16 + ((lane >> 3) & 1) * 8);
+        tc_mma(sc[nt], qa[ks], b[0], b[1]);
+        tc_mma(sc[nt], qa[ks + 1], b[2], b[3]);
+      }
+      *reinterpret_cast<float2*>(&S.sx[mt][gq][nt * 8 + tq * 2]) = make_float2(sc[nt][0], sc[nt][1]);
+      *reinterpret_cast<float2*>(&S.sx[mt][gq + 8][nt * 8 + tq * 2]) = make_float2(sc[nt][2], sc[nt][3]);
+    }
+    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + mt), "r"(64));   // the pair's halves are written (the next tile's writes follow the block barrier)
+#pragma unroll
+    for (int h2 = 0; h2 < 2; ++h2) {
+      const int nt = (1 - dh) * 2 + h2;
+      const float2 u = *reinterpret_cast<const float2*>(&S.sx[mt][gq][nt * 8 + tq * 2]);
+      const float2 w = *reinterpret_cast<const float2*>(&S.sx[mt][gq + 8][nt * 8 + tq * 2]);
+      sc[nt][0] = u.x; sc[nt][1] = u.y; sc[nt][2] = w.x; sc[nt][3] = w.y;
+    }
+    // mask + scale; row maxima
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const int c = nt * 8 + tq * 2, j = c / kQsaRatio, G = S.grp[buf][j];
+      const unsigned mk = S.msk[buf][j];
+      const int tok = G * kQsaRatio + (c % kQsaRatio);
+      const bool a0 = G >= 0 && ((mk >> rho0) & 1u) && tok <= p0, a1 = G >= 0 && ((mk >> rho0) & 1u) && tok + 1 <= p0;
+      const bool b0 = G >= 0 && ((mk >> rho1) & 1u) && tok <= p1, b1 = G >= 0 && ((mk >> rho1) & 1u) && tok + 1 <= p1;
+      sc[nt][0] = a0 ? sc[nt][0] * (1.0f / 16.0f) : -INFINITY; sc[nt][1] = a1 ? sc[nt][1] * (1.0f / 16.0f) : -INFINITY;
+      sc[nt][2] = b0 ? sc[nt][2] * (1.0f / 16.0f) : -INFINITY; sc[nt][3] = b1 ? sc[nt][3] * (1.0f / 16.0f) : -INFINITY;
+      mx0 = fmaxf(mx0, fmaxf(sc[nt][0], sc[nt][1])); mx1 = fmaxf(mx1, fmaxf(sc[nt][2], sc[nt][3]));
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+    const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
+    const float c0 = m0 == -INFINITY ? 0.f : __expf(m0 - n0), c1 = m1 == -INFINITY ? 0.f : __expf(m1 - n1);
+    m0 = n0; m1 = n1;
+    l0 *= c0; l1 *= c1;
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) { o[nt][0] *= c0; o[nt][1] *= c0; o[nt][2] *= c1; o[nt][3] *= c1; }
+    unsigned pa[2][4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const float e0 = sc[nt][0] == -INFINITY ? 0.f : __expf(sc[nt][0] - n0), e1 = sc[nt][1] == -INFINITY ? 0.f : __expf(sc[nt][1] - n0);
+      const float e2 = sc[nt][2] == -INFINITY ? 0.f : __expf(sc[nt][2] - n1), e3 = sc[nt][3] == -INFINITY ? 0.f : __expf(sc[nt][3] - n1);
+      l0 += e0 + e1; l1 += e2 + e3;
+      const __nv_bfloat162 x01 = __floats2bfloat162_rn(e0, e1), x23 = __floats2bfloat162_rn(e2, e3);
+      pa[nt >> 1][(nt & 1) * 2] = *reinterpret_cast<const unsigned*>(&x01);
+      pa[nt >> 1][(nt & 1) * 2 + 1] = *reinterpret_cast<const unsigned*>(&x23);
+    }
+#pragma unroll
+    for (int ks = 0; ks < 2; ++ks) {
+#pragma unroll
+      for (int np = 0; np < 8; ++np) {
+        unsigned b[4];
+        tc_ldm4t(b, S.v[buf] + (size_t)(ks * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * kQS + dh * 128 + np * 16 + (lane >> 4) * 8);
+        tc_mma(o[np * 2], pa[ks], b[0], b[1]);
+        tc_mma(o[np * 2 + 1], pa[ks], b[2], b[3]);
+      }
+    }
+    __syncthreads();   // the buffer is refilled by the issue two tiles on
+  }
+  l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+  l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+#pragma unroll
+  for (int hh = 0; hh < 2; ++hh) {
+    const int f = hh ? f1 : f0, rho = f / kHeadsPerKv;
+    if (rho >= nr) continue;
+    const float L = hh ? l1 : l0, inv = L > 0.f ? 1.0f / L : 0.f;
+    const int h = g * kHeadsPerKv + f % kHeadsPerKv, r = r0 + rho;
+    const bf16* gate = proj + (size_t)r * ld + (size_t)h * 2 * D + D;
+    bf16* dst = out + ((size_t)r * kQsaHeads + h) * D;
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+      const int d = dh * 128 + nt * 8 + tq * 2;
+      const float a0 = rb(o[nt][hh * 2] * inv), a1 = rb(o[nt][hh * 2 + 1] * inv);
+      const float g0 = __bfloat162float(gate[d]), g1 = __bfloat162float(gate[d + 1]);
+      *reinterpret_cast<__nv_bfloat162*>(dst + d) = __floats2bfloat162_rn(a0 * (1.0f / (1.0f + expf(-g0))), a1 * (1.0f / (1.0f + expf(-g1))));
+    }
+  }
+}
+
 // combine of the split-KV partials, splits in order: block = (row, head), thread = 2 dims
 __global__ void qsa_attn_combine_kernel(const float* __restrict__ part, int splits, const bf16* __restrict__ proj, int ld, bf16* __restrict__ out) {
   const int r = blockIdx.x, h = blockIdx.y, g = h / kHeadsPerKv, hr = h % kHeadsPerKv;
@@ -758,6 +982,38 @@ void qsa_attention(const QsaRow* rows, int n, const bf16* q, const bf16* proj, i
     launch_pdl(qsa_attn_kernel, dim3(dim3(n, kQsaKvHeads)), dim3(kAttnThreads), 0, st, rows, q, proj, ld, idx, out);
   }
   CUDA_CHECK(cudaGetLastError());
+}
+
+// several rows per block (qsa_attn_mr_kernel): ws = union lists [row groups][kMrCap] int32 + masks uint8 + counts
+size_t qsa_attention_mr_ws_bytes(int n) {
+  const size_t g = (size_t)(n + kMrRows - 1) / kMrRows;
+  return g * kMrCap * 4 + (g * kMrCap + 255) / 256 * 256 + g * 4 + 256;
+}
+bool qsa_attention_mr(const QsaRow* rows, int n, int max_pos, const bf16* q, const bf16* proj, int ld, const int32_t* idx, bf16* out, void* ws,
+                      size_t ws_bytes, cudaStream_t st) {
+  // opt-in (HIVE_QWEN_QSA_MR=1): the same math in another fp32 order, and at a fixed seed that order flips borderline answers — quality gate
+  //   2026-10-31 (quality_eval, non-thinking, seed 20261001): ruler 32/35 against 35/35 twice for the per-row kernel (vartrack at 4K, 16K and
+  //   100K), qa 73/80 against 72/80; with HIVE_QWEN_QSA_MR=0 the same build passes every vartrack item. Measured: 16K-token prefill attention
+  //   246 → 131 ms (12 layers, 600 W).
+  static const bool on = getenv("HIVE_QWEN_QSA_MR") && atoi(getenv("HIVE_QWEN_QSA_MR")) > 0;
+  const int W = max_pos / kQsaRatio / 32 + 1;   // bitmap words over the groups 0 .. max_pos / 4
+  const size_t un_smem = (size_t)(2 * W + kMrCap) * 4;
+  if (!on || n <= 64 || qsa_attention_mr_ws_bytes(n) > ws_bytes || un_smem > 96 * 1024) return false;
+  static bool attr = false;
+  if (!attr) {
+    CUDA_CHECK(cudaFuncSetAttribute(qsa_attn_mr_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(MrSmem)));
+    CUDA_CHECK(cudaFuncSetAttribute(qsa_union_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
+    attr = true;
+  }
+  const int ng = (n + kMrRows - 1) / kMrRows;
+  uint8_t* w8 = static_cast<uint8_t*>(ws);
+  int32_t* ulist = reinterpret_cast<int32_t*>(w8);
+  uint8_t* umask = w8 + (size_t)ng * kMrCap * 4;
+  int32_t* ucnt = reinterpret_cast<int32_t*>(umask + ((size_t)ng * kMrCap + 255) / 256 * 256);
+  qsa_union_kernel<<<ng, 256, un_smem, st>>>(rows, n, idx, W, ulist, umask, ucnt);
+  qsa_attn_mr_kernel<<<dim3(ng, kQsaKvHeads), kMrThreads, sizeof(MrSmem), st>>>(rows, n, q, proj, ld, ulist, umask, ucnt, out);
+  CUDA_CHECK(cudaGetLastError());
+  return true;
 }
 
 size_t qsa_attention_split_ws_bytes(int n, int splits) { return (size_t)n * kQsaKvHeads * splits * (32 + 16 * D) * 4; }

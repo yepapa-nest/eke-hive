@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Qwen3.8-Flash-Next: the NVIDIA FP4-Local checkpoint, and the family tuned against the vLLM fork
+
+- **`nvidia/Qwen3.8-Flash-Next-FP4-Local` loads** ([docs/qwen.md](docs/qwen.md) "NVIDIA FP4-Local checkpoint"): the routed experts' NVFP4
+  block scales come in a compressed form (CSF — a 16-row base of E4M3 bytes, 4-bit differences, and `uint32` exceptions), decoded on load
+  into the plain E4M3 planes the expert kernels already read; the dense projections are MXFP8 as stored (E4M3 weights, UE8M0 scales per
+  32), the n-gram table is NVFP4 (26.8 GiB pinned instead of 47.7), the MTP layer's experts are NVFP4. `safetensors` `U32` tensors are read.
+  The CPU oracle reads the same formats (`qwen_check`), so the GPU dumps are still checked token for token. On one RTX PRO 6000 at 450 W the
+  quality suite scores 169/177 (the NVFP4 checkpoint: 168), the coding throughput benchmark C1 / C4 / C8 286.5 / 623.0 / 809.0 tok/s and
+  prefill 8.1K / 10.0K / 10.1K tok/s at 4K / 16K / 64K tokens; the checkpoint is 95 GiB on disk. Running it in 68 GiB beside another GPU
+  process (`HIVE_QWEN_VRAM_MB`) is measured in the same section.
+- **`HIVE_QWEN_DENSE_MX` means one thing** — prefill dense GEMMs on the block-scaled FP8 path reading the checkpoint's MXFP8 matrices as
+  stored (lossless against the quality gate on FP4-Local). The former meaning on an NVFP4 checkpoint, re-quantizing the INT8 copies, was
+  a double loss (166) and is gone. `HIVE_QWEN_DENSE8_SCOPE=head` keeps only the verify head as an INT8 copy. `HIVE_QWEN_DENSE_MX_ROWS`
+  (default: prefill chunks only) can take batched verify rows onto the same GEMM; measured and left at its default (docs/qwen.md
+  "Explored and not adopted").
+- **Prefill and batched decode** ([docs/qwen.md](docs/qwen.md) "Against the FP4-Local vLLM fork"): second-generation W4A16 grouped
+  expert kernels for prefill with the combine fused in; four warps per GDN recurrence block; the batched MTP draft chain captured as a
+  CUDA graph; verify graphs reused across part splits (the parts read from device memory); the combine-norm fusion kept inside prefills
+  unless a layer yield is due; prefill attention over groups of four rows and W4A4 expert prefill are available behind `HIVE_QWEN_QSA_MR`
+  and `HIVE_QWEN_MOE_A4` and stay off (both lose points on the quality gate).
+- **Images in Qwen conversations reuse the prompt prefix** like text turns (`HIVE_IMAGE_CKPT`, now on in `config/qwen.env`): the M-RoPE
+  offset is part of the saved state and image signatures are compared, so a turn that appends a screenshot no longer re-reads the
+  conversation. The thinking cap arms after `<think>\n`. A system message in the middle of a conversation (the template allows one only
+  at the start) becomes a `[system]` user note that keeps its image parts; an empty one is dropped.
+- **`presence_penalty`** (OpenAI semantics, −2..2) for Qwen3.8-Flash-Next: subtracted from the logit of every token already in the
+  response, at verify rows too; a greedy request with the penalty reads the full logit row. **Han / kana leakage in Korean answers**
+  (docs/qwen.md): an opt-in answer-span token filter (`HIVE_QWEN_TOKEN_MASK` + `hanja_filter` per request), the measurement tools,
+  and the finding that no sampling setting changes the rate — the default stays unfiltered.
+- **Tools**: the coding throughput benchmark (`tools/bench_coding.py`, adapted under MIT, unique salts per run), a per-run salt for the
+  long prompts of `bench_chat.py`, `bench_fn_gemv32` (dense projection kernels at the batched-verify row counts), `HIVE_DAEMON_WRAP`
+  (a profiler in front of the daemon), `QWEN_CHECK_FILL`. The FnMx workspace is a `DevBuf`, released and restored by the level-3 sleep;
+  request records say whether the token filter was served (`hanja_filter_served`).
+- Reviewed against the public material on the family and not adopted, with the numbers: reusing the QSA block selection across MTP
+  draft steps (IndexShare — output identical, no gain, acceptance 2.12 → 1.94), a dynamic request-context draft vocabulary (the static
+  64K list already covers 99.5 % of Korean answer tokens), an MXFP8 GEMM for batched verify rows (quality 169, C8 803.6 vs 794.5).
+  `engine/tests/test_qwen_qsa` has a stale q / k / iq reference (predates these changes); its selection and attention checks pass.
+
 - **An image request no longer waits for a long prefill when the vision encoder is loaded**: at a layer yield the daemon refused every
   request with an image still to encode, because the encoder (loaded lazily, released after two idle minutes) might need its VRAM in the
   middle of the forward. On a production deployment 456 image requests waited more than half a second for admission over three days

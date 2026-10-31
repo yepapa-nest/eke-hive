@@ -113,6 +113,7 @@ void report(const char* what, const Cmp& c) {
 }  // namespace
 
 int main() {
+  setenv("HIVE_QWEN_QSA_MR", "1", 1);   // the multi-row attention is opt-in; the test checks it
   std::mt19937 rng(1234);
   std::uniform_real_distribution<float> U(-1.f, 1.f);
   auto rnd_bf16 = [&](size_t n, float scale) { std::vector<uint16_t> v(n); for (auto& x : v) x = f2b(U(rng) * scale); return v; };
@@ -294,6 +295,32 @@ int main() {
     const test::Closeness c = test::closeness(gotv, wantv);
     printf("  attention: %zu values · cos %.6f · rel %.2e · max abs %.2e\n", gotv.size(), c.cos, c.rel, c.max_abs);
     EXPECT(c.finite && c.cos >= 0.9999 && c.rel <= 1e-2, "attention output");
+    if (one && n > 64) {   // several rows per block (prefill chunks of one sequence) against the per-row kernel's output
+      const size_t mb = qsa_attention_mr_ws_bytes(n);
+      void* mws = nullptr;
+      bf16* om = nullptr;
+      CUDA_CHECK(cudaMalloc(&mws, mb)); CUDA_CHECK(cudaMalloc(&om, (size_t)n * kQsaHeads * D * 2));
+      const bool ran = qsa_attention_mr(rows_d, n, max_pos, q, proj, LD, idx, om, mws, mb, st);
+      CUDA_CHECK(cudaStreamSynchronize(st));
+      EXPECT(ran, "qsa_attention_mr did not run");
+      const std::vector<uint16_t> sm = down((const uint16_t*)om, (size_t)n * kQsaHeads * D);
+      std::vector<float> a, b;
+      for (size_t i = 0; i < sm.size(); ++i) { a.push_back(b2f(sm[i])); b.push_back(b2f(oh[i])); }
+      const test::Closeness cm = test::closeness(a, b);
+      size_t same = 0;
+      for (size_t i = 0; i < sm.size(); ++i) same += sm[i] == oh[i];
+      printf("  multi-row attention (%d rows per block) vs the per-row kernel: cos %.7f · rel %.2e · identical %.1f %%\n", 4, cm.cos, cm.rel,
+             100.0 * same / sm.size());
+      EXPECT(cm.finite && cm.cos >= 0.99999 && cm.rel <= 5e-3, "multi-row attention output");
+      std::vector<float> gm;   // and against the reference on the sampled rows
+      for (int r = 0; r < n; r += std::max(1, n / 24))
+        for (int h = 0; h < kQsaHeads; ++h)
+          for (int d = 0; d < D; ++d) gm.push_back(b2f(sm[((size_t)r * kQsaHeads + h) * D + d]));
+      const test::Closeness cr = test::closeness(gm, wantv);
+      printf("  multi-row attention vs reference: cos %.6f · rel %.2e\n", cr.cos, cr.rel);
+      EXPECT(cr.finite && cr.cos >= 0.9999 && cr.rel <= 1e-2, "multi-row attention vs reference");
+      cudaFree(mws); cudaFree(om);
+    }
     {   // split-KV attention (decode / verify rows) on the last ≤ 8 rows of the call, against the reference attention of those rows
       const int m8 = std::min(n, 8), off = n - m8;
       static void* sws = nullptr;

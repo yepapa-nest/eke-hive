@@ -225,8 +225,14 @@ class Runtime {
   // false: forward_verify(_batch) skip the full-logit copy (rows × vocab floats to the host) and return logits_rows empty — for steps whose
   //   rows are all greedy (hived samples them from the device candidates' argmax)
   void set_verify_logits(bool on) { verify_logits_ = on; }
+  // answer-span token filter (hive/token_mask.h): the engine's list (nullptr = none loaded) and the per-row flags of the next decode / verify
+  //   call (hived sets them before forward_batch / forward_verify / forward_verify_batch; consumed by that call)
+  const std::vector<int32_t>* token_mask() const;
+  void set_row_mask(const std::vector<float>& f) { row_mask_ = f; }
  private:
   bool verify_logits_ = true;
+  std::vector<float> row_mask_;
+  void arm_mask(int rows);
   // asynchronous checkpoint copies: a job copies host segments from device sources (immutable KV rows, or a device snapshot of the
   //   per-step state) on its own stream and thread
   struct CkptJob { std::vector<std::tuple<uint8_t*, const uint8_t*, size_t>> parts; int slot = -1; cudaEvent_t ready = nullptr;

@@ -93,7 +93,9 @@ int main(int argc, char** argv) {
   glm::GlmExperts experts(sp, 0, threads, 8);
   experts.load_all(threads);
   experts.alloc_cache((size_t)(cache_gib * 1073741824.0));
-  if ((spec_steps > 0 || pre_n > 0) && experts.n_slots() >= experts.n_keys()) {   // the runtime's fill_cache: every expert resident → device routing
+  // QWEN_CHECK_FILL=1: fill the cache before the dumps too, so the prompt takes the serving path (device-routed grouped prefill experts)
+  const bool fill = getenv("QWEN_CHECK_FILL") && atoi(getenv("QWEN_CHECK_FILL")) > 0;
+  if ((spec_steps > 0 || pre_n > 0 || fill) && experts.n_slots() >= experts.n_keys()) {   // the runtime's fill_cache: every expert resident → device routing
     std::vector<int32_t> miss;
     for (int k = 0; k < experts.n_keys(); ++k) if (experts.slot_of(k) < 0) miss.push_back(k);
     const int n = experts.warm_from_keys(miss);

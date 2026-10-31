@@ -557,6 +557,16 @@ void Runtime::cache_line(int M, const GlmCacheStats& b, double t0) {
   ++cache_step_;
 }
 
+// answer-span token filter: every decode / verify call is armed while the engine holds a list (flags of rows hived did not set = 0), so the
+//   captured graphs hold the masking kernel
+const std::vector<int32_t>* Runtime::token_mask() const { return eng_->token_mask().empty() ? nullptr : &eng_->token_mask(); }
+void Runtime::arm_mask(int rows) {
+  if (eng_->token_mask().empty()) { row_mask_.clear(); return; }
+  row_mask_.resize(std::max<size_t>(row_mask_.size(), (size_t)rows), 0.f);
+  eng_->arm_mask(row_mask_.data(), rows);
+  row_mask_.clear();
+}
+
 void Runtime::cands_dev(int M) {
   const int NC = opt_.sampler_cands, V = model_.qm().cfg().vocab;
   cudaStream_t st = eng_->stream();
@@ -622,14 +632,17 @@ int32_t Runtime::forward(Seq& seq, const int32_t* ids, int M, const std::vector<
   const bool pg_ok = prog_.on() && ly_.depth == 0 && M >= opt_.prefill_threshold;
   const bool hook_on = ly_ok || pg_ok;
   struct LyHook {  // restores the hook of the forward this one runs inside (a level-2 yield)
-    QwenEngine& e; bool on; std::function<void(int)> prev; bool prev_yields;
-    ~LyHook() { if (on) { e.layer_boundary = std::move(prev); e.layer_boundary_yields = prev_yields; } }
-  } ly_hook{*eng_, hook_on, hook_on ? eng_->layer_boundary : std::function<void(int)>{}, eng_->layer_boundary_yields};
+    QwenEngine& e; bool on; std::function<void(int)> prev; bool prev_yields; std::function<bool()> prev_due;
+    ~LyHook() { if (on) { e.layer_boundary = std::move(prev); e.layer_boundary_yields = prev_yields; e.yield_due = std::move(prev_due); } }
+  } ly_hook{*eng_, hook_on, hook_on ? eng_->layer_boundary : std::function<void(int)>{}, eng_->layer_boundary_yields,
+            hook_on ? eng_->yield_due : std::function<bool()>{}};
   if (pg_ok) pg_marks_.begin();
   if (hook_on) {
     if (ly_ok && ly_.depth == 0) ly_.last = hive::mono_ms();
     eng_->layer_boundary_yields = ly_ok;
-    eng_->layer_boundary = [this, ly_ok, pg_ok](int l) { ly_progress_ = eng_->boundary_base + eng_->boundary_span * (l + 1.0) / std::max(1, model_.qm().cfg().n_layers); if (pg_ok && ly_.depth == 0) { pg_marks_.mark(eng_->stream(), ly_progress_); progress_point_gpu(); } if (ly_ok) layer_yield_point(); };
+    // the same tests as ly::yield_point before it parks (period passed, hived wants rows) — want() only reads hived's queues
+    eng_->yield_due = [this] { return ly_.on() && ly_.depth < std::max(1, ly_.h.max_depth) && hive::mono_ms() - ly_.last >= ly_.h.period_ms && ly_.h.want() > 0; };
+    eng_->layer_boundary = [this, ly_ok, pg_ok](int l) { ly_progress_ = eng_->boundary_base + eng_->boundary_span * (l + 1.0) / std::max(1, model_.qm().cfg().n_layers); if (pg_ok && ly_.depth == 0) { pg_marks_.mark(eng_->stream(), ly_progress_); progress_point_gpu(); } if (ly_ok && !eng_->pre_normed()) layer_yield_point(); };
   }
   try {
     prefill_logits_.resize(c.vocab);
@@ -663,8 +676,10 @@ void Runtime::forward_batch(std::vector<Seq*>& seqs, const int32_t* ids, std::ve
   store_.experts().reset_row_stats();
   const QwenForwardStats e0 = eng_->stats();
   try {
+    arm_mask(M);
     eng_->decode(gs.data(), ids, M, logits_out ? logits_pin_ : nullptr);   // no full-logit copy unless asked (16 rows: 16 MB per step)
-  } catch (...) { for (Seq* s : seqs) s->broken = true; throw; }
+    eng_->disarm_mask();
+  } catch (...) { eng_->disarm_mask(); for (Seq* s : seqs) s->broken = true; throw; }
   const double t_eng = hive::mono_ms();
   if (prof_on()) prof_add("decode M=" + std::to_string(M), t_eng - t0, e0, eng_->stats(), before, store_.experts().stats());
   if (since_prefill_ < (1 << 30)) ++since_prefill_;
@@ -730,8 +745,10 @@ void Runtime::forward_verify(Seq& seq, const int32_t* ids, int M, std::vector<fl
   const double t0 = hive::mono_ms();
   const QwenForwardStats e0 = eng_->stats();
   try {
+    arm_mask(M);
     eng_->verify(seq, ids, M, verify_logits_ ? logits_pin_ : nullptr);
-  } catch (...) { seq.broken = true; throw; }
+    eng_->disarm_mask();
+  } catch (...) { eng_->disarm_mask(); seq.broken = true; throw; }
   const double t_eng = hive::mono_ms();
   if (verify_logits_) logits_rows.assign(logits_pin_, logits_pin_ + (size_t)M * V);
   else logits_rows.clear();   // greedy rows only (set_verify_logits(false)): the candidates carry the argmax
@@ -768,8 +785,10 @@ void Runtime::forward_verify_batch(std::vector<VerifyPart>& parts, std::vector<f
   const QwenForwardStats e0 = eng_->stats();
   const double t0 = hive::mono_ms();
   try {
+    arm_mask(R);
     eng_->verify_batch(seqs.data(), Ms.data(), S, ids.data(), verify_logits_ ? logits_pin_ : nullptr);
-  } catch (...) { for (auto& p : parts) p.seq->broken = true; throw; }
+    eng_->disarm_mask();
+  } catch (...) { eng_->disarm_mask(); for (auto& p : parts) p.seq->broken = true; throw; }
   const double t_eng = hive::mono_ms();
   if (verify_logits_) logits_rows.assign(logits_pin_, logits_pin_ + (size_t)R * V);
   else logits_rows.clear();

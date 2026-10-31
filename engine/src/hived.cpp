@@ -69,6 +69,8 @@
 #include "hive/mtp_gate.h"
 #include "hive/sampler.h"
 #include "hive/socket_writer.h"
+#include "hive/presence.h"
+#include "hive/token_mask.h"
 #include "hive/vram_limit.h"
 #include "nlohmann/json.hpp"
 #include "hive/session_store.h"
@@ -163,6 +165,11 @@ template <class R, class S, class F> concept RtHasDraftBatch =
     };
 template <class R> concept RtHasVerifyLogits = requires(R& r) { r.set_verify_logits(true); };
 template <class R> void rt_set_verify_logits(R& r, bool on) { if constexpr (RtHasVerifyLogits<R>) r.set_verify_logits(on); }
+// Answer-span token filter (hive/token_mask.h): the runtime's token list (nullptr = none — the request is served unfiltered) and the row flags
+//   of its next decode / verify call. Families without it never filter.
+template <class R> concept RtHasRowMask = requires(R& r, const std::vector<float>& f) { r.set_row_mask(f); { r.token_mask() } -> std::convertible_to<const std::vector<int32_t>*>; };
+template <class R> const std::vector<int32_t>* rt_token_mask(R& r) { if constexpr (RtHasRowMask<R>) return r.token_mask(); else return nullptr; }
+template <class R> void rt_set_row_mask(R& r, const std::vector<float>& f) { if constexpr (RtHasRowMask<R>) r.set_row_mask(f); }
 // The calls themselves go through these templates as well: a discarded if-constexpr branch in a non-template function is still checked.
 template <class R, class S> void rt_trim_seq(R& r, S& q) { if constexpr (RtHasTrimSeq<R, S>) r.trim_seq(q); }
 // A family whose KV can be cut back to any earlier position it still covers (Gemma: paged KV) continues the live state from the common
@@ -1778,6 +1785,12 @@ int main(int argc, char** argv) {
     std::vector<int32_t> think_exit;
     size_t think_exit_pos = 0;
     bool in_think = false;
+    // Answer-span token filter (request "token_mask": true, hive/token_mask.h): mstate tracks the thinking span; dev_masked = the logits / candidates
+    //   in hand came from a decode step whose row the device masked (else the host masks the row it samples — the first token after a prefill)
+    hive::tmask::State mstate;
+    bool dev_masked = false;
+    long mask_host = 0;   // tokens sampled through the host mask (observability)
+    hive::presence::State pres;   // presence_penalty (hive/presence.h): applied at every row this request samples
     long mtp_steps = 0, mtp_drafted = 0, mtp_accepted = 0;
     std::vector<int32_t> stop_ids;
     std::string finish = "length";
@@ -1861,6 +1874,7 @@ int main(int argc, char** argv) {
                  {"decode_hit", A.ds.n_hit}, {"decode_cpu", A.ds.n_cpu}, {"cpu_wait_ms", A.ds.ms_cpu_wait}, {"batch_rows", (int)active.size()}, {"held_steps", A.held_steps},
                  {"decode_dma_rows", A.ds.n_dma_rows}, {"cpu_span_ms", A.ds.ms_cpu_span}, {"timing_scope", "shared_batch_spans_not_additive"},
                  {"mtp_steps", A.mtp_steps}, {"mtp_drafted", A.mtp_drafted}, {"mtp_accepted", A.mtp_accepted}, {"restore_ms", A.restore_ms}};
+    if (A.mstate.on) done["token_mask"] = true;   // only for requests served with the filter (done message shape otherwise unchanged)
     if (A.think_cap > 0) {  // only for requests that received a thinking cap (off = done message shape unchanged)
       done["think_cap"] = A.think_cap;
       done["think_tokens"] = A.think_n;
@@ -2225,6 +2239,27 @@ int main(int argc, char** argv) {
           }
           if (ok) A->think_exit = std::move(ex);
         }
+      }
+    }
+    {  // presence_penalty (hive/presence.h): a finite number in [−2, 2] (clamped), 0 / absent / anything else = off (absorbed)
+      const auto ip = q.find("presence_penalty");
+      if (ip != q.end() && ip->is_number() && std::isfinite(ip->get<double>()) && ip->get<double>() != 0.0)
+        A->pres.pp = (float)std::max(-2.0, std::min(2.0, ip->get<double>()));
+    }
+    {  // Answer-span token penalty (hive/token_mask.h): "token_mask": true + "mask_penalty" (Δ, default ∞) + "mask_think_end" (</think> id) · "mask_think_start" (<think>, optional) ·
+       //   "mask_in_think" (the prompt ends inside an open thinking span). Absorption rules: anything but a boolean true, or a runtime without a list
+       //   = off; an end id outside the vocabulary = no thinking span (the whole output is filtered).
+      const auto it = q.find("token_mask");
+      if (it != q.end() && it->is_boolean() && it->get<bool>() && rt_token_mask(rt)) {
+        A->mstate.on = true;
+        const auto ie = q.find("mask_think_end"), is = q.find("mask_think_start"), io = q.find("mask_in_think");
+        auto id_of = [&](const json* v) { return v && v->is_number_integer() && v->get<int64_t>() >= 0 && v->get<int64_t>() < (int64_t)c.vocab ? (int32_t)v->get<int64_t>() : -1; };
+        A->mstate.end = id_of(ie != q.end() ? &*ie : nullptr);
+        A->mstate.start = id_of(is != q.end() ? &*is : nullptr);
+        A->mstate.in_think = A->mstate.end >= 0 && io != q.end() && io->is_boolean() && io->get<bool>();
+        // "mask_penalty": Δ > 0 lowers the listed logits by Δ (absent, ≤ 0, non-finite or not a number = ∞: never sampled)
+        const auto ip = q.find("mask_penalty");
+        if (ip != q.end() && ip->is_number() && std::isfinite(ip->get<double>()) && ip->get<double>() > 0.0) A->mstate.penalty = (float)ip->get<double>();
       }
     }
     {  // seed: 0, absent or non-numeric = a different seed per request (request_seed in hive/sampler.h — seeding from now_ms gave requests in the
@@ -3251,6 +3286,8 @@ int main(int argc, char** argv) {
     // Emit one token (send, stop and limit checks). Returns whether decoding can continue.
   auto emit = [&](Active& A, int32_t tok) -> bool {
     ++A.n;
+    A.mstate.feed(tok);
+    A.pres.feed(tok, (int)c.vocab);
     if (A.think_cap > 0) {  // thinking cap: count tokens in the thinking span (closed by </think>, reopened by <think>)
       if (A.in_think) { if (tok == A.think_end) A.in_think = false; else ++A.think_n; }
       else if (tok == A.think_start) A.in_think = true;
@@ -3289,8 +3326,21 @@ int main(int argc, char** argv) {
     for (auto& A : active) {
       if (!A->client_ok || A->cancel->load() || A->n >= A->max_tokens) { if (A->cancel->load()) A->finish = "cancel"; continue; }
       if (prio_class(A->prio) > best_prio) { ++A->held_steps; continue; }
-      int32_t tok = A->pending_tok >= 0 ? A->pending_tok : (fake_head ? sample(A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng)
-                                                                    : sample_cands(A->cands, A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng));
+      int32_t tok;
+      if (A->pending_tok >= 0) tok = A->pending_tok;   // (speculative verification sampled it from its masked row)
+      else if (A->mstate.active() && !A->dev_masked && !A->logits.empty()) {   // a row the device did not mask (after a prefill): the host masks it
+        if (A->pres.active()) {   // both: the masked copy, then the presence penalty on the full row
+          std::vector<float> l = A->logits;
+          for (int32_t t : *rt_token_mask(rt)) if (t >= 0 && t < (int32_t)l.size()) l[t] = std::isinf(A->mstate.penalty) ? -INFINITY : l[t] - A->mstate.penalty;
+          tok = hive::presence::sample(Cands{}, l, A->pres, A->temperature, A->top_p, A->top_k, A->min_p, A->rng);
+        } else {
+          tok = hive::tmask::sample_masked(A->logits, *rt_token_mask(rt), A->mstate.penalty, A->temperature, A->top_p, A->top_k, A->min_p, A->rng);
+        }
+        ++A->mask_host;
+      } else if (A->pres.active() && !fake_head) tok = hive::presence::sample(A->cands, A->logits, A->pres, A->temperature, A->top_p, A->top_k, A->min_p, A->rng);
+      else tok = fake_head ? sample(A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng)
+                             : sample_cands(A->cands, A->logits, A->temperature, A->top_p, A->top_k, A->min_p, A->rng);
+      A->dev_masked = false;
       A->pending_tok = -1;
       A->cands.valid = false;
       // Thinking cap: if the thinking-span tokens reached think_cap, turn this token (whether sampled or a pending token left by speculation — not
@@ -3396,7 +3446,8 @@ int main(int argc, char** argv) {
         sh_f0 = now_ms();
         // greedy request: the device candidates carry the argmax — the runtime skips the rows × vocab logit copy (Qwen: ~0.5 ms per step with
         //   the per-row copies below); the full rows are only a fallback of the sampled path
-        rt_set_verify_logits(rt, A.temperature > 0.f);
+        rt_set_verify_logits(rt, A.temperature > 0.f || A.pres.active());   // presence penalty needs the full row even when greedy (2026-10-31 review)
+        if (A.mstate.on) { std::vector<float> mf; hive::tmask::verify_flags(A.mstate, ids.data(), (int)ids.size(), mf); rt_set_row_mask(rt, mf); }
         rt.forward_verify(seq, ids.data(), (int)ids.size(), rows, &ds);
         rt_set_verify_logits(rt, true);
         sh_f1 = now_ms(); sh_kind = 0;
@@ -3408,6 +3459,11 @@ int main(int argc, char** argv) {
         Cands rc;
         auto sample_row = [&](int i) {
           snapshot_cands(rt, i, rc);
+          if (A.pres.active()) {   // presence_penalty: the drafts accepted before this row were emitted, so they count
+            std::vector<float> row;
+            if (!rows.empty()) row.assign(rows.begin() + (size_t)i * V, rows.begin() + (size_t)(i + 1) * V);
+            return hive::presence::sample(rc, row, A.pres, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
+          }
           if (rows.empty() && rc.valid && A.temperature <= 0.f) return rc.argmax;   // greedy without the full rows (see above)
           std::vector<float> row(rows.begin() + (size_t)i * V, rows.begin() + (size_t)(i + 1) * V);
           return sample_cands(rc, row, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
@@ -3561,8 +3617,13 @@ int main(int argc, char** argv) {
         sh_f0 = now_ms();
         {
           bool any_sampled_v = false;
-          for (Active* X : stepping) any_sampled_v |= X->temperature > 0.f;
+          for (Active* X : stepping) any_sampled_v |= X->temperature > 0.f || X->pres.active();   // presence penalty reads the full row
           rt_set_verify_logits(rt, any_sampled_v);
+        }
+        if (rt_token_mask(rt)) {   // answer-span token filter: each part's rows from its request's state (the parts' rows are concatenated)
+          std::vector<float> mf;
+          for (int s2 = 0; s2 < S; ++s2) hive::tmask::verify_flags(stepping[s2]->mstate, bids[s2].data(), (int)bids[s2].size(), mf);
+          rt_set_row_mask(rt, mf);
         }
         rt.forward_verify_batch(parts, brows, &ds);
         rt_set_verify_logits(rt, true);
@@ -3576,6 +3637,11 @@ int main(int argc, char** argv) {
           Cands rc;
           auto sample_at = [&](int r) {
             snapshot_cands(rt, r, rc);
+            if (A.pres.active()) {
+              std::vector<float> rowp;
+              if (!brows.empty()) rowp.assign(brows.begin() + (size_t)r * V, brows.begin() + (size_t)(r + 1) * V);
+              return hive::presence::sample(rc, rowp, A.pres, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
+            }
             if (brows.empty() && rc.valid && A.temperature <= 0.f) return rc.argmax;
             std::vector<float> rowv(brows.begin() + (size_t)r * V, brows.begin() + (size_t)(r + 1) * V);
             return sample_cands(rc, rowv, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
@@ -3636,11 +3702,17 @@ int main(int argc, char** argv) {
       const long cap_b = rt.graph_captures(), eag_b = rt.graph_eager_runs();  // HIVE_MTP_GATE3 · HIVE_MTP_BATCH (first uses as well)
       sh_f0 = tb;
       bool any_sampled_d = false;
-      for (Active* X : stepping) any_sampled_d |= X->temperature > 0.f;
+      for (Active* X : stepping) any_sampled_d |= X->temperature > 0.f || X->pres.active();   // presence penalty reads the full row
       // greedy batch: no rows × vocab copy (16 rows = 16 MB per step) — the device candidates carry the argmax. Only where the runtime has
       //   candidates (n_cands > 0): otherwise sample_cands falls back to the full rows, which must then exist.
       const bool skip_logits = !any_sampled_d && !fake_head && rt.n_cands() > 0;
       if (skip_logits) step_logits.clear();
+      const bool masking = rt_token_mask(rt) != nullptr;
+      if (masking) {   // answer-span token filter: the rows of filtered requests in their answer span (state after this step's token)
+        std::vector<float> mf(stepping.size());
+        for (size_t i = 0; i < stepping.size(); ++i) mf[i] = stepping[i]->mstate.row();
+        rt_set_row_mask(rt, mf);
+      }
       rt.forward_batch(step_seqs, step_ids.data(), step_next, skip_logits ? nullptr : &step_logits, &ds);
       sh_f1 = now_ms(); sh_kind = 2;
       const bool cap_clean = rt.graph_captures() == cap_b;
@@ -3651,6 +3723,7 @@ int main(int argc, char** argv) {
         Active& A = *stepping[i];
         if (i < step_logits.size()) A.logits = std::move(step_logits[i]); else A.logits.clear();
         if (!fake_head) snapshot_cands(rt, (int)i, A.cands);
+        A.dev_masked = masking;
         fake_logits(A.logits, (uint64_t)A.S->tokens.size() * 7919 + (uint64_t)step_ids[i]);
         A.S->tokens.push_back(step_ids[i]);
         A.S->last_used = now_ms();

@@ -231,9 +231,10 @@ __device__ __forceinline__ uint32_t pack_bf16(float a, float b) {
   const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
   return *reinterpret_cast<const uint32_t*>(&v);
 }
-// 16 weights (16 bytes) → 8 packed bf16 pairs (exact)
+// 16 weights (16 bytes) → 8 packed bf16 pairs (exact). FMT 3 (MXFP8, the checkpoint's own e4m3 values with a power-of-two scale per 32
+//   columns): the scale is folded into the weights here — e4m3 · 2^k is a bf16 value, so the operand stays exact and no group flush is needed
 template <int FMT>
-__device__ __forceinline__ void dec16(uint4 q, uint32_t (&o)[8]) {
+__device__ __forceinline__ void dec16(uint4 q, uint32_t (&o)[8], float sc = 1.f) {
   const uint32_t w[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
   for (int j = 0; j < 4; ++j)
@@ -241,10 +242,11 @@ __device__ __forceinline__ void dec16(uint4 q, uint32_t (&o)[8]) {
     for (int b = 0; b < 2; ++b) {
       const uint32_t h = (w[j] >> (16 * b)) & 0xFFFF;
       float f0, f1;
-      if (FMT == 1) {   // e4m3
+      if (FMT == 1 || FMT == 3) {   // e4m3
         const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)h, __NV_E4M3);
         const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
         f0 = f.x; f1 = f.y;
+        if (FMT == 3) { f0 *= sc; f1 *= sc; }
       } else {          // int8
         f0 = (float)(int8_t)(h & 0xFF); f1 = (float)(int8_t)(h >> 8);
       }
@@ -272,8 +274,11 @@ __global__ void __launch_bounds__(32 * NWM, LEAN ? 2 : NT <= 1 ? 3 : 1) gemv8_ke
   const uint4* wa = reinterpret_cast<const uint4*>(W + (size_t)ra * K + k0) + t;
   const uint4* wb = reinterpret_cast<const uint4*>(W + (size_t)rb * K + k0) + t;
   const int ng = (K + gs - 1) / gs;
-  const float* sa = S + (size_t)ra * ng;
-  const float* sb = S + (size_t)rb * ng;
+  const float* sa = FMT == 3 ? S : S + (size_t)ra * ng;
+  const float* sb = FMT == 3 ? S : S + (size_t)rb * ng;
+  // FMT 3: ue8m0 bytes [N, K/32]; lane t's 16 columns at 64·j + 16t lie in one 32-column block
+  const uint8_t* ea = reinterpret_cast<const uint8_t*>(S) + (size_t)ra * (K / 32) + (k0 + 16 * t) / 32;
+  const uint8_t* eb = reinterpret_cast<const uint8_t*>(S) + (size_t)rb * (K / 32) + (k0 + 16 * t) / 32;
   bool act[NT];
   const uint4* xr[NT];
 #pragma unroll
@@ -295,7 +300,7 @@ __global__ void __launch_bounds__(32 * NWM, LEAN ? 2 : NT <= 1 ? 3 : 1) gemv8_ke
       if (j0 + j < ns) { qa[buf][j] = ld_stream(wa + 4 * (j0 + j)); qb[buf][j] = ld_stream(wb + 4 * (j0 + j)); }
   };
   auto flush = [&] {
-    const float s0 = __ldg(sa + grp), s1 = __ldg(sb + grp);
+    const float s0 = FMT == 3 ? 1.f : __ldg(sa + grp), s1 = FMT == 3 ? 1.f : __ldg(sb + grp);
 #pragma unroll
     for (int u = 0; u < NT; ++u) {
       c[u][0] = fmaf(cg[u][0], s0, c[u][0]); c[u][1] = fmaf(cg[u][1], s0, c[u][1]); c[u][2] = fmaf(cg[u][2], s1, c[u][2]); c[u][3] = fmaf(cg[u][3], s1, c[u][3]);
@@ -307,9 +312,14 @@ __global__ void __launch_bounds__(32 * NWM, LEAN ? 2 : NT <= 1 ? 3 : 1) gemv8_ke
     for (int j = 0; j < KB; ++j) {
       if (j0 + j >= ns) break;
       const int col = k0 + 64 * (j0 + j);
-      if (col / gs != grp) { flush(); grp = col / gs; }   // group ended: scale its partial sums into the totals
+      if (FMT != 3 && col / gs != grp) { flush(); grp = col / gs; }   // group ended: scale its partial sums into the totals
       uint32_t A[8], B[8];
-      dec16<FMT>(qa[buf][j], A); dec16<FMT>(qb[buf][j], B);
+      if (FMT == 3) {
+        const int e = 2 * (j0 + j);   // 64 columns = 2 scale bytes per row
+        dec16<FMT>(qa[buf][j], A, __int_as_float((int)__ldg(ea + e) << 23)); dec16<FMT>(qb[buf][j], B, __int_as_float((int)__ldg(eb + e) << 23));
+      } else {
+        dec16<FMT>(qa[buf][j], A); dec16<FMT>(qb[buf][j], B);
+      }
 #pragma unroll
       for (int u = 0; u < NT; ++u) {
         if (u * 8 >= M) break;
@@ -358,13 +368,13 @@ __global__ void dequant8_kernel(const uint8_t* __restrict__ q, const float* __re
   const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (i >= (size_t)N * K) return;
   const int n = (int)(i / K), k = (int)(i % K), ng = (K + gs - 1) / gs;
-  const float sc = s[(size_t)n * ng + k / gs];
+  const float sc = FMT == 3 ? __int_as_float((int)reinterpret_cast<const uint8_t*>(s)[(size_t)n * (K / 32) + k / 32] << 23) : s[(size_t)n * ng + k / gs];
   const uint32_t v = *reinterpret_cast<const uint32_t*>(q + i);
   float f[4];
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const uint8_t b = (uint8_t)(v >> (8 * j));
-    if (FMT == 1) { __nv_fp8_e4m3 t; t.__x = b; f[j] = float(t); } else f[j] = (float)(int8_t)b;
+    if (FMT == 1 || FMT == 3) { __nv_fp8_e4m3 t; t.__x = b; f[j] = float(t); } else f[j] = (float)(int8_t)b;
   }
   *reinterpret_cast<__nv_bfloat162*>(w + i) = __floats2bfloat162_rn(f[0] * sc, f[1] * sc);
   *reinterpret_cast<__nv_bfloat162*>(w + i + 2) = __floats2bfloat162_rn(f[2] * sc, f[3] * sc);
@@ -393,7 +403,7 @@ __global__ void quant8_kernel(const bf16* __restrict__ w, int N, int K, int gs, 
 }
 }  // namespace
 
-bool fn_gemv8_ok(int N, int K, int gs, int M) { return M >= 1 && M <= 64 && N > 0 && K % 64 == 0 && gs % 64 == 0 && gs > 0; }
+bool fn_gemv8_ok(int N, int K, int gs, int M) { return M >= 1 && M <= 64 && N > 0 && K % 64 == 0 && gs > 0 && (gs % 64 == 0 || gs == 32); }
 
 void fn_quant8(const bf16* w, int N, int K, int fmt, int gs, uint8_t* q, float* s, cudaStream_t st) {
   const dim3 grid(N, (K + gs - 1) / gs);
@@ -403,7 +413,8 @@ void fn_quant8(const bf16* w, int N, int K, int fmt, int gs, uint8_t* q, float* 
 }
 
 void fn_gemv8(const uint8_t* W, const float* S, int fmt, int gs, int N, int K, const bf16* x, int ldx, int M, bf16* y, int ldy, cudaStream_t st, float* yf) {
-  HIVE_CHECK(fn_gemv8_ok(N, K, gs, M) && ldx % 8 == 0 && ((uintptr_t)W % 16) == 0 && ((uintptr_t)x % 16) == 0, "fn_gemv8: shape / alignment");
+  HIVE_CHECK(fn_gemv8_ok(N, K, gs, M) && ldx % 8 == 0 && ((uintptr_t)W % 16) == 0 && ((uintptr_t)x % 16) == 0 && (fmt == 3) == (gs == 32),
+             "fn_gemv8: shape / alignment");
   int wt = 1;   // warps per tile: K parts of ≥ 512 columns (as the bf16 kernel), at most 8, each a multiple of 64 columns
   while (wt < 8 && K % (2 * wt * 64) == 0 && K / (2 * wt) >= 512) wt *= 2;
   // warps per block: 8, halved while the grid stays under 2 blocks per SM (hc up 10240 × 320: 80 blocks of 8 warps on 188 SMs) —
@@ -416,7 +427,7 @@ void fn_gemv8(const uint8_t* W, const float* S, int fmt, int gs, int N, int K, c
   // 9..32 rows: x is read once per row tile of N per K part (x traffic = 2·M/16 bytes per weight byte: 4× the weights at 32 rows), so more
   //   tiles per block share it through L1 — HIVE_QWEN_GEMV8_NWB warps per block (8 or 16); the per-tile arithmetic is unchanged
   static const int nwb = getenv("HIVE_QWEN_GEMV8_NWB") ? (atoi(getenv("HIVE_QWEN_GEMV8_NWB")) >= 16 ? 16 : 8) : 8;
-  if (fmt == 2 && nt >= 2 && nt <= 4 && nwb == 16 && (tiles + 16 / wt - 1) / (16 / wt) >= sm_count()) nw = 16;
+  if (fmt >= 2 && nt >= 2 && nt <= 4 && nwb == 16 && (tiles + 16 / wt - 1) / (16 / wt) >= sm_count()) nw = 16;
   // 9..32 rows: LEAN instances (2 blocks per SM, 128 registers instead of 181 / 155 — one block per SM left too few loads in flight);
   //   HIVE_QWEN_GEMV8_LEAN=0 restores the old instances. bench_fn_gemv 2026-10-10: gdn_in 16 rows 41.0 → 35.0 us, 32 rows 55.6 → 46.7,
   //   lm_head 449 → 408 / 608 → 488 us; same arithmetic and order (only the weight batch in flight changes)
@@ -425,6 +436,11 @@ void fn_gemv8(const uint8_t* W, const float* S, int fmt, int gs, int N, int K, c
   auto go = [&](auto kern) { launch_pdl(kern, dim3(blocks), dim3(32 * nw), 0, st, W, S, gs, x, ldx, M, N, K, wt, y, ldy, yf, 1, (float*)nullptr); };
   if (fmt == 1) {
     if (nt == 1) go(gemv8_kernel<1, 1>); else if (nt == 2) go(gemv8_kernel<1, 2>); else if (nt <= 4) go(gemv8_kernel<1, 4>); else go(gemv8_kernel<1, 8>);
+  } else if (fmt == 3) {   // MXFP8 (the FP4-Local checkpoint's dense projections): the INT8 instance choices
+    if (nt == 1) go(gemv8_kernel<3, 1>);
+    else if (nt == 2) nw == 16 ? go(gemv8_kernel<3, 2, 16>) : lean ? go(gemv8_kernel<3, 2, 8, true>) : go(gemv8_kernel<3, 2>);
+    else if (nt <= 4) nw == 16 ? go(gemv8_kernel<3, 4, 16>) : lean ? go(gemv8_kernel<3, 4, 8, true>) : go(gemv8_kernel<3, 4>);
+    else go(gemv8_kernel<3, 8>);
   } else {
     if (nt == 1) go(gemv8_kernel<2, 1>);
     else if (nt == 2) nw == 16 ? go(gemv8_kernel<2, 2, 16>) : lean ? go(gemv8_kernel<2, 2, 8, true>) : go(gemv8_kernel<2, 2>);
@@ -438,6 +454,7 @@ void fn_dequant8(const uint8_t* q, const float* s, int fmt, int gs, int N, int K
   const size_t n4 = (size_t)N * K / 4;
   const unsigned blocks = (unsigned)((n4 + 255) / 256);
   if (fmt == 1) dequant8_kernel<1><<<blocks, 256, 0, st>>>(q, s, gs, N, K, w);
+  else if (fmt == 3) dequant8_kernel<3><<<blocks, 256, 0, st>>>(q, s, gs, N, K, w);
   else dequant8_kernel<2><<<blocks, 256, 0, st>>>(q, s, gs, N, K, w);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -458,6 +475,8 @@ void fn_gemv8_epi(const uint8_t* W, const float* S, int fmt, int gs, int N, int 
   const int nt = (M + 7) / 8;
   if (fmt == 1) {
     if (nt == 1) go(gemv8_kernel<1, 1>); else if (nt == 2) go(gemv8_kernel<1, 2>); else if (nt <= 4) go(gemv8_kernel<1, 4>); else go(gemv8_kernel<1, 8>);
+  } else if (fmt == 3) {
+    if (nt == 1) go(gemv8_kernel<3, 1>); else if (nt == 2) go(gemv8_kernel<3, 2>); else if (nt <= 4) go(gemv8_kernel<3, 4>); else go(gemv8_kernel<3, 8>);
   } else {
     if (nt == 1) go(gemv8_kernel<2, 1>); else if (nt == 2) go(gemv8_kernel<2, 2>); else if (nt <= 4) go(gemv8_kernel<2, 4>); else go(gemv8_kernel<2, 8>);
   }

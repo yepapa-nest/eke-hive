@@ -29,6 +29,9 @@ python3 tools/test_gemma_family_cpu.py  # Gemma 4 family: thinking mapping, temp
 python3 tools/test_qasr_frontend_cpu.py  # Qwen3-ASR front end: audio token count, WAV decoding, log-mel vs the reference extractor (when transformers is installed)
 python3 tools/test_qtts_server_cpu.py  # Qwen3-TTS server: /ws/speak protocol, barge-in, queueing, /health, voice / language resolution (fake engine)
 T=$(mktemp -d)/qwen_ple; g++ -std=c++20 -O1 -Itools/cpu_fake/include -Iengine/include -Iengine/third_party engine/tests/test_qwen_ple_cpu.cpp -DHIVE_SOURCE_DIR_HINT="\"$ROOT/engine\"" -o "$T" && "$T"  # PLE n-gram hash == oracle vectors, split == whole
+T=$(mktemp -d)/ckpt_quant; g++ -std=c++20 -O1 -Iengine/include -Iengine/third_party engine/tests/test_ckpt_quant_cpu.cpp engine/src/ckpt_quant.cpp engine/src/safetensors.cpp -o "$T" && "$T"  # FP4-Local formats: CSF decode round trip + 5 negative controls, MXFP8 exact, NVFP4 one rounding (hive/ckpt_quant.h)
+T=$(mktemp -d)/token_mask; g++ -std=c++20 -O2 -Iengine/include engine/tests/test_token_mask_cpu.cpp -o "$T" && "$T"  # answer-span token filter: thinking-span state, verify-row flags, masked sampler = renormalized rule (4 configs) + negative control
+T=$(mktemp -d)/presence; g++ -std=c++20 -O2 -Iengine/include engine/tests/test_presence_cpu.cpp -o "$T" && "$T"  # presence_penalty on the candidate snapshot == the rule over the penalized row (greedy, top-k/p, min_p, order-free, ± penalty) + negative control
 T=$(mktemp -d)/qwen_simd; g++ -std=gnu++20 -O3 -mavx2 -mfma -mf16c engine/tests/test_qwen_cpu_simd.cpp -o "$T" && "$T"  # Qwen CPU engine AVX2 element-wise kernels == scalar twins (bit for bit)
 python3 tools/test_hive_monitor_cpu.py  # hived.log monitor, daily report, lossless concurrent writes with an external log-rotate script (if present)
 # Real CPU expert pool, snapshot/pinned pool/fences, option plumbing, real hived.cpp

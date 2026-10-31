@@ -100,6 +100,13 @@ ok(tok.calls[-1][1].get("reasoning_effort") == "xhigh", "unknown effort value in
 qwen.encode_messages([{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": '{"a": "x"}'}}]},
                       {"role": "user", "content": "go"}])
 ok(tok.calls[-1][0][0]["tool_calls"][0]["function"]["arguments"] == {"a": "x"}, "assistant tool-call arguments decoded for the template")
+qwen.encode_messages([{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"},
+                      {"role": "system", "content": "New tools are available from this point of the conversation: f."},
+                      {"role": "user", "content": "again"}], thinking_mode="chat")
+msgs = tok.calls[-1][0]
+ok([m["role"] for m in msgs] == ["system", "user", "assistant", "user", "user"] and msgs[0]["content"] == "S" and
+   msgs[3]["content"] == "[system] New tools are available from this point of the conversation: f.",
+   f"later system message -> user note at its place, first system kept ({[m['role'] for m in msgs]})")
 
 # ---- completion parsing ----
 qwen.EOS_TEXTS = ["<|im_end|>"]
@@ -168,6 +175,29 @@ try:
     ok(False, "placeholder / media count mismatch rejected")
 except ValueError:
     ok(True, "placeholder / media count mismatch rejected")
+
+# ---- answer-span Han / kana filter: request switch (server/hive_server.py hanja_filter_wanted) and the token classes of tools/build_cjk_mask.py ----
+import importlib.util  # noqa: E402
+_spec = importlib.util.spec_from_file_location("server_under_test", Path(__file__).resolve().parents[1] / "server/hive_server.py")
+srv = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(srv)
+srv.FAMILY = "qwen4_exp"
+for body, hdr, want in [({}, {}, False), ({"hanja_filter": True}, {}, True), ({"hanja_filter": False}, {"x-hanja-filter": "1"}, False),
+                        ({"chat_template_kwargs": {"hanja_filter": 1}}, {}, True), ({}, {"x-hanja-filter": "0"}, False),
+                        ({"hanja_filter": "maybe"}, {"x-hanja-filter": "1"}, True), ({"hanja_filter": None}, {}, False)]:
+    got = srv.hanja_filter_wanted(body, hdr)
+    ok(got == want, f"hanja_filter {body} {hdr} -> {got}")
+ok(srv.hanja_filter_mode({"hanja_filter": True, "hanja_penalty": 5}, {}) == ("on", 5.0), "hanja_penalty 5")
+ok(srv.hanja_filter_mode({}, {"x-hanja-filter": "1"})[1] == float("inf"), "default penalty inf")
+ok(srv.hanja_filter_mode({"hanja_filter": True, "hanja_penalty": -2}, {})[1] == float("inf"), "bad hanja_penalty -> inf")
+srv.FAMILY = "deepseek_v4"
+ok(srv.hanja_filter_wanted({"hanja_filter": True}, {}) is False, "hanja_filter is FN only")
+_m = importlib.util.spec_from_file_location("cjk_mask", Path(__file__).resolve().parents[1] / "tools/build_cjk_mask.py")
+cm = importlib.util.module_from_spec(_m)
+_m.loader.exec_module(cm)
+for text, want in [("您的", "han"), (" 贵公司", "han"), ("開", None), (" 港", None), ("ですね", "kana"), ("東京", "han"), ("ア", "kana"),
+                   ("개항", None), ("(開港)", None), ("hello", None), ("中a", None), ("\ufffd", None)]:
+    ok(cm.classify(text) == want, f"cjk mask class {text!r} -> {cm.classify(text)}")
 
 print("ALL OK" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)
