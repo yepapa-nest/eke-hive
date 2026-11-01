@@ -217,12 +217,16 @@ A lossless-only review of the current build, from two days of production request
 real-chat decode (`--cuda-graph-trace=node`, 3 s windows at c1 and c8) and the cache replay tool. Nothing in it was adopted; it
 records where the remaining time sits so the next attempt does not repeat these measurements.
 
-- **Decode, c1.** The GPU is busy 79.5 % of the wall time. Of the time no other kernel overlaps: routed experts
+- **Decode, c1.** Kernel shares (capture with `--cuda-graph-trace=node`, time no other kernel overlaps): routed experts
   (`moe_decode_fused3`) 25.7 %, the dense decode GEMVs (`a2_gemv`: q_b, wo_b, shared expert) 21.5 %, the vocabulary head 8.0 %,
   attention 7.6 %, the FP8 `wo_a` GEMV 5.6 %. Against the bytes they read, the expert kernel runs at about the VRAM peak, the dense
-  GEMVs at ~79 % of it and the head (1.32 GB, bf16) at ~87 %. Sinkhorn overlaps other streams completely. The 20.5 % idle time is
-  mostly the wait for CPU experts at the end of a layer (~6 % of the wall) and host turnarounds at layer ends and step boundaries
-  (~4 %).
+  GEMVs at ~79 % of it and the head (1.32 GB, bf16) at ~87 %. Sinkhorn overlaps other streams completely.
+  Idle time is measured on a second capture **without** node tracing (graphs as one range), because node tracing inflates
+  `cudaGraphLaunch` about 8× (one Flash-Next graph: 1,756 vs 216 µs) and with it every gap in front of a graph: the GPU is idle
+  13.5–15.3 % of the wall time (two 3.1 s windows; 20.5 % under node tracing). Of the wall: waiting for CPU experts at a layer end 4.7 %
+  (DRAM-bound, below), the next layer's front graph launched only after that wait 2.4 % (4–23 µs per gap), host work before the ring
+  restore of a rejected draft 1.3 % (~1 ms, ~13 times per second), demand expert copies 1.1 %, step boundaries (draft ↔ verify) ~1 %,
+  the host before `act_quant_fp8` 0.8 %.
 - **CPU experts.** One CPU expert job (one row, 18.8 MB) takes 0.143 ms on average over 351 M jobs — about 132 GB/s, the DRAM
   bandwidth of both NUMA nodes together; each job is already split across the two nodes' half records. A verify step's GPU part
   grows from ~18 ms (2 rows) to ~26 ms (6 rows), and every further CPU job adds ~0.13 ms.
@@ -238,6 +242,7 @@ records where the remaining time sits so the next attempt does not repeat these 
 | Snapshots between the interval points of a long re-read (cut a 90K-token chunk into 32K pieces) | A chunk costs a fixed ~2 s (chunk time vs rows over a service day: 3K rows 2.4 s, 22K 5.6 s, 93K 17.1 s → ~0.16 ms per row + ~2 s). A conversation compacted later re-reads from the last snapshot (one case: 85K tokens, 67 s), but the extra cuts would cost ~2 s on every long re-read; over two service days the two roughly cancel |
 | Reduced-vocabulary head for the draft only (the verify head stays full, so the output is unchanged) | The draft head is ~0.84 ms of a ~38 ms step; a 64K-token copy of the head needs another 0.65 GB of VRAM, which the expert cache would lose (~35 slots) |
 | Fewer concurrent sequences (session pool 8 → 6, +98 cache slots) | Cache replay of a service trace: decode miss jobs per step 59.3 → 57.1 (−3.7 %), about +0.6 % decode; lending the whole idle pool (+300 slots) would give 53.0 (−10.7 %, about +1.9 %) |
+| Launching the next layer's front graph before the CPU-expert wait (reordering the decode layer loop) | Not built: the clean capture puts all graph-launch gaps at 2.4 % of the c1 wall, the expected gain at 1–2 % — inside the c1 noise floor (±1 %) of the official cell — for a reordering of the decode critical path |
 
 ## GLM-5.3-Flash
 
