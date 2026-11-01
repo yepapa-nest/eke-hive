@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Scheduling
+
+- **A short request no longer waits behind a long prompt it was batched with.** With `HIVE_BATCH_PREFILL`, a short request that opened a
+  batch round could take a long, lower-priority prompt from the queue into the same round; with a single long job the round runs that
+  forward first, and since the short request was already in the round (not in the queue) no layer yield admitted it — its first token came
+  after the whole forward (6.9 s in one production case, 2.6–9.3 s in 14 cases over a month). A long queued request now joins a round only
+  when every job in it is long too (they share the batched forward) and its priority class is not worse than the round's best; with layer
+  yields on, a short one stays queued and is taken at the next yield. Without layer yields short requests join as before. Admission order
+  only: per-request forwards and tokens are unchanged. `tools/test_layer_yield_cpu.py` gained the scenario and a negative control (the old rule is detected).
+
 ### Qwen3.8-Flash-Next: the NVIDIA FP4-Local checkpoint, and the family tuned against the vLLM fork
 
 - **`nvidia/Qwen3.8-Flash-Next-FP4-Local` loads** ([docs/qwen.md](docs/qwen.md) "NVIDIA FP4-Local checkpoint"): the routed experts' NVFP4

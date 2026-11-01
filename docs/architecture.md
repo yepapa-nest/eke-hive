@@ -108,6 +108,9 @@ flowchart LR
   are never evicted. Between prefill chunks the running decoders get a share of wall time (`--decode-share`).
 - **Batched prefill** (`HIVE_BATCH_PREFILL`) prefills several waiting requests in one forward pass so the experts
   stream once for all of them; simultaneous arrivals are coalesced first (`HIVE_BATCH_COALESCE_MS`).
+  A long request (at least `--prefill-threshold` rows) joins a running round only if every request already in it is long
+  too — they share the forward — and its priority class is not worse than the round's best. With layer yields on, a short
+  request stays queued and is taken at the next layer yield instead of waiting for the round's forward.
 - **Layer yield** (`HIVE_LAYER_YIELD`). A long prompt is one forward pass of up to 98,304 rows. Every 500 ms, at
   a layer boundary, the daemon parks that pass's per-layer state in pinned memory, admits waiting short requests
   up to their first token, runs a few decode steps for the active set, restores the state and continues. Chunk

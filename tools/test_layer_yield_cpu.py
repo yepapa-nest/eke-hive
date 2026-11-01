@@ -13,7 +13,8 @@ requests (first token inside the long forward) and gives running decoders steps.
   * the long forward's state (fake Work rows [0, R)) survives every yield (park/unpark — the fake checks its rows after each yield),
   * size limit (HIVE_LAYER_YIELD_MAX ∩ runtime rows R), busy/same session, image requests, max_batch are respected — an image to
     encode waits unless the encoder is loaded (FAKE_VISION_LOADED=1: admitted mid-forward, both oracles kept),
-  * H3 batch path (forward_multi with two long prompts) yields too; MTP decoder (FAKE_MTP) steps inside yields keep their oracle,
+  * H3 batch path (forward_multi with two long prompts) yields too; a short better-priority request that opens a batch round does not
+    take a long worse-priority one into it (co-admission gate, 2026-11-02); MTP decoder (FAKE_MTP) steps inside yields keep their oracle,
   * switch parsing (period/share/steps/max) absorbs junk values,
   * negative controls (each must be DETECTED): fake park disabled (FAKE_LY_NO_PARK) · hived admits beyond R (want under-reports and
     run ignores R) · long prompt's session not marked prefilling (same-session request admitted mid-forward) · want() without the
@@ -323,6 +324,32 @@ def sc_batch(h, ck, tag):
     ck.true(f'{tag}: round line carries the layer-yield tail', bool(rl), '')
 
 
+def sc_coadmit(h, ck, tag):
+    """Batch co-admission gate (2026-11-02, production 06:08 stall): a short better-priority request opens a batch round while a long
+    worse-priority one waits in the queue. The long one must not join that round — it would run its whole forward first (one multi job goes
+    to the solo front) with nothing to yield to, the short request sitting in `jobs` instead of the queue. Shape: a decoder at priority -2
+    keeps both out (each is a worse class than a running request — production: the short one waited for its own session); when the
+    decoder ends, the main loop takes the better (short, -1) first."""
+    D, L, S = t.tokens(100, 1200), t.tokens(700, 1201), t.tokens(60, 1202)
+    res, first, dtimes = {}, {}, []
+    d = t.launch(h, 'CD', D, 12, res, 'D', on_token=lambda k: dtimes.append(time.monotonic()), priority=-2)
+    deadline = time.monotonic() + 10 * SLOW
+    while len(dtimes) < 2 and time.monotonic() < deadline:
+        time.sleep(.005)
+    a = t.launch(h, 'CL', L, 3, res, 'L', on_token=lambda k: first.setdefault('L', time.monotonic()), priority=1)
+    time.sleep(.02)
+    b = t.launch(h, 'CS', S, 3, res, 'S', on_token=lambda k: first.setdefault('S', time.monotonic()), priority=-1)
+    for th in (d, a, b):
+        th.join(60 * SLOW)
+    t.done_ok(ck, f'{tag} decoder', res['D'], D, 12, 0)
+    t.done_ok(ck, f'{tag} long', res['L'], L, 3, 0)
+    t.done_ok(ck, f'{tag} short', res['S'], S, 3, 0)
+    ttft = first.get('S', 1e9) - (dtimes[-1] if dtimes else 0)
+    ck.true(f'{tag}: short first token before the long one', first.get('S', 1e9) < first.get('L', 0), repr(first))
+    ck.true(f'{tag}: short first token soon after the decoder ends (not after the long forward)', ttft < (PERIOD + 250) / 1000 * SLOW, f'{ttft:.3f}s')
+    return round(ttft, 3)
+
+
 WINDOW_RE = re.compile(r'^\[hived\] batch window: \+(\d+) requests in ([\d.]+) ms \((\S+) · (\d+) jobs · slots left (-?\d+)\)$')
 
 
@@ -426,6 +453,7 @@ def run(exe, td):
         ('mid300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: (sc_mid(h, ck, 'mid'), sc_short(h, ck, True, 'mid+short'))),
         ('prio300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: sc_prio(h, ck, 'prio')),
         ('batch-on', {**ON, **batch}, TILE3, lambda h: (sc_short(h, ck, True, 'batch'), sc_batch(h, ck, 'batch'), sc_decoder(h, ck, True, 'batch'))),
+        ('batch-coadmit', {**ON, **batch, 'HIVE_PREFILL_PRIORITY_HOLD': '1'}, TILE3, lambda h: sc_coadmit(h, ck, 'coadmit')),
         ('mtp-on', {**ON, 'FAKE_MTP': '3', 'FAKE_MTP_DRAFT_MS': '1'}, TILE3, lambda h: sc_decoder(h, ck, True, 'mtp', mtp=True)),
         ('t3+t11', {**ON, 'HIVE_PREFILL_YIELD': '1'}, TILE3, lambda h: (sc_short(h, ck, True, 't3+t11'), sc_decoder(h, ck, True, 't3+t11'))),
         # T11b simultaneous-arrival coalescing: on (default 25 ms) = one round; HIVE_BATCH_COALESCE_MS=0 = reproduces the old contention (negative control)
@@ -527,6 +555,11 @@ def run_mutants(exe, td):
     assert src.count(v_line) == 1
     exe7 = t.build_daemon(td, name='hived_mut_vision', hived_source=src.replace(v_line, "      if (rsig && !encode_ok) {"))
     out.append(('image encoded mid-forward without a loaded encoder', *mutant_case(exe7, td, ON, lambda h, ck: sc_limits(h, ck, 'mut-vision', False))))
+    # 8) the batch co-admission gate removed (pull takes any batchable queue head): the long worse-priority prompt joins the short one's round
+    p_line = "batch_eligible(queue.front(), false) && pull_ok(queue.front())) { r = std::move(queue.front()); queue.pop_front(); got = true; }"
+    assert src.count(p_line) == 1
+    exe8 = t.build_daemon(td, name='hived_mut_coadmit', hived_source=src.replace(p_line, "batch_eligible(queue.front(), false)) { r = std::move(queue.front()); queue.pop_front(); got = true; }"))
+    out.append(('long worse-priority prompt pulled into a short round', *mutant_case(exe8, td, {**ON, **t.BATCH, 'HIVE_PREFILL_PRIORITY_HOLD': '1'}, lambda h, ck: sc_coadmit(h, ck, 'mut-coadmit'))))
     return out
 
 

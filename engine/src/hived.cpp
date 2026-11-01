@@ -3074,6 +3074,30 @@ int main(int argc, char** argv) {
       jobs[j].reset();
       admit_epilogue(tag.flag, tag.sid);
     };
+    // Co-admission gate (pull and the batch window). A long queued request (>= stream_floor rows to prefill) joins this round only when every
+    //   job already in it is long too (they share forward_multi) and its priority class is not worse than the round's best. A short one joins
+    //   as before unless layer yields are on — then it stays queued and is taken at the next yield of the round's forward (want() and the
+    //   yield admission scan the queue, not this round's jobs), instead of waiting for that whole forward inside the round. Everything held
+    //   back is admitted by the main loop's usual rules once the round ends.
+    //   Measured 2026-11-02 06:08 KST (production DeepSeek, requests-server.jsonl + hived.log): a short routing request (priority -1, 55 new rows)
+    //   opened a round, pull took a scheduled background request (priority 1, 21,382 new rows) behind it; with one multi job the plan below runs it first
+    //   (solo front), its 6.1 s forward saw 0 layer yields (queue empty, nothing active — the short job sat in `jobs`), and the short
+    //   request's first token came +6.9 s after admission. Since 10-01: 14 such stalls of 2.6-9.3 s, 9 behind a priority-1 request.
+    //   Admission order only — no request is refused, values and forwards per request are unchanged.
+    auto pull_ok = [&](const Request& r) {
+      const json& q = r.req;
+      if (rows_to_prefill(q.value("session", "default"), q) < stream_floor) return !layer_yield;
+      int best = INT_MAX;
+      for (const auto& Jp : jobs) {
+        if (!Jp) continue;
+        if (Jp->ids.size() - Jp->i < stream_floor) return false;
+        best = std::min(best, prio_class(Jp->A->prio));
+      }
+      const auto it = q.find("priority");
+      const double v = it != q.end() && it->is_number() ? it->get<double>() : 0.0;
+      const int p = std::isfinite(v) ? (int)std::max(-1000.0, std::min(1000.0, v)) : 0;  // the same normalization as req_prio
+      return prio_class(p) <= best;
+    };
     auto pull = [&] {
       for (;;) {  // take more: only while seats (max_batch) and slots (at least one per request) remain and the queue head is batchable
         if ((int)(active.size() + sliced.size() + jobs.size()) >= rt.max_batch() || (int)jobs.size() >= rt.prefill_slots()) break;
@@ -3081,7 +3105,7 @@ int main(int argc, char** argv) {
         bool got = false;
         {
           std::lock_guard<std::mutex> lk(mu);
-          if (!queue.empty() && stop_state.load() == 0 && !sleep_asked.load() && batch_eligible(queue.front(), false)) { r = std::move(queue.front()); queue.pop_front(); got = true; }
+          if (!queue.empty() && stop_state.load() == 0 && !sleep_asked.load() && batch_eligible(queue.front(), false) && pull_ok(queue.front())) { r = std::move(queue.front()); queue.pop_front(); got = true; }
         }
         if (!got) break;
         add(std::move(r));
@@ -3119,7 +3143,7 @@ int main(int argc, char** argv) {
             {
               std::unique_lock<std::mutex> lk(mu);
               if (stop_state.load() != 0 || sleep_asked.load()) { why = "stop"; break; }
-              if (!queue.empty() && !batch_eligible(queue.front(), false)) { why = "blocked"; break; }  // FIFO: if the head cannot join, nothing behind it can
+              if (!queue.empty() && !(batch_eligible(queue.front(), false) && pull_ok(queue.front()))) { why = "blocked"; break; }  // FIFO: if the head cannot join, nothing behind it can
               if (queue.empty() && active.empty()) {  // without decoders, sleep until an arrival (or the end of the window)
                 const auto left = std::chrono::microseconds((long long)std::max(0.0, (wake_at - now_ms()) * 1000.0));
                 cv.wait_for(lk, left, [&] { return !queue.empty() || stop_state.load() != 0 || sleep_asked.load(); });
