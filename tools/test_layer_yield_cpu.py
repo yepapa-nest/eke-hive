@@ -196,6 +196,40 @@ def sc_prio(h, ck, tag):
     ck.true(f'{tag} control: request waits for the long forward', first.get('S', 1e9) > first.get('L', 0), repr(first))
 
 
+def sc_hold_arrival(h, ck, tag):
+    """Priority hold arrival (2026-11-04 — production 11-03 16:52: a conversation turn needing 136 rows waited 35.3 s behind another user's 47 s
+    answer, R = 128): a worse-priority long prefill runs; a better-priority 40-row request is admitted at one of its yields (R = what want()
+    asked then) and decodes, the yield holding the forward for it. A second better-priority request needing 100 rows (> R) arrives during
+    the hold. It must not wait for the decoder to finish: the hold ends, the forward runs to its next layer point and that yield admits it
+    while the first one is still decoding."""
+    L, D, T = t.tokens(700, 1211), t.tokens(40, 1210), t.tokens(100, 1212)
+    res, first, dtimes = {}, {}, []
+    a = t.launch(h, 'HL', L, 3, res, 'L', on_token=lambda k: first.setdefault('L', time.monotonic()), priority=1)
+    time.sleep(.25 * SLOW)  # inside the long forward
+    d = t.launch(h, 'HD', D, 3000, res, 'D', on_token=lambda k: dtimes.append(time.monotonic()), priority=-1)
+    deadline = time.monotonic() + 10 * SLOW
+    while len(dtimes) < 5 and time.monotonic() < deadline:
+        time.sleep(.005)
+    sent = time.monotonic()
+    b = t.launch(h, 'HT', T, 3, res, 'T', on_token=lambda k: first.setdefault('T', time.monotonic()), priority=-1)
+    b.join(60 * SLOW)
+    d_running = d.is_alive()
+    h.cancel('HD')
+    for th in (d, a):
+        th.join(60 * SLOW)
+    t.done_ok(ck, f'{tag} long', res['L'], L, 3, 0)
+    t.done_ok(ck, f'{tag} arrival', res['T'], T, 3, 0)
+    ck.true(f'{tag}: decoder ok', res['D']['error'] is None, repr(res['D']['error']))
+    ck.eq(f'{tag}: decoder tokens follow its oracle', res['D']['tokens'], t.oracle(D, len(res['D']['tokens'])))
+    ttft = first.get('T', 1e9) - sent
+    ck.true(f'{tag}: the forward was held for the first decoder', any('priority hold' in l for l in lines(h)), '')
+    ck.true(f'{tag}: arrival answered while the first decoder still decodes (not after its hold)', d_running, '')
+    ck.true(f'{tag}: arrival first token within about one layer + period', ttft < (FWD_MS / LAYERS + PERIOD + 300) / 1000 * SLOW, f'{ttft:.3f}s')
+    ck.true(f'{tag}: hold ended for it', any('priority hold ended' in l for l in lines(h)), '')
+    ck.true(f'{tag}: long prompt first token after both', first.get('L', 0) > first.get('T', 1e9), repr(first))
+    return round(ttft, 3)
+
+
 def sc_reuse(h, ck, tag):
     """A follow-up turn of a cached conversation: 300 ids + its 3-token answer + 50 new ids = 353 prompt ids (> default max 127) but only
     51 rows to prefill (the live state covers 302) → admitted mid-forward. Control: the same 353 ids in a fresh session → waits."""
@@ -452,6 +486,7 @@ def run(exe, td):
         ('vision-loaded', {**ON, 'FAKE_VISION_LOADED': '1'}, TILE3, lambda h: sc_image_loaded(h, ck, 'vision')),
         ('mid300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: (sc_mid(h, ck, 'mid'), sc_short(h, ck, True, 'mid+short'))),
         ('prio300', {**ON, 'HIVE_LAYER_YIELD_MID': '300'}, TILE3, lambda h: sc_prio(h, ck, 'prio')),
+        ('hold-arrival', ON, TILE3, lambda h: sc_hold_arrival(h, ck, 'hold')),
         ('batch-on', {**ON, **batch}, TILE3, lambda h: (sc_short(h, ck, True, 'batch'), sc_batch(h, ck, 'batch'), sc_decoder(h, ck, True, 'batch'))),
         ('batch-coadmit', {**ON, **batch, 'HIVE_PREFILL_PRIORITY_HOLD': '1'}, TILE3, lambda h: sc_coadmit(h, ck, 'coadmit')),
         ('mtp-on', {**ON, 'FAKE_MTP': '3', 'FAKE_MTP_DRAFT_MS': '1'}, TILE3, lambda h: sc_decoder(h, ck, True, 'mtp', mtp=True)),
@@ -560,6 +595,11 @@ def run_mutants(exe, td):
     assert src.count(p_line) == 1
     exe8 = t.build_daemon(td, name='hived_mut_coadmit', hived_source=src.replace(p_line, "batch_eligible(queue.front(), false)) { r = std::move(queue.front()); queue.pop_front(); got = true; }"))
     out.append(('long worse-priority prompt pulled into a short round', *mutant_case(exe8, td, {**ON, **t.BATCH, 'HIVE_PREFILL_PRIORITY_HOLD': '1'}, lambda h, ck: sc_coadmit(h, ck, 'mut-coadmit'))))
+    # 9) no early end of the priority hold: a better-priority arrival beyond the lent rows waits for the decoder (2026-11-04)
+    h_line = "          if (const size_t x = urgent_beyond_lent()) {"
+    assert src.count(h_line) == 1
+    exe9 = t.build_daemon(td, name='hived_mut_hold', hived_source=src.replace(h_line, "          if (const size_t x = 0 * urgent_beyond_lent()) {"))
+    out.append(('priority hold ignores a better-priority arrival', *mutant_case(exe9, td, ON, lambda h, ck: sc_hold_arrival(h, ck, 'mut-hold'))))
     return out
 
 

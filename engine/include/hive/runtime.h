@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -24,6 +25,7 @@
 #include <cstdio>
 
 namespace hive {
+namespace spec { struct Dist; }   // hive/spec_sample.h — the draft distribution of a sampled draft (HIVE_MTP_SAMPLE_DRAFTS)
 
 struct SnapshotFence {
   cudaEvent_t event = nullptr;
@@ -269,6 +271,7 @@ class Runtime {
   // Share of the paused forward's work done at the current layer boundary (0..1) — hived's HIVE_LAYER_YIELD_MID estimates the forward's remaining rows
   //   from it. Encoder layers (all rows) carry 90 % of a decoder-tail forward, the tail layers (128 rows) the rest; without the tail, layers are equal.
   double layer_yield_progress() const { return ly_progress_; }
+  int layer_yield_cap() const { return ly_.cap; }  // the most rows a layer yield can lend (hived: whether a later yield can admit a waiting request)
   // HIVE_LAYER_YIELD_INTRA ("T11b" comment in runtime.cpp): yield points inside a layer, decode only. layer_yield_kind() = kind of the point
   //   currently yielding (ly::kLayer at layer boundaries — hived admits only there). layer_yield_intra_on() = the switch was read on (the runtime
   //   still skips intra points when HIVE_CACHE_ELASTIC is off or incomplete, or CPU misses are off — see the startup line).
@@ -291,7 +294,12 @@ class Runtime {
   int32_t row_argmax(int m) const;
   bool mtp_enabled() const { return mtp_on_; }
   int mtp_block() const;
-  void mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats* stats);
+  // HIVE_MTP_SAMPLE_DRAFTS (hived): with `sd`, every draft is drawn from the draft head's distribution under the request's sampling rule
+  //   (temperature → top_k → top_p → min_p, hive/sampler.h) instead of being its argmax, and `q` receives that distribution per draft
+  //   (hive/spec_sample.h) for the acceptance rule min(1, p/q) + residual sampling. Without `sd` (or temperature ≤ 0): greedy drafts, `q` cleared.
+  struct DraftSampling { float temperature = 1.f, top_p = 1.f, min_p = 0.f; int top_k = 0; std::mt19937_64* rng = nullptr; };
+  void mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats* stats, const DraftSampling* sd = nullptr,
+                 std::vector<hive::spec::Dist>* q = nullptr);
   void forward_verify(Seq& seq, const int32_t* ids, int M, std::vector<float>& logits_rows, ForwardStats* stats);
   void rollback(Seq& seq, int n_keep);
   // HIVE_MTP_VERIFY2 (env_on, constructor option block): run forward_verify on the decode path (decode_layer — layer graphs, fused attention kernel, moe_decode_experts,
@@ -485,11 +493,27 @@ class Runtime {
   bool dec_defer_ = false; float dec_skip_ = 0.f;
   std::vector<ExpertStore::Job> djobs_;
   float* def_out_h_ = nullptr; float* def_out_d_ = nullptr; int32_t* def_rows_h_ = nullptr; int32_t* def_rows_d_ = nullptr; float* def_scratch_h_ = nullptr;
+  // Two sets of the deferred row table and output rows (def_set_ = the one the batch being built writes; the pointers above name it).
+  //   deferred_flush only *issues* hc_inject_rows, which reads the mapped table and outputs when it runs — after the rest of the front
+  //   that is still executing — while the host goes straight on to write the next layer's deferred rows. With one set the kernel read the
+  //   next layer's row numbers (found by reading the code, 2026-11-11): at M >= 2 a deferred expert output was then added to another row
+  //   of the batch (another conversation, or another verify position). The set being rewritten is the one flushed a layer earlier; its
+  //   kernel was issued before this layer's front, whose routing publish the host has already received, so it has finished.
+  //   HIVE_DECODE_DEFER_SETS=1 keeps the single set (A/B only).
+  float* def_out_h2_[2] = {nullptr, nullptr}; float* def_out_d2_[2] = {nullptr, nullptr};
+  int32_t* def_rows_h2_[2] = {nullptr, nullptr}; int32_t* def_rows_d2_[2] = {nullptr, nullptr};
+  int def_set_ = 0; bool def_two_sets_ = true, def_sync_ = false;
+  // HIVE_DECODE_DEFER_CHECK (validation only): right after hc_inject_rows a copy kernel reads the same mapped row table into device
+  //   memory, and the next flush compares what it read with the table the host had built for that batch — counting the batches whose
+  //   kernel saw a table the host had already rewritten.
+  bool def_check_ = false; DevBuf def_chk_dev_; int32_t* def_chk_h_ = nullptr; std::vector<int32_t> def_chk_want_; bool def_chk_armed_ = false;
+  long def_chk_n_ = 0, def_chk_bad_ = 0, def_chk_rows_ = 0, def_chk_rows_bad_ = 0;
   int def_rows_n_ = 0, def_M_ = 0; bool def_pending_ = false;
   DevBuf post_def_;
   long def_layers_ = 0, def_rows_total_ = 0, skip_rows_total_ = 0;
   void deferred_flush();   // wait for a pending deferred batch and add it to the hidden streams (stream order: now)
   uint8_t* cache_mask_h_ = nullptr;   // pinned [n_layers][n_routed]
+  DevBuf cache_mask_dev_;             // HIVE_ROUTER_MASK_DEV: device copy [n_layers][n_routed] — row l is refreshed by a small kernel right before layer l's router
   DevBuf prior_range_;                // [n_layers] running average of the selection-score range
   int dec_row0_ = 0;       // first row of a half decode (UBATCH) (stats row number, observe row) — default 0
   bool ub_active_ = false; // inside the UBATCH layer loop (do not shrink stats row arrays)
@@ -535,6 +559,16 @@ class Runtime {
   bool engram_par_ = false;             // HIVE_ENGRAM_PAR: engram row lookups (memcpy) on several threads
   bool engram_digest_ = false;          // HIVE_ENGRAM_DIGEST: one hash line of lookup results per layer (RAM vs SSD bit comparison)
   double essd_log_ms_ = 0;              // time of the periodic HIVE_ENGRAM_SSD summary line
+  bool idx_vis_dev_ = true;             // HIVE_IDX_VIS_DEV: the indexer's row loop reads visible counts from device memory (0 = the mapped table)
+  // 2026-11-11, same kind as HIVE_IDX_VIS_DEV: kernels that read mapped pinned host tables in every thread or block now read a device copy made once
+  //   (same values, same kernels and order — only the address read changes). Each is on by default; 0 = the mapped table, as before.
+  bool router_mask_dev_ = true;         // HIVE_ROUTER_MASK_DEV: the decode router tail reads the cache-prior mask row from device memory
+  bool verify_tab_dev_ = true;          // HIVE_VERIFY_TAB_DEV: the verify front's compressor and ring write read positions, state and ring pointers from the device row table
+  bool pf_pos_dev_ = true;              // HIVE_PF_POS_DEV: prefill RoPE kernels (q, kv, o, indexer q, compressed latents/keys) read positions from device memory
+  bool pf_embed_dev_ = true;            // HIVE_PF_EMBED_DEV: prefill embedding rows go to the device once and are expanded there
+  bool pf_engram_dev_ = true;           // HIVE_PF_ENGRAM_DEV: prefill engram rows go to the device once and are dequantized there
+  bool pf_cpu_rows_dev_ = true;         // HIVE_PF_CPU_ROWS_DEV: the prefill CPU share's gather/accumulate kernels read the row map from device memory
+  int idx_msub_max_ = 256;              // HIVE_IDX_MSUB_MAX: rows topk_pos is sized for, the cap of that sub-chunk at long T (0 = constructor Msub)
   bool idx_msub_actual_ = false;        // HIVE_IDX_MSUB_ACTUAL: indexer sub-chunk rows = actual T (within the same scratch capacity)
   int host_par_threads_ = 1;            // parallel threads for EARLY_STREAM/ENGRAM_PAR = CPU expert pool thread count (the pool is idle at that moment)
   std::unique_ptr<VitCache> vit_cache_; // HIVE_VIT_CACHE_MB: LRU of image encoder outputs (host RAM, hit only on exact byte match)
@@ -561,6 +595,7 @@ class Runtime {
   int32_t* cand_idx_h_ = nullptr; float* cand_val_h_ = nullptr; float* cand_max_h_ = nullptr; float* cand_sum_h_ = nullptr;
   DevBuf cand_idx_, cand_val_, cand_max_, cand_sum_;
   void sampler_cands_dev(int M);  // build candidates, max and sum-exp of logits_b rows [0,M) and copy them to the host (async, same stream)
+  void sampler_cands_row(int i);  // the same for logits_b row i alone, plus the row itself → dlog_h + i·V (the draft chain samples row by row)
   bool graphs_ = true;
   bool capturing_ = false;
   bool dump_final_ = false;  // window that allows only the final dump at the end of forward_batch in graph mode

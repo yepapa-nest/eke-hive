@@ -144,9 +144,21 @@ class QwenEngine {
   //   boundary_base + boundary_span × (layers done / layers).
   double boundary_base = 0, boundary_span = 1;
   double pf_yield_body_ms = 0;
-  struct YieldSave { bf16* hcur = nullptr; std::vector<EmbedOverride> emb; int64_t emb_base = 0; bool on = false; };
+  // What a prefill forward parked at a layer boundary needs back after the forwards run inside the yield. Besides the hidden-stream buffer
+  //   and the embedding override, that is every engine member forward() / verify_batch() / the graph paths decide per forward:
+  //   2026-11-11 — only hcur / emb / emb_base were saved, so a decode or verify forward run inside the yield left pf_dev_ = false (its own
+  //   `prefill && …`), and the remaining layers of the parked prefill fell from fn_moe_prefill to the host route (ex_.prefill_layer: a
+  //   routing D2H + stream sync per layer, other fp32 rounding than the layers before the yield); map_now_ left true made the prefill's
+  //   closing route_bookkeeping() count the inner step's routing a second time.
+  //   pf_dev is restored as saved and then re-checked against the cache by forward() (yields_ — the residency may have changed inside the
+  //   yield: KV growth of an inner sequence lends expert slots).
+  struct YieldSave {
+    bf16* hcur = nullptr; std::vector<EmbedOverride> emb; int64_t emb_base = 0; bool on = false;
+    bool pf_dev = false, dr_now = false, hyb_now = false, map_now = false, pre_normed = false, verify = false, vdyn = false, mask_armed = false;
+    int nonres_now = 0, hyb_rows = 0, gphase = 0, graph_ctx = 0, mtp_slot = 0, route_rows = 0;
+  };
   bool yield_enter(YieldSave& s);
-  void yield_exit(YieldSave& s);
+  void yield_exit(YieldSave& s);   // (no throw: it also runs while an exception from the yield body unwinds)
   int yield_rows_cap() const { return hcur_ ? max_chunk_ : hy_rows_; }
   void alloc_yield_rows(int rows);
 
@@ -205,6 +217,7 @@ class QwenEngine {
   bf16* hb() const { return hcur_ ? hcur_ : h_.as<bf16>(); }
   DevBuf hy_; int hy_rows_ = 0;
   int tiles_ = 1;
+  uint64_t yields_ = 0;               // yield_exit calls: forward() re-checks pf_dev_ against the cache after a boundary that yielded
   std::vector<EmbedOverride> emb_over_;
   int64_t emb_base_ = 0;
   // work buffers (rows ≤ max_chunk)

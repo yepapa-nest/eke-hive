@@ -269,6 +269,11 @@ class SessionStore {
   std::unique_ptr<Loaded<Image>> load_canary() { std::string f; { std::lock_guard<std::mutex> lk(im_); f = canary_.file; } return load(f, fds_); }
   size_t entries() { std::lock_guard<std::mutex> lk(im_); return ckpt_.size() + snaps_.size(); }
   bool has_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); return ckpt_.count(sid) > 0; }
+  // The engine reused the in-memory copy of a stored entry: refresh the disk copy's recency too. Without this the budget ordered entries by
+  //   the time they were written, so a head snapshot many conversations resume from every minute — written once, days ago — was the first
+  //   to go when the store filled, and the next restart read that head again for every one of them. Index only: any thread.
+  void touch_snap(uint64_t key) { std::lock_guard<std::mutex> lk(im_); auto it = snaps_.find(key); if (it != snaps_.end()) it->second.last_used = wall_ms(); }
+  void touch_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid); if (it != ckpt_.end()) it->second.last_used = wall_ms(); }
   // position and last token of a session's checkpoint on disk (-1 = none) — the caller checks the token before reading GBs
   std::pair<int64_t, int32_t> ckpt_at(const std::string& sid) {
     std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid);
@@ -321,7 +326,7 @@ class SessionStore {
     for (auto& [k, m] : snaps_) ::unlink(m.file.c_str());
     if (with_canary && !canary_.file.empty()) { ::unlink(canary_.file.c_str()); canary_ = Meta{}; }
     ckpt_.clear(); snaps_.clear(); known_.clear();
-    gc_packs();
+    gc_packs();  // rebuilds pack_refs_ (the canary's packs stay unless it was dropped above)
     return n;
   }
 
@@ -338,6 +343,7 @@ class SessionStore {
   std::map<uint64_t, Meta> snaps_;              // prefix key -> boundary snapshot
   Meta canary_;                                 // the canary (file empty = none)
   std::map<uint64_t, long long> pack_bytes_;    // pack id -> size
+  std::map<uint64_t, long> pack_refs_;          // pack id -> number of entries (ckpt_, snaps_, canary_) that refer to it
   size_t disk_bytes_ = 0;
   std::map<const uint8_t*, typename WriteAr::Known> known_;
   std::map<uint64_t, int> fds_;                 // engine thread only (load_ckpt / load_snap / load_canary; load_ckpt_detached has its own)
@@ -349,10 +355,11 @@ class SessionStore {
   std::string meta_path(const std::string& kind, const std::string& name) const {
     return dir_ + "/metas/" + kind + "-" + hex16(hash_bytes(reinterpret_cast<const uint8_t*>(name.data()), name.size())) + ".json";
   }
+  // A read refreshes the entry's recency (in memory): the budget drops the least recently *used* entry, not the least recently written one.
   std::string meta_of(const std::string& kind, const std::string& name) {
     std::lock_guard<std::mutex> lk(im_);
-    if (kind == "ckpt") { auto it = ckpt_.find(name); return it == ckpt_.end() ? "" : it->second.file; }
-    auto it = snaps_.find(std::stoull(name, nullptr, 16)); return it == snaps_.end() ? "" : it->second.file;
+    if (kind == "ckpt") { auto it = ckpt_.find(name); if (it == ckpt_.end()) return ""; it->second.last_used = wall_ms(); return it->second.file; }
+    auto it = snaps_.find(std::stoull(name, nullptr, 16)); if (it == snaps_.end()) return ""; it->second.last_used = wall_ms(); return it->second.file;
   }
   static void collect_packs(const json& j, std::set<uint64_t>& out) {
     if (j.is_array() && j.size() == 4 && j[0].is_string() && j[3].is_string()) { out.insert(std::stoull(j[0].get<std::string>(), nullptr, 16)); return; }
@@ -405,22 +412,47 @@ class SessionStore {
     auto it = known_.lower_bound(prune_from_);
     for (size_t n = 0, end = std::min(budget, known_.size()); n < end; ++n) {
       if (it == known_.end()) it = known_.begin();
-      it = it->second.owner.expired() ? known_.erase(it) : std::next(it);
+      it = it->second.owner.expired() || !pack_bytes_.count(it->second.ref.pack) ? known_.erase(it) : std::next(it);
     }
     prune_from_ = it == known_.end() ? nullptr : it->first;
   }
+  // Reference counts per pack, kept as entries come and go.
+  //   Measured 2026-11-11 (the reference machine's store, 22,107 entries · 34,920 packs · 960,378 pack references · 8.8 M segments): every
+  //   write rebuilt the set of referenced packs from all entries (gc_packs, ~0.15 s) under the index lock, once more per entry the budget
+  //   dropped, and scanned every known segment once per dropped pack. The engine thread reads the index (stats at each chunk end, the
+  //   look-ups of an admission) and waited for it: a write took 70 ms (p50) / 143 ms (p99) on 2026-11-07 and 205 ms / 1,855 ms once the
+  //   store reached its budget on 2026-11-10 — 85 minutes a day in which no request advanced, against 6.
+  void ref_packs(const Meta& m) { for (uint64_t p : m.packs) ++pack_refs_[p]; }
+  // Drops the references of a replaced or evicted entry. Packs nothing refers to any more leave the index here; their files are removed
+  //   by the caller after it releases the index lock (`dead`). Segments known to be in such a pack are not searched for: find and the
+  //   load registration check the pack is still indexed, and prune_known erases them as it passes.
+  void unref_packs(const Meta& m, std::vector<std::string>& dead) {
+    for (uint64_t p : m.packs) {
+      auto r = pack_refs_.find(p);
+      if (r == pack_refs_.end() || --r->second > 0) continue;
+      pack_refs_.erase(r);
+      auto b = pack_bytes_.find(p);
+      if (b == pack_bytes_.end()) continue;
+      disk_bytes_ -= std::min(disk_bytes_, (size_t)std::max(0LL, b->second));
+      pack_bytes_.erase(b);
+      dead.push_back(pack_path(p));
+    }
+  }
+  // The full pass: start-up (scan) and clear only — rebuilds pack_refs_ from the entries and drops every pack none refers to.
   void gc_packs() {  // under im_ (or before the writer starts)
-    std::set<uint64_t> used;
-    for (auto& [k, m] : ckpt_) used.insert(m.packs.begin(), m.packs.end());
-    for (auto& [k, m] : snaps_) used.insert(m.packs.begin(), m.packs.end());
-    used.insert(canary_.packs.begin(), canary_.packs.end());
+    pack_refs_.clear();
+    for (auto& [k, m] : ckpt_) ref_packs(m);
+    for (auto& [k, m] : snaps_) ref_packs(m);
+    ref_packs(canary_);
+    bool dropped = false;
     for (auto it = pack_bytes_.begin(); it != pack_bytes_.end();) {
-      if (used.count(it->first)) { ++it; continue; }
+      if (pack_refs_.count(it->first)) { ++it; continue; }
       ::unlink(pack_path(it->first).c_str());
       disk_bytes_ -= std::min(disk_bytes_, (size_t)std::max(0LL, it->second));
-      for (auto k = known_.begin(); k != known_.end();) k = k->second.ref.pack == it->first ? known_.erase(k) : std::next(k);
       it = pack_bytes_.erase(it);
+      dropped = true;
     }
+    if (dropped) for (auto k = known_.begin(); k != known_.end();) k = pack_bytes_.count(k->second.ref.pack) ? std::next(k) : known_.erase(k);
   }
   void enqueue(Job j) {
     { std::lock_guard<std::mutex> lk(qm_); q_.push_back(std::move(j)); ++queued_; }
@@ -454,7 +486,7 @@ class SessionStore {
     ar.find = [this](const uint8_t* p, Ref& r) {  // the index lock only per lookup — the engine thread reads the index while this writes GBs
       std::lock_guard<std::mutex> lk(im_);
       auto it = known_.find(p);
-      if (it == known_.end() || it->second.owner.expired()) return false;
+      if (it == known_.end() || it->second.owner.expired() || !pack_bytes_.count(it->second.ref.pack)) return false;  // its pack may be gone (unref_packs)
       r = it->second.ref;
       return true;
     };
@@ -474,28 +506,47 @@ class SessionStore {
     if (!logit_ref.empty()) m["logits"] = ref_json(logit_ref[0]);
     const std::string mpath = meta_path(j.kind, j.name);
     if (!write_file_atomic(mpath, m.dump())) { std::lock_guard<std::mutex> lk(im_); ++st_.write_fail; return; }
-    std::lock_guard<std::mutex> lk(im_);
-    if (ar.fresh) { pack_bytes_[pack] = (long long)ar.off; disk_bytes_ += ar.off; }
-    for (auto& [owner, r] : ar.made) known_[owner.get()] = {owner, r};
-    prune_known(2 * ar.made.size());
+    // The parsing of this image's references happens before the index lock; under it only map updates remain. Files that leave the index
+    //   (a replaced entry's packs, evicted entries and their packs) are removed after the lock is released.
     Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"];
     collect_packs(ar.out, e.packs); if (!logit_ref.empty()) e.packs.insert(pack);
     e.bytes = range_bytes(ar.out) + (logit_ref.empty() ? 0 : (size_t)logit_ref[0].len);
-    if (j.kind == "ckpt") ckpt_[j.name] = e; else if (j.kind == "snap") snaps_[j.key] = e; else canary_ = e;
-    gc_packs();  // a replaced checkpoint's packs that no entry refers to any more
-    if (j.kind != "canary") { ++st_.writes; st_.written += ar.fresh; st_.write_ms += wall_ms() - t0; }  // the counters are conversation state
-    evict();
+    std::vector<std::string> dead;
+    double disk_gb;
+    {
+      std::lock_guard<std::mutex> lk(im_);
+      if (ar.fresh) { pack_bytes_[pack] = (long long)ar.off; disk_bytes_ += ar.off; }
+      for (auto& [owner, r] : ar.made) known_[owner.get()] = {owner, r};
+      prune_known(2 * ar.made.size() + 64);
+      Meta& slot = j.kind == "ckpt" ? ckpt_[j.name] : j.kind == "snap" ? snaps_[j.key] : canary_;
+      ref_packs(e);              // the new entry first: packs it shares with the one it replaces never reach zero
+      unref_packs(slot, dead);   // a replaced entry's packs that no entry refers to any more (an empty slot has none)
+      slot = std::move(e);
+      // a pack written now that nothing refers to (cannot happen: a fresh pack is named by its own entry) would stay until the next start-up scan
+      if (j.kind != "canary") { ++st_.writes; st_.written += ar.fresh; st_.write_ms += wall_ms() - t0; }  // the counters are conversation state
+      evict(dead);
+      disk_gb = disk_bytes_ / 1073741824.0;
+    }
+    for (const auto& f : dead) ::unlink(f.c_str());
     fprintf(stderr, "[store] %s %.16s pos %lld · %.1f MB new · %.0f ms · disk %.2f GB / %.0f GB\n", j.kind.c_str(), j.name.c_str(),
-            (long long)j.image->pos, ar.fresh / 1048576.0, wall_ms() - t0, disk_bytes_ / 1073741824.0, budget_ / 1073741824.0);
+            (long long)j.image->pos, ar.fresh / 1048576.0, wall_ms() - t0, disk_gb, budget_ / 1073741824.0);
   }
-  void evict() {  // under im_: oldest entries first until the packs fit the budget (the newest entry always stays)
-    while (disk_bytes_ > budget_ && ckpt_.size() + snaps_.size() > 1) {
-      double oldest = 1e300; std::string ck; uint64_t sk = 0; bool is_snap = false;
-      for (auto& [k, m] : ckpt_) if (m.last_used < oldest) { oldest = m.last_used; ck = k; is_snap = false; }
-      for (auto& [k, m] : snaps_) if (m.last_used < oldest) { oldest = m.last_used; sk = k; is_snap = true; }
-      if (is_snap) { ::unlink(snaps_[sk].file.c_str()); snaps_.erase(sk); } else { ::unlink(ckpt_[ck].file.c_str()); ckpt_.erase(ck); }
+  // under im_: least recently used entries first until the packs fit the budget (the newest entry always stays). One pass orders the
+  //   entries; each dropped entry releases its packs through the reference counts (the files go to `dead`, removed by the caller).
+  void evict(std::vector<std::string>& dead) {
+    if (disk_bytes_ <= budget_ || ckpt_.size() + snaps_.size() <= 1) return;
+    struct V { double used; bool snap; const std::string* ck; uint64_t sk; };
+    std::vector<V> order;
+    order.reserve(ckpt_.size() + snaps_.size());
+    for (auto& [k, m] : ckpt_) order.push_back({m.last_used, false, &k, 0});
+    for (auto& [k, m] : snaps_) order.push_back({m.last_used, true, nullptr, k});
+    // ties: checkpoints before snapshots, then key order — the order the previous scan (strict <, checkpoints first) picked
+    std::stable_sort(order.begin(), order.end(), [](const V& a, const V& b) { return a.used < b.used; });
+    for (size_t i = 0; i + 1 < order.size() && disk_bytes_ > budget_; ++i) {
+      const V& v = order[i];
+      if (v.snap) { auto it = snaps_.find(v.sk); dead.push_back(it->second.file); unref_packs(it->second, dead); snaps_.erase(it); }
+      else { auto it = ckpt_.find(*v.ck); dead.push_back(it->second.file); unref_packs(it->second, dead); ckpt_.erase(it); }
       ++st_.evicted;
-      gc_packs();
     }
   }
   int pack_fd(uint64_t id, std::map<uint64_t, int>& fds) {

@@ -309,8 +309,15 @@ int QwenEngine::mtp_draft(QwenSeq& s, int32_t tok, int k, int32_t* drafts, float
   if (p < 0 || p + k + 1 > s.cap) return 0;
   kv_reserve(s, std::min<int64_t>(s.cap, s.pos + k + kKvSlack));
   const int HC = c_.hcw();
+  // the chain reads the sequence's h_last from an engine buffer (mtp_hout_ row 2), as the batched chain does from mtpb_h_. 2026-11-11: step 0
+  //   took s.h_last.p directly, so the pointer was baked into the captured graph and had to be part of its key — one draft graph per
+  //   (session slot, context bucket), each holding device memory, with no cap on the whole-card configuration. Everything else the chain
+  //   reads of the sequence goes through the pinned / mirrored tables (rope_dst_pin_, the attention row table), so with this copy one
+  //   graph per (k, context bucket) serves every sequence. Same bytes, same kernels: the drafts are unchanged.
+  bf16* const hin0 = mtp_hout_.as<bf16>() + (size_t)2 * HC;
+  CUDA_CHECK(cudaMemcpyAsync(hin0, s.h_last.p, (size_t)HC * 2, cudaMemcpyDeviceToDevice, stream_));
   auto chain = [&] {
-    const bf16* hin = s.h_last.as<bf16>();
+    const bf16* hin = hin0;
     for (int i = 0; i < k; ++i) {
       bf16* hout = mtp_hout_.as<bf16>() + (size_t)(i & 1) * HC;
       mtp_step(s, i, tok, hin, p + i, hout);
@@ -323,7 +330,7 @@ int QwenEngine::mtp_draft(QwenSeq& s, int32_t tok, int k, int32_t* drafts, float
   if (graphs && mtp_dev_ && !layer_hook && !layer_inject) {
     const bool scoring = (p + k) / kQsaRatio > kQsaTopBlocks;
     const int ctx = scoring ? (int)((p + k + 4095) / 4096 * 4096) : 0;
-    const std::string key = "mtp" + std::to_string(k) + ":" + std::to_string(scoring) + ":" + std::to_string(ctx) + ":" + std::to_string((uintptr_t)s.h_last.p);
+    const std::string key = "mtp" + std::to_string(k) + ":" + std::to_string(scoring) + ":" + std::to_string(ctx);   // (no sequence pointer: hin0)
     graph_ctx_ = ctx;
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     gphase_ = 1;

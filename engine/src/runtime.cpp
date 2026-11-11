@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Eke Hive Authors
 #include "hive/runtime.h"
 #include "hive/image_reaper.h"
+#include "hive/spec_sample.h"  // HIVE_MTP_SAMPLE_DRAFTS — the draft distribution of a sampled draft (mtp_draft)
 
 #include <algorithm>
 #include <atomic>
@@ -159,13 +160,16 @@ inline void unpack_acts(const uint8_t* xq, const uint8_t* xs, int i0, int i1, in
 //   candidate-pool path), bmax (rows × blocks), topk_pos (rows × selection width).
 //   Capacity = the constructor allocation (Msub·(Tcap+8), Msub·nblocks_cap, Msub·topk_w). Kernel grid.y = row count, hence the 65535 cap. The result is
 //   never smaller than Msub (columns, blocks and width are all ≤ worst case) → only the batch size of row-independent kernels changes; values are the same.
-inline int idx_msub_for(int Msub, int Tcap, int nblocks_cap, int topk_w, int M, int T, int bs, int CB, int index_topk) {
+//   topk_rows = rows topk_pos was sized for (capacity topk_rows × topk_w). Sized for Msub only, every T >= 16K stayed at Msub = 32 rows at a 1M max_ctx: one launch of each
+//   kernel per 32 rows. HIVE_IDX_MSUB_MAX sizes it. Rows above 32 need HIVE_IDX_VIS_DEV: measured 2026-11-06 on the mapped table, 64 rows took twice as long at 512K context.
+inline int idx_msub_for(int Msub, int Tcap, int nblocks_cap, int topk_w, int M, int T, int bs, int CB, int index_topk, int topk_rows = 0) {
+  if (topk_rows < Msub) topk_rows = Msub;
   const int nblocks = (T + bs - 1) / bs;
   const long long cols = std::max<long long>(T, (long long)nblocks * bs);
   const long long used_w = std::max(std::min(index_topk, T), std::min(CB, nblocks));
   long long r = (long long)Msub * (Tcap + 8) / std::max(1LL, cols);
   r = std::min(r, (long long)Msub * nblocks_cap / std::max(1, nblocks));
-  r = std::min(r, (long long)Msub * topk_w / std::max(1LL, used_w));
+  r = std::min(r, (long long)topk_rows * topk_w / std::max(1LL, used_w));
   r = std::min<long long>(r, std::min(M, 65535));
   return (int)std::max<long long>(Msub, r);
 }
@@ -415,7 +419,7 @@ struct Runtime::Work {
   std::vector<int> rows_by_e;  // per-expert (m·k+j) sort buffer
   std::vector<ExpertStore::Job> cpu_jobs;  // this layer's CPU jobs (must live from start_jobs to wait_jobs, hence owned by Work)
   std::unique_ptr<k::GroupedMoe> gmoe;  // H1 HIVE_GROUPED_PREFILL group executor (table ring — built at the first prefill layer when on)
-  int Msub = 0, Tcap = 0, nblocks_cap = 0;
+  int Msub = 0, Tcap = 0, nblocks_cap = 0, topk_rows = 0;
   // ---- DSpark ----
   DevBuf mh, mhq, mhs, mx;       // target-layer hidden capture [mh_rows, ntgt·dim] bf16, fp8, scales; main_x [mh_rows, dim]
   int mh_rows = 0;               // capture row cap = max(win, Mb, verify rows)
@@ -424,6 +428,7 @@ struct Runtime::Work {
   bf16** mhid_h = nullptr; bf16** mhid_d = nullptr;       // row→seq.mtp_hidden [Mb]
   DevBuf dids, dconf, membed, dx;   // draft ids [B+1] i32, confidences [B] f32, markov embeddings [B, rank] bf16, head input x [B, dim] bf16
   int32_t* dids_h = nullptr; float* dconf_h = nullptr;
+  float* dlog_h = nullptr;         // [B, V] draft head logits rows on the host (HIVE_MTP_SAMPLE_DRAFTS — a dense draft distribution reads its row)
   DevBuf ring_snap;               // verify ring snapshot [L, Mv, D] bf16
   bf16** lringp_h = nullptr; bf16** lringp_d = nullptr;   // layer→ring pointers [L] (verify sequence)
   std::vector<DevBuf> vxn;        // attention input xn per ratio>1 kv-source layer [Mv, dim] bf16 (for rollback recomputation)
@@ -851,6 +856,16 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   engram_par_ = env_on("HIVE_ENGRAM_PAR");                        // L2
   engram_digest_ = engram_digest_on();                            // HIVE_ENGRAM_DIGEST (verification log)
   idx_msub_actual_ = env_on("HIVE_IDX_MSUB_ACTUAL");              // L3
+  idx_msub_max_ = [] { const char* v = getenv("HIVE_IDX_MSUB_MAX"); return v && *v ? std::clamp(atoi(v), 0, 4096) : 256; }();
+  idx_vis_dev_ = [] { const char* v = getenv("HIVE_IDX_VIS_DEV"); return !(v && *v && atoi(v) == 0); }();
+  router_mask_dev_ = [] { const char* v = getenv("HIVE_ROUTER_MASK_DEV"); return !(v && *v && atoi(v) == 0); }();
+  verify_tab_dev_ = [] { const char* v = getenv("HIVE_VERIFY_TAB_DEV"); return !(v && *v && atoi(v) == 0); }();
+  pf_pos_dev_ = [] { const char* v = getenv("HIVE_PF_POS_DEV"); return !(v && *v && atoi(v) == 0); }();
+  pf_embed_dev_ = [] { const char* v = getenv("HIVE_PF_EMBED_DEV"); return !(v && *v && atoi(v) == 0); }();
+  pf_engram_dev_ = [] { const char* v = getenv("HIVE_PF_ENGRAM_DEV"); return !(v && *v && atoi(v) == 0); }();
+  pf_cpu_rows_dev_ = [] { const char* v = getenv("HIVE_PF_CPU_ROWS_DEV"); return !(v && *v && atoi(v) == 0); }();
+  fprintf(stderr, "[runtime] device copies of mapped tables: router mask %d · verify tables %d · prefill pos %d · embed %d · engram %d · cpu rows %d\n",
+          (int)router_mask_dev_, (int)verify_tab_dev_, (int)pf_pos_dev_, (int)pf_embed_dev_, (int)pf_engram_dev_, (int)pf_cpu_rows_dev_);
   host_par_threads_ = std::max(1, store_.cpu_threads());          // L1/L2: the CPU expert pool is idle in that section (after the previous layer's wait_jobs, before this layer's start_jobs)
   if (const char* v = getenv("HIVE_VIT_CACHE_MB"); v && *v) {     // M3: MB (fractions allowed). 0, negative or non-numeric = off
     const double mb = atof(v);
@@ -906,6 +921,12 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
     std::memset(cache_mask_h_, 0, (size_t)cc.n_layers * cc.n_routed);
     prior_range_.alloc((size_t)cc.n_layers * sizeof(float));
     CUDA_CHECK(cudaMemset(prior_range_.p, 0, (size_t)cc.n_layers * sizeof(float)));
+    // HIVE_ROUTER_MASK_DEV: device copy of the mask (15 KB at 40 × 384). Copied a row at a time as 32-bit words (k::copy_rows_i32), so the row
+    //   length must be a multiple of 4 (the rows then start on a 4-byte boundary of the page-aligned host table); otherwise the mapped row is read as before.
+    if (router_mask_dev_ && cc.n_routed % 4 == 0) {
+      cache_mask_dev_.alloc((size_t)cc.n_layers * cc.n_routed);
+      CUDA_CHECK(cudaMemset(cache_mask_dev_.p, 0, (size_t)cc.n_layers * cc.n_routed));
+    }
     fprintf(stderr, "[runtime] cache prior on: λ %.3f · top-%d always kept (decode routing biased toward VRAM-resident experts; HIVE_DECODE_ROUTER3 path)\n",
             cache_prior_, cache_prior_j_);
   }
@@ -1023,7 +1044,8 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   w->iscore.alloc((size_t)w->Msub * (w->Tcap + 8) * 2);
   w->iscore_f.alloc((size_t)w->Msub * (w->Tcap + 8) * 4);
   w->bmax.alloc((size_t)w->Msub * w->nblocks_cap * 4);
-  w->topk_pos.alloc((size_t)w->Msub * std::max(c.index_topk, c.cand_topk_blocks) * 4);
+  w->topk_rows = idx_msub_actual_ ? std::max(w->Msub, std::min(M, idx_msub_max_)) : w->Msub;
+  w->topk_pos.alloc((size_t)w->topk_rows * std::max(c.index_topk, c.cand_topk_blocks) * 4);
   if (c.cand_source_layer >= 0) w->cand.alloc((size_t)M * c.cand_topk_blocks * 4);  // 128 MB at a 16K chunk (a per-context keep buffer would be 512 MB at 262K context)
   // (CUB TopK replaced by the radix-select kernel — nothing reserved)
   w->xlast.alloc((size_t)dim * 4);
@@ -1038,8 +1060,16 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
   w->cpu_out_h = pinned_mapped<float>((size_t)Mrows * dim, &w->cpu_out_d);  // CPU job rows ≤ Mrows (prefill share ≤ M, decode ≤ threshold·k)
   if (dec_defer_) {  // deferred decode rows: at most max_batch-sized decode × k (decode kernel M ≤ 8)
     const size_t drows = (size_t)8 * k;
-    def_out_h_ = pinned_mapped<float>(drows * dim, &def_out_d_);
-    def_rows_h_ = pinned_mapped<int32_t>(drows, &def_rows_d_);
+    { const char* v = getenv("HIVE_DECODE_DEFER_SETS"); def_two_sets_ = !(v && atoi(v) == 1); }
+    def_check_ = env_on("HIVE_DECODE_DEFER_CHECK");
+    if (def_check_) { def_chk_dev_.alloc(drows * 4); def_chk_h_ = pinned<int32_t>(drows); }
+    def_sync_ = env_on("HIVE_DECODE_DEFER_SYNC");  // validation only: the injection finishes before the host goes on (the reference the two sets must equal)
+    for (int i = 0; i < (def_two_sets_ ? 2 : 1); ++i) {
+      def_out_h2_[i] = pinned_mapped<float>(drows * dim, &def_out_d2_[i]);
+      def_rows_h2_[i] = pinned_mapped<int32_t>(drows, &def_rows_d2_[i]);
+    }
+    def_set_ = 0;
+    def_out_h_ = def_out_h2_[0]; def_out_d_ = def_out_d2_[0]; def_rows_h_ = def_rows_h2_[0]; def_rows_d_ = def_rows_d2_[0];
     def_scratch_h_ = pinned<float>(drows * ExpertStore::job_scratch_floats(c.moe_inter));
     post_def_.alloc((size_t)8 * c.hc * 4);
     fprintf(stderr, "[runtime] expert deferral on: CPU misses ranked 3rd or lower are added one layer later (early-route decode)\n");
@@ -1137,6 +1167,7 @@ Runtime::Runtime(Model& model, ExpertStore& store, const EngramHash* eh, const R
     w->mhid_h = pinned_mapped<bf16*>(Mb, &w->mhid_d);
     w->dids.alloc((size_t)(B + 1) * 4); w->dconf.alloc((size_t)B * 4); w->membed.alloc((size_t)B * rank * 2); w->dx.alloc((size_t)B * dim * 2);
     w->dids_h = pinned<int32_t>(B + 1); w->dconf_h = pinned<float>(B);
+    if (opt_.sampler_cands > 0) w->dlog_h = pinned<float>((size_t)B * c.vocab);
     // R1: only when the verify decode path (HIVE_MTP_VERIFY2, HIVE_MTP_BATCH) is on, size snapshot rows for several sequences (≤ 8, ≤ Mb) — off keeps the base size
     const bool v2_any = verify2_ || mtp_batch_;
     const int Vrows = v2_any ? std::max(B + 1, std::min(8, Mb)) : B + 1;
@@ -1512,7 +1543,7 @@ Runtime::~Runtime() {
                     (void*)w_->eg_v_h, (void*)w_->eg_s_h, (void*)w_->is_image_h, (void*)w_->emb_h, (void*)w_->kvrows_h,
                     (void*)w_->kptrs_h, (void*)w_->trows_h, (void*)w_->dsti_h, (void*)w_->ringp_h, (void*)w_->dstp_h, (void*)w_->dstk_h, (void*)w_->skv_h,
                     (void*)w_->ssc_h, (void*)w_->next_b_h, (void*)w_->gdesc_h, (void*)w_->tbl_h, (void*)w_->mpos_h, (void*)w_->mhid_h,
-                    (void*)w_->dids_h, (void*)w_->dconf_h, (void*)w_->lringp_h, (void*)w_->ringp1_h})
+                    (void*)w_->dids_h, (void*)w_->dconf_h, (void*)w_->dlog_h, (void*)w_->lringp_h, (void*)w_->ringp1_h})
       if (p) cudaFreeHost(p);
     for (void* p : w_->mringp_h) if (p) cudaFreeHost(p);
   }
@@ -1617,7 +1648,7 @@ void Runtime::quiesce_after_host_error() {
   store_.wait_jobs();
   // HIVE_DECODE_DEFER: a failed decode step can leave its deferred batch pending (def_pending_) — the next decode step's first layer would add those
   //   rows into a different batch's h (and inside a layer yield, the paused prefill's). The failed step's sequences are marked broken: discard it.
-  def_pending_ = false; djobs_.clear();
+  def_pending_ = false; djobs_.clear(); def_chk_armed_ = false;
   store_.flush_promotions();  // E4: issue the remaining slices of decided promotions (batch events before issue are not recorded yet) so the sync and commit below cover them
   CUDA_CHECK(cudaStreamSynchronize(st_));
   CUDA_CHECK(cudaStreamSynchronize(side_));
@@ -2151,7 +2182,16 @@ void Runtime::prologue_rows(const int32_t* rows, int n, int64_t start) {
   Work& w = *w_;
   for (int m = 0; m < n; ++m) { w.ids_h[m] = rows[m]; w.pos_h[m] = (int32_t)(start + m); }
   for (int m = 0; m < n; ++m) memcpy(w.emb_h + (size_t)m * c.dim, model_.embed_host() + (size_t)rows[m] * c.dim, (size_t)c.dim * 2);
-  k::embed_expand(w.emb_d, w.iota.as<int32_t>(), n, c.dim, c.hc, w.h.as<bf16>(), st_);
+  // HIVE_PF_EMBED_DEV: embed_expand read the mapped pinned emb_h two bytes per thread and once per hc copy — a 16K-row chunk read its 168 MB of rows
+  //   four times over PCIe (2026-11-11, found by reading the code). Prefill chunks (n > 8) send the rows to the device once and expand there. No new
+  //   buffer: w.x ([rows, dim] bf16, exactly this size) is dead here — hc_pre of the first layer front writes it, after this expand in st_ order.
+  //   Same kernel and ids, so h holds the same bytes. If w.x is too small in the current layout, the mapped rows are read as before.
+  const bf16* emb = w.emb_d;
+  if (pf_embed_dev_ && n > 8 && w.x.p && (size_t)n * c.dim * 2 <= w.x.n) {
+    CUDA_CHECK(cudaMemcpyAsync(w.x.p, w.emb_h, (size_t)n * c.dim * 2, cudaMemcpyHostToDevice, st_));
+    emb = w.x.as<bf16>();
+  }
+  k::embed_expand(emb, w.iota.as<int32_t>(), n, c.dim, c.hc, w.h.as<bf16>(), st_);
   k::identity_pre_mix(w.pre_mix.as<float>(), n, c.hc, st_);
   memset(w.is_image_h, 0, (size_t)n);
 }
@@ -2568,9 +2608,9 @@ struct Runtime::LyPark {
 //   mixes: hc mix coefficients — written and read inside hc_attn_pre/hc_ffn_pre (and as a row-move temporary of prepare_decoder_tail)
 //   rsq: same as mixes
 //   qrs: q_lora scales — read by the q and indexer-q GEMMs, both before the indexer row loop; the next layer rewrites them
-//   pos: never read (positions live in the mapped pos_h)
-//   gpos: never read (the mapped gpos_h is used)
-//   visible: never read (the mapped visible_h is used)
+//   pos: device copy of pos_h for the prefill RoPE kernels (HIVE_PF_POS_DEV) — rewritten at the start of every attention() call with M > 8; decode steps inside a kIndex yield (M <= 8) use the mapped pos_h
+//   gpos: device copy of gpos_h for compress_source's RoPE kernels (HIVE_PF_POS_DEV, M > 8) — written and read inside that call, before the indexer row loop
+//   visible: device copy of visible_h for the indexer's row loop (HIVE_IDX_VIS_DEV) — rewritten at the start of indexer(); decode steps inside a kIndex yield use the mapped visible_h
 //   ids: router output — moved to route_ids_h by route_to_host before the front's sync; read again only by the next router
 //   rw: same as ids
 //   g_rows: expert-stage scratch (moe_decode_experts default table pointer) — written after the points
@@ -2668,6 +2708,7 @@ struct Runtime::LyPark {
 //   cpu_jobs: expert-stage job list
 //   gmoe: grouped prefill executor (moe_experts_multi only — decode never touches it)
 //   Msub: scalar (indexer rows per batch)
+//   topk_rows: scalar (rows topk_pos is sized for — HIVE_IDX_MSUB_MAX)
 //   Tcap: scalar
 //   nblocks_cap: scalar
 //   mh_rows: scalar
@@ -2679,6 +2720,7 @@ struct Runtime::LyPark {
 //   mhid_d: = mhid_h
 //   dids_h: draft only
 //   dconf_h: draft only
+//   dlog_h: draft only (host rows of the draft head logits — HIVE_MTP_SAMPLE_DRAFTS)
 //   lringp_h: verify only
 //   lringp_d: = lringp_h
 //   vxn: verify only
@@ -3008,6 +3050,24 @@ void Runtime::sampler_cands_dev(int M) {
   CUDA_CHECK(cudaMemcpyAsync(cand_val_h_, cand_val_.p, (size_t)M * NC * 4, cudaMemcpyDeviceToHost, st_));
   CUDA_CHECK(cudaMemcpyAsync(cand_max_h_, cand_max_.p, (size_t)M * 4, cudaMemcpyDeviceToHost, st_));
   CUDA_CHECK(cudaMemcpyAsync(cand_sum_h_, cand_sum_.p, (size_t)M * 4, cudaMemcpyDeviceToHost, st_));
+}
+// One row (the draft chain: row i's Markov bias depends on the token drawn from row i−1, so the rows are sampled one after another):
+//   candidates, max and Σexp of logits_b row i into slot i of the same buffers, and the row itself into dlog_h + i·V (a dense draft distribution
+//   reads it; the slot is rewritten only by the next mtp_draft).
+void Runtime::sampler_cands_row(int i) {
+  if (opt_.sampler_cands <= 0) return;
+  const Config& c = model_.cfg();
+  Work& w = *w_;
+  const int NC = opt_.sampler_cands, V = c.vocab;
+  const float* row = w.logits_b.as<float>() + (size_t)i * V;
+  k::row_max_sumexp(row, 1, V, cand_it_d_ + i, cand_max_.as<float>() + i, cand_sum_.as<float>() + i, st_);
+  k::topk_select_rows(row, 1, V, NC, V, cand_idx_.as<int32_t>() + (size_t)i * NC, NC, st_);
+  k::gather_vals(row, cand_idx_.as<int32_t>() + (size_t)i * NC, 1, NC, V, cand_val_.as<float>() + (size_t)i * NC, st_);
+  CUDA_CHECK(cudaMemcpyAsync(cand_idx_h_ + (size_t)i * NC, cand_idx_.as<int32_t>() + (size_t)i * NC, (size_t)NC * 4, cudaMemcpyDeviceToHost, st_));
+  CUDA_CHECK(cudaMemcpyAsync(cand_val_h_ + (size_t)i * NC, cand_val_.as<float>() + (size_t)i * NC, (size_t)NC * 4, cudaMemcpyDeviceToHost, st_));
+  CUDA_CHECK(cudaMemcpyAsync(cand_max_h_ + i, cand_max_.as<float>() + i, 4, cudaMemcpyDeviceToHost, st_));
+  CUDA_CHECK(cudaMemcpyAsync(cand_sum_h_ + i, cand_sum_.as<float>() + i, 4, cudaMemcpyDeviceToHost, st_));
+  if (w.dlog_h) CUDA_CHECK(cudaMemcpyAsync(w.dlog_h + (size_t)i * V, row, (size_t)V * 4, cudaMemcpyDeviceToHost, st_));
 }
 int32_t Runtime::row_argmax(int m) const { return w_->next_b_h[m]; }
 
@@ -4068,19 +4128,22 @@ void Runtime::compress_source(Seq& seq, const LayerWeights& L, int l, int M, int
     shared_comp_kv_ = seq.comp_cache[l].as<uint8_t>();
     // group positions (position of each group's first token)
     for (int g = 0; g < G; ++g) w.gpos_h[g] = (int32_t)((g0 + g) * ratio);
+    // HIVE_PF_POS_DEV (see attention()): the two RoPE kernels below read gpos[g] in every thread — device copy of the G rows just written (M > 8 only).
+    const int32_t* gpos_d = w.gpos_d;
+    if (pf_pos_dev_ && M > 8 && G > 0 && (size_t)G * 4 <= w.gpos.n) { k::copy_rows_i32(w.gpos_d, w.gpos.as<int32_t>(), G, st_); gpos_d = w.gpos.as<int32_t>(); }
     (void)0;
     if (c.is_index_source(l)) {
       // indexer keys (from the latent before RoPE) → cache
       if (G > 0) {
         blas_->gemm_bf16(w.latent.as<bf16>(), A.idx_wk.as<bf16>(), w.ik.as<bf16>(), G, c.index_head_dim, D);
         k::rmsnorm(w.ik.as<bf16>(), A.idx_k_norm.as<bf16>(), c.norm_eps, G, c.index_head_dim, w.ik.as<bf16>(), st_);
-        k::rope_last(w.ik.as<bf16>(), G, 1, c.index_head_dim, rd, freqs, w.gpos_d, false, st_);
+        k::rope_last(w.ik.as<bf16>(), G, 1, c.index_head_dim, rd, freqs, gpos_d, false, st_);
         k::fp4_pack(w.ik.as<bf16>(), G, c.index_head_dim, 32, false, seq.idx_k_cache[l].as<uint8_t>() + (size_t)g0 * kvp::IDX_ROW, kvp::IDX_ROW, st_);
       }
       shared_index_k_ = seq.idx_k_cache[l].as<uint8_t>();
     }
     if (G > 0) {
-      k::rope_last(w.latent.as<bf16>(), G, 1, D, rd, freqs, w.gpos_d, false, st_);
+      k::rope_last(w.latent.as<bf16>(), G, 1, D, rd, freqs, gpos_d, false, st_);
       k::fp4_pack(w.latent.as<bf16>(), G, D, 16, true, seq.comp_cache[l].as<uint8_t>() + (size_t)g0 * kvp::COMP_ROW, kvp::COMP_ROW, st_);
     }
   
@@ -4102,6 +4165,15 @@ void Runtime::attention(Seq& seq, const LayerWeights& L, int l, int M, int64_t s
   //   approach as mtp_attention) → ring_write **after** attention. Speculative verify (rows 2–6) takes the fused path (~22 launches) instead of the chain
   //   (~40). Fused and chained values are bit-identical (test_fused).
   const bool fused = fuse_ && M <= 8;
+  // HIVE_PF_POS_DEV: the RoPE kernels of this call (q, kv, o and the indexer's q) read pos[m] in every thread — from the mapped pinned table that is a host
+  //   read per thread (2026-11-11, found by reading the code: per 16K-row layer 33.5M threads for q, 8.4M for o, 16.8M for the indexer q; the device buffer
+  //   w.pos was allocated and never written). A small kernel copies the M rows once per call (not a copy-engine transfer — see HIVE_IDX_VIS_DEV in indexer()).
+  //   Same values: pos_h is written at the chunk head (prologue_rows) and by the decoder-tail row move (after a stream sync), never inside this call; the only
+  //   yield point inside (kIndex) runs decode steps (M <= 8 — they never take this branch, so w.pos is not rewritten) and its unpark restores pos_h.
+  //   Per call, not per forward: a layer-boundary yield may run another prefill through the same Work, and tiles/units switch pos_h between calls.
+  const bool pos_dev = pf_pos_dev_ && M > 8 && (size_t)M * 4 <= w.pos.n;
+  const int32_t* pos_d = w.pos_d;
+  if (pos_dev) { k::copy_rows_i32(w.pos_d, w.pos.as<int32_t>(), M, st_); pos_d = w.pos.as<int32_t>(); }
   if (fused) {  // fused q/kv chain (fused.cu)
     (k::decode_gemv2_on() ? k::gemv2_q_proj : k::fused_q_proj)(w.xn.as<bf16>(), dim, A.wq_a.w.as<uint8_t>(), A.wq_a.s.as<uint8_t>(), A.wq_a.N, A.q_norm.as<bf16>(), c.norm_eps, A.wq_b.w.as<uint8_t>(),
                     A.wq_b.s.as<uint8_t>(), H, D, rd, freqs, w.pos_d, M, w.qr.as<bf16>(), w.qrn.as<bf16>(), w.q.as<bf16>(), w.qrq.as<uint8_t>(),
@@ -4118,13 +4190,13 @@ void Runtime::attention(Seq& seq, const LayerWeights& L, int l, int M, int64_t s
   k::act_quant_fp8(w.qrn.as<bf16>(), M, c.q_lora_rank, w.qrq.as<uint8_t>(), w.qrs.as<uint8_t>(), st_);
   k::gemm_bs(w.qrq.as<uint8_t>(), w.qrs.as<uint8_t>(), A.wq_b.w.as<uint8_t>(), A.wq_b.s.as<uint8_t>(), false, M, A.wq_b.N,
              c.q_lora_rank, w.q.as<bf16>(), nullptr, st_);
-  k::rope_last(w.q.as<bf16>(), M, H, D, rd, freqs, w.pos_d, false, st_);
+  k::rope_last(w.q.as<bf16>(), M, H, D, rd, freqs, pos_d, false, st_);
   pmark("attn.q");
   // window kv
   k::gemm_bs(w.xq.as<uint8_t>(), w.xs.as<uint8_t>(), A.wkv.w.as<uint8_t>(), A.wkv.s.as<uint8_t>(), false, M, D, dim, w.kv.as<bf16>(),
              nullptr, st_);
   k::rmsnorm(w.kv.as<bf16>(), A.kv_norm.as<bf16>(), c.norm_eps, M, D, w.kv.as<bf16>(), st_);
-  k::rope_last(w.kv.as<bf16>(), M, 1, D, rd, freqs, w.pos_d, false, st_);
+  k::rope_last(w.kv.as<bf16>(), M, 1, D, rd, freqs, pos_d, false, st_);
   k::act_quant_fp8_roundtrip(w.kv.as<bf16>(), M, D, st_);
   }
   const int idx_stride = win + c.index_topk;
@@ -4164,7 +4236,7 @@ void Runtime::attention(Seq& seq, const LayerWeights& L, int l, int M, int64_t s
   // inverse RoPE on o, then act_quant(o, 32, ue8m0) in place — reference model.py since deepseek-ai/DeepSeek-V4.1-Flash 4dd75a8
   //   (2026-10-12), also in DeepSeek-V4.1-Flash-1017; every wo_a site below (decode, DSpark draft, verify) quantizes o the same way.
   //   One pass here: a separate quantize pass re-read and re-wrote o (M x 32768 bf16 per layer) — 64K prefill +0.25 s (cell 2026-10-18).
-  k::rope_last_quant(w.o.as<bf16>(), M, H, D, rd, freqs, w.pos_d, true, st_);
+  k::rope_last_quant(w.o.as<bf16>(), M, H, D, rd, freqs, pos_d, true, st_);
   pmark("attn.sparse");
   // wo_a: per group og[:, g, :] = o[:, g, :] · wo_a[g]ᵀ  (A row stride = HD, batch stride = sub; B batch stride = R·sub; C row stride = G·R)
   {  // wo_a: for each group g, og[:, g·R + r] = o[:, g·sub + k] · wo_a[g·R + r, k] — bf16 activations × fp8 original (no bf16 copy, same values)
@@ -4212,7 +4284,8 @@ void Runtime::indexer(Seq& seq, const LayerWeights& L, int l, int M, int64_t sta
   // q: wq_b(qr) → rope → fp4
   k::gemm_bs(w.qrq.as<uint8_t>(), w.qrs.as<uint8_t>(), A.idx_wq_b.w.as<uint8_t>(), A.idx_wq_b.s.as<uint8_t>(), false, M, Hi * Di,
              c.q_lora_rank, w.iq.as<bf16>(), nullptr, st_);
-  k::rope_last(w.iq.as<bf16>(), M, Hi, Di, rd, freqs, w.pos_d, false, st_);
+  // HIVE_PF_POS_DEV: attention() (the only caller, same M) copied this call's positions to w.pos — same condition as there
+  k::rope_last(w.iq.as<bf16>(), M, Hi, Di, rd, freqs, (pf_pos_dev_ && M > 8 && (size_t)M * 4 <= w.pos.n) ? w.pos.as<int32_t>() : w.pos_d, false, st_);
   // D-2: with HIVE_IDX_TC=1 scores use e2m1×e2m1 tensor cores — queries are packed into the same IDX_ROW as keys from the bf16 before the roundtrip
   //   (fp4_pack uses the same scale and rounding as fp4_roundtrip_kernel → unpacked value = roundtrip value). Off by default (not yet compared on GPU).
   static const bool idx_tc = getenv("HIVE_IDX_TC") && atoi(getenv("HIVE_IDX_TC")) != 0;
@@ -4225,6 +4298,11 @@ void Runtime::indexer(Seq& seq, const LayerWeights& L, int l, int M, int64_t sta
   blas_->gemm_bf16(w.xn.as<bf16>(), A.idx_weights_proj.as<bf16>(), w.iw.as<bf16>(), M, Hi, c.dim);
   k::scale_bf16(w.iw.as<bf16>(), M * Hi, (1.0f / sqrtf((float)Di)) * (1.0f / sqrtf((float)Hi)), st_);
   for (int m = 0; m < M; ++m) w.visible_h[m] = (int32_t)((start_pos + m + 1) / ratio);
+  // The score kernels read a row's visible count in every block. From the mapped pinned table that is a PCIe round trip per block (2026-11-06, one process, real buffers,
+  // T = 252,505, 32 rows: 1.69 ms per launch, 0.27 ms with the table in device memory — scores were 8.3 s of a 15.6 s prefill at 512K context; decode moved off it earlier).
+  // A small kernel, not a copy-engine transfer: that one queues behind the expert copies. Same values, read once.
+  const int32_t* vis_d = w.visible_d;
+  if (idx_vis_dev_) { k::copy_rows_i32(w.visible_d, w.visible.as<int32_t>(), M, st_); vis_d = w.visible.as<int32_t>(); }
   (void)0;
   const bool cand_src = (l == c.cand_source_layer);
   const bool uses_cand = (c.cand_source_layer >= 0 && c.cand_source_layer < l);
@@ -4236,7 +4314,7 @@ void Runtime::indexer(Seq& seq, const LayerWeights& L, int l, int M, int64_t sta
   HIVE_CHECK(!(idx_f32 && idx_tc), "HIVE_IDX_F32 and HIVE_IDX_TC are exclusive");
   // L3 (opt-in HIVE_IDX_MSUB_ACTUAL): sub-chunk row count from the actual T (idx_msub_for — same scratch capacity, never fewer rows). Dump mode keeps the base row count (dump shape unchanged).
   const int Msub = idx_msub_actual_ && opt_.dump_dir.empty()
-                       ? idx_msub_for(w.Msub, w.Tcap, w.nblocks_cap, std::max(c.index_topk, c.cand_topk_blocks), M, T, bs, CB, c.index_topk)
+                       ? idx_msub_for(w.Msub, w.Tcap, w.nblocks_cap, std::max(c.index_topk, c.cand_topk_blocks), M, T, bs, CB, c.index_topk, w.topk_rows)
                        : w.Msub;
   const bool ly_ix = ly_live_ && M > Msub;  // T11b kIndex (off: ly_live_ is false)
   if (ly_ix) ly_ev_n_ = 0;
@@ -4257,32 +4335,32 @@ void Runtime::indexer(Seq& seq, const LayerWeights& L, int l, int M, int64_t sta
       const int ncand = kbc * bs;
       if (idx_f32)
         k::indexer_scores_cand_f32(w.iq.as<bf16>() + (size_t)m0 * Hi * Di, shared_index_k_, nullptr, nullptr, w.iw.as<bf16>() + (size_t)m0 * Hi, Ms, Hi, Di,
-                                   w.cand.as<int32_t>() + (size_t)m0 * CB, CB, kbc, bs, w.visible_d + m0, w.iscore_f.as<float>(), st_);
+                                   w.cand.as<int32_t>() + (size_t)m0 * CB, CB, kbc, bs, vis_d + m0, w.iscore_f.as<float>(), st_);
       else if (idx_tc)  // candidate-pool tensor-core variant (HIVE_IDX_TC=1 — packed queries iqp are built above)
         k::indexer_scores_cand_tc(w.iqp.as<uint8_t>() + (size_t)m0 * Hi * kvp::IDX_ROW, shared_index_k_, nullptr, nullptr, w.iw.as<bf16>() + (size_t)m0 * Hi, Ms, Hi,
-                                  w.cand.as<int32_t>() + (size_t)m0 * CB, CB, kbc, bs, w.visible_d + m0, w.iscore.as<bf16>(), st_);
+                                  w.cand.as<int32_t>() + (size_t)m0 * CB, CB, kbc, bs, vis_d + m0, w.iscore.as<bf16>(), st_);
       else
         k::indexer_scores_cand(w.iq.as<bf16>() + (size_t)m0 * Hi * Di, shared_index_k_, nullptr, nullptr, w.iw.as<bf16>() + (size_t)m0 * Hi, Ms, Hi, Di,
-                               w.cand.as<int32_t>() + (size_t)m0 * CB, CB, kbc, bs, w.visible_d + m0, w.iscore.as<bf16>(), st_);
+                               w.cand.as<int32_t>() + (size_t)m0 * CB, CB, kbc, bs, vis_d + m0, w.iscore.as<bf16>(), st_);
       if (!idx_f32) k::bf16_rows_to_f32(w.iscore.as<bf16>(), Ms * ncand, w.iscore_f.as<float>(), st_);
       k::topk_select_rows(w.iscore_f.as<float>(), Ms, ncand, topk, ncand, w.topk_pos.as<int32_t>(), topk, st_);
       k::cand_to_pos(w.topk_pos.as<int32_t>(), Ms, topk, w.cand.as<int32_t>() + (size_t)m0 * CB, CB, bs, st_);
-      k::offset_idxs(w.topk_pos.as<int32_t>(), Ms, topk, w.visible_d + m0, win + M,
+      k::offset_idxs(w.topk_pos.as<int32_t>(), Ms, topk, vis_d + m0, win + M,
                      w.idx.as<int32_t>() + (size_t)m0 * idx_stride + win, idx_stride, st_);
       continue;
     }
     if (idx_f32)
       k::indexer_scores_f32(w.iq.as<bf16>() + (size_t)m0 * Hi * Di, shared_index_k_, w.iw.as<bf16>() + (size_t)m0 * Hi, Ms, Hi, Di, T,
-                            w.visible_d + m0, w.iscore_f.as<float>(), st_);
+                            vis_d + m0, w.iscore_f.as<float>(), st_);
     else if (idx_tc)
       k::indexer_scores_tc(w.iqp.as<uint8_t>() + (size_t)m0 * Hi * kvp::IDX_ROW, shared_index_k_, w.iw.as<bf16>() + (size_t)m0 * Hi, Ms, Hi, T,
-                           w.visible_d + m0, w.iscore.as<bf16>(), st_);
+                           vis_d + m0, w.iscore.as<bf16>(), st_);
     else
       k::indexer_scores(w.iq.as<bf16>() + (size_t)m0 * Hi * Di, shared_index_k_, w.iw.as<bf16>() + (size_t)m0 * Hi, Ms, Hi, Di, T,
-                        w.visible_d + m0, w.iscore.as<bf16>(), st_);
+                        vis_d + m0, w.iscore.as<bf16>(), st_);
     if (cand_src) {
-      if (idx_f32) k::block_max_f32(w.iscore_f.as<float>(), Ms, T, bs, w.visible_d + m0, w.bmax.as<float>(), st_);
-      else k::block_max(w.iscore.as<bf16>(), Ms, T, bs, w.visible_d + m0, w.bmax.as<float>(), st_);
+      if (idx_f32) k::block_max_f32(w.iscore_f.as<float>(), Ms, T, bs, vis_d + m0, w.bmax.as<float>(), st_);
+      else k::block_max(w.iscore.as<bf16>(), Ms, T, bs, vis_d + m0, w.bmax.as<float>(), st_);
       const int kb = std::min(c.cand_topk_blocks, nblocks);
       k::topk_select_rows(w.bmax.as<float>(), Ms, nblocks, kb, nblocks, w.topk_pos.as<int32_t>(), kb, st_);
       // keep the candidate block list (ascending, -1 when short) per row — blocks with bmax = -inf (positions not yet visible) become -inf at the scoring step, so they are not filtered separately
@@ -4292,13 +4370,13 @@ void Runtime::indexer(Seq& seq, const LayerWeights& L, int l, int M, int64_t sta
     }
     if (!idx_f32) k::bf16_rows_to_f32(w.iscore.as<bf16>(), Ms * T, w.iscore_f.as<float>(), st_);
     k::topk_select_rows(w.iscore_f.as<float>(), Ms, T, topk, T, w.topk_pos.as<int32_t>(), topk, st_);
-    k::offset_idxs(w.topk_pos.as<int32_t>(), Ms, topk, w.visible_d + m0, win + M,
+    k::offset_idxs(w.topk_pos.as<int32_t>(), Ms, topk, vis_d + m0, win + M,
                    w.idx.as<int32_t>() + (size_t)m0 * idx_stride + win, idx_stride, st_);
   }
   if (!opt_.dump_dir.empty() && !idx_f32) {  // (the fp32 variant differs from the golden format and is not dumped)
     if (uses_cand) {  // golden comparison tools expect the full-T shape (-inf outside candidates) — only when dumping, rebuild the first sub-batch in that shape
       const int Ms = std::min(M, w.Msub);
-      k::indexer_scores(w.iq.as<bf16>(), shared_index_k_, w.iw.as<bf16>(), Ms, Hi, Di, T, w.visible_d, w.iscore.as<bf16>(), st_);
+      k::indexer_scores(w.iq.as<bf16>(), shared_index_k_, w.iw.as<bf16>(), Ms, Hi, Di, T, vis_d, w.iscore.as<bf16>(), st_);
       k::mask_by_cand(w.iscore.as<bf16>(), Ms, T, bs, w.cand.as<int32_t>(), CB, std::min(CB, nblocks), st_);
     }
     dump("index_score_L" + std::to_string(l) + ".bf16", w.iscore.p, (size_t)std::min(M, w.Msub) * T * 2);
@@ -4417,7 +4495,17 @@ void Runtime::engram_dev(const LayerWeights& L, int M) {
   Work& w = *w_;
   const EngramWeights& E = *L.engram;
   const int cols = c.n_hash_cols(), hd = c.engram_head_dim;
-  k::engram_dequant(w.eg_v_d, w.eg_s_d, M, cols, hd, w.eg_vals.as<bf16>(), st_);
+  // HIVE_PF_ENGRAM_DEV: engram_dequant read the mapped pinned lookup rows one byte per thread (~100 MB per 16K-row unit at each engram layer —
+  //   2026-11-11, found by reading the code). Prefill (M > 8) sends them to the device once. No new buffer: eg_q and eg_sc have exactly the sizes of
+  //   eg_v and eg_s and are dead until act_quant_fp8 below writes them, after the dequant in st_ order (also with HIVE_ENGRAM_ALIAS — they are
+  //   separate ranges of o). Same kernel, same bytes. Decode (M <= 8, captured in graphs) is unchanged.
+  const uint8_t *eg_v = w.eg_v_d, *eg_s = w.eg_s_d;
+  if (pf_engram_dev_ && M > 8 && w.eg_q.p && w.eg_sc.p && (size_t)M * cols * hd <= w.eg_q.n && (size_t)M * cols * hd / 32 <= w.eg_sc.n) {
+    CUDA_CHECK(cudaMemcpyAsync(w.eg_q.p, w.eg_v_h, (size_t)M * cols * hd, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(w.eg_sc.p, w.eg_s_h, (size_t)M * cols * hd / 32, cudaMemcpyHostToDevice, st_));
+    eg_v = w.eg_q.as<uint8_t>(); eg_s = w.eg_sc.as<uint8_t>();
+  }
+  k::engram_dequant(eg_v, eg_s, M, cols, hd, w.eg_vals.as<bf16>(), st_);
   k::act_quant_fp8(w.eg_vals.as<bf16>(), M, cols * hd, w.eg_q.as<uint8_t>(), w.eg_sc.as<uint8_t>(), st_);
   k::gemm_bs(w.eg_q.as<uint8_t>(), w.eg_sc.as<uint8_t>(), E.wkv.w.as<uint8_t>(), E.wkv.s.as<uint8_t>(), false, M, E.wkv.N, cols * hd,
              w.eg_kv.as<bf16>(), nullptr, st_);
@@ -4475,7 +4563,19 @@ void Runtime::moe_router_shared(const LayerWeights& L, int M, bool copy_acts) {
   if (fuse_ && M <= 8) {
     // router (fp32 GEMV + top-k in one kernel), shared expert (w1‖w3+swiglu+quantization, w2+acc write — two kernels). xq/xs are produced by block 0 of the w13 kernel.
     if (cache_prior_ > 0.f && cp_layer_ >= 0 && cp_layer_ < c.n_layers && k::decode_router3_on() && E == c.n_routed) {
-      const k::CachePriorArgs cpa{cache_mask_h_ + (size_t)cp_layer_ * c.n_routed, cache_prior_, prior_range_.as<float>() + cp_layer_, cache_prior_j_};
+      // The router tail (last block, before the routing publish) read the mask from pinned host memory: M rows × n_routed one-byte loads, each a PCIe
+      //   round trip, in every decode layer (2026-11-11, found by reading the code — cache_mask_h_ is cudaMallocHost memory passed to the kernel as is).
+      //   HIVE_ROUTER_MASK_DEV: a small kernel (not a copy-engine transfer — that one queues behind the expert copies) copies this layer's row to device
+      //   memory first, n_routed / 4 word loads, and the tail reads the copy. Same bytes: the copy is the kernel right before the router on st_ (inside the
+      //   same captured front), so it reads the row decode_layer wrote for this step at the same point the tail did; the host rewrites row l only at the
+      //   next step's decode_layer(l), after this front has finished. Row addresses are fixed per layer, and the layer is part of the graph key.
+      const uint8_t* mask_row = cache_mask_h_ + (size_t)cp_layer_ * c.n_routed;
+      if (cache_mask_dev_.p) {
+        uint8_t* dev_row = cache_mask_dev_.as<uint8_t>() + (size_t)cp_layer_ * c.n_routed;
+        k::copy_rows_i32(reinterpret_cast<const int32_t*>(mask_row), reinterpret_cast<int32_t*>(dev_row), c.n_routed / 4, st_);
+        mask_row = dev_row;
+      }
+      const k::CachePriorArgs cpa{mask_row, cache_prior_, prior_range_.as<float>() + cp_layer_, cache_prior_j_};
       k::attn3_router_cp(w.xn.as<bf16>(), dim, F.gate_w.as<float>(), M, E, F.gate_bias.as<float>(), F.gate_bias_vl.p ? F.gate_bias_vl.as<float>() : nullptr,
                          w.is_image_d, k, c.route_scale, w.scores.as<float>(), w.ids.as<int32_t>(), w.rw.as<float>(), w.counters.as<int>() + 2, cpa, st_);
     } else
@@ -4868,7 +4968,13 @@ void Runtime::moe_decode_experts(const LayerWeights& L, int l, int M, ForwardSta
     // The previous layer's deferred batch may still be running on the pool: it reads djobs_ and def_rows_h_, which the lines below
     //   rewrite (without this the first decode of a DS run with HIVE_DECODE_DEFER=1 never finished) — finish and add it first
     if (def_pending_) deferred_flush();
-    if (defer_now) { djobs_.clear(); def_rows_n_ = 0; }
+    if (defer_now) {
+      djobs_.clear(); def_rows_n_ = 0;
+      if (def_two_sets_) {  // the set just flushed may not have been read by its kernel yet — build this layer's batch in the other one (runtime.h)
+        def_set_ ^= 1;
+        def_out_h_ = def_out_h2_[def_set_]; def_out_d_ = def_out_d2_[def_set_]; def_rows_h_ = def_rows_h2_[def_set_]; def_rows_d_ = def_rows_d2_[def_set_];
+      }
+    }
     float rowsum[8] = {};
     if (skip_f > 0.f) for (int m = 0; m < M && m < 8; ++m) for (int j = 0; j < k; ++j) rowsum[m] += w.rw_h[m * k + j];
     for (int ei = 0; ei < n_cpu_e; ++ei) {
@@ -5046,7 +5152,27 @@ void Runtime::deferred_flush() {
   if (!def_pending_) return;
   store_.wait_jobs();
   const Config& c = model_.cfg();
+  if (def_check_) {
+    // the previous batch's check ran before the front whose routing the host has since received — its copy has landed
+    if (def_chk_armed_) {
+      long bad = 0;
+      for (size_t i = 0; i < def_chk_want_.size(); ++i) bad += def_chk_h_[i] != def_chk_want_[i];
+      ++def_chk_n_; def_chk_bad_ += bad > 0; def_chk_rows_ += (long)def_chk_want_.size(); def_chk_rows_bad_ += bad;
+      if (def_chk_n_ % 20000 == 0)
+        fprintf(stderr, "[defer-check] batches %ld · the kernel read a rewritten row table in %ld (%.2f %%) · rows %ld wrong %ld (%.2f %%) · sets %d\n", def_chk_n_,
+                def_chk_bad_, 100.0 * def_chk_bad_ / def_chk_n_, def_chk_rows_, def_chk_rows_bad_, 100.0 * def_chk_rows_bad_ / std::max(1L, def_chk_rows_), def_two_sets_ ? 2 : 1);
+    }
+    def_chk_want_.assign(def_rows_h_, def_rows_h_ + def_rows_n_);
+  }
   k::hc_inject_rows(w_->h.as<bf16>(), post_def_.as<float>(), def_out_d_, def_rows_d_, def_rows_n_, def_M_, c.hc, c.dim, st_);
+  if (def_check_) {
+    def_chk_armed_ = def_M_ >= 2 && def_rows_n_ > 0;  // one row: every entry is 0 whichever table is read
+    if (def_chk_armed_) {
+      k::copy_rows_i32(def_rows_d_, def_chk_dev_.as<int32_t>(), def_rows_n_, st_);
+      CUDA_CHECK(cudaMemcpyAsync(def_chk_h_, def_chk_dev_.as<int32_t>(), (size_t)def_rows_n_ * 4, cudaMemcpyDeviceToHost, st_));
+    }
+  }
+  if (def_sync_) CUDA_CHECK(cudaStreamSynchronize(st_));
   def_pending_ = false;
   djobs_.clear();
 }
@@ -5386,6 +5512,11 @@ void Runtime::moe_experts_multi(const LayerWeights& L, int l, const std::vector<
   std::vector<int> job_rows_begin(S + 1, 0);  // gathered row range of sub-chunk s: [begin[s], begin[s+1])
   const size_t scratch_n = ExpertStore::job_scratch_floats(I);
   double t_cpu0 = now_ms();
+  // HIVE_PF_CPU_ROWS_DEV: gather_rows_u8 and accum_f32_rows read the row map in every thread (rows × dim loads) — from the mapped pinned cpu_rows_h
+  //   that is a host read each (2026-11-11, found by reading the code). A small kernel copies each sub-chunk's range to w.cpu_rows (expert-stage scratch,
+  //   written nowhere else in this function; no yield point inside it) as soon as the host has written it; ranges are disjoint, so the values are the same.
+  const bool rows_dev = pf_cpu_rows_dev_ && w.cpu_rows.p && (size_t)cpu_rows_total * 4 <= w.cpu_rows.n;
+  const int32_t* cpu_rows_d = rows_dev ? w.cpu_rows.as<int32_t>() : w.cpu_rows_d;
   if (cpu_rows_total > 0) {
     int g = 0;  // gathered row index = row of cpu_out_h/cpu_rows_h/a_f_h
     for (int s = 0; s < S; ++s) {
@@ -5393,8 +5524,9 @@ void Runtime::moe_experts_multi(const LayerWeights& L, int l, const std::vector<
       const int g0 = g;
       for (int e = 0; e < E; ++e) { if (!to_cpu_e[e]) continue; for (const Ref& r : by_e[e]) if (r.s == s) w.cpu_rows_h[g++] = r.m; }
       if (g > g0) {
-        k::gather_rows_u8(subs[s].xq_d, w.cpu_rows_d + g0, g - g0, dim, w.g_xq.as<uint8_t>() + (size_t)g0 * dim, st_);
-        k::gather_rows_u8(subs[s].xs_d, w.cpu_rows_d + g0, g - g0, dim / 32, w.g_xs.as<uint8_t>() + (size_t)g0 * (dim / 32), st_);
+        if (rows_dev) k::copy_rows_i32(w.cpu_rows_d + g0, w.cpu_rows.as<int32_t>() + g0, g - g0, st_);
+        k::gather_rows_u8(subs[s].xq_d, cpu_rows_d + g0, g - g0, dim, w.g_xq.as<uint8_t>() + (size_t)g0 * dim, st_);
+        k::gather_rows_u8(subs[s].xs_d, cpu_rows_d + g0, g - g0, dim / 32, w.g_xs.as<uint8_t>() + (size_t)g0 * (dim / 32), st_);
       }
     }
     job_rows_begin[S] = g;
@@ -5635,7 +5767,7 @@ void Runtime::moe_experts_multi(const LayerWeights& L, int l, const std::vector<
     }
     for (int s = 0; s < S; ++s) {
       const int b = job_rows_begin[s], n = job_rows_begin[s + 1] - b;
-      if (n > 0) k::accum_f32_rows(w.cpu_out_d + (size_t)b * dim, w.cpu_rows_d + b, n, dim, subs[s].acc_d, st_);
+      if (n > 0) k::accum_f32_rows(w.cpu_out_d + (size_t)b * dim, cpu_rows_d + b, n, dim, subs[s].acc_d, st_);
     }
   }
   pmark("moe.cpu_experts");
@@ -6529,8 +6661,13 @@ void Runtime::mtp_attention(Seq& seq, int s, int B, int64_t pos0, int filled) {
   }
 }
 
-void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats* stats) {
+void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats* stats, const DraftSampling* sd,
+                        std::vector<hive::spec::Dist>* q) {
   if (seq.snapshot_fence) CUDA_CHECK(cudaStreamWaitEvent(st_, seq.snapshot_fence->event, 0));
+  // HIVE_MTP_SAMPLE_DRAFTS: draw each draft from its row's distribution (hive/spec_sample.h) instead of the argmax. Needs the device sampler
+  //   candidates (opt_.sampler_cands) and the host copy of the row (dlog_h); otherwise greedy as before.
+  const bool sampled = sd && sd->rng && sd->temperature > 0.f && q && opt_.sampler_cands > 0 && w_->dlog_h;
+  if (q) q->clear();
   struct MissClear {
     std::vector<int>* v; std::vector<int>* draft; bool keep; int ex;
     ~MissClear() {
@@ -6585,10 +6722,28 @@ void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std
   k::head_logits(w.xf.as<float>(), model_.head(), B, V, dim, w.logits_b.as<float>(), st_);
   w.dids_h[0] = tok;
   CUDA_CHECK(cudaMemcpyAsync(w.dids.p, w.dids_h, 4, cudaMemcpyHostToDevice, st_));
+  if (sampled) for (int i = 0; i < B; ++i) cand_it_h_[i] = 1.f / sd->temperature;   // mapped: row_max_sumexp reads it on the device
   for (int i = 0; i < B; ++i) {
     k::markov_gather(Wl.markov_embed.as<bf16>(), w.dids.as<int32_t>() + i, rank, w.membed.as<bf16>() + (size_t)i * rank, st_);
     k::markov_add_bias(w.logits_b.as<float>() + (size_t)i * V, Wl.markov_head.as<bf16>(), w.membed.as<bf16>() + (size_t)i * rank, V, rank, st_);
-    k::argmax_rows(w.logits_b.as<float>() + (size_t)i * V, 1, V, w.dids.as<int32_t>() + i + 1, st_);
+    if (!sampled) { k::argmax_rows(w.logits_b.as<float>() + (size_t)i * V, 1, V, w.dids.as<int32_t>() + i + 1, st_); continue; }
+    // sampled draft: candidates + the row to the host, one draw under the request's rule, the token back to the device for the next row's bias
+    sampler_cands_row(i);
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    const int NC = opt_.sampler_cands;
+    hive::spec::Cands cd;
+    cd.idx.assign(cand_idx(i), cand_idx(i) + NC);
+    cd.val.assign(cand_val(i), cand_val(i) + NC);
+    cd.mx = row_max(i); cd.sum = row_sumexp(i);
+    { float best = -INFINITY; for (int j = 0; j < NC; ++j) if (cd.idx[j] >= 0 && cd.val[j] > best) { best = cd.val[j]; cd.argmax = cd.idx[j]; } }
+    cd.valid = cd.argmax >= 0;
+    hive::spec::Dist d = hive::spec::dist_cands(cd, w.dlog_h + (size_t)i * V, V, sd->temperature, sd->top_p, sd->top_k, sd->min_p);
+    d.take_copy();   // a dense distribution keeps its own row: the batched path drafts several sequences before verifying any
+    int32_t x = hive::spec::draw(d, *sd->rng);
+    if (x < 0 || x >= V) x = cd.argmax >= 0 ? cd.argmax : 0;
+    w.dids_h[i + 1] = x;
+    CUDA_CHECK(cudaMemcpyAsync(w.dids.as<int32_t>() + i + 1, w.dids_h + i + 1, 4, cudaMemcpyHostToDevice, st_));
+    q->push_back(std::move(d));
   }
   k::conf_dot(w.dx.as<bf16>(), dim, w.membed.as<bf16>(), rank, Wl.conf_proj.as<float>(), B, w.dconf.as<float>(), st_);
   CUDA_CHECK(cudaMemcpyAsync(w.dids_h, w.dids.p, (size_t)(B + 1) * 4, cudaMemcpyDeviceToHost, st_));
@@ -6734,6 +6889,9 @@ void Runtime::attention_verify_dev(const LayerWeights& L, int l, int M, int Tmax
     a.scratch = w.iscore_f.p; a.scratch_bytes = w.iscore_f.n;
     // ↑ identical text to the D2 argument fill in attention_decode_dev (compared by tools/test_verify_fused_cpu.py); ↓ verify mode only
     a.vgrp = w.vgrp_d;
+    // HIVE_VERIFY_TAB_DEV: the front's first kernel also stages the ring pointers, and the verify compressor and ring write read the device row table
+    //   (k::DecSoA) instead of the mapped pos/skv/ssc/ringp tables (attn_decode_fused.cu). Fixed for the process lifetime — same graph body per key.
+    if (verify_tab_dev_) a.src.ring = w.ringp_d;
     for (size_t i = 0; i < v_src2_.size(); ++i)
       if (v_src2_[i] == l) { a.vsave = w.vckv[i].as<float>(); a.vsave_rows = w.vckv[i].n / ((size_t)2 * D * 4); }  // keep rollback inputs as in R1
     if (k::dec_attention_front(a, blas_.get(), st_)) have_candidates_ = true;

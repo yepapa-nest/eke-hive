@@ -940,7 +940,15 @@ void qsa_select(const QsaRow* rows, int n, int max_pos, const bf16* iq, int32_t*
   float* score = reinterpret_cast<float*>(w8 + L.score);
   int32_t* trows = reinterpret_cast<int32_t*>(w8 + L.trows);
   int32_t* top = reinterpret_cast<int32_t*>(w8 + L.top);
-  const bool scoring = (max_pos + 1) / kQsaRatio > kQsaTopBlocks;  // otherwise every row is dense
+  // Scoring is launched when some row sees more than 512 groups — or always under a context cap (ctx_cap > 0: the launches are being
+  //   captured into a CUDA graph that is replayed at later positions up to the cap). 2026-11-11: the MTP draft chain is one graph keyed by
+  //   its LAST step (qwen_mtp.cpp: scoring / context bucket of position p + k − 1), while each step called this with its own max_pos; a chain
+  //   captured across the 2,048-token boundary (first steps ≤ 2050, last ≥ 2051) therefore held those steps without the visible / score /
+  //   top-k launches, and every later replay of the key (positions up to the bucket) ran qsa_expand_kernel on rows with V > 512 over a
+  //   `top` nobody had written for them (stale ids or score bits of another call → wrong groups, possibly positions outside the cache).
+  //   With the launches always in such a graph, rows with V ≤ 512 are unchanged: qsa_visible_kernel gives them T = 0, the score kernels
+  //   skip them, topk_select reads no key for T = 0, and qsa_expand_kernel takes its dense branch without reading `top`.
+  const bool scoring = ctx_cap > 0 || (max_pos + 1) / kQsaRatio > kQsaTopBlocks;  // otherwise every row is dense
   for (int r0 = 0; r0 < n; r0 += nb) {
     const int m = std::min(nb, n - r0);
     if (scoring) {

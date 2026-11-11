@@ -170,4 +170,14 @@ void topk_select_rows(const float* keys, int M, int T, int k, int row_stride, in
   topk_select_kernel<<<M, TPK_THREADS, smem, st>>>(keys, nullptr, T, k, row_stride, out, out_stride);
 }
 
+__global__ void __launch_bounds__(256) copy_rows_i32_kernel(const int32_t* __restrict__ src, int32_t* __restrict__ dst, int n) {
+  const int i = blockIdx.x * 256 + threadIdx.x;
+  if (i < n) dst[i] = src[i];
+}
+
+void copy_rows_i32(const int32_t* src, int32_t* dst, int n, cudaStream_t st) {
+  if (n <= 0) return;
+  copy_rows_i32_kernel<<<(n + 255) / 256, 256, 0, st>>>(src, dst, n);
+}
+
 }  // namespace hive::k

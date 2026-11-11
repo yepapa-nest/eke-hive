@@ -106,13 +106,27 @@ def encode_messages(messages: list[dict], thinking_mode: str = "thinking", reaso
                 m["content"] = parts
             else:
                 m["content"] = _content_text(m["content"])
-        for tc in m.get("tool_calls") or []:
-            f = tc.get("function") if isinstance(tc, dict) else None
-            if f and isinstance(f.get("arguments"), str):
-                try:
-                    f["arguments"] = json.loads(f["arguments"])
-                except ValueError:
-                    f["arguments"] = {}
+        if m.get("tool_calls"):
+            # The template reads tool-call arguments as a mapping. A JSON string is decoded; anything that is not an object after
+            #   that becomes an empty object, on copies — the caller's messages are left as they came.
+            #   2026-11-11, measured with the real GLM-5.3-Flash template: arguments "null", "[1,2]", "\"x\"", "3", a JSON null /
+            #   list sent as such, and a call without arguments raised in the template ("'None' has no attribute 'items'" and the
+            #   like) — a 400, and since the message stays in the conversation's history, a 400 on every later request of that
+            #   conversation. The decoded value was also written back into the caller's own message (function.arguments turned
+            #   from str into dict). Object arguments render byte for byte as before (tools/test_glm_family_cpu.py).
+            calls = []
+            for tc in m["tool_calls"]:
+                f = tc.get("function") if isinstance(tc, dict) else None
+                if isinstance(f, dict) and f:
+                    a = f.get("arguments")
+                    if isinstance(a, str):
+                        try:
+                            a = json.loads(a)
+                        except ValueError:
+                            a = {}
+                    tc = {**tc, "function": {**f, "arguments": a if isinstance(a, dict) else {}}}
+                calls.append(tc)
+            m["tool_calls"] = calls
         msgs.append(m)
     # clear_thinking: the official template's default (false = earlier turns keep their reasoning when the client sends it back) unless
     #   HIVE_GLM_CLEAR_THINKING=1 (the previous fixed true: a new user message re-rendered the last turn without its reasoning)

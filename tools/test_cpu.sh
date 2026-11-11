@@ -14,6 +14,7 @@ python3 tools/test_cache_replay_cpu.py
 python3 tools/test_host_cpu.py
 T=$(mktemp -d)/host_ledger; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_host_ledger_cpu.cpp -o "$T" && "$T"  # hived host_total ledger == full deduplicating walk (shared prefixes, repeats, drops, address reuse), no image kept alive, pass cost
 T=$(mktemp -d)/store_index; g++ -std=c++20 -O1 -pthread -Iengine/include -Iengine/third_party engine/tests/test_session_store_index_cpu.cpp -o "$T" && "$T" > /dev/null  # session store index: bounded by the live segments under random writes/releases, live entries never dropped
+T=$(mktemp -d)/store_evict; g++ -std=c++20 -O1 -pthread -Iengine/include -Iengine/third_party engine/tests/test_session_store_evict_cpu.cpp -o "$T" && "$T"  # session store budget: running pack reference counts == a full recount (reopen), disk == index, least recently used goes first, write time independent of the entry count
 T=$(mktemp -d)/grouped_plan; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_grouped_plan_cpu.cpp -o "$T" && "$T"  # grouped prefill plan (slot/release invariants)
 T=$(mktemp -d)/prefill_split; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_prefill_split_cpu.cpp -o "$T" && "$T"  # HIVE_PREFILL_SPLIT=balance cost model (cold start, limits, convergence)
 T=$(mktemp -d)/decode_split; g++ -std=c++20 -O1 -Iengine/include engine/tests/test_decode_split_cpu.cpp -o "$T" && "$T"  # HIVE_DECODE_SPLIT=balance cost model (table, cold start, verify back-off, exhaustive minimum, synthetic world)
@@ -25,12 +26,15 @@ python3 tools/test_validation_cpu.py
 python3 tools/test_server_cpu.py
 python3 tools/test_glm_family_cpu.py  # GLM family: effort mapping, unset = high, HIVE_GLM_NOTHINK
 python3 tools/test_qwen_family_cpu.py  # Qwen3.8-Flash-Next family: effort mapping, tool-call parsing, stop ids, image/video preprocessing and spans
+python3 tools/test_qwen_engine_contracts_cpu.py  # Qwen engine text contracts (the engine itself needs CUDA): per-forward members saved across a layer yield, scoring under a graph's context cap, draft graph key without a sequence pointer, PLE block sync in the layer-major prefill
+python3 tools/test_glm_experts_step_cpu.py  # GlmExperts (GLM / Qwen expert cache) step bookkeeping sliced from glm_experts.cpp: after_step == its eager definition (random worlds), warm start with promotions in flight, 2 negative controls, text contracts
 python3 tools/test_gemma_family_cpu.py  # Gemma 4 family: thinking mapping, template (tool-response branch), tool-call / thought-channel parsing, stop ids, defaults
 python3 tools/test_qasr_frontend_cpu.py  # Qwen3-ASR front end: audio token count, WAV decoding, log-mel vs the reference extractor (when transformers is installed)
 python3 tools/test_qtts_server_cpu.py  # Qwen3-TTS server: /ws/speak protocol, barge-in, queueing, /health, voice / language resolution (fake engine)
 T=$(mktemp -d)/qwen_ple; g++ -std=c++20 -O1 -Itools/cpu_fake/include -Iengine/include -Iengine/third_party engine/tests/test_qwen_ple_cpu.cpp -DHIVE_SOURCE_DIR_HINT="\"$ROOT/engine\"" -o "$T" && "$T"  # PLE n-gram hash == oracle vectors, split == whole
 T=$(mktemp -d)/ckpt_quant; g++ -std=c++20 -O1 -Iengine/include -Iengine/third_party engine/tests/test_ckpt_quant_cpu.cpp engine/src/ckpt_quant.cpp engine/src/safetensors.cpp -o "$T" && "$T"  # FP4-Local formats: CSF decode round trip + 5 negative controls, MXFP8 exact, NVFP4 one rounding (hive/ckpt_quant.h)
 T=$(mktemp -d)/token_mask; g++ -std=c++20 -O2 -Iengine/include engine/tests/test_token_mask_cpu.cpp -o "$T" && "$T"  # answer-span token filter: thinking-span state, verify-row flags, masked sampler = renormalized rule (4 configs) + negative control
+T=$(mktemp -d)/tool_mask; g++ -std=c++20 -O2 -Iengine/include engine/tests/test_tool_mask_cpu.cpp -o "$T" && "$T"  # allowed_tools: block / parameter / name-span state machine, automaton validation, constrained sampler = renormalized rule
 T=$(mktemp -d)/presence; g++ -std=c++20 -O2 -Iengine/include engine/tests/test_presence_cpu.cpp -o "$T" && "$T"  # presence_penalty on the candidate snapshot == the rule over the penalized row (greedy, top-k/p, min_p, order-free, ± penalty) + negative control
 T=$(mktemp -d)/qwen_simd; g++ -std=gnu++20 -O3 -mavx2 -mfma -mf16c engine/tests/test_qwen_cpu_simd.cpp -o "$T" && "$T"  # Qwen CPU engine AVX2 element-wise kernels == scalar twins (bit for bit)
 python3 tools/test_hive_monitor_cpu.py  # hived.log monitor, daily report, lossless concurrent writes with an external log-rotate script (if present)
@@ -64,10 +68,13 @@ python3 tools/test_stage_progress_cpu.py  # HIVE_STAGE_PROGRESS_MS: read progres
 python3 tools/test_cache_where_cpu.py  # {"op":"where"} / {"op":"load"} on the real hived.cpp: none / vram / ram / ssd, load into RAM then resume without a disk read, one read for two loads, budget, flush, asleep, during a long prefill
 python3 tools/test_cache_server_cpu.py  # GET /v1/hive/cache, POST /v1/hive/cache/load: conversation key -> session table (head change, split requests, persistence), fake daemon socket
 python3 tools/test_session_store_cpu.py  # HIVE_SESSION_STORE: checkpoints and boundary snapshots survive SIGKILL + restart (real hived.cpp), increment-only follow-up writes, damaged pack, other build, budget, flush, control
+python3 tools/test_admit_order_cpu.py  # admission in arrival order within one HIVE_PRIORITY_SHARED class, a queued cancel answered while the seats are full, no decode share before a generation-suffix tail (HIVE_TAIL_FIRST), a disk-only snapshot found behind an unrelated one in memory (real hived.cpp; each with its fix reverted as the control)
 T=$(mktemp -d)/gpu_marks; g++ -std=c++20 -O1 -pthread -Itools/cpu_fake/include -Iengine/include engine/tests/test_gpu_marks_cpu.cpp -o "$T" && "$T"  # hive/gpu_marks.h: reported read progress = what the stream executed (held stream not overtaken), drain, reuse, synchronous
 python3 tools/test_quality_eval_cpu.py
 python3 tools/test_gap_eval_cpu.py
 python3 tools/test_sampler_cpu.py  # hive/sampler.h: sample/sample_cands == definition, lossless speculative acceptance rule (joint distribution), top_p truncation mechanism, request seeds, 4 header mutants
+python3 tools/test_tool_mask_cpu.py  # allowed_tools: real hived.cpp (plain, MTP right / wrong drafts, gates, batch, absorption, 5 mutants), server: automaton, field rules, the field changes nothing but sampling
+python3 tools/test_tool_calls_ref.py  # tool-call format gate (skipped without a checkpoint: HIVE_CKPT)
 python3 tools/test_think_cap_cpu.py  # thinking cap (think_cap): default off unchanged, </think> after exactly N tokens (plain, MTP, wrong drafts, batched MTP), exit phrase (think_exit_ids), absorption, server fields/records, 6 mutants
 python3 tools/test_sleep_cpu.py  # sleep/wake: real ExpertStore release, re-allocation, restore (bytes, scores, state, 4 mutants), real hived state machine, server endpoints
 python3 tools/test_load_par_cpu.py  # HIVE_LOAD_PAR cold load: bulk_load == pread, real ExpertStore load_bulk == per-layer load (5 variants + failure absorption), real hived absorption path transcript identical, 1 mutant

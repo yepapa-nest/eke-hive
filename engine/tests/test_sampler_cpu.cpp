@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "hive/sampler.h"
+#include "hive/spec_sample.h"
 
 using namespace hive::sampling;
 static int fails = 0;
@@ -295,10 +296,140 @@ static void test_seed() {
   EXPECT(request_seed(42) == 42 && request_seed(-1) == (uint64_t)-1, "explicit seeds must be used as given");
 }
 
+// (6) + (7) HIVE_MTP_SAMPLE_DRAFTS (hive/spec_sample.h) — (7) Dist == the sampler's distribution (dist_full / dist_cands against theory(),
+//   draw() against prob()); (6) sampled drafts + min(1, p/q) acceptance + residual correction: the emitted sequence distribution == AR sampling
+//   of the target, with the draft model a perturbed target (context-dependent, correlated but different) drawn through dist_full or CPU-built
+//   candidates (small NC → the fallbacks run). Negative controls: the correction drawn from p instead of max(0, p − q); every draft accepted.
+static void test_spec_dist(bool quick) {
+  std::mt19937_64 g(777);
+  std::normal_distribution<float> N(0.f, 2.0f);
+  struct S { float T, top_p; int top_k; float min_p; int NC; };
+  const S settings[] = {{1.0f, 0.95f, 0, 0.f, 64}, {0.7f, 0.9f, 0, 0.f, 16}, {1.0f, 1.0f, 0, 0.f, 64}, {1.0f, 1.0f, 0, 0.05f, 64}, {1.2f, 1.0f, 40, 0.f, 64},
+                        {1.0f, 0.99f, 0, 0.f, 8}, {0.9f, 0.95f, 0, 0.02f, 64}, {1.0f, 1.0f, 200, 0.f, 64}};
+  const int V = 3000;
+  for (const auto& s : settings) {
+    for (int rep = 0; rep < 3; ++rep) {
+      std::vector<float> l(V);
+      for (auto& x : l) x = N(g);
+      if (rep == 1) l[17] += 6.f;   // one dominant token
+      const auto th = theory(l, s.T, s.top_p, s.top_k, s.min_p);
+      const hive::spec::Dist df = hive::spec::dist_full(l.data(), V, s.T, s.top_p, s.top_k, s.min_p);
+      const Cands c = make_cands(l, s.NC, s.T);
+      const hive::spec::Dist dc = hive::spec::dist_cands(c, l.data(), V, s.T, s.top_p, s.top_k, s.min_p);
+      double e1 = 0, e2 = 0;
+      for (int t = 0; t < V; ++t) { e1 = std::max(e1, std::fabs(df.prob(t) - th[t])); e2 = std::max(e2, std::fabs(dc.prob(t) - th[t])); }
+      EXPECT(e1 < 2e-5, "dist_full T %.1f top_p %.2f top_k %d min_p %.2f: max |prob − theory| %.2e", s.T, s.top_p, s.top_k, s.min_p, e1);
+      EXPECT(e2 < 2e-5, "dist_cands NC %d T %.1f top_p %.2f top_k %d min_p %.2f: max |prob − theory| %.2e", s.NC, s.T, s.top_p, s.top_k, s.min_p, e2);
+      if (quick || rep > 0) continue;
+      // draw(): the empirical distribution of 200K draws against prob() — TV within 1.5× the noise of two same-size exact samples
+      const long Nd = 200000;
+      std::vector<double> cnt(V, 0.0), ref1(V, 0.0), ref2(V, 0.0);
+      std::vector<double> cum(V, 0.0);
+      { double a = 0; for (int t = 0; t < V; ++t) { a += dc.prob(t); cum[t] = a; } }
+      std::uniform_real_distribution<double> U(0.0, 1.0);
+      for (long i = 0; i < Nd; ++i) {
+        ++cnt[hive::spec::draw(dc, g)];
+        ++ref1[(int)(std::lower_bound(cum.begin(), cum.end(), U(g) * cum[V - 1]) - cum.begin())];
+        ++ref2[(int)(std::lower_bound(cum.begin(), cum.end(), U(g) * cum[V - 1]) - cum.begin())];
+      }
+      double tv = 0, noise = 0;
+      for (int t = 0; t < V; ++t) { tv += std::fabs(cnt[t] - ref1[t]); noise += std::fabs(ref1[t] - ref2[t]); }
+      tv /= 2.0 * Nd; noise /= 2.0 * Nd;
+      EXPECT(tv < 1.5 * noise + 0.003, "draw() NC %d T %.1f top_p %.2f top_k %d min_p %.2f: TV %.4f vs noise %.4f", s.NC, s.T, s.top_p, s.top_k, s.min_p, tv, noise);
+    }
+  }
+  printf("  spec dist: dist_full / dist_cands == theory, draw() == prob() (8 settings)\n");
+}
+static std::vector<float> draft_logits(const std::vector<int>& ctx) {  // the draft model: the target plus a context-dependent perturbation
+  std::vector<float> l = target_logits(ctx);
+  uint64_t h = 1099511628211ull;
+  for (int t : ctx) { h ^= (uint64_t)t * 31 + 7; h *= 1469598103934665603ull; }
+  std::mt19937_64 g(h ^ 0xABCDEF);
+  std::normal_distribution<float> N(0.f, 0.9f);
+  for (auto& x : l) x += N(g);
+  return l;
+}
+// mode: 0 = dist_full · 1 = CPU candidates (NC 4 of V 7 — the fallbacks run) · bad 0 = the real rule · 1 = correction from p · 2 = accept everything
+static std::vector<int> spec_generate_sampled(int L, int k, int mode, float T, float top_p, std::mt19937_64& rng, int bad) {
+  std::vector<int> out;
+  int pending = -1;
+  auto dist_of = [&](const std::vector<float>& l) {
+    if (mode == 0) return hive::spec::dist_full(l.data(), (int)l.size(), T, top_p, 0, 0.f);
+    const Cands c = make_cands(l, 4, T);
+    return hive::spec::dist_cands(c, l.data(), (int)l.size(), T, top_p, 0, 0.f);
+  };
+  { auto l = target_logits(out); out.push_back(sample(l, T, top_p, 0, 0.f, rng)); }
+  while ((int)out.size() < L) {
+    if (pending >= 0) { out.push_back(pending); pending = -1; if ((int)out.size() >= L) break; }
+    std::vector<int> ctx = out, drafts;
+    std::vector<std::vector<float>> dl;       // the draft rows (a dense Dist references its row)
+    std::vector<hive::spec::Dist> q;
+    for (int i = 0; i < k; ++i) {
+      dl.push_back(draft_logits(ctx));
+      q.push_back(dist_of(dl.back()));
+      const int d = hive::spec::draw(q.back(), rng);
+      drafts.push_back(d); ctx.push_back(d);
+    }
+    int nxt = -1, n_keep = 1;
+    bool cont = true;
+    std::vector<int> pre = out;
+    for (int i = 0; i < k; ++i) {
+      const auto l = target_logits(pre);
+      const hive::spec::Dist p = dist_of(l);
+      bool ok;
+      if (bad == 2) ok = p.prob(drafts[i]) > 0;
+      else ok = hive::spec::accept(p, q[i], drafts[i], rng);
+      if (!ok) { nxt = bad == 1 ? hive::spec::draw(p, rng) : hive::spec::residual_draw(p, q[i], rng); break; }
+      ++n_keep;
+      out.push_back(drafts[i]); pre.push_back(drafts[i]);
+      cont = (int)out.size() < L;
+      if (!cont) break;
+    }
+    if (nxt < 0 && cont && n_keep == k + 1) { const auto l = target_logits(pre); nxt = hive::spec::draw(dist_of(l), rng); }
+    pending = cont ? nxt : -1;
+  }
+  out.resize(L);
+  return out;
+}
+static void test_spec_sampled(bool quick) {
+  const int L = 4;
+  const long N = quick ? 120000 : 400000;
+  struct Case { int k, mode; float T, top_p; };
+  const Case cases[] = {{3, 0, 1.0f, 0.95f}, {2, 0, 0.7f, 0.9f}, {5, 0, 1.0f, 1.0f}, {3, 1, 1.0f, 1.0f}, {2, 1, 1.0f, 0.95f}};
+  for (const auto& cs : cases) {
+    if (quick && cs.mode == 0 && cs.k == 2) continue;
+    std::mt19937_64 r1(101), r2(202), r3(303), r4(404), r5(505);
+    std::map<std::vector<int>, long> spec, ar, ar2, bad1, bad2, ar_q, ar_q2;
+    for (long i = 0; i < N; ++i) {
+      ++spec[spec_generate_sampled(L, cs.k, cs.mode, cs.T, cs.top_p, r1, 0)];
+      ++ar[ar_generate(L, cs.T, cs.top_p, r2)];
+      ++ar2[ar_generate(L, cs.T, cs.top_p, r3)];
+      if (i < N / 4) { ++bad1[spec_generate_sampled(L, cs.k, cs.mode, cs.T, cs.top_p, r4, 1)]; ++bad2[spec_generate_sampled(L, cs.k, cs.mode, cs.T, cs.top_p, r5, 2)]; }
+    }
+    const double noise = seq_tv(ar, ar2, N), d = seq_tv(spec, ar, N);
+    { std::mt19937_64 r6(606), r7(707); for (long c = 0; c < N / 4; ++c) { ++ar_q[ar_generate(L, cs.T, cs.top_p, r6)]; ++ar_q2[ar_generate(L, cs.T, cs.top_p, r7)]; } }
+    const double noise_q = seq_tv(ar_q2, ar_q, N / 4), d1 = seq_tv(bad1, ar_q, N / 4), d2 = seq_tv(bad2, ar_q, N / 4);
+    EXPECT(d < 1.5 * noise + 0.003, "sampled drafts k %d mode %d T %.1f top_p %.2f: TV(spec, AR) %.4f vs noise %.4f", cs.k, cs.mode, cs.T, cs.top_p, d, noise);
+    EXPECT(d1 > 3 * noise_q, "negative control (correction from p) not detected (k %d mode %d): TV %.4f vs noise %.4f", cs.k, cs.mode, d1, noise_q);
+    EXPECT(d2 > 3 * noise_q, "negative control (accept everything) not detected (k %d mode %d): TV %.4f vs noise %.4f", cs.k, cs.mode, d2, noise_q);
+    printf("  sampled drafts k %d %-10s T %.1f top_p %.2f: TV(spec,AR) %.4f · AR noise %.4f · wrong correction TV %.4f · accept-all TV %.4f (noise %.4f)\n", cs.k,
+           cs.mode == 0 ? "dist_full" : "cands NC 4", cs.T, cs.top_p, d, noise, d1, d2, noise_q);
+  }
+}
+
 int main(int argc, char** argv) {
-  const bool quick = argc > 1 && !strcmp(argv[1], "--quick");  // for mutation checks (skips the speculative test)
+  const bool quick = argc > 1 && !strcmp(argv[1], "--quick");  // for mutation checks of sampler.h (skips the speculative tests)
+  const bool spec = argc > 1 && !strcmp(argv[1], "--spec");    // for mutation checks of spec_sample.h (its tests only, smaller samples)
+  if (spec) {
+    test_spec_dist(true);
+    test_spec_sampled(true);
+    if (fails) { fprintf(stderr, "sampler CPU (spec): %d failures\n", fails); return 1; }
+    printf("sampler CPU (spec): ok\n");
+    return 0;
+  }
   test_sample_paths();
   if (!quick) test_speculative();
+  if (!quick) { test_spec_dist(false); test_spec_sampled(false); }
   test_peaked_truncation();
   test_seed();
   if (fails) { fprintf(stderr, "sampler CPU: %d failures\n", fails); return 1; }

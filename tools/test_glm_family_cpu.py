@@ -122,5 +122,48 @@ ok = _strict(msg["tool_calls"][0]["function"]["arguments"]) == {"job_id": "3e382
 fails += not ok
 print(f"{'ok  ' if ok else 'FAIL'} parse_message_from_completion_text passes tools to the argument parser")
 
+
+# ---- tool-call arguments in the history: a mapping for the template, the caller's messages untouched ----
+# 2026-11-11: arguments that are not a JSON object (and a call without arguments) raised in the real template ("'None' has no
+#   attribute 'items'") — a 400 for the rest of the conversation; they reach the template as an empty object now
+import copy  # noqa: E402
+
+
+class _RecTok:
+    def __init__(self): self.calls = []
+    def apply_chat_template(self, msgs, **kw):
+        self.calls.append(msgs)
+        for m in msgs:
+            for tc in m.get("tool_calls") or []:
+                tc["function"]["arguments"].items()   # what the template does
+        return "PROMPT"
+
+
+_tok_before, glm.TOK = glm.TOK, _RecTok()
+_MISSING = object()
+for bad in ("null", "[1,2]", '"x"', "3", "{oops", "", None, [1, 2], 7, _MISSING):
+    fn = {"name": "f"} if bad is _MISSING else {"name": "f", "arguments": bad}
+    sent = [{"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": fn},
+                                                                 {"id": "c2", "type": "function", "function": {"name": "g", "arguments": '{"k": [1, {"z": null}]}'}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"}]
+    before = copy.deepcopy(sent)
+    try:
+        glm.encode_messages(sent)
+        got = glm.TOK.calls[-1][1]["tool_calls"]
+        ok = (got[0]["function"] == {"name": "f", "arguments": {}} and got[0]["id"] == "c1" and got[1]["function"]["arguments"] == {"k": [1, {"z": None}]}
+              and sent == before)
+    except Exception as e:  # noqa: BLE001
+        got, ok = repr(e), False
+    fails += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} history tool-call arguments {'(missing)' if bad is _MISSING else repr(bad)} -> empty object, caller's messages untouched"
+          + ("" if ok else f" ({got})"))
+given = {"a": 1}
+glm.encode_messages([{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": given}}]}])
+ok = glm.TOK.calls[-1][0]["tool_calls"][0]["function"]["arguments"] is given
+fails += not ok
+print(f"{'ok  ' if ok else 'FAIL'} object arguments pass through as they are")
+glm.TOK = _tok_before
+
 print("RESULT:", "PASS" if not fails else f"FAIL ({fails})")
 sys.exit(1 if fails else 0)

@@ -167,6 +167,7 @@ int main(int argc,char** argv){
  struct Ctl{int fd;bool sleep;double deadline;int level;};std::deque<Ctl> ctl_q;std::atomic<bool> sleep_asked{false};
  std::vector<int> flush_q;  // {"op":"flush"} connections (hived) — none are drained in this fixture
  std::atomic<int> g_mtp_batch_override{-1};  // {"op":"set","mtp_batch":...} run-time override (hived global — the engine thread is not part of this fixture)
+ std::atomic<int> g_sample_drafts_override{-1};  // {"op":"set","sample_drafts":...} run-time override (hived global, same)
  const size_t kMaxHeaderBytes=(size_t)64<<20,kMaxBinBytes=(size_t)1<<30;  // request size caps (hived, next to the listening socket)
  // {"op":"where"} / {"op":"load"} (hived session cache lookup): no session store in this fixture — every session is "none", loads stay queued
  auto where_json=[](const std::string&){return json{{"where","none"},{"tokens",0},{"bytes",0}};};

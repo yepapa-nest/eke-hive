@@ -535,6 +535,7 @@ void q2_front(const Case& cs, const LayerW& A, Work& w, Blas& blas, int M, int T
   a.idx_mode = cs.idx_tc ? 1 : 0; a.iqp = w.iqp;
   a.src = k::DecRowSrc{w.kvrows_d, w.kptrs_d, w.dstp_d, w.dstk_d, w.skv_d, w.ssc_d, w.pos_d, w.gpos_d, w.visible_d, w.trows_d, w.dsti_d};
   a.ring_ptrs = w.ringp_d;
+  a.src.ring = w.ringp_d;  // HIVE_VERIFY_TAB_DEV: the verify compressor and ring write read the device table the first kernel fills
   a.scratch = w.iscore_f; a.scratch_bytes = (size_t)VROWS * (w.Tcap + 8) * 4;
   a.v3 = v3; a.lctx = lctx;
   a.vgrp = w.vgrp_d;

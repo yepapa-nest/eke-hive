@@ -396,6 +396,115 @@ def hanja_filter_wanted(body: dict, headers) -> bool:
     return hanja_filter_mode(body, headers)[0] == "on"
 
 
+# Allowed tool names (request field "allowed_tools": a list of names beside "tools"; hive/tool_mask.h, docs/configuration.md): the daemon samples a tool name
+#   inside a DSML block only from tokens that spell one of these names. The field never reaches the template, the token ids, the session key or the
+#   boundary hints — the prompt and its cached prefix are the same with and without it. Absent, null, [], a list without a known name, or "tool_choice":
+#   "none" restrict nothing. Off (HIVE_TOOL_MASK=0), another family or a name the vocabulary cannot spell: served unconstrained, and a call outside the
+#   list is returned as generated and flagged in the request record (allowed_violation).
+_TOOL_MASK_TAGS = None
+_TOOL_MASK_VOCAB = None
+_TOOL_TRIES: "OrderedDict[tuple, dict | None]" = OrderedDict()
+_TOOL_NAME_CLOSERS = ('">\n', '">', '"')   # the reference grammar closes a name with ">\n"; ">" and " leave the rest to the next tokens
+
+
+def _tool_encoded_names(tools, messages) -> dict:
+    """{name the client may list: name written in the prompt} for the tools of this request, including tools a later system message announces."""
+    names = {}
+    def add(t):
+        if not isinstance(t, dict):
+            return
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name:
+            return
+        ns = t.get("namespace", fn.get("namespace"))
+        ns = ns.get("name") if isinstance(ns, dict) else ns
+        encoded = f"{ns}::{name}" if isinstance(ns, str) and ns and "::" not in name else name
+        names[name] = encoded
+        names[encoded] = encoded
+    for t in tools if isinstance(tools, list) else ():
+        add(t)
+    for m in messages if isinstance(messages, list) else ():
+        if isinstance(m, dict) and m.get("role") == "system" and isinstance(m.get("tools"), list):
+            for t in m["tools"]:
+                add(t)
+    return names
+
+
+def allowed_tool_names(body: dict, tools, messages) -> list:
+    """The prompt names of the request's allowed tools ([] = no restriction): the field intersected with the request's tools. Listing every tool restricts nothing."""
+    field = body.get("allowed_tools")
+    if not isinstance(field, list) or not field or body.get("tool_choice") == "none":
+        return []
+    known = _tool_encoded_names(tools, messages)
+    allowed = sorted({known[n] for n in field if isinstance(n, str) and n in known})
+    return [] if len(allowed) >= len(set(known.values())) else allowed
+
+
+def compile_tool_trie(names: list, vocab: dict) -> dict | None:
+    """Automaton over the vocabulary's own tokens (hive/tool_mask.h Trie): from each prefix of a name, every token that extends it along a name, or finishes the
+    name and closes it. Every spelling the tokenizer can produce stays reachable, not only the canonical one. None when a name cannot be spelled (not printable
+    ASCII: the vocabulary's byte-level form differs) — the request is then served unconstrained."""
+    if not all(isinstance(n, str) and n and all(0x21 <= ord(c) <= 0x7e and c != '"' for c in n) for n in names):
+        return None
+    prefixes = sorted({n[:i] for n in names for i in range(len(n))} | set(names))
+    index = {p: i for i, p in enumerate(prefixes)}
+    first, tok, nxt = [0], [], []
+    for p in prefixes:
+        edges = {}
+        for n in names:
+            if not n.startswith(p):
+                continue
+            rest = n[len(p):]
+            for q in range(1, len(rest) + 1):
+                t = vocab.get(rest[:q])
+                if t is not None:
+                    edges[t] = index[p + rest[:q]]
+            for closer in _TOOL_NAME_CLOSERS:
+                t = vocab.get(rest + closer.replace("\n", "\u010a"))   # byte-level vocabulary form of a newline
+                if t is not None:
+                    edges[t] = -1
+        if not edges:
+            return None
+        for t, to in sorted(edges.items()):
+            tok.append(t)
+            nxt.append(to)
+        first.append(len(tok))
+    return {"first": first, "tok": tok, "next": nxt}
+
+
+def tool_mask_for(names: list, ids: list) -> dict | None:
+    """The daemon's "tool_mask" field for these allowed names, or None (off, another family, a tokenizer without these tag pieces): served unconstrained."""
+    global _TOOL_MASK_TAGS, _TOOL_MASK_VOCAB
+    if not names or adapter_family() or os.environ.get("HIVE_TOOL_MASK") == "0" or not hasattr(TOK, "get_vocab"):
+        return None
+    if _TOOL_MASK_VOCAB is None or _TOOL_MASK_VOCAB[0] is not TOK:
+        _TOOL_MASK_VOCAB = (TOK, TOK.get_vocab())
+        _TOOL_TRIES.clear()
+        pieces = [getattr(ENC, "dsml_token", "｜DSML｜"), getattr(ENC, "tool_calls_block_name", " calls"), getattr(ENC, "tool_call_tag_name", " invoke"),
+                  getattr(ENC, "tool_parameter_tag_name", " parameter"), " name", '="']
+        try:
+            coded = [TOK.encode(p, add_special_tokens=False) for p in pieces]
+            _TOOL_MASK_TAGS = [int(c[0]) for c in coded] if all(len(c) == 1 for c in coded) else None
+        except Exception:  # noqa: BLE001 — a tokenizer that cannot say: off
+            _TOOL_MASK_TAGS = None
+    if _TOOL_MASK_TAGS is None:
+        return None
+    key = tuple(names)
+    if key not in _TOOL_TRIES:
+        _TOOL_TRIES[key] = compile_tool_trie(names, _TOOL_MASK_VOCAB[1])
+        while len(_TOOL_TRIES) > 64:
+            _TOOL_TRIES.popitem(last=False)
+    _TOOL_TRIES.move_to_end(key)
+    trie = _TOOL_TRIES[key]
+    if trie is None:
+        return None
+    t_start, t_end = think_token_ids()
+    return {"tags": _TOOL_MASK_TAGS, **trie,
+            **({"think_end": t_end, "in_think": think_open_at_end(ids, t_start)} if t_end is not None else {}),
+            **({"think_start": t_start} if t_start is not None else {})}
+
+
 def think_open_at_end(ids: list, t_start) -> bool:
     """The prompt ends inside an open thinking block: its last token is <think>, or <think> followed only by whitespace tokens
     (Qwen3.8-Flash-Next's template ends the prompt with "<think>\\n" — with only ids[-1] checked the cap never armed for it)."""
@@ -677,7 +786,7 @@ class TokenCache:
     Each turn of a conversation re-sends the whole prompt, and the server tokenized it whole, with an offset mapping, twice
     (ids, then boundary hints): 232 + 305 ms for a 159K-token GLM conversation (prep_bench, 2026-10-06; service log p50
     676 ms per request at 131K+). Per conversation the last prompt, its ids and token end offsets are kept (LRU, bounded by the
-    tokens kept — limits()). A new prompt is cut at the last special token (role marker) that starts inside
+    tokens kept — limits()). A new prompt is cut at the last special token (role marker) that lies wholly inside
     the common prefix with the kept prompt: the tokens before it are reused, the rest is tokenized without the template's
     added tokens. A fast tokenizer splits added special tokens out of the text before anything else, so the pieces on
     either side of one are tokenized independently and the result equals a whole-prompt tokenization. Only special tokens
@@ -717,8 +826,14 @@ class TokenCache:
             self.lead = full[:k]
             self.supported = k >= 0 and full[k:] == bare
             dec = getattr(tok, "added_tokens_decoder", {}) or {}
-            self.cut_ids = frozenset(i for i, t in dec.items()
-                                     if getattr(t, "special", False) and not getattr(t, "lstrip", False) and not getattr(t, "rstrip", False))
+            cut = {i: (getattr(t, "content", None) or str(t)) for i, t in dec.items()
+                   if getattr(t, "special", False) and not getattr(t, "lstrip", False) and not getattr(t, "rstrip", False)}
+            # 2026-11-11: a marker whose text sits inside another added token past that token's first character is not a cut point.
+            #   The longer token can begin before the marker and end after it, so text appended after the marker can turn the pieces
+            #   on both sides of it into that one token — the tokens kept before the marker would then differ from a whole
+            #   tokenization (tools/test_server_cpu.py test_marker_inside_a_longer_added_token_is_not_a_cut_point).
+            every = [(getattr(t, "content", None) or str(t)) for t in dec.values()]
+            self.cut_ids = frozenset(i for i, text in cut.items() if text and not any(text in other[1:] for other in every))
             self.supported = self.supported and bool(self.cut_ids)
         except Exception:  # noqa: BLE001 — a tokenizer without offsets or added-token metadata: whole tokenization only
             self.supported = False
@@ -735,6 +850,64 @@ class TokenCache:
         offs = enc["offset_mapping"]
         return list(enc["input_ids"]), array("l", [e for _, e in offs]), array("l", [b for b, _ in offs])
 
+    def _reuse(self, e, c: int, prompt: str):
+        """(ids, ends, starts, cuts) of prompt from the kept entry e, whose prompt shares the first c characters with it — the tokens
+        before a cut point reused, the rest tokenized — or None when there is no cut point to reuse from. Changes nothing."""
+        from array import array
+        import bisect
+        p_old, ids_old, ends_old, starts_old, cuts = e
+        cut = None
+        # The cut point is the last special token that lies WHOLLY inside the common prefix (it ends at or before c), so the new
+        #   prompt has the same marker at the same place and the text before it is a piece of its own there too.
+        #   2026-11-11: this took the last marker that STARTS at or before c. When the kept prompt's marker starts exactly at
+        #   c (a message's text grew in place: "...check the log<|assistant|>" -> "...check the logs please<|assistant|>") or the
+        #   prompts part inside the marker, the new prompt has ordinary text there, which BPE merges with the text before it —
+        #   yet the tokens before the marker were reused as they were. Measured: 92 of 123 in-place extensions gave ids that
+        #   differ from a whole tokenization with the repository's test tokenizer, and the Qwen3.8-Flash-Next tokenizer gave 30
+        #   tokens instead of 29 for the example above (tools/test_server_cpu.py test_message_text_grown_in_place).
+        j = bisect.bisect_right(cuts, c) - 1  # last cut point starting at or before the divergence
+        while j >= 0 and cuts[j] > 0:
+            p = cuts[j]
+            t = bisect.bisect_left(starts_old, p)  # index of the special token that starts at p
+            if not (t < len(ids_old) and starts_old[t] == p and ids_old[t] in self.cut_ids):
+                break
+            if ends_old[t] <= c:
+                cut = (p, t, ids_old, ends_old, starts_old, cuts)
+                break
+            j -= 1  # this marker reaches past the common prefix: the one before it ends at or before this one's start
+        if cut is None:
+            return None
+        p, t = cut[0], cut[1]
+        enc = TOK(prompt[p:], add_special_tokens=False, return_offsets_mapping=True)
+        tail = list(enc["input_ids"])
+        offs = enc["offset_mapping"]
+        # 2026-11-11: the tail must begin with the very marker the cut was made at (same id, same end). A marker that matches
+        #   only as a whole word, or a longer added token beginning at the same place, makes the new prompt read differently
+        #   there even though the marker's own characters are shared — then nothing is reused.
+        if not tail or tail[0] != ids_old[t] or offs[0][1] + p != ends_old[t]:
+            return None
+        ids = ids_old[:t].tolist() + tail
+        ends = ends_old[:t] + array("l", [x + p for _, x in offs])
+        starts = starts_old[:t] + array("l", [x + p for x, _ in offs])
+        cuts = cuts[:bisect.bisect_left(cuts, p)] + array("l", [x + p for (x, _), v in zip(offs, tail) if v in self.cut_ids])
+        return ids, ends, starts, cuts
+
+    def peek(self, key: str, prompt: str):
+        """(ids, token end offsets) of prompt — the same values as a whole tokenization with offsets — computed from the entry kept
+        under key when there is one to reuse, and keeping nothing: no entry is added, replaced or moved, no divergence is recorded,
+        the hit count and its verification cadence stay as they are. For a prompt that is not a request's (the read-ahead plan)."""
+        if self.tok is not TOK:
+            self._bind(TOK)
+        got = None
+        if key is not None and not self.disabled and self.supported and self.enabled():
+            with self.lock:
+                e = self.entries.get(key)
+            if e is not None:
+                got = self._reuse(e, _common_prefix_len(e[0], prompt), prompt)
+        if got is None:
+            got = self._whole(prompt)
+        return got[0], got[1]
+
     def tokenize(self, key: str, prompt: str):
         """(ids, token end offsets) for prompt; ends is None when offsets are unavailable."""
         from array import array
@@ -748,7 +921,13 @@ class TokenCache:
             e = self.entries.get(key)
             if e is not None:
                 self.entries.move_to_end(key)
-            others = list(self.entries.values()) if e is None else []
+            # 2026-11-11: only the kept prompts that begin with this prompt's first 4,096 characters can share that many with it, so
+            #   only those are compared character by character (the same choice as comparing every entry: the first of the longest
+            #   common prefixes of 4,096+). Comparing every entry cost a short one-shot request 0.9 ms at 1,000 kept prompts and
+            #   3.8 ms at 4,000 (CPU-only host, short kept prompts; more with long ones), for every request with a new key — the
+            #   one-shot requests that fill the cache; now 0.06 ms at either (a prompt under 4,096 characters compares with none).
+            head = prompt[:4096] if e is None and len(prompt) >= 4096 else None
+            others = [x for x in self.entries.values() if x[0].startswith(head)] if head is not None else []
         c = None
         if e is None and others:
             # Content first, like the engine's prefix reuse: a conversation whose key is new (a client began sending a conversation
@@ -758,41 +937,26 @@ class TokenCache:
             best = max(((_common_prefix_len(x[0], prompt), x) for x in others), key=lambda t: t[0])
             if best[0] >= 4096:
                 c, e = best
-        cut = None
+        got = None
         same_key = e is not None and c is None  # the kept prompt is this conversation's own previous prompt
         if e is not None:
-            p_old, ids_old, ends_old, starts_old, cuts = e
             if c is None:
-                c = _common_prefix_len(p_old, prompt)
+                c = _common_prefix_len(e[0], prompt)
             if same_key:
                 with self.lock:
-                    self.last_diverge[key] = (len(ids_old), bisect.bisect_right(ends_old, c))
+                    self.last_diverge[key] = (len(e[1]), bisect.bisect_right(e[2], c))
                     while len(self.last_diverge) > 4096:
                         self.last_diverge.pop(next(iter(self.last_diverge)))
-            j = bisect.bisect_right(cuts, c) - 1  # last cut point starting at or before the divergence
-            while j >= 0 and cuts[j] == 0:
-                j -= 1
-            if j >= 0:
-                p = cuts[j]
-                t = bisect.bisect_left(starts_old, p)  # index of the special token that starts at p
-                if t < len(ids_old) and starts_old[t] == p and ids_old[t] in self.cut_ids:
-                    cut = (p, t, ids_old, ends_old, starts_old, cuts)
-        if cut is None:
+            got = self._reuse(e, c, prompt)
+        if got is None:
             ids, ends, starts = self._whole(prompt)
             cuts = array("l", [starts[i] for i, v in enumerate(ids) if v in self.cut_ids])
         else:
-            p, t, ids_old, ends_old, starts_old, _ = cut
-            enc = TOK(prompt[p:], add_special_tokens=False, return_offsets_mapping=True)
-            tail = list(enc["input_ids"])
-            ids = ids_old[:t].tolist() + tail
-            offs = enc["offset_mapping"]
-            ends = ends_old[:t] + array("l", [x + p for _, x in offs])
-            starts = starts_old[:t] + array("l", [x + p for x, _ in offs])
+            ids, ends, starts, cuts = got
             self.hits += 1
             n = int(os.environ.get("HIVE_TOKEN_CACHE_VERIFY", "32") or 0)
             if n > 0 and self.hits % n == 0:
                 self._verify_later(prompt, list(ids))
-            cuts = cut[5][:bisect.bisect_left(cut[5], p)] + array("l", [x + p for (x, _), v in zip(offs, tail) if v in self.cut_ids])
         with self.lock:
             old = self.entries.get(key)
             if old is not None:
@@ -1198,6 +1362,41 @@ class MessageTrail:
 MSGTRAIL = MessageTrail()
 
 
+class PrefixHashes:
+    """blake2b-128 of a request's ids (as int32 bytes) up to any token count, for the three trackers below (TailChangeTracker,
+    SeenPrefixes, FirstTurnTails), which a request runs one after another over the same ids and mostly the same boundaries.
+    2026-11-11: each tracker built its own int32 copy of the ids and hashed every prefix from the first token, before the request
+    goes to the daemon — measured on a CPU-only host at 838K tokens with 8 boundaries, the three trackers over two requests of a
+    conversation: 125 ms -> 34 ms. Here the copy is made once (on first use, so off the event loop like the trackers) and a prefix continues from the
+    longest one already hashed (blake2b fed in pieces gives the digest of the whole — tools/test_server_cpu.py
+    test_prefix_hashes_equal_one_shot_hashing). The digests, and so everything the trackers keep and answer, are the same."""
+
+    def __init__(self, ids):
+        self.ids = ids
+        self.view = None
+        self.at: list[int] = []      # token counts hashed so far, ascending
+        self.state: list = []        # the hash object after that many tokens
+        self.digests: dict = {}
+
+    def get(self, n: int) -> bytes:
+        """The digest of the first n tokens."""
+        import bisect
+        if self.view is None:
+            self.view = memoryview(array("i", self.ids)).cast("B")
+            self.w = array("i").itemsize
+        if n < 0 or n * self.w > len(self.view):  # not a plain prefix: hashed as the slice is, like the trackers did
+            return hashlib.blake2b(self.view[: n * self.w], digest_size=16).digest()
+        d = self.digests.get(n)
+        if d is None:
+            i = bisect.bisect_right(self.at, n)
+            h = self.state[i - 1].copy() if i else hashlib.blake2b(digest_size=16)
+            h.update(self.view[(self.at[i - 1] if i else 0) * self.w: n * self.w])
+            self.at.insert(i, n)
+            self.state.insert(i, h)
+            d = self.digests[n] = h.digest()
+        return d
+
+
 class TailChangeTracker:
     """HIVE_PREFIX_ADAPTIVE: spend an extra prefill chunk on a boundary snapshot only for conversations whose tail changes.
 
@@ -1221,32 +1420,31 @@ class TailChangeTracker:
     def _hash(view: memoryview, n: int) -> bytes:
         return hashlib.blake2b(view[:n], digest_size=16).digest()
 
-    def observe(self, key: str, ids: list[int], hints: list[int], history: bool = False) -> bool:
+    def observe(self, key: str, ids: list[int], hints: list[int], history: bool = False, hashes: "PrefixHashes | None" = None) -> bool:
         """Record this request (call off the event loop: hashing touches every token). True = ask for an extra chunk.
         `history` = the request already has an assistant turn. Such a conversation seen for the first time (a server restart, or
         evicted from this tracker) is flagged too: without a snapshot now, its next turn re-reads everything when the tail changes
         (measured 2026-10-08, DeepSeek, one conversation right after a restart: turn 1 not flagged → turn 2 cached 0, 6.9 s prefill →
         turn 3 resumed 23,287 tokens, 2.2 s). The cost is one extra chunk once per conversation (~0.9 s there: 24,737 tokens in one
         chunk 6.0 s vs 25,310 in two 6.9 s)."""
-        view = memoryview(array("i", ids)).cast("B")
-        w = array("i").itemsize
+        ph = hashes if hashes is not None else PrefixHashes(ids)  # hashes: this request's shared PrefixHashes (the same digests)
         with self.lock:
             prev = self.entries.get(key)
         flag = prev is None and history
         if prev is not None:
             plen, phash, phints = prev
-            append = len(ids) >= plen and self._hash(view, plen * w) == phash
+            append = len(ids) >= plen and ph.get(plen) == phash
             if not append:
                 # history: a conversation re-read from the top (its head changed — 2026-10-14: a client re-sent its tool list in a different
                 #   JSON key order) shares none of its old boundaries, so it went unflagged and saved no snapshot; its next turn changes
                 #   the tail (GLM clear_thinking drops the last turn's reasoning) and re-read everything again (GLM 379K: 130 s, then 139 s —
                 #   the second request was flagged and saved 375500, the third resumed). Flag it the same way as a first sight with history.
-                flag = history or any(h <= len(ids) and self._hash(view, h * w) == hh for h, hh in phints)
+                flag = history or any(h <= len(ids) and ph.get(h) == hh for h, hh in phints)
         # A generation-suffix hint (≤ GEN_TAIL_MAX before the end) marks where the next turn continues — the next request extends the
         #   prompt up to there, not the reasoning-start token after it. Compared over the whole prompt, every turn with reasoning on
         #   looked "not append-only" and paid an extra boundary chunk it no longer needs (2026-10-08: 3 chunks instead of 2).
         plen = max((h for h in hints if 0 < len(ids) - h <= GEN_TAIL_MAX), default=len(ids))
-        entry = (plen, self._hash(view, plen * w), tuple((h, self._hash(view, h * w)) for h in hints if 0 < h <= len(ids)))
+        entry = (plen, ph.get(plen), tuple((h, ph.get(h)) for h in hints if 0 < h <= len(ids)))
         with self.lock:
             self.entries[key] = entry
             self.entries.move_to_end(key)
@@ -1279,12 +1477,11 @@ class SeenPrefixes:
         self.entries: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
 
-    def observe(self, key: str, ids: list[int], hints: list[int]) -> int:
+    def observe(self, key: str, ids: list[int], hints: list[int], hashes: "PrefixHashes | None" = None) -> int:
         """Record this request's boundary prefixes (call off the event loop). Returns the deepest boundary another conversation already
-        sent (0 = none)."""
-        view = memoryview(array("i", ids)).cast("B")
-        w = array("i").itemsize
-        hashes = [(h, hashlib.blake2b(view[: h * w], digest_size=16).digest()) for h in hints if 0 < h <= len(ids)]
+        sent (0 = none). hashes: this request's shared PrefixHashes (the same digests)."""
+        ph = hashes if hashes is not None else PrefixHashes(ids)
+        hashes = [(h, ph.get(h)) for h in hints if 0 < h <= len(ids)]
         seen = 0
         with self.lock:
             for h, d in hashes:
@@ -1300,6 +1497,72 @@ class SeenPrefixes:
 
 
 SEEN = SeenPrefixes()
+
+
+class FirstTurnTails:
+    """HIVE_FIRST_TAIL: learn which kind of request sends the same long prompt twice with a different last block, and cut its first turn there.
+
+    Some clients make one-shot calls in pairs: a first request, then a second in the same conversation that keeps all of it but the last
+    message. Without a snapshot at that boundary the second reads everything again, from token 0. Production 2026-11-04..06: "schedule-card"
+    after "schedule-summary" read 379,221 tokens (345 s) again in 19 pairs, each sharing 15-31K tokens with the request a few seconds before.
+    The first request cannot know (SeenPrefixes: nobody else sent that block; TailChangeTracker: no previous request). So the first such pair of
+    a kind pays, and later first turns of that kind ask for the extra cut at their deepest boundary. The kind is the client's tag (a request
+    without one learns nothing); only hashes are kept; memory only, so a restart learns again."""
+
+    MIN_SHARED = 4096
+    TTL = 7 * 86400.0
+
+    def __init__(self, cap: int = 2048):
+        self.cap = cap
+        self.first: OrderedDict = OrderedDict()  # session -> (kind, prompt length, its hash, deepest boundary, its hash) | None once answered
+        self.kinds: dict = {}  # kind -> when a pair last showed it
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _hash(view: memoryview, n: int) -> bytes:
+        return hashlib.blake2b(view[:n], digest_size=16).digest()
+
+    def observe(self, key: str, kind: str | None, ids: list[int], hints: list[int], now: float | None = None,
+                hashes: "PrefixHashes | None" = None) -> bool:
+        """Record this request (off the event loop: hashing). True = a first turn of a kind known to change its last block.
+        hashes: this request's shared PrefixHashes (the same digests)."""
+        now = time.time() if now is None else now
+        ph = hashes if hashes is not None else PrefixHashes(ids)
+        with self.lock:
+            seen = key in self.first
+            rec = self.first.get(key)
+            if seen:
+                self.first[key] = None
+                self.first.move_to_end(key)
+        if seen:
+            if rec is not None:
+                k, plen, phash, deep, dhash = rec
+                if (deep <= len(ids) and ph.get(deep) == dhash
+                        and not (len(ids) >= plen and ph.get(plen) == phash)):
+                    with self.lock:
+                        self.kinds[k] = now
+            return False
+        deep = max((h for h in hints if h <= len(ids) and len(ids) - h > GEN_TAIL_MAX), default=0)
+        rec = (kind, len(ids), ph.get(len(ids)), deep, ph.get(deep)) if kind and deep >= self.MIN_SHARED else None
+        with self.lock:
+            self.first[key] = rec
+            self.first.move_to_end(key)
+            while len(self.first) > self.cap:
+                self.first.popitem(last=False)
+            when = self.kinds.get(kind)
+            if when is not None and now - when > self.TTL:
+                del self.kinds[kind]
+                when = None
+        return rec is not None and when is not None
+
+
+FIRST_TAILS = FirstTurnTails()
+
+
+def client_kind(tags: dict) -> str | None:
+    """The kind of a request for FirstTurnTails: its client tags without the user agent, the user and the metadata (None = no tag)."""
+    kept = sorted((k, v) for k, v in tags.items() if k not in ("user-agent", "user", "metadata") and isinstance(v, str))
+    return "\n".join(f"{k}={v}" for k, v in kept) or None
 
 
 HINT_LEAD_BLOCKS = 4  # leading fixed user blocks (each followed by another user message) that end a boundary
@@ -2387,6 +2650,104 @@ THINK_END = "</think>"
 DSML_START = "<｜DSML｜"
 
 
+# Broken tool block retry (HIVE_TOOL_RETRY = attempts, default 2; "0" = off — the old behaviour: the raw block went out as content).
+#   Seen 2026-11-05 15:18 KST (a production agent conversation, DeepSeek-V4.1-Flash, 89K prompt, after 7 tool calls in the turn): the thinking cap (1024) closed
+#   the reasoning and the model wrote a 26-token DSML block the reference parser could not read —
+#   `<｜DSML｜ calls>\n<｜DSML｜ invoke name="give me</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>` — and the server sent it to the
+#   user as the answer (finish "stop"). Only the server knows the block is DSML that failed, so it is absorbed here: the generation is
+#   continued again from the end of the content before the block (the tokens already generated, so only the block is sampled anew), and
+#   when every attempt fails the block is dropped instead of shown. Request record: tool_retry (per attempt) · tool_retry_ok.
+#   What counts as a tool block: tool_block_head below.
+def tool_retry_attempts() -> int:
+    try:
+        return max(0, min(5, int(os.environ.get("HIVE_TOOL_RETRY", "2"))))
+    except ValueError:
+        return 2
+
+
+#   2026-11-11 (decided by the operator): what counts as a tool block was narrowed. Any "<｜DSML｜" after the reasoning used to count, so
+#   an ordinary answer that writes the notation (explaining how tools are called, quoting this code or a template) was taken for a
+#   broken block — generated again twice and, the same words coming back, cut off at the first "<｜DSML｜"; a stream held everything from
+#   there to the end. A tool block is now only DSML that (1) starts the way the format writes it — after a blank line ("\n\n", the
+#   reference parser's own start marker) or as the first thing of the content (only whitespace after the reasoning: the 2026-11-05 block
+#   came right after a thinking cap closed the reasoning) — and (2) is the last thing of the response: no block end
+#   ("</｜DSML｜ calls>") followed by more text. Any other "<｜DSML｜" is content and goes out as written. A real broken block (the
+#   2026-11-05 one, an unterminated one, one with a garbled head such as "<｜DSML｜ invoke" without the calls line) is still generated
+#   again and dropped when every attempt fails. Not covered (they go out as text, as before 2026-11-05): a broken block after a single
+#   newline in the middle of the content, and one followed by more text after its block end.
+def dsml_calls_end() -> str:
+    return f"</{getattr(ENC, 'dsml_token', '｜DSML｜')}{getattr(ENC, 'tool_calls_block_name', ' calls')}>"
+
+
+def tool_block_head_at(text: str, base: int, q: int) -> bool:
+    """Whether the DSML at text[q:] starts the way a tool block does: after a blank line, or first in the content (text[base:])."""
+    return (q - 2 >= base and text[q - 2:q] == "\n\n") or not text[base:q].strip()
+
+
+def tool_block_head(text: str, base: int = 0) -> int | None:
+    """Where the response's tool block starts (the "<" of its DSML), else None: the first DSML at a block head (tool_block_head_at)
+    that runs to the end of the text — no block end after it, or nothing but whitespace after its block end."""
+    end = dsml_calls_end()
+    q = text.find(DSML_START, base)
+    while q >= 0:
+        if tool_block_head_at(text, base, q):
+            k = text.find(end, q)
+            if k < 0 or not strip_eos(text[k + len(end):]).strip():
+                return q
+            q = text.find(DSML_START, k + len(end))  # a closed block followed by text (an example in an answer): content
+        else:
+            q = text.find(DSML_START, q + 1)
+    return None
+
+
+def tool_block_calls(text: str, p: int, tools):
+    """The calls of the tool block at text[p:] read on its own (the reference parser's start marker is "\n\n" + the block), else None.
+    The whole text does not parse when the content before the block writes DSML itself; the block alone still does."""
+    try:
+        block = strip_eos(text[p:])
+        return parse_completion(("\n\n" if not block.startswith("\n") else "") + block + TOK.eos_token, "chat", tools).get("tool_calls") or None
+    except Exception:  # noqa: BLE001 — the reference parser rejects the block
+        return None
+
+
+def broken_tool_block(text: str, thinking_mode: str, tools) -> int | None:
+    """Where the content ends before a DSML tool block the reference parser reads no call from (trailing newlines excluded), else None.
+    DeepSeek only (adapter families have their own formats) and only for requests that offered tools. A tool block = tool_block_head."""
+    if not tools or adapter_family() or not text:
+        return None
+    base = 0
+    if thinking_mode == "thinking":
+        j = text.find(THINK_END)
+        if j < 0:
+            return None
+        base = j + len(THINK_END)
+    p = tool_block_head(text, base)
+    if p is None:
+        return None
+    try:
+        calls = parse_completion(text + TOK.eos_token, thinking_mode, tools).get("tool_calls")
+    except Exception:  # noqa: BLE001 — the reference parser rejects the text: the block alone decides
+        calls = None
+    if calls or tool_block_calls(text, p, tools):
+        return None
+    return max(base, len(text[:p].rstrip("\n")))
+
+
+def tool_retry_cut(cum: list, cut: int, raw: str = "") -> int:
+    """How many generated ids to keep so their text ends at `cut` or only newlines past it (cum = text length of `raw` after each id).
+    Ids that added no text at that point (partial UTF-8 bytes of the next character) are dropped. The id that ends the content with the
+    newlines before the block (one token ".\\n\\n" — measured with the DeepSeek tokenizer 2026-11-05) is kept, so the content is not
+    sampled again."""
+    k = 0
+    while k < len(cum) and cum[k] <= cut:
+        k += 1
+    while k > 0 and (cum[k - 2] if k > 1 else 0) == cum[k - 1]:
+        k -= 1
+    if k < len(cum) and cum[k] > cut and (cum[k - 1] if k else 0) <= cut and raw[cut:cum[k]] and raw[cut:cum[k]].strip("\n") == "":
+        k += 1
+    return k
+
+
 def _tag_hold(buf: str, tag: str) -> int:
     """If buf ends with a prefix of tag, return its length (undecidable until the next piece arrives)."""
     return max((k for k in range(1, len(tag)) if buf.endswith(tag[:k])), default=0)
@@ -2565,11 +2926,15 @@ async def models():
 # HIVE_STAGE_STATUS (default off): the engine-side stage of each request, for clients that want to show what a response is waiting on.
 #   GET /v1/hive/requests/{id} (id = the response id, "chatcmpl-…", sent in the first stream chunk) →
 #   {"id", "stage": queued | prefill | thinking | tool_call | answer | done | error, "prompt_tokens", "cached_tokens", "prefill_total",
-#    "prefill_done", "prefill_rate", "prefill_eta_s", "seen_before", "tool_name", "updated"}. queued = other requests were in flight when it
-#   arrived, so it waits behind them until the engine admits it; prefill = reading the prompt (cached_tokens reused, prefill_total to read,
+#    "prefill_done", "prefill_rate", "prefill_eta_s", "seen_before", "tool_name", "updated"}. queued = every seat of the engine was taken when
+#   it arrived (HIVE_MAX_BATCH requests in flight), so it waits until one frees; prefill = reading the prompt (cached_tokens reused, prefill_total to read,
 #   prefill_done after each chunk — before the engine admits a request with nothing ahead, prefill with prefill_total 0: the prompt is being
 #   handed over), then the generated text's stage. A request with nothing ahead used to start as queued as well, so a client showed "waiting
-#   for an earlier request" for the whole hand-over — measured 2026-10-25, 15–31 s on a 430–460K-token browser conversation that ran alone. Off = the route
+#   for an earlier request" for the whole hand-over — measured 2026-10-25, 15–31 s on a 430–460K-token browser conversation that ran alone.
+#   Until 2026-11-09 "queued" meant "any other request in flight" — with up to HIVE_MAX_BATCH (8) requests served together and a long prompt
+#   started beside another at the next layer yield (HIVE_LAYER_YIELD_SLICE), that showed "waiting" for requests the engine was already taking
+#   (2026-11-09 production log, 1,415 requests: arrival → admitted median 0.13 s, p90 0.36 s, yet every request with another in flight showed
+#   queued). Now queued only when the seats are full. Off = the route
 #   answers 404 and nothing else changes (responses are byte-identical; the daemon line "admitted" is only sent when asked for).
 #   Entries live while the request runs and STAGE_KEEP_S after it ends.
 #   While reading: "prefill_rate" (tokens/s at the position reached) and "prefill_eta_s" (seconds left at "updated"), so a client can
@@ -2587,6 +2952,8 @@ async def models():
 #   whole-chunk speeds is not shown (null) — see stage_prefill.
 STAGE_STATUS = env_on("HIVE_STAGE_STATUS")
 STAGE_KEEP_S = 120.0
+# the daemon's seats (hive-start.sh passes the same value as --max-batch); a non-numeric value is absorbed as the daemon default 8
+STAGE_SEATS = int(os.environ["HIVE_MAX_BATCH"]) if os.environ.get("HIVE_MAX_BATCH", "").isdigit() and int(os.environ["HIVE_MAX_BATCH"]) > 0 else 8
 STAGES: dict = {}
 STAGE_SEEN: OrderedDict = OrderedDict()  # conversations this server has served (LRU)
 STAGE_SEEN_CAP = 4096
@@ -2662,7 +3029,7 @@ def prefill_rate_save() -> None:
 
 
 def stage_open(rid: str, prompt_tokens: int, session: str | None = None, ahead: bool = True) -> None:
-    """ahead = other requests are in flight (the daemon admits this one after them) — queued; else prefill with nothing read yet."""
+    """ahead = every engine seat is taken (the daemon admits this one when one frees) — queued; else prefill with nothing read yet."""
     now = time.time()
     for k in [k for k, v in STAGES.items() if v.get("_ended") and now - v["_ended"] > STAGE_KEEP_S]:
         STAGES.pop(k, None)
@@ -3002,11 +3369,36 @@ def _bounded_set(d: OrderedDict, k, v, cap: int = 4096) -> None:
         d.popitem(last=False)
 
 
-def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_text: str, client: str = "", info: dict | None = None):
+def _first_end_past(ends, c: int) -> int:
+    """The first index whose token end offset is greater than c (len(ends) when none is) — the scan `while ends[b] <= c: b += 1`,
+    vectorized for an int64 array (TokenCache's `ends`)."""
+    if isinstance(ends, array) and ends.typecode in ("l", "q") and ends.itemsize == 8 and len(ends):
+        try:
+            import numpy as np
+            over = np.frombuffer(ends, dtype=np.int64) > c
+            return int(over.argmax()) if over.any() else len(ends)
+        except Exception:  # noqa: BLE001 — no numpy: the scan below
+            pass
+    b = 0
+    while b < len(ends) and ends[b] <= c:
+        b += 1
+    return b
+
+
+def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_text: str, client: str = "", info: dict | None = None,
+                   cache_key: str | None = None):
     """(ids, boundaries) of the next request's history, or None. ids end one token past the boundary (the daemon cuts inside a prompt).
     None also when the read-ahead would save fewer than PRERENDER_MIN tokens: the session already holds this request and its answer,
     so a next prompt that only appends to them is continued there without it. info (optional dict) gets "basis": where the
-    keep/drop decision came from ("turns" = this request's earlier turns, "client" = the client's observed habit)."""
+    keep/drop decision came from ("turns" = this request's earlier turns, "client" = the client's observed habit).
+    cache_key = the key this conversation's request was tokenized under (TokenCache): the planned prompt shares all but its last turn
+    with that request's, so only that tail is tokenized (TokenCache.peek — the same ids and offsets, nothing kept).
+    2026-11-11, why: the plan runs after every thinking turn that ends in an answer and most end in "not needed" (121 of 141, see below),
+    yet each tokenized the whole planned prompt and walked it in Python (a character loop for the common prefix, a list of every
+    offset, a token-by-token scan — all holding the GIL, so other requests' preparation and stream delivery waited). Measured on a
+    CPU-only host with the Qwen3.8-Flash-Next tokenizer and template, a 2.57M-character / 831K-token conversation: 1,382 ms -> 82 ms
+    when the answer is "not needed", 1,755 ms -> 345 ms when a plan comes back, the plans identical (and
+    tools/test_server_cpu.py test_turn_prerender_plan_same_with_kept_tokens compares them with the former steps)."""
     try:
         parsed = parse_completion(raw_text + TOK.eos_token, thinking_mode, tools)
     except Exception:
@@ -3052,19 +3444,12 @@ def prerender_plan(messages: list[dict], tools, thinking_mode: str, effort, raw_
     pb, _ = encode_prompt(hist + [{"role": "user", "content": "y"}], tools, thinking_mode, effort)
     if media_a:
         return None
-    c = 0
-    n = min(len(pa), len(pb))
-    while c < n and pa[c] == pb[c]:
-        c += 1
+    c = _common_prefix_len(pa, pb)
     try:
-        enc = TOK(pa, return_offsets_mapping=True)
+        ids, ends = TOKCACHE.peek(cache_key, pa)
     except Exception:
         return None
-    ids = list(enc["input_ids"])
-    ends = [int(e) for _, e in enc["offset_mapping"]]
-    b = 0
-    while b < len(ends) and ends[b] <= c:
-        b += 1
+    b = _first_end_past(ends, c)
     if b < PRERENDER_MIN or b >= len(ids):
         return None
     # what the session holds after this turn: this prompt and the generated text. Tokens of the next prompt up to where it leaves that
@@ -3123,7 +3508,7 @@ def schedule_prerender(messages, tools, thinking_mode, effort, session: str, raw
         return
     async def go():
         info: dict = {}
-        plan = await asyncio.to_thread(prerender_plan, messages, tools, thinking_mode, effort, raw_text, client, info)
+        plan = await asyncio.to_thread(prerender_plan, messages, tools, thinking_mode, effort, raw_text, client, info, session)
         if plan:
             await turn_prerender(session, plan, (client, info.get("basis", "")))
     task = asyncio.get_running_loop().create_task(go())
@@ -3293,7 +3678,8 @@ async def chat(request: Request):
         return JSONResponse(overflow_body(mc, len(ids)), status_code=400)
     # (session: computed before prepare — the token cache is keyed on it)
     # HIVE_PREFIX_ADAPTIVE (needs HIVE_PREFIX_SHARE hints): one extra boundary chunk only for conversations whose tail changes (TailChangeTracker)
-    prefix_extra = ((await asyncio.to_thread(TAILS.observe, session, ids, hints, has_turns))
+    prefix_hashes = PrefixHashes(ids)  # shared by the three trackers below (each call runs in a thread, one after another)
+    prefix_extra = ((await asyncio.to_thread(TAILS.observe, session, ids, hints, has_turns, prefix_hashes))
                     if hints and env_on("HIVE_PREFIX_ADAPTIVE") else False)
     # HIVE_PREFIX_FIRST_TURN (needs HIVE_PREFIX_SHARE hints): the first turn of a conversation (no assistant message yet) asks for one extra
     #   chunk too, so the daemon saves a shared snapshot at the end of the system/tools block — the next new conversation with the same
@@ -3303,14 +3689,19 @@ async def chat(request: Request):
     #   HIVE_PREFIX_FIRST_TURN=seen: the same, but only when another conversation already sent this exact block (SeenPrefixes) — a block
     #   that never repeats (per-document dates, per-conversation memory) pays no cut.
     first_turn = os.environ.get("HIVE_PREFIX_FIRST_TURN", "")
+    # HIVE_FIRST_TAIL (FirstTurnTails): this kind of request sends its prompt again with another last block — keep the deepest boundary below
+    first_tail = ((await asyncio.to_thread(FIRST_TAILS.observe, session, client_kind(client_tags(request, body)), ids, hints, None, prefix_hashes))
+                  if hints and env_on("HIVE_FIRST_TAIL") else False)
     if hints and not prefix_extra and env_on("HIVE_PREFIX_FIRST_TURN") and not any(m.get("role") == "assistant" for m in messages if isinstance(m, dict)):
         if first_turn != "seen":
             prefix_extra = True
-        elif seen_at := await asyncio.to_thread(SEEN.observe, session, ids, hints):
+        elif seen_at := await asyncio.to_thread(SEEN.observe, session, ids, hints, prefix_hashes):
             # the daemon spends the extra cut on the deepest boundary it gets — leave out the deeper ones nobody else sent (SeenPrefixes);
             #   a generation-suffix hint stays (a free cut)
             prefix_extra = True
-            hints = [h for h in hints if h <= seen_at or len(ids) - h <= GEN_TAIL_MAX]
+            if not first_tail:
+                hints = [h for h in hints if h <= seen_at or len(ids) - h <= GEN_TAIL_MAX]
+    prefix_extra = prefix_extra or first_tail
     if conv_key:  # session cache location: the conversation's session (the base one — the "~k" split below is per request, not the conversation's)
         CONV_SESSIONS.note(conv_key, session)
     if INFLIGHT.get(session, 0) > 0:  # concurrent request in the same conversation (regenerate, two tabs, parallel bench) — separate session
@@ -3358,10 +3749,14 @@ async def chat(request: Request):
         sampling.update({"token_mask": True, **({"mask_penalty": hanja_mode[1]} if math.isfinite(hanja_mode[1]) else {}),
                          **({"mask_think_end": t_end, "mask_in_think": think_open_at_end(ids, t_start)} if t_end is not None else {}),
                          **({"mask_think_start": t_start} if t_start is not None else {})})
+    allowed_names = allowed_tool_names(body, tools, messages)
+    tool_mask = tool_mask_for(allowed_names, ids)
+    if tool_mask is not None:
+        sampling["tool_mask"] = tool_mask
     rid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     if STAGE_STATUS:  # GET /v1/hive/requests/{rid} (stage_status) — the daemon adds its "admitted" line only to requests that ask
-        stage_open(rid, len(ids), conv_key or session, ahead=any(n > 0 for n in INFLIGHT.values()))
+        stage_open(rid, len(ids), conv_key or session, ahead=sum(INFLIGHT.values()) >= STAGE_SEATS)
         sampling["stages"] = True
     stream = bool(body.get("stream"))
     # Reserve before yielding the response; two streams may be created before either
@@ -3372,6 +3767,13 @@ async def chat(request: Request):
         nonlocal released
         if not released:
             released = True
+            # 2026-11-11: a stream response closed before its body was ever read (the client left between the handler's return
+            #   and the first chunk) never runs the generator's cleanup, so its STAGES entry had no end time and stage_open never
+            #   removed it — one entry per such request for the life of the process. The entry's visible fields are left as they
+            #   are; it only becomes removable STAGE_KEEP_S from now (tools/test_server_cpu.py test_unread_stream_entry_is_removed).
+            st = STAGES.get(rid) if STAGE_STATUS else None
+            if st is not None:
+                st.setdefault("_ended", time.time())
             remaining = INFLIGHT.get(session, 1) - 1
             if remaining: INFLIGHT[session] = remaining
             else: INFLIGHT.pop(session, None)
@@ -3411,12 +3813,69 @@ async def chat(request: Request):
                #   done message is read (a request asking for the filter on a daemon without HIVE_QWEN_TOKEN_MASK is served unfiltered; 2026-10-31 review)
                **({"hanja_filter": f"on:{hanja_mode[1]:g}"} if hanja_mode[0] == "on" else {}),
                **({"prefix_extra": 1} if prefix_extra else {}),
+               # allowed tool names: how many apply · mask_applied = the daemon constrained a tool-name span · allowed_violation = a returned call outside the list
+               **({"allowed_tools_n": len(allowed_names), "mask_applied": False, "allowed_violation": False} if allowed_names else {}),
                **({"cut_leaks_stripped": cut_leaks} if cut_leaks else {})}  # HIVE_CUT_LEAK_STRIP: preambles rendered empty in this prompt
+
+    def note_allowed(called: list):
+        """allowed_violation of the request record: a call that came back outside the list (no reject, no resample: the client decides)."""
+        if allowed_names and any(n not in allowed_names and not any(a.endswith("::" + str(n)) for a in allowed_names) for n in called):
+            req_rec["allowed_violation"] = True
 
     def note_cut_leak(content: str, has_tools: bool):
         """HIVE_CUT_LEAK_STRIP: the cap cut this response and it calls a tool — remember its content when it is a leaked preamble."""
         if has_tools and req_rec.get("think_forced") and CUT_LEAKS.note(content):
             req_rec["cut_leak_noted"] = True
+
+    async def retry_tool_block(gen_ids: list, gen_cum: list, gen_raw: str, cut: int) -> dict:
+        """The response's DSML block did not parse (broken_tool_block): continue from the end of the content before it, up to
+        tool_retry_attempts() times, inside this request's session reservation and with its rid (a client cancel reaches the retry).
+        Returns {"at": offset in the generated text from which "text" replaces it}: the new tail, or "" (block dropped) when every
+        attempt failed. A DeepSeek daemon cannot rewind its live state, so each attempt re-reads from the nearest boundary snapshot."""
+        k = tool_retry_cut(gen_cum, cut, gen_raw)
+        kept = gen_cum[k - 1] if k else 0
+        new_ids = ids + gen_ids[:k]
+        base = {key: v for key, v in sampling.items()
+                if not key.startswith("think_") and key not in ("stages", "history", "prefix_extra", "tool_mask")}
+        if "mask_in_think" in base:
+            base["mask_in_think"] = False  # the kept text ends after </think>
+        if base.get("max_tokens"):
+            base["max_tokens"] = max(1, base["max_tokens"] - k)
+        tm = tool_mask_for(allowed_names, new_ids)
+        if tm is not None:
+            base["tool_mask"] = tm
+        stops = set(sampling["stop_ids"])
+        tries = req_rec.setdefault("tool_retry", [])
+        for attempt in range(tool_retry_attempts()):
+            s2 = dict(base)
+            if s2.get("seed"):
+                s2["seed"] = s2["seed"] + attempt + 1
+            d2, text, end = Detok(), "", None
+            t0 = time.time()
+            try:
+                async with aclosing(DAEMON.generate(session, new_ids, [], b"", rid=daemon_rid, **s2)) as src:
+                    async for m in src:
+                        if "id" in m:
+                            if m["id"] not in stops:
+                                text += d2.push(m["id"])
+                        elif m.get("done") or m.get("error"):
+                            end = m
+                            break
+            except (OSError, ValueError, RuntimeError) as e:
+                end = {"error": str(e)[:200]}
+            full = gen_raw[:kept] + text
+            ok = bool(end and end.get("done") and end.get("finish") == "stop") and broken_tool_block(full, thinking_mode, tools) is None
+            tries.append({"kept": k, "n": (end or {}).get("n"), "finish": (end or {}).get("finish"), "ok": ok,
+                          "cached_prefix": (end or {}).get("cached_prefix"), "ms": round((time.time() - t0) * 1000, 1),
+                          **({"error": str(end["error"])[:200]} if end and end.get("error") else {})})
+            if ok:
+                req_rec["tool_retry_ok"] = True
+                # the content up to `cut` is already out (streams): the new tail replaces only what follows it
+                return {"at": cut, "text": full[cut:]} if full[:cut] == gen_raw[:cut] else {"at": kept, "text": text}
+            if not end or not end.get("done") or end.get("finish") == "cancel":
+                break  # cancelled or failed: no further attempt
+        req_rec["tool_retry_ok"] = False
+        return {"at": cut, "text": ""}
 
     async def daemon_source():
         """DAEMON.generate — with images MediaTokens prepared, those hived already has go without their bytes (DaemonImages), and once more
@@ -3456,6 +3915,9 @@ async def chat(request: Request):
         stop_text = VisibleStop(body.get('stop'), thinking_mode == "thinking")  # D12: content only
         terminal = False
         generated = 0
+        gen_ids: list = []   # generated ids without stop ids, the raw text they decode to, its length after each (broken tool block retry)
+        gen_cum: list = []
+        gen_raw = ""
         monitor_stop = asyncio.Event()
         async def watch_disconnect():
             # Measured (2 in ~60 requests): when monitor.cancel() at the end of a response lands inside the anyio CancelScope
@@ -3483,6 +3945,9 @@ async def chat(request: Request):
                         if msg["id"] in stop_ids:
                             continue
                         raw = det.push(msg["id"])
+                        gen_ids.append(msg["id"])
+                        gen_raw += raw
+                        gen_cum.append(len(gen_raw))
                         if stage_text is not None and (stage_text.feed(raw) or generated == 1):  # the first id ends the prefill stage
                             stage_update(rid, stage=stage_text.stage, **({"tool_name": stage_text.tool} if stage_text.tool else {}))
                         piece = stop_text.push(raw)
@@ -3510,10 +3975,18 @@ async def chat(request: Request):
                         if "think_forced" in msg:  # only requests with a thinking cap (the daemon sends it only then) — also at the record's top level for aggregation
                             req_rec["think_forced"] = bool(msg["think_forced"])
                             req_rec["think_tokens"] = msg.get("think_tokens")
+                        if "allowed_tools_n" in req_rec:  # daemon's count of rows sampled through the tool-name constraint (absent: served unconstrained)
+                            req_rec["mask_applied"] = bool((msg.get("tool_mask") or {}).get("rows"))
                         if "hanja_filter" in req_rec:  # answer-span filter: served only when the daemon has a token list (done.token_mask) — else unfiltered
                             req_rec["hanja_filter_served"] = bool(msg.get("token_mask"))
+                        fix = None
+                        if (msg.get("finish") == "stop" and not images and not body.get("stop") and tool_retry_attempts()
+                                and (cut := broken_tool_block(gen_raw, thinking_mode, tools)) is not None):
+                            fix = await retry_tool_block(gen_ids, gen_cum, gen_raw, cut)
                         tail = stop_text.finish()
                         if tail: yield ('delta', tail)
+                        if fix is not None:
+                            yield ("retool", fix)
                         if msg.get("finish") == "cancel":
                             # D13: a daemon cancel must not be reported as length (= max_tokens reached) — a cut answer would look
                             #   like a normal truncation. OpenAI has no cancel finish reason. If the client disconnected this never
@@ -3568,6 +4041,8 @@ async def chat(request: Request):
                     return JSONResponse({'error': {'message': 'client disconnected'}}, status_code=499)
                 if kind == "delta":
                     text_parts.append(val)
+                elif kind == "retool":  # broken tool block: the text from val["at"] on is replaced (retry_tool_block)
+                    text_parts = ["".join(text_parts)[:val["at"]] + val["text"]]
                 elif kind == "done":
                     done = val
                 elif kind == "overflow":
@@ -3584,6 +4059,14 @@ async def chat(request: Request):
                 parsed = {"reasoning_content": text, "content": ""} if j < 0 else {"reasoning_content": text[:j], "content": text[j + len("</think>"):]}
             else:
                 parsed = {"content": text}
+            # 2026-11-11: content that writes DSML itself and then a real tool block — the reference parser rejects the whole text
+            #   (the notation in the content), so the block went out as text. The block is read on its own (as the stream does).
+            if done.get("finish") == "stop" and tools and not adapter_family() and "content" in parsed and (thinking_mode != "thinking" or j >= 0):
+                base = len(text) - len(parsed["content"])
+                p = tool_block_head(text, base)
+                calls = tool_block_calls(text, p, tools) if p is not None else None
+                if calls:
+                    parsed = {**parsed, "content": text[base:p].rstrip("\n"), "tool_calls": calls}
         message = {"role": "assistant", "content": parsed.get("content") or ""}
         note_cut_leak(message["content"], bool(parsed.get("tool_calls")))
         if done.get("finish") == "stop" and not parsed.get("tool_calls"):
@@ -3592,6 +4075,7 @@ async def chat(request: Request):
             message["reasoning_content"] = parsed["reasoning_content"]
         if parsed.get("tool_calls"):
             message["tool_calls"] = openai_tool_calls(parsed["tool_calls"])
+            note_allowed([c["function"]["name"] for c in message["tool_calls"]])
             bad = invalid_tool_args([(c["function"]["name"], c["function"]["arguments"]) for c in message["tool_calls"]])
             if bad:
                 req_rec["tool_args_invalid"] = bad
@@ -3638,6 +4122,16 @@ async def chat(request: Request):
             tstream = DsmlToolStream(ENC) if not adapter_family() else (ENC.ToolStream(ENC) if hasattr(ENC, "ToolStream") else None)
         done = {}
         gen_text = ""  # the generated text as one string (HIVE_TURN_PRERENDER parses it like the non-streaming path)
+        # 2026-11-11 (DeepSeek): only DSML at a block head (tool_block_head_at) is held as a tool block; any other "<｜DSML｜" is content
+        #   and goes out as it comes. A held block is given back as content — and the stream goes on — as soon as text follows its block
+        #   end ("</｜DSML｜ calls>" + anything but whitespace): it was an example in an answer, not the response's tool block. A block
+        #   without a block end stays held to the end of the response (that is where a real one ends, broken or not). Calls already sent
+        #   as tool_call deltas are never taken back, as before. Adapter families: unchanged (their marker anywhere starts the block).
+        narrow = not adapter_family()
+        calls_end = dsml_calls_end() if narrow else ""
+        body_at = 0      # where the content starts in gen_text (after the reasoning)
+        not_before = 0   # DSML before this offset of gen_text was found to be content
+        held_nl = ""     # the newlines between the content and the held block (not content when it is a tool block)
 
         def tool_chunks(piece):
             if tstream is None or tstream.broken:
@@ -3648,6 +4142,17 @@ async def chat(request: Request):
             yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
             source = run()
             async for kind, val in source:
+                if kind == "retool":
+                    # broken tool block (retry_tool_block): nothing of it went out unless calls were already streamed (those cannot be taken
+                    #   back — keep the original then). Drop it and feed the new tail through the same path (content, tool block).
+                    if tstream is not None and tstream.calls:
+                        continue
+                    gen_text, tool_buf, in_tool, buf, held_nl = gen_text[:val["at"]], "", False, "", ""
+                    if tstream is not None:
+                        tstream = DsmlToolStream(ENC)
+                    kind, val = "delta", val["text"]
+                    if not val:
+                        continue
                 if kind == "delta":
                     gen_text += val
                     buf += val
@@ -3665,25 +4170,36 @@ async def chat(request: Request):
                                 yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'reasoning_content': buf[:j]}, 'finish_reason': None}]})}\n\n"
                             buf = buf[j + len(te):]
                             in_think = False
+                            body_at = len(gen_text) - len(buf)
                             continue
                         if in_tool:
                             tool_buf += buf
                             for c in tool_chunks(buf):
                                 yield c
                             buf = ""
+                            if narrow and not (tstream is not None and tstream.calls):
+                                k = tool_buf.find(calls_end)
+                                if k >= 0 and tool_buf[k + len(calls_end):].strip():
+                                    # text after the block end: not the response's tool block — back to content, from the held newlines on
+                                    not_before = len(gen_text) - len(tool_buf) + k + len(calls_end)
+                                    buf, tool_buf, in_tool, held_nl = held_nl + tool_buf, "", False, ""
+                                    if tstream is not None:
+                                        tstream = DsmlToolStream(ENC)
+                                    continue
                             break
                         j = buf.find(DSML_START)
+                        while j >= 0 and narrow:
+                            q = len(gen_text) - len(buf) + j
+                            if q >= not_before and tool_block_head_at(gen_text, body_at, q):
+                                break
+                            j = buf.find(DSML_START, j + 1)  # DSML that does not start a block: content
                         if j >= 0:
                             # the reference format puts "\n\n" before the tool block ("{content}\n\n<｜DSML｜ calls>...") — those newlines are not content
                             pre = buf[:j].rstrip("\n")
                             if pre:
                                 yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'content': pre}, 'finish_reason': None}]})}\n\n"
-                            tool_buf = buf[j:]
-                            for c in tool_chunks(tool_buf):
-                                yield c
-                            buf = ""
-                            in_tool = True
-                            break
+                            held_nl, buf, in_tool = buf[len(pre):j], buf[j:], True
+                            continue  # the block's text goes through the in_tool branch above (tool_call deltas, the block-end check)
                         safe = buf if not any(buf.endswith(DSML_START[:k]) for k in range(1, len(DSML_START))) else buf[: len(buf) - max(k for k in range(1, len(DSML_START)) if buf.endswith(DSML_START[:k]))]
                         safe = safe[: len(safe.rstrip("\n"))]  # hold trailing newlines — they may start a "\n\n<｜DSML｜" tool block (emitted with the next piece or the final flush)
                         if safe:
@@ -3728,6 +4244,8 @@ async def chat(request: Request):
                 finish = "tool_calls"
             else:
                 yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'hive', 'choices': [{'index': 0, 'delta': {'content': tool_buf}, 'finish_reason': None}]})}\n\n"
+        if tool_buf and sent:
+            note_allowed([n for n, _ in sent])
         bad = invalid_tool_args(sent) if tool_buf and sent else []
         if bad:
             req_rec["tool_args_invalid"] = bad

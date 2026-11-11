@@ -89,6 +89,49 @@ int main() {
     all_ok = all_ok && ok;
     cudaFree(dQ); cudaFree(dK); cudaFree(dW); cudaFree(dQp); cudaFree(dKp); cudaFree(dV); cudaFree(s_ref); cudaFree(s_tc);
   }
+  // Sub-chunk invariance (HIVE_IDX_MSUB_MAX): the runtime cuts M rows into batches of Ms. Scores and the selected top-k must be byte-identical for every Ms,
+  // including Ms that start a batch inside a warp's 16 rows and that leave a warp half full.
+  for (const int T : {203, 8192, 40000}) {
+    const int M = 300, Hi = 32, Di = kvp::IDX_D, R = kvp::IDX_ROW, topk = std::min(512, T);
+    std::mt19937 rng(77 + T);
+    std::normal_distribution<float> nd;
+    std::vector<uint16_t> Q((size_t)M * Hi * Di), K((size_t)T * Di), W((size_t)M * Hi);
+    for (auto& v : Q) v = f2bits(nd(rng) * 2.f);
+    for (auto& v : K) v = f2bits(nd(rng));
+    for (auto& v : W) v = f2bits(nd(rng) * 0.02f);
+    std::vector<int32_t> vis(M);
+    for (int m = 0; m < M; ++m) vis[m] = (m % 7 == 0) ? T : (int)(rng() % (T + 1));
+    bf16 *dQ, *dK, *dW, *s; float* sf; uint8_t *dQp, *dKp; int32_t *dV, *pos;
+    CUDA_CHECK(cudaMalloc(&dQ, Q.size() * 2)); CUDA_CHECK(cudaMalloc(&dK, K.size() * 2)); CUDA_CHECK(cudaMalloc(&dW, W.size() * 2));
+    CUDA_CHECK(cudaMalloc(&dQp, (size_t)M * Hi * R)); CUDA_CHECK(cudaMalloc(&dKp, (size_t)T * R)); CUDA_CHECK(cudaMalloc(&dV, M * 4));
+    CUDA_CHECK(cudaMalloc(&s, (size_t)M * T * 2)); CUDA_CHECK(cudaMalloc(&sf, (size_t)M * T * 4)); CUDA_CHECK(cudaMalloc(&pos, (size_t)M * topk * 4));
+    CUDA_CHECK(cudaMemcpy(dQ, Q.data(), Q.size() * 2, cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(dK, K.data(), K.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dW, W.data(), W.size() * 2, cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(dV, vis.data(), M * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dQp, 0, (size_t)M * Hi * R)); CUDA_CHECK(cudaMemset(dKp, 0, (size_t)T * R));
+    k::fp4_pack(dK, T, Di, 32, false, dKp, R, 0);
+    k::fp4_pack(dQ, M * Hi, Di, 32, false, dQp, R, 0);
+    auto run = [&](int Ms0, std::vector<uint16_t>& hs, std::vector<int32_t>& hp) {
+      CUDA_CHECK(cudaMemset(s, 0xAB, (size_t)M * T * 2)); CUDA_CHECK(cudaMemset(pos, 0xAB, (size_t)M * topk * 4));
+      for (int m0 = 0; m0 < M; m0 += Ms0) {
+        const int Ms = std::min(Ms0, M - m0);
+        k::indexer_scores_tc(dQp + (size_t)m0 * Hi * R, dKp, dW + (size_t)m0 * Hi, Ms, Hi, T, dV + m0, s + (size_t)m0 * T, 0);
+        k::bf16_rows_to_f32(s + (size_t)m0 * T, Ms * T, sf, 0);
+        k::topk_select_rows(sf, Ms, T, topk, T, pos + (size_t)m0 * topk, topk, 0);
+      }
+      CUDA_CHECK(cudaDeviceSynchronize());
+      hs.resize((size_t)M * T); hp.resize((size_t)M * topk);
+      CUDA_CHECK(cudaMemcpy(hs.data(), s, hs.size() * 2, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hp.data(), pos, hp.size() * 4, cudaMemcpyDeviceToHost));
+    };
+    std::vector<uint16_t> s0, s1; std::vector<int32_t> p0, p1;
+    run(32, s0, p0);
+    for (const int Ms : {1, 16, 31, 64, 100, 127, 256, 300}) {
+      run(Ms, s1, p1);
+      const bool ok = s1 == s0 && p1 == p0;
+      printf("T=%-6d Ms=%-4d vs Ms=32: scores %s · top-k %s  %s\n", T, Ms, s1 == s0 ? "same" : "DIFFER", p1 == p0 ? "same" : "DIFFER", ok ? "PASS" : "FAIL");
+      all_ok = all_ok && ok;
+    }
+    cudaFree(dQ); cudaFree(dK); cudaFree(dW); cudaFree(dQp); cudaFree(dKp); cudaFree(dV); cudaFree(s); cudaFree(sf); cudaFree(pos);
+  }
   printf(all_ok ? "ALL PASS\n" : "SOME FAIL\n");
   return all_ok ? 0 : 1;
 }

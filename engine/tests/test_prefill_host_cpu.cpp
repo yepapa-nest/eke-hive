@@ -129,7 +129,8 @@ static void t_idx_msub() {
       for (int it = 0; it < 400; ++it) {
         const int M = 1 + (int)(rng() % WM);
         const int T = 1 + (int)(rng() % Tcap);
-        const int r = idx_msub_for(Msub, Tcap, nblocks_cap, topk_w, M, T, bs, CB, topk_idx);
+        const int topk_rows = (it & 1) ? std::max(Msub, std::min(WM, 256)) : Msub;  // HIVE_IDX_MSUB_MAX 256 / 0
+        const int r = idx_msub_for(Msub, Tcap, nblocks_cap, topk_w, M, T, bs, CB, topk_idx, topk_rows);
         ++cases;
         EXPECT(r >= Msub, "msub %d below constructor %d", r, Msub);
         EXPECT(r <= std::max(Msub, std::min(M, 65535)), "msub %d above bound (M %d)", r, M);
@@ -140,7 +141,7 @@ static void t_idx_msub() {
           const long long used_w = std::max(std::min(topk_idx, T), std::min(CB, nblocks));
           EXPECT((long long)r * cols <= (long long)Msub * (Tcap + 8), "iscore overflow: r %d cols %lld cap %lld", r, cols, (long long)Msub * (Tcap + 8));
           EXPECT((long long)r * nblocks <= (long long)Msub * nblocks_cap, "bmax overflow");
-          EXPECT((long long)r * used_w <= (long long)Msub * topk_w, "topk_pos overflow");
+          EXPECT((long long)r * used_w <= (long long)topk_rows * topk_w, "topk_pos overflow");
           EXPECT(r <= 65535, "grid.y overflow");
         }
       }

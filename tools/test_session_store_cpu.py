@@ -71,6 +71,13 @@ def run(exe, td):
     st = wait_writes(h, 1)
     # the rows restored from disk are known there: the follow-up writes its new rows, tokens and logits, not the whole image again
     ck.true('the follow-up checkpoint writes its increment only', 0 < st.get('written', 0) < full, f"{st.get('written')} vs first {full}")
+    # 2b. the very same prompt after a restart (a client's read-ahead) is served by the checkpoint at its end, with nothing read again
+    #     (2026-11-06, production: the checkpoint was refused at exactly that position — 250,960 tokens, 195 s, read again)
+    kill(h)
+    h = t.Hived(exe, td, env, name='st2b')
+    r = h.generate('S', B, 3)
+    t.done_ok(ck, 'the same prompt after a restart', r, B, 3, len(B))
+    ck.eq('the same prompt after a restart: nothing read', r['done'].get('prefill_tokens'), 0)
     # 3. a boundary snapshot of one conversation serves another after a restart
     C = t.tokens(500, 1602)
     r = h.generate('X', C + t.tokens(30, 1603), 3, boundaries=[500])

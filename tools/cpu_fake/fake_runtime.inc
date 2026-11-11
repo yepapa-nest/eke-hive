@@ -21,6 +21,7 @@
 #include <new>
 #include <thread>
 #include "hive/clock.h"
+#include "hive/spec_sample.h"  // mtp_draft's `q` parameter (HIVE_MTP_SAMPLE_DRAFTS) — complete type for vector::clear
 
 namespace hive {
 void fake_ckpt_put(const std::string&, const uint8_t*, size_t, const std::string& = "U8");
@@ -164,8 +165,10 @@ int Runtime::wake_warm(const std::vector<int32_t>& keys, const std::function<voi
   return store_.restore_keys(keys, promo_, [&](int d, int t) { if (progress) progress(d, t); fake_sleep_ms(fake_env("FAKE_WAKE_MS", 0)); });
 }
 static void fake_awake_check(bool asleep) { if (asleep) { fprintf(stderr, "fake: forward while asleep\n"); abort(); } }
-void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats*) {
+void Runtime::mtp_draft(Seq& seq, int32_t tok, std::vector<int32_t>& drafts, std::vector<float>& conf, ForwardStats*, const DraftSampling*,
+                        std::vector<hive::spec::Dist>* q) {
   HIVE_CHECK(mtp_on_ && seq.mtp_hidden_valid && seq.mtp_pos == seq.pos - 1, "mtp_draft needs the hidden of pos-1");
+  if (q) q->clear();   // the fake drafts greedily (no sampler candidates) — hived then verifies with the equality rule
   CUDA_CHECK(cudaStreamSynchronize(st_));
   const int B = mtp_block(), wrong = fake_env("FAKE_MTP_WRONG", 0);
   const char* cf = getenv("FAKE_MTP_CONF");

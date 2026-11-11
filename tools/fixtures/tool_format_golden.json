@@ -1,0 +1,12 @@
+{
+ "chat": {
+  "prompt_sha256": "0a8c37ecc766584f3f4def4ad405c759d86be5c8f2b1cfa65e3351acbd1fdf71",
+  "tokens": 750,
+  "ids_sha256": "2f1db37abb0f8e6b88d653d56bdeca3536b994c80547e28ed92316da6ecc96b2"
+ },
+ "thinking": {
+  "prompt_sha256": "4522bd5766a0979b7a14f455e2271efd6fba4723bb59a50ee0b75ca25a9a9d7a",
+  "tokens": 776,
+  "ids_sha256": "2fceed758d235644068f4ce006267816a341a80d92727e8268c490e2cd3d9402"
+ }
+}

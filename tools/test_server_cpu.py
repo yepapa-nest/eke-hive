@@ -292,6 +292,23 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         chunks = [x async for x in response.body_iterator]
         return chunks, seen, s.DAEMON.kw
 
+    async def test_unread_stream_entry_is_removed(self):
+        """2026-11-11: a stream response closed before its body was read left its status entry without an end time — never removed.
+        It is marked ended at the release (visible fields unchanged) and goes STAGE_KEEP_S later, when the next request opens."""
+        s.STAGE_STATUS = True
+        s.DAEMON = StageDaemon([1, 2, 3], [])
+        response = await s.chat(Request({**BODY, 'stream': True}))
+        (rid, st), = s.STAGES.items()
+        shown = {k: v for k, v in st.items() if not k.startswith('_')}
+        self.assertNotIn('_ended', st)
+        await response.close()
+        self.assertFalse(s.INFLIGHT)
+        self.assertIn('_ended', s.STAGES[rid])
+        self.assertEqual({k: v for k, v in s.STAGES[rid].items() if not k.startswith('_')}, shown)
+        s.STAGES[rid]['_ended'] -= s.STAGE_KEEP_S + 1
+        s.stage_open('chatcmpl-next', 10)
+        self.assertEqual(list(s.STAGES), ['chatcmpl-next'])
+
     async def test_off_changes_nothing(self):
         s.DSML_START = '<tool_call>'
         chunks_off, seen, kw = await self.stream([1, 2, 3, 4, 5, 6, 7, 8, 9], False)
@@ -315,6 +332,27 @@ class StageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[-1].get('tool_name'), 'read_file')
         final = await s.stage_status(rid)
         self.assertEqual(final['stage'], 'done'); self.assertEqual(final['id'], rid)
+
+    async def test_queued_only_when_seats_full(self):
+        """2026-11-09: other requests in flight are served together (up to HIVE_MAX_BATCH seats) — the arrival stage is prefill (being
+        handed over) unless every seat is taken; it used to be queued whenever anything else was in flight."""
+        class ArrivalDaemon(StageDaemon):
+            async def generate(self, session, *args, **kw):
+                self.arrival = s.STAGES[next(reversed(s.STAGES))]['stage']
+                async for m in super().generate(session, *args, **kw): yield m
+        s.STAGE_STATUS = True; s.DSML_START = '<tool_call>'
+        saved = s.STAGE_SEATS
+        try:
+            s.STAGE_SEATS = 8
+            for others, want in ((0, 'prefill'), (3, 'prefill'), (7, 'prefill'), (8, 'queued')):
+                s.INFLIGHT.clear(); s.STAGES.clear()
+                s.INFLIGHT.update({f'other{k}': 1 for k in range(others)})
+                s.DAEMON = ArrivalDaemon([1, 2, 3], [])
+                response = await s.chat(Request({**BODY, 'stream': True}))
+                _ = [x async for x in response.body_iterator]
+                self.assertEqual(s.DAEMON.arrival, want, others)
+        finally:
+            s.STAGE_SEATS = saved; s.INFLIGHT.clear()
 
     async def test_ds_tool_name_and_answer(self):
         s.DSML_START = '<｜DSML｜'
@@ -663,6 +701,198 @@ class ReviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(c['choices'][0]['delta'].get('tool_calls') for c in ch if c.get('choices')))
             self.assertEqual([c['choices'][0]['finish_reason'] for c in ch if c.get('choices') and c['choices'][0]['finish_reason']], ['tool_calls'])
             self.assertEqual(s.DAEMON.cancelled, [])
+
+    async def test_broken_tool_block_is_generated_again(self):
+        """2026-11-05, production: a DSML block the parser cannot read went to the user as content. The server continues from the end of
+        the content before it (same session, the generated ids kept) and replaces the block; when every attempt fails it drops it."""
+        class SeqDaemon(FlagDaemon):
+            def __init__(self, seqs): super().__init__([]); self.seqs=list(seqs); self.calls=[]
+            async def generate(self, session, ids, *a, **kw):
+                self.calls.append((session, list(ids), kw)); self.seq=self.seqs.pop(0)
+                async for m in FlagDaemon.generate(self, session, ids, *a, **kw): yield m
+        tools=[{'type':'function', 'function':{'name':'f', 'parameters':{}}}]
+        chat_body={**BODY, 'tools':tools}                                   # chat mode
+        think_body={'messages':BODY['messages'], 'tools':tools}             # thinking mode (default)
+        good=[8,9,99]
+        cases=[(chat_body, [1,8,6,99], [10,11,1], 'a'), (think_body, [1,5,6,8,7,99], [10,11,1,5,6], 'X')]
+        for body, broken, kept_ids, content in cases:
+            for stream in (False, True):
+                s.DAEMON=SeqDaemon([broken, good]); s.INFLIGHT.clear()
+                r=await s.chat(Request({**body, 'stream':stream}))
+                if stream:
+                    ch=sse_json([x async for x in r.body_iterator])
+                    got=''.join(c['choices'][0]['delta'].get('content') or '' for c in ch if c.get('choices'))
+                    calls=[d for c in ch if c.get('choices') for d in (c['choices'][0]['delta'].get('tool_calls') or [])]
+                    fin=[c['choices'][0]['finish_reason'] for c in ch if c.get('choices') and c['choices'][0]['finish_reason']]
+                else:
+                    m=r['choices'][0]; got=m['message']['content']; calls=m['message'].get('tool_calls') or []; fin=[m['finish_reason']]
+                self.assertEqual(got, content, (stream, body is think_body))
+                self.assertNotIn('DSML', got)
+                self.assertEqual(len(calls), 1); self.assertEqual(fin, ['tool_calls'])
+                (s1, ids1, kw1), (s2, ids2, kw2)=s.DAEMON.calls
+                self.assertEqual(s1, s2); self.assertEqual(ids2, kept_ids); self.assertEqual(kw1['rid'], kw2['rid'])
+                self.assertFalse(any(k.startswith('think_') for k in kw2))
+                self.assertFalse(s.INFLIGHT)
+        # every attempt broken: the block is dropped, not shown (2 attempts by default)
+        for stream in (False, True):
+            s.DAEMON=SeqDaemon([[1,8,6,99], [8,6,99], [8,7,99]]); s.INFLIGHT.clear()
+            r=await s.chat(Request({**chat_body, 'stream':stream}))
+            if stream:
+                ch=sse_json([x async for x in r.body_iterator])
+                got=''.join(c['choices'][0]['delta'].get('content') or '' for c in ch if c.get('choices'))
+                fin=[c['choices'][0]['finish_reason'] for c in ch if c.get('choices') and c['choices'][0]['finish_reason']]
+            else:
+                got=r['choices'][0]['message']['content']; fin=[r['choices'][0]['finish_reason']]
+            self.assertEqual((got, fin), ('a', ['stop']))
+            self.assertEqual(len(s.DAEMON.calls), 3)
+        # a retry that answers in text instead: that text is the answer
+        s.DAEMON=SeqDaemon([[1,8,6,99], [2,3,99]])
+        self.assertEqual((await s.chat(Request(chat_body)))['choices'][0]['message']['content'], 'abc')
+        # off (HIVE_TOOL_RETRY=0), no tools, or a block that parses: one generation, as before
+        os.environ['HIVE_TOOL_RETRY']='0'
+        try:
+            s.DAEMON=SeqDaemon([[1,8,6,99]])
+            self.assertIn('<｜DSML｜X', (await s.chat(Request(chat_body)))['choices'][0]['message']['content'])
+            self.assertEqual(len(s.DAEMON.calls), 1)
+        finally:
+            del os.environ['HIVE_TOOL_RETRY']
+        for body, seq in ((BODY, [1,8,6,99]), (chat_body, [1,8,9,99])):
+            s.DAEMON=SeqDaemon([seq])
+            await s.chat(Request(body))
+            self.assertEqual(len(s.DAEMON.calls), 1)
+
+    async def test_dsml_in_content_is_not_a_tool_block(self):
+        """2026-11-11: only DSML that starts like a tool block (after a blank line, or first in the content) AND ends the response is
+        a tool block. (a) an answer that writes the notation — inline, in a code fence, as a snippet after a blank line followed by more
+        text — goes out as written, one generation, in a stream without waiting for the end; (b) a broken block after the content and
+        (c) right after the reasoning (the 2026-11-05 shape) are generated again and dropped when every attempt fails; (d) content
+        that writes DSML and then a real tool block: the text stays text and the call is made."""
+        import re
+        class RefEncoder:
+            """The reference parser's rules: the block starts at "\n\n<｜DSML｜ calls", the content must not hold the DSML token, nothing follows the block."""
+            def parse_message_from_completion_text(self, text, thinking_mode=None, **kw):
+                if not text.endswith('<EOS>'): raise ValueError('no eos')
+                text, out = text[:-5], {}
+                if thinking_mode == 'thinking':
+                    if '</think>' not in text: raise ValueError('no end think')
+                    out['reasoning_content'], text = text.split('</think>', 1)
+                i = text.find('\n\n<｜DSML｜ calls')
+                content = text if i < 0 else text[:i]
+                if '｜DSML｜' in content: raise ValueError('special token in content')
+                if i >= 0:
+                    block = text[i + len('\n\n<｜DSML｜ calls'):]
+                    if not re.fullmatch(r'>\n(?:<｜DSML｜ invoke name="\w+">\n</｜DSML｜ invoke>\n)+</｜DSML｜ calls>', block): raise ValueError('bad dsml')
+                    out['tool_calls'] = [{'type': 'function', 'function': {'name': n, 'arguments': '{}'}} for n in re.findall(r'invoke name="(\w+)"', block)]
+                out['content'] = content
+                return out
+        class PieceTok(Tokenizer):
+            def __init__(self): self.pieces = {99: '<EOS>'}
+            def decode(self, ids, **kw): return ''.join(self.pieces[i] for i in ids)
+            def ids(self, text, step):   # text as ids of `step` characters each (new ids from 1000 on)
+                out = []
+                for k in range(0, len(text), step):
+                    i = 1000 + len(self.pieces); self.pieces[i] = text[k:k + step]; out.append(i)
+                return out + [99]
+        class SeqDaemon(FlagDaemon):
+            # texts[0] = the generation; the later ones = what a continuation should read as a whole — the daemon writes the part after
+            #   the ids it is given back (the prompt's two ids + the generated ids the server kept)
+            def __init__(self, texts, step): super().__init__([]); self.texts = list(texts); self.step = step; self.calls = []
+            async def generate(self, session, ids, *a, **kw):
+                self.calls.append(list(ids)); text = self.texts.pop(0); kept = s.TOK.decode(ids[2:])
+                assert text.startswith(kept), (text, kept)
+                self.seq = s.TOK.ids(text[len(kept):], self.step)
+                async for m in FlagDaemon.generate(self, session, ids, *a, **kw): yield m
+        GOOD = '<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>'
+        BROKEN = '<｜DSML｜ calls>\n<｜DSML｜ invoke name="give me</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>'   # 2026-11-05
+        tools = [{'type': 'function', 'function': {'name': 'f', 'parameters': {}}}]
+        chat_body = {**BODY, 'tools': tools}
+        think_body = {'messages': BODY['messages'], 'tools': tools}
+        saved = (s.TOK, s.ENC)
+        s.TOK, s.ENC = PieceTok(), RefEncoder()
+        async def ask(body, texts, stream, step):
+            s.DAEMON = SeqDaemon(texts, step); s.INFLIGHT.clear()
+            r = await s.chat(Request({**body, 'stream': stream}))
+            if stream:
+                ch = sse_json([x async for x in r.body_iterator])
+                parts = [c['choices'][0]['delta'].get('content') for c in ch if c.get('choices') and c['choices'][0]['delta'].get('content')]
+                calls = {}
+                for c in ch:
+                    for d in (c['choices'][0]['delta'].get('tool_calls') or []) if c.get('choices') else []:
+                        calls.setdefault(d['index'], {'name': '', 'arguments': ''})
+                        calls[d['index']]['name'] += d['function'].get('name') or ''; calls[d['index']]['arguments'] += d['function'].get('arguments') or ''
+                fin = [c['choices'][0]['finish_reason'] for c in ch if c.get('choices') and c['choices'][0]['finish_reason']]
+                return ''.join(parts), [(c['name'], c['arguments']) for _, c in sorted(calls.items())], fin, len(s.DAEMON.calls), parts
+            m = r['choices'][0]
+            return m['message']['content'], [(c['function']['name'], c['function']['arguments']) for c in m['message'].get('tool_calls') or []], [m['finish_reason']], len(s.DAEMON.calls), None
+        try:
+            # (a) the notation written in an answer: content, as written, one generation
+            with self.subTest('a: the notation in an answer is content'):
+                explain = ('Tools are called with `<｜DSML｜ calls>` and `<｜DSML｜ invoke`. In a fence:\n```\n' + GOOD + '\n```\nA snippet:\n\n'
+                           '<｜DSML｜ calls>\n...\n</｜DSML｜ calls>\n\nThat is all there is to it, and the answer goes on for a while after the snippet.')
+                for body, lead in ((chat_body, ''), (think_body, 'why</think>')):
+                    for stream in (False, True):
+                        for step in (1, 3, 7, 10 ** 6):
+                            got, calls, fin, n, parts = await ask(body, [lead + explain], stream, step)
+                            self.assertEqual((got, calls, fin, n), (explain, [], ['stop'], 1), (stream, step, bool(lead)))
+                            if stream and step == 1:
+                                # not held to the end: the inline mention is out long before the last piece, and the text after the
+                                #   snippet's block end comes in pieces of its own (the held snippet is given back at the first word after it)
+                                first = next(i for i, p in enumerate(parts) if 'DSML' in p)
+                                self.assertLess(first, len(parts) // 4)
+                                after = next(i for i in range(len(parts)) if 'That' in ''.join(parts[:i + 1]))
+                                self.assertGreater(len(parts) - after, 20)
+            # (b) content, then a broken block at the end: generated again (from the end of the content), dropped when every attempt fails
+            # (c) the same right after the reasoning, with and without the blank line (2026-11-05: after a thinking cap closed the reasoning)
+            with self.subTest('b, c: a broken block at the end / right after the reasoning'):
+                for body, lead, text, content in ((chat_body, '', 'Checking.\n\n' + BROKEN, 'Checking.'), (think_body, 'hm</think>', 'Checking.\n\n' + BROKEN, 'Checking.'),
+                                                  (think_body, 'hm</think>', BROKEN, ''), (think_body, 'hm</think>', '\n\n' + BROKEN, ''), (chat_body, '', BROKEN, ''),
+                                                  (chat_body, '', 'Checking.\n\n<｜DSML｜ invoke name="f">\n</｜DSML｜ invoke>', 'Checking.'),   # no calls line, no block end
+                                                  (chat_body, '', 'Checking.\n\n' + BROKEN + '\n', 'Checking.')):
+                    good, bad = lead + content + '\n\n' + GOOD, lead + content + '\n\n' + BROKEN
+                    for stream in (False, True):
+                        for step in (1, 5):
+                            got, calls, fin, n, _ = await ask(body, [lead + text, good], stream, step)
+                            self.assertEqual((got, calls, fin, n), (content, [('f', '{}')], ['tool_calls'], 2), (text, stream, step))
+                            got, calls, fin, n, _ = await ask(body, [lead + text, bad, bad], stream, step)
+                            self.assertEqual((got, calls, fin, n), (content, [], ['stop'], 3), (text, stream, step))
+                            self.assertNotIn('DSML', got)
+            # (d) content that writes DSML, then a real tool block: both
+            with self.subTest('d: DSML in the content, then a real tool block'):
+                for body, lead in ((chat_body, ''), (think_body, 'why</think>')):
+                    for pre in ('The `<｜DSML｜ calls>` tag starts a call. Calling now.', 'In a fence:\n```\n' + GOOD + '\n```\nCalling now.',
+                                'A snippet:\n\n<｜DSML｜ calls>\n...\n</｜DSML｜ calls>\n\nCalling now.'):
+                        for stream in (False, True):
+                            for step in (1, 4, 10 ** 6):
+                                got, calls, fin, n, _ = await ask(body, [lead + pre + '\n\n' + GOOD], stream, step)
+                                self.assertEqual((got, calls, fin, n), (pre, [('f', '{}')], ['tool_calls'], 1), (pre, stream, step, bool(lead)))
+            # a tool call the reference parser reads: as before (content, the call, one generation)
+            with self.subTest('a tool call that parses: as before'):
+                for body, lead in ((chat_body, ''), (think_body, 'why</think>')):
+                    for stream in (False, True):
+                        for step in (1, 4, 10 ** 6):
+                            got, calls, fin, n, _ = await ask(body, [lead + 'Calling.\n\n' + GOOD], stream, step)
+                            self.assertEqual((got, calls, fin, n), ('Calling.', [('f', '{}')], ['tool_calls'], 1), (stream, step))
+            self.assertFalse(s.INFLIGHT)
+        finally:
+            s.TOK, s.ENC = saved
+
+    def test_tool_block_head(self):
+        end = '</｜DSML｜ calls>'
+        for text, base, want in (('a\n\n<｜DSML｜ calls>x', 0, 3), ('<｜DSML｜ calls>x', 0, 0), (' \n<｜DSML｜ calls>x', 0, 2), ('r</think><｜DSML｜ calls>', 9, 9),
+                                 ('a <｜DSML｜ calls>x', 0, None), ('a\n<｜DSML｜ calls>x', 0, None), ('a\n\n<｜DSML｜ calls>x' + end + ' more', 0, None),
+                                 ('a\n\n<｜DSML｜ calls>x' + end + '\n \n', 0, 3), ('a\n\n<｜DSML｜ calls>x' + end + '<EOS>', 0, 3),
+                                 ('a\n\n<｜DSML｜ calls>x' + end + ' b\n\n<｜DSML｜ calls>y' + end, 0, 37), ('no dsml', 0, None)):
+            self.assertEqual(s.tool_block_head(text, base), want, text)
+
+    def test_tool_retry_cut(self):
+        self.assertEqual(s.tool_retry_cut([1, 12, 13], 1), 1)
+        self.assertEqual(s.tool_retry_cut([1, 1, 12], 1), 1)      # an id that added nothing yet (partial bytes) is not kept
+        self.assertEqual(s.tool_retry_cut([0, 5], 3), 0)
+        self.assertEqual(s.tool_retry_cut([2, 4], 9), 2)
+        raw = 'ab.\n\n<｜DSML｜X'                                    # ".\n\n" is one token: kept (only newlines past the cut)
+        self.assertEqual(s.tool_retry_cut([1, 2, 5, 13], 3, raw), 3)
+        raw = 'ab.\n\n<｜DSML｜X'                                    # a token reaching into the block is not kept
+        self.assertEqual(s.tool_retry_cut([1, 2, 7, 13], 3, raw), 2)
 
     async def test_d13_cancel_is_not_length_and_error_shape(self):
         class CancelDaemon(Daemon):
@@ -1433,6 +1663,24 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
             await s.chat(Request({'messages':other, 'reasoning_effort':'none'}))
             self.assertIsNone(extra())
             # the tracker keeps only hashes and stays bounded
+            # FirstTurnTails: a pair sharing all but the last block teaches the kind; only later first turns of that kind ask for the cut
+            ft=s.FirstTurnTails(); ft.MIN_SHARED=100
+            base=list(range(1000,1300)); a=base+[1]*50; b=base+[2]*80
+            self.assertFalse(ft.observe('p1','k',a,[300],now=1.0))        # first of the kind
+            self.assertFalse(ft.observe('p1','k',b,[300],now=2.0))        # the pair teaches it (and is not itself a first turn)
+            self.assertTrue(ft.observe('p2','k',a,[300],now=3.0))         # later first turn
+            self.assertFalse(ft.observe('p2','k',b,[300],now=4.0))        # its second request
+            self.assertFalse(ft.observe('p3','other',a,[300],now=5.0))    # another kind has not shown it
+            self.assertFalse(ft.observe('p3','other',a+[3]*9,[300],now=6.0))  # append-only teaches nothing
+            self.assertFalse(ft.observe('p4','other',a,[300],now=7.0))
+            self.assertFalse(ft.observe('p5',None,a,[300],now=8.0))       # no tag: nothing learned, nothing asked
+            self.assertFalse(ft.observe('p5',None,b,[300],now=9.0))
+            self.assertFalse(ft.observe('p6','short',[1]*60,[20],now=10.0))   # below MIN_SHARED
+            self.assertFalse(ft.observe('p6','short',[1]*20+[2]*40,[20],now=11.0))
+            self.assertFalse(ft.observe('p7','short',[1]*60,[20],now=12.0))
+            self.assertFalse(ft.observe('p8','k',a,[300],now=4.0+ft.TTL+1))    # expired
+            self.assertEqual(s.client_kind({'user-agent':'x','x-nest-feature':'f','user':'u'}),'x-nest-feature=f')
+            self.assertIsNone(s.client_kind({'user-agent':'x'}))
             t=s.TailChangeTracker(cap=2)
             for k in range(5): t.observe(f'k{k}', list(range(100)), [10, 50])
             self.assertEqual(list(t.entries), ['k3', 'k4'])
@@ -2023,6 +2271,103 @@ class TokenCacheTests(unittest.TestCase):
         self.check('d3', self.render(long_sys + [('user', 'other')]))         # new key served by content: not its own history
         self.assertNotIn('d3', self.cache.last_diverge)
 
+    def test_message_text_grown_in_place(self):
+        """2026-11-11: the last message's text grows in place (the same text plus more, then the same role marker). The kept
+        prompt's marker then starts exactly where the prompts part; the tokens before it were reused although the new prompt has
+        ordinary text there, which merges with the text before it — 92 of these 123 gave ids unlike a whole tokenization."""
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        base = '<|system|>you are helpful. <|user|>hello<|assistant|>ok<|user|>'
+        words = ['the engine streams experts over PCIe and computes misses on the CPU', 'def f(x):\n    return [i * i for i in range(x)]',
+                 '\uc11c\ubc84 \uc900\ube44 \ub2e8\uacc4\uc758 \uc2dc\uac04\uc744']
+        bad = total = 0
+        for w in words:
+            for i in range(1, len(w)):
+                self.cache = s.TokenCache()
+                self.cache.tokenize('k', base + w[:i] + '<|assistant|>')
+                ids, ends = self.cache.tokenize('k', base + w + '<|assistant|>')
+                enc = s.TOK(base + w + '<|assistant|>', return_offsets_mapping=True)
+                total += 1
+                bad += ids != list(enc['input_ids']) or list(ends) != [e for _, e in enc['offset_mapping']]
+                self.assertEqual(self.cache.hits, 1)   # still served from the kept prompt (cut at the marker before the message)
+        self.assertEqual((bad, total), (0, 123))
+
+    def test_random_edits_match_whole_tokenization(self):
+        """2026-11-11: a chain of random edits under one key and under new keys — text grown in place, inserted, deleted, replaced,
+        the prompt cut short (also inside a marker), edits right before and right after a marker — always equals a whole
+        tokenization: ids, token ends, and the kept cut points."""
+        import random
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        rnd = random.Random(20261111)
+        marks = ['<|user|>', '<|assistant|>', '<|system|>']
+        bits = ['the engine ', 'streams experts', ' over PCIe', 'def f(x):\n    return ', '[i * i for i in range(x)]', '\uc11c\ubc84 \uc900\ube44',
+                ' \ub2e8\uacc4\uc758 \uc2dc\uac04\uc744', 'a', ' ', 'x1', '<|use', 'r|>', '<|', '|>', '<', '>', 'assistant', '\n\n']
+        def text():
+            return ''.join(rnd.choice(bits) for _ in range(rnd.randint(0, 6)))
+        def fresh():
+            return '<|system|>' + text() + ''.join(rnd.choice(marks) + text() for _ in range(rnd.randint(1, 8)))
+        def edit(p):
+            spots = [i for m in marks for i in range(len(p)) if p.startswith(m, i)]
+            at = rnd.choice(spots) if spots and rnd.random() < 0.7 else rnd.randint(0, len(p))
+            if spots and rnd.random() < 0.5:
+                at += rnd.choice([0, 0, len(next(m for m in marks if p.startswith(m, at))), rnd.randint(1, 5), -rnd.randint(1, 3)]) if at in spots else 0
+            at = max(0, min(len(p), at))
+            op = rnd.randint(0, 5)
+            if op == 0: return p[:at] + text() + rnd.choice(bits) + p[at:]                 # insert (before / after / inside a marker)
+            if op == 1: return p[:at] + p[at + rnd.randint(1, 12):]                        # delete
+            if op == 2: return p[:at] + rnd.choice(marks) + text() + p[at:]                # a new message
+            if op == 3: return p[:at]                                                      # cut short
+            if op == 4: return p + rnd.choice(bits) + text() + rnd.choice(marks + [''])    # append
+            return p[:at] + text() + p[at + rnd.randint(0, 20):]                           # replace
+        checked = reused = 0
+        for chain in range(120):
+            self.cache = s.TokenCache()
+            p = fresh()
+            for step in range(8):
+                ids, ends = self.cache.tokenize('k', p)
+                enc = s.TOK(p, return_offsets_mapping=True)
+                self.assertEqual(ids, list(enc['input_ids']), (chain, step, p))
+                self.assertEqual(list(ends), [e for _, e in enc['offset_mapping']], (chain, step, p))
+                kept = self.cache.entries['k']
+                self.assertEqual(list(kept[3]), [b for b, _ in enc['offset_mapping']], (chain, step, p))
+                self.assertEqual(list(kept[4]), [b for (b, _), v in zip(enc['offset_mapping'], enc['input_ids']) if v in self.cache.cut_ids], (chain, step, p))
+                checked += 1
+                p = edit(p)
+            reused += self.cache.hits
+        self.assertEqual(checked, 960)
+        self.assertGreater(reused, 300)   # the edits were served from the kept prompt, not tokenized whole
+        # new keys served by content (the 4,096-character floor): the same edits on a long shared head
+        head = '<|system|>sys<|user|>' + 'the engine streams experts over PCIe ' * 150
+        self.cache = s.TokenCache()
+        p = head + '<|user|>hello'
+        for step in range(150):
+            ids, ends = self.cache.tokenize(f'k{step}', p)
+            enc = s.TOK(p, return_offsets_mapping=True)
+            self.assertEqual(ids, list(enc['input_ids']), (step, p[len(head):]))
+            self.assertEqual(list(ends), [e for _, e in enc['offset_mapping']], (step, p[len(head):]))
+            q = edit(p[len(head):]) if rnd.random() < 0.8 else p[len(head):] + text()
+            p = head + q
+        self.assertEqual(self.cache.hits, 149)   # every prompt after the first reused the long head
+
+    def test_marker_inside_a_longer_added_token_is_not_a_cut_point(self):
+        """2026-11-11: an added token that contains a marker past its own first character ('A<|user|>B') can begin before the marker
+        and end after it; text appended after the marker then changes the tokens BEFORE it. Such a marker is not a cut point. A longer
+        added token that begins where the marker begins ('<|assistant|>2') is caught by the tail's first token."""
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        from tokenizers import AddedToken
+        s.TOK.add_special_tokens({'additional_special_tokens': ['<|user|>', '<|assistant|>', '<|system|>', 'A<|user|>B', '<|assistant|>2',
+                                                                AddedToken('<|word|>', single_word=True)]})
+        self.cache._bind(s.TOK)
+        self.assertNotIn(s.TOK.convert_tokens_to_ids('<|user|>'), self.cache.cut_ids)
+        self.assertIn(s.TOK.convert_tokens_to_ids('<|assistant|>'), self.cache.cut_ids)
+        self.check('m1', '<|system|>sys<|assistant|>ok A<|user|>')
+        self.check('m1', '<|system|>sys<|assistant|>ok A<|user|>B more')       # 'A<|user|>B' is one token now
+        self.check('m2', '<|system|>sys<|assistant|>ok<|assistant|>')
+        self.check('m2', '<|system|>sys<|assistant|>ok<|assistant|>2 more')    # '<|assistant|>2' is one token now
+        self.check('m3', '<|system|>sys<|assistant|>ok <|word|> x')
+        self.check('m3', '<|system|>sys<|assistant|>ok <|word|>x')             # no longer a whole word: ordinary text
+        self.check('m3', '<|system|>sys<|assistant|>ok <|word|>')
+        self.check('m3', '<|system|>sys<|assistant|>ok <|word|> y<|user|>z')
+
     def test_off_switch_and_lstrip_markers(self):
         os.environ['HIVE_TOKEN_CACHE'] = '0'
         p = self.render([('user', 'x'), ('assistant', 'y')])
@@ -2059,6 +2404,209 @@ class TokenCacheTests(unittest.TestCase):
             self.assertTrue(self.cache.disabled)
         finally:
             threading.Thread = real_thread
+
+
+class SameResultTests(unittest.TestCase):
+    """2026-11-11: three preparation steps made cheaper (the read-ahead plan through TokenCache.peek, one PrefixHashes for the three
+    tail trackers, new conversation keys compared only with kept prompts that share their first 4,096 characters) give the values
+    the former code gave — each compared here with that code's steps on the same inputs."""
+    def setUp(self):
+        self.saved = (s.TOK, s.ENC, s.encode_prompt, s.TOKCACHE, s.PRERENDER_MIN, dict(s.PRERENDER_CLIENT_KEEPS), s._common_prefix_len, s._first_end_past)
+        s.TOK = bpe_tokenizer()
+        s.TOKCACHE = s.TokenCache()
+        self.env = {k: os.environ.pop(k, None) for k in ('HIVE_TOKEN_CACHE', 'HIVE_TOKEN_CACHE_VERIFY', 'HIVE_TOKEN_CACHE_SESSIONS', 'HIVE_TOKEN_CACHE_TOKENS', 'HIVE_PREFIX_SHARE')}
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+    def tearDown(self):
+        s.TOK, s.ENC, s.encode_prompt, s.TOKCACHE, s.PRERENDER_MIN = self.saved[:5]
+        s.PRERENDER_CLIENT_KEEPS.clear(); s.PRERENDER_CLIENT_KEEPS.update(self.saved[5])
+        s._common_prefix_len, s._first_end_past = self.saved[6:]
+        for k, v in self.env.items():
+            os.environ.pop(k, None)
+            if v is not None: os.environ[k] = v
+
+    def test_turn_prerender_plan_same_with_kept_tokens(self):
+        """prerender_plan with the conversation's kept tokens (cache_key) == without them == the former steps (whole tokenization with
+        offsets, the character loop, the token scan), over random conversations and both client habits; and the plan leaves the token
+        cache as it was (entries, their order, the hit count, the divergence record)."""
+        import random
+        def render(messages, tools, thinking_mode, effort):  # keeps reasoning only after the last user message (Qwen / DeepSeek style)
+            last = max(i for i, m in enumerate(messages) if m['role'] == 'user')
+            text = ''
+            for i, m in enumerate(messages):
+                text += '<|' + m['role'] + '|>'
+                if m['role'] == 'assistant':
+                    r = m.get('reasoning_content') or ''
+                    text += ('<think>' + r + '</think>' if i > last and r else '') + (m.get('content') or '') + '<eos>'
+                else:
+                    text += m.get('content') or ''
+            return text + '<|assistant|><think>', []
+        def render_keep(messages, tools, thinking_mode, effort):  # keeps every turn's reasoning (GLM style)
+            text = ''
+            for m in messages:
+                r = m.get('reasoning_content') or ''
+                text += '<|' + m['role'] + '|>' + ('<think>' + r + '</think>' if m['role'] == 'assistant' and r else '') + (m.get('content') or '') + ('<eos>' if m['role'] == 'assistant' else '')
+            return text + '<|assistant|><think>', []
+        class Parse:
+            def parse_message_from_completion_text(self, text, thinking_mode=None, **kw):
+                text = text.replace('<bos>', '')
+                r, c = text.split('</think>', 1) if '</think>' in text else ('', text)
+                return {'reasoning_content': r, 'content': c}
+        s.ENC = Parse(); s.TOK.eos_token = '<bos>'
+        rnd = random.Random(3)
+        bits = ['the engine streams experts ', 'over PCIe and computes ', 'def f(x):\n    return x', '\uc11c\ubc84 \uc900\ube44 \ub2e8\uacc4', ' misses on the CPU. ', '12', '\n']
+        def words(lo, hi): return ''.join(rnd.choice(bits) for _ in range(rnd.randint(lo, hi)))
+        def former(loop_prefix, scan):
+            def run(*a):
+                keep = (s._common_prefix_len, s._first_end_past, s.TOKCACHE.peek)
+                def whole(key, prompt):
+                    enc = s.TOK(prompt, return_offsets_mapping=True)
+                    return list(enc['input_ids']), [int(e) for _, e in enc['offset_mapping']]
+                s._common_prefix_len, s._first_end_past, s.TOKCACHE.peek = loop_prefix, scan, whole
+                try: return s.prerender_plan(*a)
+                finally:
+                    s._common_prefix_len, s._first_end_past = keep[:2]; del s.TOKCACHE.peek
+            return run
+        def loop_prefix(a, b):
+            c, n = 0, min(len(a), len(b))
+            while c < n and a[c] == b[c]: c += 1
+            return c
+        def scan(ends, c):
+            b = 0
+            while b < len(ends) and ends[b] <= c: b += 1
+            return b
+        old_plan = former(loop_prefix, scan)
+        plans = nones = 0
+        for case in range(60):
+            s.encode_prompt = rnd.choice([render, render_keep])
+            s.PRERENDER_MIN = rnd.choice([8, 16, 64, 256])
+            s.PRERENDER_CLIENT_KEEPS.clear()
+            sends_back = rnd.random() < 0.5
+            msgs = [{'role': 'system', 'content': words(2, 30)}]
+            for turn in range(rnd.randint(1, 4)):
+                msgs.append({'role': 'user', 'content': words(1, 6)})
+                if turn or rnd.random() < 0.7:
+                    msgs.append({'role': 'assistant', 'content': words(1, 8), **({'reasoning_content': words(1, 8)} if sends_back else {})})
+            if msgs[-1]['role'] == 'assistant':
+                msgs.append({'role': 'user', 'content': words(1, 6)})
+            for step in range(rnd.randint(0, 2)):   # tool steps of the current turn (reasoning sent back within the turn)
+                msgs += [{'role': 'assistant', 'content': words(0, 3), 'reasoning_content': words(1, 20)}, {'role': 'tool', 'content': words(1, 10)}]
+            raw = words(1, 40) + '</think>' + words(1, 10)
+            if rnd.random() < 0.3: s.PRERENDER_CLIENT_KEEPS['ua'] = rnd.random() < 0.5
+            habit = dict(s.PRERENDER_CLIENT_KEEPS)
+            s.TOKCACHE = s.TokenCache()
+            key = 'conv' if rnd.random() < 0.8 else 'other'
+            s.TOKCACHE.tokenize('conv', s.encode_prompt(msgs, None, 'thinking', None)[0])   # the request this turn answered
+            s.TOKCACHE.tokenize('side', '<|system|>another conversation<|user|>hi')
+            before = (list(s.TOKCACHE.entries.items()), s.TOKCACHE.hits, dict(s.TOKCACHE.last_diverge), s.TOKCACHE.kept_tokens)
+            got = []
+            for share in ('', '1'):
+                os.environ['HIVE_PREFIX_SHARE'] = share
+                for plan in (old_plan, lambda *a: s.prerender_plan(*a), lambda *a: s.prerender_plan(*a, key)):
+                    s.PRERENDER_CLIENT_KEEPS.clear(); s.PRERENDER_CLIENT_KEEPS.update(habit)
+                    info = {}
+                    out = plan(msgs, None, 'thinking', None, raw, 'ua', info)
+                    got.append((share, out if out is None else (list(out[0]), list(out[1]), out[2]), info, dict(s.PRERENDER_CLIENT_KEEPS)))
+                self.assertEqual(got[-3][1:], got[-2][1:], case); self.assertEqual(got[-3][1:], got[-1][1:], case)
+            after = (list(s.TOKCACHE.entries.items()), s.TOKCACHE.hits, dict(s.TOKCACHE.last_diverge), s.TOKCACHE.kept_tokens)
+            self.assertEqual(len(before[0]), len(after[0]))
+            self.assertTrue(all(a[0] == b[0] and a[1] is b[1] for a, b in zip(before[0], after[0])), case)
+            self.assertEqual(before[1:], after[1:], case)
+            plans += got[0][1] is not None; nones += got[0][1] is None
+        self.assertGreater(plans, 10); self.assertGreater(nones, 10)   # both outcomes were compared
+
+    def test_peek_equals_whole_tokenization_and_keeps_nothing(self):
+        import random
+        rnd = random.Random(5)
+        marks = ['<|user|>', '<|assistant|>', '<|system|>']
+        bits = ['the engine ', 'streams experts', 'def f(x):', '\uc11c\ubc84', ' ', 'a', '<|use', 'r|>', '\n']
+        def text(): return ''.join(rnd.choice(bits) for _ in range(rnd.randint(0, 6)))
+        cache = s.TOKCACHE
+        for case in range(300):
+            p = '<|system|>' + text() + ''.join(rnd.choice(marks) + text() for _ in range(rnd.randint(1, 6)))
+            cache.tokenize('k', p)
+            at = rnd.randint(0, len(p))
+            q = rnd.choice([p + text() + rnd.choice(marks) + text(), p[:at] + text() + p[at:], p[:at], p, text()])
+            before = (list(cache.entries.items()), cache.hits, dict(cache.last_diverge), cache.kept_tokens)
+            ids, ends = cache.peek(rnd.choice(['k', 'k', 'missing', None]), q)
+            enc = s.TOK(q, return_offsets_mapping=True)
+            self.assertEqual(ids, list(enc['input_ids']), (p, q)); self.assertEqual(list(ends), [e for _, e in enc['offset_mapping']], (p, q))
+            after = (list(cache.entries.items()), cache.hits, dict(cache.last_diverge), cache.kept_tokens)
+            self.assertTrue(all(a[0] == b[0] and a[1] is b[1] for a, b in zip(before[0], after[0])) and before[1:] == after[1:])
+        os.environ['HIVE_TOKEN_CACHE'] = '0'
+        ids, ends = cache.peek('k', p)
+        self.assertEqual(ids, list(s.TOK(p)['input_ids']))
+
+    def test_first_end_past(self):
+        import random
+        rnd = random.Random(9)
+        def scan(ends, c):
+            b = 0
+            while b < len(ends) and ends[b] <= c: b += 1
+            return b
+        for case in range(400):
+            n = rnd.randint(0, 40)
+            ends = sorted(rnd.randint(0, 30) for _ in range(n)) if rnd.random() < 0.8 else [rnd.randint(0, 30) for _ in range(n)]
+            c = rnd.randint(-2, 33)
+            self.assertEqual(s._first_end_past(array('l', ends), c), scan(ends, c), (ends, c))
+            self.assertEqual(s._first_end_past(ends, c), scan(ends, c), (ends, c))
+
+    def test_prefix_hashes_equal_one_shot_hashing(self):
+        """PrefixHashes.get(n) == blake2b-128 of the first n ids as int32 bytes, asked in any order; and each tracker answers and keeps
+        the same with one shared PrefixHashes per request as with none (its own hashing), over random request sequences."""
+        import random
+        rnd = random.Random(17)
+        for case in range(60):
+            ids = [rnd.randint(0, 2 ** 31 - 1) for _ in range(rnd.randint(0, 300))]
+            view = memoryview(array('i', ids)).cast('B')
+            ph = s.PrefixHashes(ids)
+            for n in [rnd.randint(-3, len(ids) + 3) for _ in range(40)] + [0, len(ids)]:
+                self.assertEqual(ph.get(n), hashlib.blake2b(view[: n * 4], digest_size=16).digest(), (len(ids), n))
+        self.assertEqual(s.TailChangeTracker._hash(memoryview(array('i', [1, 2, 3])).cast('B'), 8), s.PrefixHashes([1, 2, 3]).get(2))
+        runs = []
+        for shared in (False, True):
+            rnd = random.Random(23)
+            tails, seen, first = s.TailChangeTracker(cap=6), s.SeenPrefixes(cap=40), s.FirstTurnTails(cap=6)
+            first.MIN_SHARED = 20
+            convs, out = {}, []
+            for step in range(600):
+                key = f'c{rnd.randint(0, 8)}'
+                ids = list(convs.get(key) or [rnd.randint(1, 5) for _ in range(rnd.randint(30, 80))])
+                op = rnd.randint(0, 3)
+                if op == 0: ids += [rnd.randint(1, 5) for _ in range(rnd.randint(1, 40))]                       # append
+                elif op == 1: ids = ids[: rnd.randint(1, len(ids))] + [rnd.randint(6, 9) for _ in range(rnd.randint(1, 30))]   # changed tail
+                elif op == 2: ids = [rnd.randint(1, 5) for _ in range(rnd.randint(30, 80))]                    # another head
+                convs[key] = ids
+                hints = sorted(rnd.sample(range(1, len(ids) + 1), min(len(ids), rnd.randint(0, 5))))
+                if rnd.random() < 0.2: hints = hints[::-1] + [len(ids) + 7]
+                ph = s.PrefixHashes(ids) if shared else None
+                kind = rnd.choice([None, 'a', 'b'])
+                out.append((tails.observe(key, ids, hints, rnd.random() < 0.5, ph), first.observe(key, kind, ids, hints, 1000.0 + step, ph),
+                            seen.observe(key, ids, hints, ph)))
+            runs.append((out, list(tails.entries.items()), list(seen.entries.items()), list(first.first.items()), dict(first.kinds)))
+        self.assertEqual(runs[0], runs[1])
+        self.assertTrue(any(a for a, _, _ in runs[0][0]) and any(c for _, _, c in runs[0][0]))   # the flags did fire
+
+    def test_new_key_is_compared_only_with_prompts_sharing_its_head(self):
+        """A new key reuses a kept prompt exactly when the longest common prefix over ALL kept prompts is 4,096+ characters (the former
+        rule, computed here over every entry), and takes that longest one."""
+        import random
+        rnd = random.Random(29)
+        cache = s.TOKCACHE
+        heads = ['<|system|>' + c * 30 + '<|user|>' + ('the engine streams experts ' * 200) for c in 'abc']
+        used = 0
+        for step in range(120):
+            h = rnd.choice(heads)
+            cutat = rnd.choice([4090, 4095, 4096, 4097, 4200, len(h)])
+            p = h[:cutat] + rnd.choice(['', 'X', '<|assistant|>ok<|user|>' + 'tail ' * rnd.randint(0, 30)]) + str(step)
+            best = max((s._common_prefix_len(e[0], p) for e in cache.entries.values()), default=0)
+            h0 = cache.hits
+            ids, ends = cache.tokenize(f'k{step}', p)
+            self.assertEqual(ids, list(s.TOK(p)['input_ids']))
+            if best < 4096: self.assertEqual(cache.hits, h0, step)
+            else:
+                # the marker inside the shared head is a cut point, so a 4,096+ share is always reused
+                self.assertEqual(cache.hits, h0 + 1, step); used += 1
+        self.assertGreater(used, 30)
 
 
 class AnnouncedToolsTests(unittest.TestCase):

@@ -467,7 +467,10 @@ __device__ __forceinline__ void q3_stage_row(const DecRowSrc& s, int m, DecRow* 
   r.dsti = s.dsti ? s.dsti[m] : 0;
   r.pad_[0] = r.pad_[1] = r.pad_[2] = 0;
   tab[m] = r;
-  if (soa) { soa->kptr[m] = r.kptr; soa->trows[m] = r.trows; soa->visible[m] = r.visible; }
+  if (soa) {
+    soa->kptr[m] = r.kptr; soa->trows[m] = r.trows; soa->visible[m] = r.visible;
+    soa->skv[m] = r.skv; soa->ssc[m] = r.ssc; soa->pos[m] = r.pos; soa->ring[m] = s.ring ? s.ring[m] : nullptr;  // HIVE_VERIFY_TAB_DEV (DecSoA)
+  }
 }
 // NBL = (K/32)/32 blocks per lane (K = 5120 → 5) · NQ = Nqa/256 (1280 → 5) · ND = D/256 (512 → 2)
 template <int NBL, int NQ, int ND>

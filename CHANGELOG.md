@@ -1,8 +1,91 @@
 # Changelog
 
+
+## 2026-11-11 — A value bug in deferred experts, the session store at its budget, the first token under load
+
+Found by reading two days of production records and the whole DeepSeek path (measured on an RTX PRO 6000 at 450 W, side by side with the previous tree in one window).
+
+- **Deferred expert rows were added to the wrong rows (`HIVE_DECODE_DEFER`, M ≥ 2).** `hc_inject_rows` reads the mapped row table when it runs, but the host rewrote that table for the next layer right after issuing it. Measured with `HIVE_DECODE_DEFER_CHECK=1` over c1/c4/c8 chat: the kernel read a rewritten table in 62,836 of 120,000 deferred batches (52.4 %), 84,637 of 210,364 rows (40.2 %) carried another row's number — a CPU expert ranked 3rd or lower was then added to another conversation of the batch or another verify position. There are two sets of the table and output rows now; the same measurement reads 0 of 120,000. Speed unchanged (c1 82.4 → 82.8, c4 117.6 → 117.3 tok/s with the check on). `HIVE_DECODE_DEFER_SETS=1` keeps one set (A/B only).
+- **Session store at its budget.** Every write rebuilt the set of referenced packs from all entries under the index lock, once more per evicted entry, and scanned every known segment per dropped pack; the engine thread reads that index at each chunk end and admission. Production (22,107 entries, 960,378 pack references): a write took 70 ms (p50) / 143 ms (p99) before the store filled and 205 ms / 1,855 ms after — 85 minutes a day in which no request advanced, against 6. Pack references are counted as entries come and go, files are removed outside the lock (`tests/test_session_store_evict_cpu.cpp`: 1.06 ms a write at 6,800 entries × 48 references, 16.4 ms before). The budget now drops the least recently *used* entry (a read, or the engine reusing the in-memory copy, refreshes it) — it used to order by write time, so a system block resumed from every minute went first.
+- **`HIVE_TAIL_FIRST` (default on).** A turn is read as "the new tokens up to the generation suffix" + "the 3–16 suffix tokens". With decoders running they got their share (0.515 × the chunk's time) between the two, so the first token waited that long for a ~77 ms forward. The tail now runs first, on the single and the batched path (CPU test: 63–66 decoder tokens between the two pieces → 0–1; first token 0.65 → 0.44 s on the fake runtime). A decoder beside a stream of arrivals decodes in a larger batch sooner instead of alone (85K prefill + 4 short arrivals: 14.2 → 12.4 tok/s mean of 3, range 9.9–14.2 vs 12.3–15.3).
+- **Arrival order.** With `HIVE_PRIORITY_SHARED` the queue still compared raw priorities (-1 before 0 before 1), in the main loop and at layer yields; both compare classes now. A queued request its client gave up is answered at once and never read (it was swept only while idle), and a prefill stops before its next chunk when the client is gone.
+- **Disk snapshot search.** The candidates only share the prompt's token at their position; an unrelated one that was in memory ended the search before the matching one on disk was tried. The key is confirmed first. The in-memory search compares the last token before the whole prefix (8,185 snapshots in production, most sharing a system block of tens of thousands of tokens with any prompt).
+- **Device copies of mapped tables (bit-identical; logits and session image of a 65,536-row prefill with decoders at its yields compared off vs on):** `HIVE_ROUTER_MASK_DEV`, `HIVE_VERIFY_TAB_DEV`, `HIVE_PF_POS_DEV`, `HIVE_PF_EMBED_DEV`, `HIVE_PF_ENGRAM_DEV`, `HIVE_PF_CPU_ROWS_DEV` (all default on). Reading 16K–48K new tokens at 0/256K/512K context: 4.2–6.2 % faster in all six cells (48K: 6.82 → 6.42, 7.87 → 7.54, 9.10 → 8.62 s).
+- **Token cache.** A message grown in place could reuse the token before a marker that no longer stood there, giving ids that differ from tokenizing the whole prompt (92 of 123 edits on the test tokenizer, 336 of 3,200 on a real one; never seen in production). Reuse now stops at markers that lie wholly inside the common prefix.
+- **Tool block head.** `<｜DSML｜` counts as a tool block only at its head position (after a blank line, or first after the reasoning) and as the last piece of the answer; text that mentions the notation goes out as written. Production: some retries had regenerated 7–10K tokens twice for such answers.
+- **Server preparation:** the read-ahead plan tokenizes only the tail of a kept prompt (1,382 → 82 ms at 830K tokens when nothing needs reading), the three tail trackers share one prefix hash pass (125 → 34 ms), a new conversation key is compared only with prompts sharing its head; tool arguments that are not a JSON object render as `{}` instead of failing the room (Qwen, GLM); an unread stream's stage entry is removed.
+- **Measured (450 W, previous → this tree):** official cell c1 86.5 → 87.0, c4 122.6 → 122.7, c8 172.5 → 174.9, c16 172.1 → 172.4 tok/s; thinking axis (effort low, temperature 1.0) c1 79.0 → 80.9, c4 116.1 → 118.7, c8 152.2 → 158.8 tok/s, c8 TTFT 0.94 → 0.71 s. Decode right after a 32K / 64K prefill, mean of three cells each: 75.8 → 72.2 and 74.2 → 70.3 tok/s with ranges that overlap (70.3–80.1 vs 65.8–79.8); after an 8K prefill 66.6 → 68.4 and 65.0 → 70.8.
+- **Qwen3.8-Flash-Next (compiled and CPU-tested; not run on a GPU):** per-forward flags saved across a layer yield and the device route re-checked after it, the draft-chain graph no longer captures an unscored selection at the 2,048 boundary, the PLE row buffer is not overwritten by the next block of a layer-major prefill, a warm start skips keys being promoted, the single-draft graph key has no session pointer, `after_step` builds its victim lists only when they can be read.
+
+## 2026-11-09 — "Queued" only when the engine is full
+
+- `HIVE_STAGE_STATUS`: a request now starts as `queued` only when every seat is taken (`HIVE_MAX_BATCH` requests in flight); otherwise it starts as `prefill` (being handed over). It used to be `queued` whenever any other request was in flight, so clients showed "waiting for an earlier request" while the engine was already serving it beside the others (production, 1,415 requests in a day: arrival → admitted median 0.13 s, p90 0.36 s).
+
+## 2026-11-07 — Long conversations read new tokens up to twice as fast
+
+- The prefill indexer's score kernels read each row's visible count from mapped host memory in every block, a PCIe round trip each, so reading new tokens slowed as a conversation grew. A small kernel now copies the table to device memory once per stage (`HIVE_IDX_VIS_DEV`, default on; decode moved off the mapped table earlier). 48K new tokens after a 512K context: 16.55 → 8.41 s; after 256K: 11.56 → 7.48 s; from an empty context: 8.09 → 6.64 s. Same bits: logits and session images compared at a 1M context.
+- The indexer's top-k buffer no longer pins long prompts to 32 rows per launch at a 1M context (`HIVE_IDX_MSUB_MAX`, default 256, about 2 MB).
+- `HIVE_LAYER_YIELD_SHARE` 0.2 → 0.3: a decoder beside a long prefill keeps its speed now that the indexer stage is shorter.
+
+## 2026-11-06 — Less reading the same tokens again
+
+- The session store's checkpoint now serves a request whose prompt ends exactly at it. A read-ahead of the same prompt after a restart used to read the tail again (production: 250,960 tokens, 195 s).
+- `HIVE_PREFIX_LEARN` also applies past a resume point: a request that resumes somewhere and shares at least 4 units and a quarter of what is left with a snapshot it cannot use keeps a snapshot there.
+- `HIVE_FIRST_TAIL`: the server learns which client kinds resend a long prompt with another last block and cuts their first turn at its deepest boundary.
 ## Unreleased
 
+### Tool calling
+
+- **Broken tool block retry (`HIVE_TOOL_RETRY`, default 2; DeepSeek).** A DSML block the reference parser could not read used to go to the client as the answer's text (seen once in production after a thinking cap closed the reasoning: `invoke name="give me</｜DSML｜ parameter>`). The server now continues the generation again from the end of the content before the block, in the same session, and replaces the block; when every attempt fails the block is dropped. In a stream the block is held until it parses, so the client sees only the repaired call (a call already streamed before the block broke is kept as it was). `tools/test_server_cpu.py` covers stream and non-stream, thinking and chat, repaired / text answer / all attempts failing / off. Since 2026-11-11 a tool block is only DSML that starts like one (after a blank line, or first in the content) and ends the response: an answer that writes `<｜DSML｜` itself (explaining the notation, quoting a template) used to be taken for a broken block, generated again and cut off there; it now goes out as written, and a stream no longer holds it to the end (a block-like snippet is held only until text follows its `</｜DSML｜ calls>`). Content that writes DSML and then calls a tool gets both: the text and the call.
+- **`allowed_tools`: per-request tool-name constraint (`HIVE_TOOL_MASK`, default on; DeepSeek).** A client that offers its whole tool list (so the prompt head and
+  its cached prefix stay the same) can name the tools the current step may call. While the model writes a tool name inside a DSML block, only tokens that keep the
+  text on an allowed name and then close it can be sampled — every spelling the vocabulary allows, not only the canonical one (`hive/tool_mask.h`, `compile_tool_trie`). The output
+  is the model's distribution conditioned on those tokens, with or without speculation: a verify row in a name span samples through the constraint and a draft
+  survives only when it equals that sample. Text, reasoning, whether to call and the arguments are untouched; a value or a reasoning passage quoting an invoke tag is not a
+  name span. The field reaches sampling only: same prompt bytes, token ids, session and boundaries with and without it. `tools/test_tool_mask_cpu.py` runs the real `hived.cpp` on
+  the fake runtime (plain, speculative with right and wrong drafts, batched; five mutants detected).
+  Measured on the real model (DeepSeek, one GPU): a question the model answers with `web_search` (16 of 16 without the field) called only `shell` under `allowed_tools: ["shell"]` (30 of 30), also
+  streamed and with eight concurrent requests; with the model's own choice allowed, a short greedy tool call came out the same with and without the field; a repeated prompt reused all its tokens (694 of 694) and the next turn continued from it
+  with another list. Time per token with / without the field: 0.978 and 1.002 at temperature 1 (two groups without the field differ by 1.002 and 1.024), 1.016 at temperature 0, where the field also requires the full logit row.
+- **Tool-call format gate (`tools/test_tool_calls_ref.py`).** Against the checkpoint's own tokenizer and encoding, without GPU or weights: the rendered prompts equal a recorded fixture byte and
+  token, a rendered call parses back to the same names and arguments (types, Korean, quotes, a value quoting a tag, several calls), the streaming parser fed token by token equals the
+  reference parse, and the real token ids replay through the name-span automaton. Run before a build goes into service; skipped when no checkpoint is present.
+
+### Speculative decoding
+
+- **Sampled drafts at temperature > 0 (`HIVE_MTP_SAMPLE_DRAFTS`, measured and left off).** A draft was the draft head's argmax and survived
+  only when the target row's sample equalled it, so at temperature T it was accepted with probability p_T(argmax q) — the target's probability
+  of that one token (production, DeepSeek 2026-11-01..04: thinking requests at T 1 accepted 73 % of their drafts, chat requests 82 %). Now each
+  draft is drawn from the draft head's distribution under the request's rule (temperature → top_k → top_p → min_p, the device candidates plus
+  the row on the host, one row after another because the next row's Markov bias takes the drawn token) and verified with the standard rule:
+  accepted with probability min(1, p/q), the correction token from norm(max(0, p − q)), the bonus unchanged (`hive/spec_sample.h`). The output
+  distribution is the target's for any draft distribution — `tests/test_sampler_cpu.cpp` (6) compares the emitted sequences with autoregressive
+  sampling (two negative controls are detected), (7) checks the distribution object against the sampler's definition, and
+  `tools/test_sampler_cpu.py` adds six mutants of the new header. Not with `presence_penalty` (greedy rule kept); nothing changes at temperature 0.
+  Measured on the thinking-axis cell (effort low, T 1.0; off/on interleaved twice in one daemon through `{"op":"set","sample_drafts"}`): the
+  acceptance rose only 66.4 / 65.1 → 69.4 / 68.5 % (the draft head is less peaked than the target, so Σ min(p, q) is about p(argmax q))
+  while the draft chain's five row-by-row host round trips cost 3.3 → 4.3 ms per step — c1 80.1 / 78.0 → 77.1 / 76.0 tok/s, c4–c16 within noise. Off in
+  `config/hive.env`, kept as a measurement switch (performance.md "Rejected").
+
 ### Scheduling
+
+- **A better-priority request no longer waits out another request's priority hold.** While a better-priority request decodes, a layer
+  yield holds the paused (worse-priority) prefill until it finishes. A second better-priority request arriving during that hold was admitted
+  only if it fit the rows the yield had lent when it began — the decode floor when nothing was queued then — so a conversation turn needing
+  136 rows waited 35.3 s for another user's 47 s answer (12.0 s in a second case). Such a request now ends the hold: the prefill runs to its
+  next layer point, whose yield lends its rows and admits it (or starts it as a slice). Only for requests a layer point can take
+  (`layer_yield_cap()`, new on every runtime); the CPU runtimes, which lend a few decode rows, keep the old behaviour. Admission order only.
+  `tools/test_layer_yield_cpu.py` gained the scenario and a negative control.
+
+### Prefix sharing
+
+- **New conversations learn the head they share (`HIVE_PREFIX_LEARN`, default 512 with `HIVE_PREFIX_SHARE`).** The server's boundaries are
+  message ends. When new conversations share the start of a block but not its end — a system message with a per-room or per-person tail —
+  every kept snapshot lay deeper than the shared part and each new conversation read from token 0 (production: chat rooms shared 27.2–28.0K
+  of their 34–38K first prompts, 7–15 s each; an API consumer's requests shared ~1.1K of ~1.7K). A request read from the start that shares
+  at least a quarter of its prompt with such a snapshot now cuts one extra chunk at the shared length rounded down to 512 tokens and keeps
+  a snapshot there; the next conversation with that head resumes from it. Text requests only. `0` = off. `tools/test_daemon_cpu.py` covers
+  learning, the rounding, the resume, the quarter rule and the switch off.
 
 - **A short request no longer waits behind a long prompt it was batched with.** With `HIVE_BATCH_PREFILL`, a short request that opened a
   batch round could take a long, lower-priority prompt from the queue into the same round; with a single long job the round runs that

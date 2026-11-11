@@ -60,7 +60,8 @@ void qsa_prep(const QsaWeights& w, const QsaRope& rope, const QsaRow* rows, int 
 //   number ≤ 512 skip the scoring. Rows are processed in sub-blocks that fit the workspace (≥ qsa_select_ws_bytes(1, ctx) is enough).
 size_t qsa_select_ws_bytes(int n, int ctx);
 //   ctx_cap > max_pos + 1 sizes the score layout for a longer context (the kernels bound every row by its own position), so a captured CUDA
-//   graph stays valid while the positions grow within the cap; 0 = max_pos + 1.
+//   graph stays valid while the positions grow within the cap; 0 = max_pos + 1. With a cap the scoring launches are always issued (rows
+//   with ≤ 512 visible groups still skip the scoring inside the kernels), so the captured launches do not depend on max_pos.
 void qsa_select(const QsaRow* rows, int n, int max_pos, const __nv_bfloat16* iq, int32_t* idx, void* ws, size_t ws_bytes, cudaStream_t st,
                 int ctx_cap = 0, bool one_seq = false);   // one_seq: every row belongs to one sequence (prefill chunk) — tensor-core scoring
 // Attention for n rows: q [n, 24, 256], gate = proj's gate halves (row stride ld), idx [n, 2051] → out bf16 [n, 6144].

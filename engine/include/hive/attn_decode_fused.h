@@ -34,6 +34,13 @@ struct DecSoA {
   const uint8_t* kptr[8];
   int32_t trows[8];
   int32_t visible[8];
+  // HIVE_VERIFY_TAB_DEV (2026-11-11): what the verify front's compressor_step_seq and ring_write_rows take as arrays. They read the mapped pinned
+  //   pos/skv/ssc/ring tables in every thread (ring write: M*D threads, compressor: D threads x M rows), in every layer of every verify step.
+  //   Filled with the rest of the table by the front's first kernel; ring = DecRowSrc::ring (nullptr when not staged).
+  float* skv[8];
+  float* ssc[8];
+  bf16* ring[8];
+  int32_t pos[8];
 };
 // Mapped pinned sources (device pointers — Work's *_d). Missing tables are nullptr (not copied).
 struct DecRowSrc {
@@ -44,6 +51,7 @@ struct DecRowSrc {
   float* const* skv;
   float* const* ssc;
   const int32_t *pos, *gpos, *visible, *trows, *dsti;
+  bf16* const* ring;  // HIVE_VERIFY_TAB_DEV: row -> ring (write) table to stage into DecSoA::ring; nullptr (brace-initialized default) = not staged, the verify front reads the mapped tables
 };
 
 struct DecAttnArgs {
@@ -88,6 +96,7 @@ struct DecAttnArgs {
   DecSoA* soa = nullptr;     // column arrays of the same table (filled by this function)
   DecRowSrc src{};
   bf16* const* ring_ptrs = nullptr;  // mapped pinned row -> ring (write)
+  //   src.ring != nullptr with vgrp (HIVE_VERIFY_TAB_DEV): steps (2) and (3) of the verify variant below read pos/skv/ssc/ring from soa (device) — same kernels and values
   // (decode_attn3.h): -1 = follow the switches (HIVE_DECODE_QKV3 -> bit 1, HIVE_DECODE_SPARSE3 -> bit 2); >= 0 = this bitmask (tests).
   //   v3_g = heads per block for SPARSE3 (0 = HIVE_DECODE_SPARSE3_G / auto)
   int v3 = -1;

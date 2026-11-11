@@ -146,6 +146,8 @@ void scale_bf16(bf16* x, int n, float c, cudaStream_t st);
 void iota_rows(int32_t* out, int M, int T, cudaStream_t st);
 // bf16 → fp32 (sort keys)
 void bf16_rows_to_f32(const bf16* src, int n, float* dst, cudaStream_t st);
+// dst[i] = src[i] on the GPU (for a mapped pinned src: no copy-engine queue; the source is read when the kernel runs, also in a replayed graph).
+void copy_rows_i32(const int32_t* src, int32_t* dst, int n, cudaStream_t st);
 
 // ---- compressor / indexer ------------------------------------------------------------------------------------------------
 // ratio>1: kv[M,D] score[M,D] fp32 (per-token projections of the chunk) + state (state_kv/state_score [ratio, D], fill count of the first token's group slot)

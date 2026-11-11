@@ -67,6 +67,11 @@ void QwenEngine::prefill_layer_major(QwenSeq& s, const int32_t* ids, int T, floa
       layer_front(l, brows[b], ids + r0, true, hcur_);
       CUDA_CHECK(cudaMemcpyAsync(xnall + (size_t)r0 * H, x_.p, (size_t)n * H * 2, cudaMemcpyDeviceToDevice, stream_));
       CUDA_CHECK(cudaMemcpyAsync(dlall + (size_t)r0 * ND, dl_.p, (size_t)n * ND * 2, cudaMemcpyDeviceToDevice, stream_));
+      // 2026-11-11: the PLE layer's front reads this block's n-gram rows from ple_rows_pin_ — pinned host memory the dequant kernel reads
+      //   when it runs (UVA), not when it is issued — and the next block's ple_block() gathers its rows into the same buffer at once. With
+      //   no sync in between (the embedding / rope loop above has one for the same reason) the kernel could read the next block's rows
+      //   for this block's tokens: no error, wrong PLE input. One sync per block of the PLE layer only.
+      if (L.ple) CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
     if (L.ple) s.tokens.resize(tok0);
     // MoE over all T rows: router, then every expert once

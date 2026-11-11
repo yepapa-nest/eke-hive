@@ -870,8 +870,14 @@ std::vector<int32_t> GlmExperts::resident_keys_by_score() const {
 }
 int GlmExperts::warm_from_keys(const std::vector<int32_t>& keys) {
   int s = 0, n = 0;
+  // 2026-11-11: a key whose promotion copy is in flight (promos_: its slot is pending, slot_of_ still −1) was placed a second time here;
+  //   commit_ready() then pointed slot_of_ at the promotion's slot and the slot filled here stayed behind with key_of_slot_ set — counted by
+  //   n_resident() but unreachable, so "every expert resident" could hold with a key missing (Qwen fill_cache never filled it again). Such
+  //   keys are left to their promotion. (No promotion in flight — every warm start after a wake or at startup — is unchanged.)
+  auto in_flight = [&](int32_t k) { for (const Promo& p : promos_) if (p.key == k) return true; return false; };
   for (int32_t k : keys) {
     if (k < 0 || k >= n_keys() || slot_of_[k] >= 0) continue;
+    if (!promos_.empty() && in_flight(k)) continue;
     while (s < n_slots_ && (key_of_slot_[s] >= 0 || pending_[s])) ++s;
     if (s >= n_slots_) break;
     CUDA_CHECK(cudaMemcpyAsync(slots_ + (size_t)s * L_.total, host_rec(k), L_.total, cudaMemcpyHostToDevice, side_));
@@ -879,6 +885,7 @@ int GlmExperts::warm_from_keys(const std::vector<int32_t>& keys) {
     ++n;
   }
   CUDA_CHECK(cudaStreamSynchronize(side_));
+  commit_ready();   // the promotions skipped above have finished with the copies of this call (same stream): they are resident on return
   return n;
 }
 void GlmExperts::commit_ready() {
@@ -983,15 +990,24 @@ void GlmExperts::after_step(int tokens) {
   int budget = promote_per_step_ * std::max(1, tokens) + (warm_left_ > 0 ? std::min(warm_left_, warm_per_step_) : 0);
   // Victim candidates sorted once per step: non-pending slots by (score, slot index), the first `budget` of them. promote_key used to scan every
   //   slot for each used key — measured (host timestamps, real chat c1): 1.88 ms per verify step with the GPU idle, ~5 % of the step. Same choices.
+  // 2026-11-11: built on first need (need_vic, before the first promote_key of the step) instead of on every step. The list is read by
+  //   promote_key only, and nothing between here and that first call changes what it is built from (pending_, key_of_slot_, score_) — the
+  //   same list, the same choices. A step with no promotion candidate (device-routed steps: step_used_ is empty and no warm quota is left —
+  //   every Qwen step on the whole card) used to pay this scan + partial_sort of every slot (24,576) with the GPU idle, for a list nobody read.
   vic_.clear();
-  for (int s2 = 0; s2 < n_slots_; ++s2) if (!pending_[s2]) vic_.push_back(s2);
-  auto vsc = [&](int s2) { const int k2 = key_of_slot_[s2]; return k2 < 0 ? -1.f : score_[k2]; };
-  const size_t vk = std::min<size_t>(vic_.size(), (size_t)std::max(0, budget));
-  std::partial_sort(vic_.begin(), vic_.begin() + vk, vic_.end(), [&](int a, int b) { const float x = vsc(a), y = vsc(b); return x < y || (x == y && a < b); });
-  vic_.resize(vk);
+  bool vic_built = false;
+  auto need_vic = [&] {
+    if (vic_built) return;
+    vic_built = true;
+    for (int s2 = 0; s2 < n_slots_; ++s2) if (!pending_[s2]) vic_.push_back(s2);
+    auto vsc = [&](int s2) { const int k2 = key_of_slot_[s2]; return k2 < 0 ? -1.f : score_[k2]; };
+    const size_t vk = std::min<size_t>(vic_.size(), (size_t)std::max(0, budget));
+    std::partial_sort(vic_.begin(), vic_.begin() + vk, vic_.end(), [&](int a, int b) { const float x = vsc(a), y = vsc(b); return x < y || (x == y && a < b); });
+    vic_.resize(vk);
+  };
   size_t vp = 0;
   int issued = 0;
-  for (int k : step_used_) { if (issued >= budget) break; const uint64_t before = stats_.promoted; promote_key(k, vic_, vp); issued += stats_.promoted > before; }
+  for (int k : step_used_) { if (issued >= budget) break; need_vic(); const uint64_t before = stats_.promoted; promote_key(k, vic_, vp); issued += stats_.promoted > before; }
   if (warm_left_ > 0 && issued < budget) {
     // warm: top scores among non-resident keys
     std::vector<int> cand;
@@ -999,10 +1015,19 @@ void GlmExperts::after_step(int tokens) {
     const int need = budget - issued;
     if ((int)cand.size() > need) std::partial_sort(cand.begin(), cand.begin() + need, cand.end(), [&](int a, int b) { return score_[a] > score_[b]; });
     int n = 0;
-    for (int k : cand) { if (n >= need) break; const uint64_t before = stats_.promoted; promote_key(k, vic_, vp); n += stats_.promoted > before; }
+    for (int k : cand) { if (n >= need) break; need_vic(); const uint64_t before = stats_.promoted; promote_key(k, vic_, vp); n += stats_.promoted > before; }
     warm_left_ = n == 0 ? 0 : warm_left_ - n;
   }
   step_used_.clear();
+  // 2026-11-11: with every key resident now, the prefetch victim list below cannot be read before it is rebuilt or dropped — prefetch()
+  //   skips resident keys and returns before next_victim() while none is missing, and a key leaves the cache before the next after_step only
+  //   through shrink_cache / lend_tail_slots / sleep_release, each of which clears the list (as here: next_victim then scans, its "not built"
+  //   path). So the 512-slot partial_sort of every slot is skipped; the test is one pass over slot_of_ (sign bits OR-ed, no branch).
+  {
+    int any_missing = 0;
+    for (const int sl : slot_of_) any_missing |= sl;
+    if (any_missing >= 0) { victims_.clear(); vpos_ = 0; return; }
+  }
   // prefetch victims for the next step: the 512 lowest-score slots, ascending
   victims_.resize(n_slots_);
   for (int s2 = 0; s2 < n_slots_; ++s2) victims_[s2] = s2;

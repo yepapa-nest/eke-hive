@@ -100,6 +100,26 @@ ok(tok.calls[-1][1].get("reasoning_effort") == "xhigh", "unknown effort value in
 qwen.encode_messages([{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": '{"a": "x"}'}}]},
                       {"role": "user", "content": "go"}])
 ok(tok.calls[-1][0][0]["tool_calls"][0]["function"]["arguments"] == {"a": "x"}, "assistant tool-call arguments decoded for the template")
+# 2026-11-11: arguments that are not a JSON object reach the template as an empty object (the real template raised "Can only get
+#   item pairs from a mapping." on them — a 400 for the rest of the conversation), and the caller's messages are not written to
+import copy  # noqa: E402
+for bad in ("null", "[1,2]", '"x"', "3", "{oops", "", None, [1, 2], 7):
+    sent = [{"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": bad}},
+                                                                 {"id": "c2", "type": "function", "function": {"name": "g", "arguments": '{"k": [1, {"z": null}]}'}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"}, {"role": "user", "content": "go"}]
+    before = copy.deepcopy(sent)
+    qwen.encode_messages(sent)
+    got = tok.calls[-1][0][0]["tool_calls"]
+    ok(got[0]["function"] == {"name": "f", "arguments": {}} and got[0]["id"] == "c1" and got[1]["function"]["arguments"] == {"k": [1, {"z": None}]},
+       f"non-object tool-call arguments {bad!r} -> empty object, the object beside it decoded")
+    ok(sent == before, f"caller's messages untouched (arguments {bad!r})")
+given = {"a": 1}
+sent = [{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": given}}, {"function": {"name": "g"}}, "odd"]},
+        {"role": "user", "content": "go"}]
+qwen.encode_messages(sent)
+got = tok.calls[-1][0][0]["tool_calls"]
+ok(got[0]["function"]["arguments"] is given and got[1] == {"function": {"name": "g"}} and got[2] == "odd",
+   "object arguments, a call without arguments and a non-dict entry pass through as they are")
 qwen.encode_messages([{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"},
                       {"role": "system", "content": "New tools are available from this point of the conversation: f."},
                       {"role": "user", "content": "again"}], thinking_mode="chat")

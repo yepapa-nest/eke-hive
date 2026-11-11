@@ -229,7 +229,7 @@ QwenEngine::QwenEngine(QwenModel& m, GlmExperts& x, int max_chunk) : m_(m), ex_(
     al(fh_, R * HC * 2);
     mtp_emb_pin_ = pinned<bf16>(R * H);
     al(mtp_emb_, R * H * 2); al(mtp_en_, R * H * 2); al(mtp_fc_, R * H * 2); al(mtp_hn_, R * HC * 2); al(mtp_h_, R * HC * 2);
-    al(mtp_hout_, 2 * HC * 2); al(mtp_ids_d_, 16 * 4); al(mtp_conf_d_, 32 * 4);
+    al(mtp_hout_, 3 * HC * 2); al(mtp_ids_d_, 16 * 4); al(mtp_conf_d_, 32 * 4);   // rows 0 / 1: step outputs (ping, pong) · row 2: the chain's input (mtp_draft)
     al(mtpb_h_, (size_t)3 * kDraftRows * HC * 2); al(mtpb_ids_d_, (size_t)8 * kDraftRows * 4); al(mtpb_conf_d_, (size_t)16 * kDraftRows * 4);
     one_f_.alloc(16); { const float one = 1.f; CUDA_CHECK(cudaMemcpy(one_f_.p, &one, 4, cudaMemcpyHostToDevice)); }
     // the draft chain gathers the embedding of its previous draft on the device: pin + map the host table
@@ -985,7 +985,15 @@ void QwenEngine::forward(const std::vector<RowInfo>& rows, const int32_t* ids, b
     //   combine + separate norm cost 30 ms of 1.12 s of kernels, 118 ms at 64K)
     combine_mlp(l, h, R, !layer_hook && !layer_inject && !(prefill && layer_boundary && layer_boundary_yields && (!yield_due || yield_due())));
     if (layer_hook) { CUDA_CHECK(cudaStreamSynchronize(stream_)); layer_hook(l, h, R); }
-    if (prefill && layer_boundary && l + 1 < c_.n_layers) layer_boundary(l);
+    if (prefill && layer_boundary && l + 1 < c_.n_layers) {
+      const uint64_t y0 = yields_;
+      layer_boundary(l);
+      // 2026-11-11: other forwards ran inside this boundary (yield_exit restored this forward's flags). Their KV growth may have lent expert
+      //   slots and their steps promote / evict, and a mapped or hybrid step re-uploads rec_tab_ with host or null records — so the grouped
+      //   prefill MoE continues only if every expert is still resident, on a table rebuilt from the slot map as it is now; otherwise the
+      //   remaining layers take the host route (ex_.prefill_layer streams what is missing), as a forward started now would.
+      if (yields_ != y0 && pf_dev_) pf_dev_ = device_route_ready() && refresh_rec_table();
+    }
   }
   if (tail_) run_tail(rows, ids, prefill, tail_coords.data(), h);
   if (mtp_on()) CUDA_CHECK(cudaMemcpyAsync(fh_.p, h, (size_t)R * HC * 2, cudaMemcpyDeviceToDevice, stream_));
@@ -1216,6 +1224,10 @@ bool QwenEngine::yield_enter(YieldSave& sv) {
   if (hcur_ && hcur_ == hy_.as<bf16>()) return false;
   if (!hcur_ && !hy_.p) return false;
   sv.hcur = hcur_; sv.emb = std::move(emb_over_); sv.emb_base = emb_base_; sv.on = true;
+  // the per-forward decisions of the parked prefill (YieldSave, qwen_engine.h): the forwards run inside the yield set their own
+  sv.pf_dev = pf_dev_; sv.dr_now = dr_now_; sv.hyb_now = hyb_now_; sv.map_now = map_now_; sv.nonres_now = nonres_now_; sv.hyb_rows = hyb_rows_;
+  sv.pre_normed = pre_normed_; sv.verify = verify_; sv.vdyn = vdyn_; sv.mask_armed = mask_armed_;
+  sv.gphase = gphase_; sv.graph_ctx = graph_ctx_; sv.mtp_slot = mtp_slot_; sv.route_rows = route_rows_;
   emb_over_.clear(); emb_base_ = 0;
   hcur_ = sv.hcur ? nullptr : hy_.as<bf16>();
   return true;
@@ -1224,6 +1236,10 @@ bool QwenEngine::yield_enter(YieldSave& sv) {
 void QwenEngine::yield_exit(YieldSave& sv) {
   if (!sv.on) return;
   hcur_ = sv.hcur; emb_over_ = std::move(sv.emb); emb_base_ = sv.emb_base; sv.on = false;
+  pf_dev_ = sv.pf_dev; dr_now_ = sv.dr_now; hyb_now_ = sv.hyb_now; map_now_ = sv.map_now; nonres_now_ = sv.nonres_now; hyb_rows_ = sv.hyb_rows;
+  pre_normed_ = sv.pre_normed; verify_ = sv.verify; vdyn_ = sv.vdyn; mask_armed_ = sv.mask_armed;
+  gphase_ = sv.gphase; graph_ctx_ = sv.graph_ctx; mtp_slot_ = sv.mtp_slot; route_rows_ = sv.route_rows;
+  ++yields_;   // forward() re-checks pf_dev_ against the expert cache (not here: this must not throw)
 }
 
 }  // namespace hive::qwen

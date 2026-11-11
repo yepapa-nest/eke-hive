@@ -222,6 +222,7 @@ class Runtime {
   const ly::Stats& layer_yield_stats() const { return ly_.st; }
   double layer_yield_resume_ms() const { return ly_.last; }
   double layer_yield_progress() const { return ly_progress_; }
+  int layer_yield_cap() const { return ly_.cap; }  // the most rows a layer yield can lend (hived: whether a later yield can admit a waiting request)
   const RuntimeOptions& opt() const { return opt_; }
   int n_cands() const { return opt_.sampler_cands; }
   float* row_inv_temp() { return inv_temp_.data(); }

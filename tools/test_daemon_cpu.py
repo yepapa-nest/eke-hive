@@ -813,6 +813,48 @@ def sc_share_cross(h, ck):
     done_ok(ck, 'H5 boundaries not a list: ignored', h.generate('sf', ids5, 3, boundaries={'a': 300}), ids5, 3, 300)
 
 
+def sc_share_learn(h, ck, on):
+    """HIVE_PREFIX_LEARN (2026-11-04, production: new chat rooms shared ~27.5K of their 34-38K first prompts, but the only boundary was the end
+    of a system block whose tail differs per room, so every room read from 0). Rooms = a 450-token common head + a 150-token per-room tail
+    (boundary at 600, the end of that block) + a question. A: no snapshot to share. B: A's 600-snapshot shares 450 -> learns 384 (450 rounded
+    down to 128) and cuts there. C: resumes at 384. E: shares less than a quarter of its prompt -> learns nothing. Off: C reads from 0."""
+    HEAD = tokens(450, 200)
+    def room(tseed):
+        return HEAD + tokens(150, tseed) + tokens(40, tseed + 1)
+    A, B, C = room(201), room(203), room(205)
+    done_ok(ck, f'learn{on} A: first room', h.generate('la', A, 3, boundaries=[600]), A, 3, 0)
+    done_ok(ck, f'learn{on} B: second room (head shared, tail not)', h.generate('lb', B, 3, boundaries=[600]), B, 3, 0)
+    learned = log_lines(h, 'lb: shared-prefix boundary learned at')
+    if on:
+        ck.true('learn B: boundary learned at 384', any('lb: shared-prefix boundary learned at 384 ' in l for l in learned), repr(learned))
+        ck.true('learn B: snapshot at 384', any('lb: prefix snapshot at 384 (' in l for l in log_lines(h, 'prefix snapshot')), '')
+        ck.eq('learn B: chunks cut at 384 (256 natural + 128) then as before', [m for m, _ in chunks(h, 'lb')][:2], [256, 128])
+        done_ok(ck, 'learn C: third room resumes at the learned boundary', h.generate('lc', C, 3, boundaries=[600]), C, 3, 384)
+        ck.true('learn C: reuse via shared-prefix', any('lc: reuse 384/' in l for l in log_lines(h, 'via shared-prefix')), '')
+        ck.eq('learn C: nothing more to learn', log_lines(h, 'lc: shared-prefix boundary learned'), [])
+        E = HEAD[:300] + tokens(1500, 207)  # shares 300 with the 384-snapshot: less than a quarter of 1,800 -> no cut
+        done_ok(ck, 'learn E: small share of a long prompt', h.generate('le', E, 3), E, 3, 0)
+        ck.eq('learn E: no boundary learned (quarter rule)', log_lines(h, 'le: shared-prefix boundary learned'), [])
+        # past a resume point (2026-11-06, production: new quick rooms resumed a 15,086-token block, then read ~7K more each). Rooms = the 384 head
+        #   + 1,100 shared + a per-room tail. G saves its prompt's deep snapshot through a boundary; H resumes at 384 and learns; I resumes deeper.
+        DEEP = HEAD[:384] + tokens(1100, 211)
+        def deep_room(tseed):
+            return DEEP + tokens(60, tseed) + tokens(40, tseed + 1)
+        G, H, I = deep_room(213), deep_room(215), deep_room(217)
+        h.generate('lg', G, 3, boundaries=[len(DEEP) + 60], prefix_extra=1)
+        done_ok(ck, 'learn H: resumes the head, shares far more', h.generate('lh', H, 3), H, 3, 384)
+        learned_h = log_lines(h, 'lh: shared-prefix boundary learned at')
+        ck.true('learn H: boundary learned past the resume point (1484 rounded to 1408)', any(' at 1408 ' in l for l in learned_h), repr(learned_h))
+        done_ok(ck, 'learn I: resumes at the deeper learned boundary', h.generate('li', I, 3), I, 3, 1408)
+        ck.eq('learn I: nothing more to learn', log_lines(h, 'li: shared-prefix boundary learned'), [])
+        J = HEAD[:384] + tokens(700, 219)  # shares nothing past the 384 it resumes: no scan result, no cut
+        done_ok(ck, 'learn J: nothing shared past the resume point', h.generate('lj', J, 3), J, 3, 384)
+        ck.eq('learn J: no boundary learned', log_lines(h, 'lj: shared-prefix boundary learned'), [])
+    else:
+        ck.eq('learn off: nothing learned', learned, [])
+        done_ok(ck, 'learn off C: third room reads from 0 (the old behaviour)', h.generate('lc', C, 3, boundaries=[600]), C, 3, 0)
+
+
 def sc_restore_once(h, ck):
     # B2 (2026-10-21): the session's own checkpoint was loaded and then replaced by a deeper shared snapshot — two full image copies (425K: ~400 MB,
     #   364 ms). The restore point is now chosen first and loaded once. Needs the 300-token system snapshot that sc_share_cross left.
@@ -1132,6 +1174,12 @@ def run_round2(exe, td):
         sc_share_image(h, ck)
     finally:
         stop_clean(h, ck)
+    for on in (True, False):
+        h = Hived(exe, td, {**SHARE, 'HIVE_PREFIX_LEARN': '128' if on else '0'}, name=f'learn{int(on)}')
+        try:
+            sc_share_learn(h, ck, on)
+        finally:
+            stop_clean(h, ck)
     for every in (512, 0):
         h = Hived(exe, td, {**SHARE, 'HIVE_PREFIX_INTERVAL': str(every)}, name=f'interval{every}')
         try:

@@ -17,6 +17,7 @@
 //     (idempotent; failure/timeout responses and the queueing policy are described in the header comment of the "sleep / wake" block below)
 //   (optional) generate's "boundaries":[offset...] — read only with HIVE_PREFIX_SHARE (boundary snapshots). Otherwise ignored like any unknown field.
 //   {"op":"set","mtp_batch":1|0|-1} -> {"ok":true,"mtp_batch":v} — run-time HIVE_MTP_BATCH override (-1 = startup value; needs the verify decode path allocated at startup)
+//   {"op":"set","sample_drafts":1|0|-1} -> {"ok":true,"sample_drafts":v} — run-time HIVE_MTP_SAMPLE_DRAFTS override (-1 = startup value)
 //   {"op":"flush"} — drop every reusable prompt state (session tokens/checkpoints/history, archived sessions, shared boundary snapshots)
 //     when no request is decoding; replies {"ok":true,...} or {"error":"not idle",...}. The expert VRAM cache (weights) is kept.
 //   {"op":"where","sessions":["s1",...]} -> {"ok":true,"sessions":{"s1":{"where":"vram|ram|ssd|none","tokens":N,"bytes":B,"tiers":{...}[,"loading":true]}}}
@@ -68,9 +69,11 @@
 #include "hive/host_ledger.h"
 #include "hive/mtp_gate.h"
 #include "hive/sampler.h"
+#include "hive/spec_sample.h"  // HIVE_MTP_SAMPLE_DRAFTS — sampled drafts, min(1, p/q) acceptance, residual correction
 #include "hive/socket_writer.h"
 #include "hive/presence.h"
 #include "hive/token_mask.h"
+#include "hive/tool_mask.h"
 #include "hive/vram_limit.h"
 #include "nlohmann/json.hpp"
 #include "hive/session_store.h"
@@ -163,6 +166,23 @@ template <class R, class S, class F> concept RtHasDraftBatch =
     requires(R& r, std::vector<S*>& v, std::vector<int32_t>& t, std::vector<std::vector<int32_t>>& d, std::vector<std::vector<float>>& c, F* f) {
       r.mtp_draft_batch(v, t, d, c, f);
     };
+// HIVE_MTP_SAMPLE_DRAFTS: a runtime whose mtp_draft takes the sampling rule and returns the draft distributions (DeepSeek); the other families draft greedily.
+template <class R, class S, class F> concept RtHasSampledDraft =
+    requires(R& r, S& q, std::vector<int32_t>& d, std::vector<float>& c, F* f, const typename R::DraftSampling* sd, std::vector<hive::spec::Dist>* qd) {
+      r.mtp_draft(q, (int32_t)0, d, c, f, sd, qd);
+    };
+template <class R, class S, class F>
+void rt_mtp_draft(R& r, S& q, int32_t tok, std::vector<int32_t>& d, std::vector<float>& c, F* f, bool sampled, float temperature, float top_p, int top_k,
+                  float min_p, std::mt19937_64& rng, std::vector<hive::spec::Dist>& qd) {
+  qd.clear();
+  if constexpr (RtHasSampledDraft<R, S, F>) {
+    typename R::DraftSampling sd;
+    sd.temperature = temperature; sd.top_p = top_p; sd.top_k = top_k; sd.min_p = min_p; sd.rng = &rng;
+    r.mtp_draft(q, tok, d, c, f, sampled ? &sd : nullptr, sampled ? &qd : nullptr);
+  } else {
+    r.mtp_draft(q, tok, d, c, f);
+  }
+}
 template <class R> concept RtHasVerifyLogits = requires(R& r) { r.set_verify_logits(true); };
 template <class R> void rt_set_verify_logits(R& r, bool on) { if constexpr (RtHasVerifyLogits<R>) r.set_verify_logits(on); }
 // Answer-span token filter (hive/token_mask.h): the runtime's token list (nullptr = none — the request is served unfiltered) and the row flags
@@ -205,6 +225,13 @@ double vram_used_mib(size_t tot, size_t fr) { const size_t u = tot > fr ? tot - 
 //   thread at each batched step (relaxed — a step or two of delay is fine). Added 2026-10-09 so the batched-speculation A/B can alternate inside one
 //   running service instead of restarting it (no spare GPU window — the service carries live traffic).
 std::atomic<int> g_mtp_batch_override{-1};
+// {"op":"set","sample_drafts":0|1|-1}: the same for HIVE_MTP_SAMPLE_DRAFTS (2026-11-04 — the sampled-drafts A/B alternates inside one running daemon).
+std::atomic<int> g_sample_drafts_override{-1};
+bool sample_drafts_on() {
+  static const bool env = env_on("HIVE_MTP_SAMPLE_DRAFTS");
+  const int ov = g_sample_drafts_override.load(std::memory_order_relaxed);
+  return ov < 0 ? env : ov > 0;
+}
 int g_stop_pipe_w = -1;
 volatile sig_atomic_t g_stop_seen = 0;
 void on_stop_signal(int sig) {
@@ -811,7 +838,15 @@ int main(int argc, char** argv) {
   //   differs)". A chunk end costs no extra chunk, only the image copy (a delta on the request's previous snapshot: new rows plus the
   //   fixed window state), and the snapshots go to the session store with the others.
   static const size_t prefix_interval = !prefix_share ? 0 : (getenv("HIVE_PREFIX_INTERVAL") && *getenv("HIVE_PREFIX_INTERVAL")) ? (size_t)std::max(0L, atol(getenv("HIVE_PREFIX_INTERVAL"))) : 32768;
-  if (prefix_share) fprintf(stderr, "[hived] prefix share on: boundary snapshots, extra chunks per request %d · interval %zu\n", prefix_extra, prefix_interval);
+  // HIVE_PREFIX_LEARN (with HIVE_PREFIX_SHARE; default 512 tokens, "0" = off): a request read from the start whose prompt shares at least a
+  //   quarter of itself with a kept snapshot it cannot use (the snapshot lies deeper than the shared part — "shared-prefix not used ... (prompt
+  //   differs)") also cuts and keeps a snapshot at that shared length, rounded down to this many tokens, so the next request with the same
+  //   head resumes there. The server's boundaries are message ends; a client whose new conversations share the start of a block but not its
+  //   end (a per-room or per-person tail in the system message) left nothing usable. Measured 2026-11-02..04 (production log, DeepSeek):
+  //   new chat rooms shared 27.2-28.0K of their 34-38K first prompts with each other's snapshots (at 27.5-38.8K) and prefilled all of it
+  //   (7-15 s); an API consumer's requests shared ~1.1K of ~1.7K (1,441 requests in 2.4 days). One extra chunk for the request that learns.
+  static const size_t prefix_learn = !prefix_share ? 0 : (getenv("HIVE_PREFIX_LEARN") && *getenv("HIVE_PREFIX_LEARN")) ? (size_t)std::max(0L, atol(getenv("HIVE_PREFIX_LEARN"))) : 512;
+  if (prefix_share) fprintf(stderr, "[hived] prefix share on: boundary snapshots, extra chunks per request %d · interval %zu · learn %zu\n", prefix_extra, prefix_interval, prefix_learn);
   if (defer_ckpt) fprintf(stderr, "[hived] deferred prompt checkpoint on (after the first token)\n");
   // HIVE_WARM_BUSY_CAP (optional; unset / "" / "0" = off): while other requests are decoding, the synchronous cache warm after a prefill is
   //   capped at N experts (1 = effectively skipped — the per-step paced promotions fill the cache instead). Measured (chat shape,
@@ -1616,6 +1651,11 @@ int main(int argc, char** argv) {
           g_mtp_batch_override.store(!std::isfinite(v) || v < 0 ? -1 : v > 0 ? 1 : 0);
         }
         out["mtp_batch"] = g_mtp_batch_override.load();
+        if (j.contains("sample_drafts") && j["sample_drafts"].is_number()) {
+          const double v = j["sample_drafts"].get<double>();
+          g_sample_drafts_override.store(!std::isfinite(v) || v < 0 ? -1 : v > 0 ? 1 : 0);
+        }
+        out["sample_drafts"] = g_sample_drafts_override.load();
         send_json(fd, out);
         finish_socket(fd); incoming.erase(fd);
         continue;
@@ -1790,6 +1830,7 @@ int main(int argc, char** argv) {
     hive::tmask::State mstate;
     bool dev_masked = false;
     long mask_host = 0;   // tokens sampled through the host mask (observability)
+    hive::toolmask::State tool;   // allowed tool names (request "tool_mask", hive/tool_mask.h): constrains the tool-name span of a DSML block
     hive::presence::State pres;   // presence_penalty (hive/presence.h): applied at every row this request samples
     long mtp_steps = 0, mtp_drafted = 0, mtp_accepted = 0;
     std::vector<int32_t> stop_ids;
@@ -1875,6 +1916,7 @@ int main(int argc, char** argv) {
                  {"decode_dma_rows", A.ds.n_dma_rows}, {"cpu_span_ms", A.ds.ms_cpu_span}, {"timing_scope", "shared_batch_spans_not_additive"},
                  {"mtp_steps", A.mtp_steps}, {"mtp_drafted", A.mtp_drafted}, {"mtp_accepted", A.mtp_accepted}, {"restore_ms", A.restore_ms}};
     if (A.mstate.on) done["token_mask"] = true;   // only for requests served with the filter (done message shape otherwise unchanged)
+    if (A.tool.on) done["tool_mask"] = {{"rows", A.tool.rows}, {"spans", A.tool.spans}, {"left", A.tool.left}};   // only for requests that asked for it
     if (A.think_cap > 0) {  // only for requests that received a thinking cap (off = done message shape unchanged)
       done["think_cap"] = A.think_cap;
       done["think_tokens"] = A.think_n;
@@ -2042,6 +2084,7 @@ int main(int argc, char** argv) {
     bool last_boundary_full = false;  // last_boundary was taken with the upper layers on (a complete state — usable as the checkpoint's base)
     size_t last_snap_at = 0;  // HIVE_PREFIX_INTERVAL: position of this request's last snapshot (or where it resumed) · 0 interval = none for this request
     bool interval_ok = false;
+    size_t learn_at = 0;  // HIVE_PREFIX_LEARN: the learned boundary still to be cut (one of hints · 0 = none or already cut)
     ForwardStats st{};
     std::unique_ptr<PrefillPending> pending;
     // current chunk (chunk_begin -> chunk_end)
@@ -2148,13 +2191,14 @@ int main(int argc, char** argv) {
     auto plan_cost = [&](size_t a, size_t b, size_t c) { return plan_cost_j(J, a, b, c); };
     if (hints.empty()) return M;
     size_t deepest = 0;
-    for (size_t h : hints) if (h > i && hint_ok(h) && ids.size() - h > 16) deepest = h;  // the deepest conversation boundary (not the generation-suffix hint below)
-    size_t free_cut = 0, extra_cut = 0, gen_cut = 0;
+    for (size_t h : hints) if (h > i && h != J.learn_at && hint_ok(h) && ids.size() - h > 16) deepest = h;  // the deepest conversation boundary (not the generation-suffix hint below)
+    size_t free_cut = 0, extra_cut = 0, gen_cut = 0, learn_cut = 0;
     std::array<size_t, 3> nat{};
     bool have_nat = false;
     for (size_t h : hints) {
       if (h <= i || h >= i + (size_t)M || !hint_ok(h)) continue;
       if (last_upper_skipped && !rt.tail_mode_for((int)(h - i))) continue;
+      if (h == J.learn_at) { learn_cut = h; continue; }  // HIVE_PREFIX_LEARN: always cut (admit_setup decided it pays)
       // A generation-suffix hint (the server sends it at most GEN_TAIL_MAX = 16 tokens before the end — hive_server.boundary_hints):
       //   the piece after it is a few tokens on the short path (decode policy, about one decode step), and the chunk before it keeps
       //   its tail mode with the upper layers on (the next chunk is not a tail-mode chunk), so the snapshot there is complete. It is
@@ -2167,9 +2211,12 @@ int main(int argc, char** argv) {
       if (cut[0] <= nat[0] && cut[1] <= nat[1] && cut[2] >= nat[2]) free_cut = h;
       else if (extra_left > 0 && h == deepest) extra_cut = h;
     }
-    if (extra_cut > free_cut) { --extra_left; return (int)(extra_cut - i); }
-    if (free_cut) return (int)(free_cut - i);
-    return gen_cut ? (int)(gen_cut - i) : M;
+    const bool by_extra = extra_cut > free_cut;
+    const int cut = by_extra ? (int)(extra_cut - i) : free_cut ? (int)(free_cut - i) : gen_cut ? (int)(gen_cut - i) : M;
+    // the learned boundary first when it comes first (the other cut is chosen again by the next chunk); after it, as before
+    if (learn_cut && (int)(learn_cut - i) < cut) { J.learn_at = 0; return (int)(learn_cut - i); }
+    if (by_extra) --extra_left;
+    return cut;
   };
   // boundary snapshot of the same request's previous boundary (PJob::last_boundary — HIVE_CKPT_DELTA base; save_image validates lineage and prefix)
   auto snapshot_boundary_j = [&](PJob& J, size_t at, bool skipped) {
@@ -2180,7 +2227,10 @@ int main(int argc, char** argv) {
     auto it = shared_snaps.find(key);
     if (it != shared_snaps.end()) {
       const bool same = it->second.image && (size_t)it->second.image->pos == at && std::equal(it->second.image->tokens.begin(), it->second.image->tokens.end(), ids.begin());
-      if (!same || !(it->second.upper_skipped && !skipped)) { if (same) it->second.last_used = now_ms(); return; }  // already present (or a hash collision — keep the old one)
+      if (!same || !(it->second.upper_skipped && !skipped)) {  // already present (or a hash collision — keep the old one)
+        if (same) { it->second.last_used = now_ms(); if (sstore) sstore->touch_snap(key); }  // the disk copy is in use too (session_store.h touch_snap)
+        return;
+      }
     }
     auto img = std::make_shared<SeqImage>();
     rt.save_image(*S->seq, *img, last_boundary ? last_boundary.get() : S->ckpt.get());
@@ -2262,6 +2312,39 @@ int main(int argc, char** argv) {
         if (ip != q.end() && ip->is_number() && std::isfinite(ip->get<double>()) && ip->get<double>() > 0.0) A->mstate.penalty = (float)ip->get<double>();
       }
     }
+    {  // Allowed tool names (hive/tool_mask.h): "tool_mask": {"tags":[｜DSML｜, calls, invoke, parameter, name, ="], "first":[...], "tok":[...], "next":[...],
+       //   "think_end", "think_start", "in_think", "mode" (0 text, default · 1 inside a block · 2 at the start of a name: a prompt that already opened one)}.
+       //   Absorption rules: anything that does not form a valid automaton over this vocabulary = off, the request is served unconstrained
+       //   (the done message then has no "tool_mask", which the server records).
+      const auto it = q.find("tool_mask");
+      if (it != q.end() && it->is_object()) {
+        auto ints = [&](const char* k, std::vector<int32_t>& out) {
+          const auto v = it->find(k);
+          if (v == it->end() || !v->is_array()) return false;
+          out.clear(); out.reserve(v->size());
+          for (const auto& x : *v) { if (!x.is_number_integer() || std::abs(x.get<int64_t>()) > (int64_t)INT32_MAX) return false; out.push_back((int32_t)x.get<int64_t>()); }
+          return true;
+        };
+        auto vid = [&](const char* k) {
+          const auto v = it->find(k);
+          return v != it->end() && v->is_number_integer() && v->get<int64_t>() >= 0 && v->get<int64_t>() < (int64_t)c.vocab ? (int32_t)v->get<int64_t>() : -1;
+        };
+        std::vector<int32_t> tags;
+        hive::toolmask::State& t = A->tool;
+        if (ints("tags", tags) && tags.size() == 6 && ints("first", t.trie.first) && ints("tok", t.trie.tok) && ints("next", t.trie.next) && t.trie.valid(c.vocab) &&
+            std::all_of(tags.begin(), tags.end(), [&](int32_t x) { return x >= 0 && x < c.vocab; })) {
+          t.tag = {tags[0], tags[1], tags[2], tags[3], tags[4], tags[5]};
+          t.think_end = vid("think_end");
+          t.think_start = vid("think_start");
+          const auto io = it->find("in_think");
+          t.in_think = t.think_end >= 0 && io != it->end() && io->is_boolean() && io->get<bool>();
+          const auto im = it->find("mode");
+          const int64_t m = im != it->end() && im->is_number_integer() ? im->get<int64_t>() : 0;
+          t.mode = m == 1 ? hive::toolmask::Mode::kBlock : m == 2 ? hive::toolmask::Mode::kName : hive::toolmask::Mode::kText;
+          t.on = true;
+        }
+      }
+    }
     {  // seed: 0, absent or non-numeric = a different seed per request (request_seed in hive/sampler.h — seeding from now_ms gave requests in the
       // same ms the same seed) · integer = a deterministic random sequence
       const auto sd = q.find("seed");
@@ -2308,7 +2391,10 @@ int main(int argc, char** argv) {
       auto [cpos, ctok] = held ? std::pair<int64_t, int32_t>{-1, -1} : sstore->ckpt_at(A->sid);
       // its last token must match too: a Qwen prompt ends "<think>\n" and the next turn merges it into another token, so a checkpoint at the
       //   prompt end is often no prefix of the next turn (measured 2026-10-15 FN after a restart: 4.94 GB read for nothing, 4.7 s)
-      if (cpos > 0 && ((size_t)cpos >= J.ids.size() || J.ids[(size_t)cpos - 1] != ctok)) cpos = -1;
+      //   A checkpoint at exactly this prompt's end serves it too (exact reuse below, with its stored logits). It was refused here until 2026-11-06:
+      //   a client's read-ahead (the same prompt again after a restart) read the prompt's tail again every time — production, 11-04..05: 28,612
+      //   tokens from the same older snapshot five times, and 250,960 tokens (195 s) of a room whose checkpoint was on disk at that very position.
+      if (cpos > 0 && ((size_t)cpos > J.ids.size() || J.ids[(size_t)cpos - 1] != ctok)) cpos = -1;
       bool deeper = false;
       const bool text_only = !(q.contains("images") && q["images"].is_array() && !q["images"].empty());  // (J.request_sig is filled below)
       if (cpos >= 0 && prefix_share && text_only) {
@@ -2618,8 +2704,10 @@ int main(int argc, char** argv) {
       const auto& pids = J.ids;
       auto cands = sstore->snap_candidates((int64_t)common, (int64_t)pids.size(), [&](int64_t p) { return pids[(size_t)p]; });
       for (const auto& [key, pos] : cands) {
-        if (shared_snaps.count(key)) break;  // already in memory
+        // candidates only share this prompt's token at pos-1 — confirm the key before anything else. The memory check came first: an
+        //   unrelated snapshot that happened to be in memory ended the search, and a matching one on disk only was read again as prompt.
         if (prefix_key(pids.data(), (size_t)pos, sig_upto_j(J, (size_t)pos)) != key) continue;
+        if (shared_snaps.count(key)) break;  // already in memory
         if (auto L = sstore->load_snap(key)) {
           shared_snaps[key] = SharedSnap{L->image, from_store_sig(L->sig), L->upper_skipped, now_ms()};
           A->restore_ms += L->ms;
@@ -2630,18 +2718,24 @@ int main(int argc, char** argv) {
         break;
       }
     }
+    size_t learned_at = 0;  // HIVE_PREFIX_LEARN (below)
     if (prefix_share && (!has_images || image_ckpt) && !shared_snaps.empty()) {
       SharedSnap* best = nullptr;
+      uint64_t best_key = 0;
       // in a batched prefill the first chunk may shrink this round to one slot (max_chunk) or the decoders-present size (busy/budget) — measure
             // with that lower bound (tail_mode_for is monotone)
       const size_t restore_cap = std::min(first_cap, batched ? std::min({cap_now(), c1_floor_j(J), (size_t)max_chunk}) : cap_now());
       size_t best_len = common;
       for (auto& [key, e] : shared_snaps) {
         const size_t k = e.image ? (size_t)e.image->pos : 0;
-        if (k <= best_len || k >= ids.size() || e.image->tokens.size() != k || !std::equal(e.image->tokens.begin(), e.image->tokens.end(), ids.begin())) continue;
+        // the last token first: the full comparison below runs the shared head of every snapshot of every other conversation otherwise
+        //   (production 2026-11-11: 8,185 snapshots in memory, most sharing a system block of tens of thousands of tokens with any prompt —
+        //   each admission compared that block once per snapshot on the engine thread). The same entries pass: equal ranges end equal.
+        if (k <= best_len || k >= ids.size() || e.image->tokens.size() != k || e.image->tokens[k - 1] != ids[k - 1] ||
+            !std::equal(e.image->tokens.begin(), e.image->tokens.end(), ids.begin())) continue;
         if (!images_match(e.sig, k)) continue;
         if (e.upper_skipped && !rt.tail_mode_for((int)chunk_rows_j(J, k, restore_cap))) continue;  // C1 validity (the first chunk from k, image spans applied)
-        best = &e; best_len = k;
+        best = &e; best_len = k; best_key = key;
       }
       if (!best && common == 0) {  // log why the deepest snapshot sharing this prompt's head was not taken (2026-10-14: a new conversation
         //   prefilled 8,915 tokens from 0 with a 6,922-token snapshot of the same system block present, and the log could not say why)
@@ -2656,6 +2750,31 @@ int main(int argc, char** argv) {
               : !images_match(e.sig, k) ? "images" : "C1 tail mode";
         }
         if (near_m) fprintf(stderr, "[hived] %s: shared-prefix not used — snapshot at %zu shares %zu tokens (%s)\n", A->sid.c_str(), near_k, near_m, why);
+        // HIVE_PREFIX_LEARN: a text request whose head another snapshot shares (only its deeper end differs) keeps a snapshot there
+        if (prefix_learn && !has_images && near_m && !strcmp(why, "prompt differs") && 4 * near_m >= ids.size()) {
+          const size_t at = near_m / prefix_learn * prefix_learn;
+          if (at >= prefix_learn && at >= (size_t)std::max(0, hint_min_tokens >= 0 ? hint_min_tokens : ckpt_min_tokens) && ids.size() - at > 16) learned_at = at;
+        }
+      }
+      // HIVE_PREFIX_LEARN, past a resume point: a text request that resumes somewhere (a shared block, its own older state) and still shares much
+      //   more with a snapshot it cannot use keeps a snapshot at that length too, so the next request resumes there. Production 2026-11-05: new
+      //   quick rooms resumed the 15,086-token block and read about 7K more (3.9 s) each. Only when the gain is at least 4 learn units and a
+      //   quarter of what is left to read; nothing shared that far costs nothing but this scan, which the token at the needed depth cuts short.
+      if (prefix_learn && !has_images && !learned_at) {
+        const size_t from = best ? best_len : common, gain = 4 * prefix_learn, left = ids.size() - from;
+        if (from > 0 && left > gain) {
+          size_t near_m = 0;
+          for (auto& [key, e] : shared_snaps) {
+            if (!e.image) continue;
+            const auto& t = e.image->tokens;
+            const size_t k = (size_t)e.image->pos, n = std::min(t.size(), ids.size());
+            if (n < from + gain || k != t.size() || t[from + gain - 1] != ids[from + gain - 1]) continue;
+            size_t m = 0; while (m < n && t[m] == ids[m]) ++m;
+            if (m < k && m > near_m) near_m = m;  // m == k: a snapshot this request could use, not one it cannot (the choice above saw it)
+          }
+          const size_t at = near_m / prefix_learn * prefix_learn;
+          if (at >= from + gain && 4 * (at - from) >= left && ids.size() - at > 16) learned_at = at;
+        }
       }
       if (best) {
         deferred.img.reset();  // the deeper shared snapshot replaces the session's own state — one load instead of two
@@ -2666,6 +2785,7 @@ int main(int argc, char** argv) {
         S->tokens.assign(ids.begin(), ids.begin() + best_len);
         S->img_sig = best->sig;
         best->last_used = now_ms();
+        if (sstore) sstore->touch_snap(best_key);  // the disk copy's recency follows its use, not the day it was written
         ++shared_hits;
         last_upper_skipped = best->upper_skipped;
         fprintf(stderr, "[hived] %s: reuse %zu/%zu via shared-prefix (was %s %zu · upper %s · %zu entries)\n", A->sid.c_str(), best_len, ids.size(),
@@ -2723,6 +2843,12 @@ int main(int argc, char** argv) {
     //   (the first turn's head snapshot, shared by new conversations, is unaffected).
     //   That includes the generation-suffix cut (its point is the next turn re-rendering this prompt's end, which a rewind absorbs).
     if constexpr (RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) if (history) { J.extra_left = 0; hints.clear(); }
+    // HIVE_PREFIX_LEARN: shared by other conversations, so kept whatever this one's history (like the first turn's head snapshot)
+    if (learned_at && !fake_head && learned_at > common && !std::binary_search(hints.begin(), hints.end(), learned_at)) {
+      hints.insert(std::lower_bound(hints.begin(), hints.end(), learned_at), learned_at);
+      J.learn_at = learned_at;
+      fprintf(stderr, "[hived] %s: shared-prefix boundary learned at %zu (another snapshot shares the head)\n", A->sid.c_str(), learned_at);
+    }
     // HIVE_PREFIX_INTERVAL: the same requests that may take boundary snapshots (a rewinding family continues a changed history from its
     //   live or archived state instead)
     J.interval_ok = prefix_interval > 0 && prefix_share && !fake_head && (!has_images || image_ckpt) &&
@@ -2955,8 +3081,17 @@ int main(int argc, char** argv) {
     }
     admit_epilogue(flag, sid);
   };
+  // HIVE_TAIL_FIRST (default on, 0 = off): no decode share before a generation-suffix tail. Nearly every turn is cut into "the new
+  //   tokens up to the generation suffix" + "the 3-16 suffix tokens" (hint_cut: the boundary the next turn resumes from). The decoders
+  //   got their share (0.515 x the chunk's time at decode_share 0.34) between the two, so the new request's first token waited that
+  //   long for a ~77 ms forward (production 2026-11-10 daily report: "between chunks" 1.0-1.8 s mean per request). The tail runs first;
+  //   the main loop decodes right after, with the new request in the batch, and the share stays owed to the decoders before the next
+  //   queued prefill (last_prefill_tc keeps the chunk's time for HIVE_PREFILL_FAIR). Same forwards in the same order per request.
+  static const bool tail_first = [] { const char* v = getenv("HIVE_TAIL_FIRST"); return !(v && !strcmp(v, "0")); }();
   run_chunks = [&](PJob& J) -> bool {
+    double owed_tc = 0;
     while (J.i < J.ids.size()) {
+      if (J.A->cancel->load() || !J.A->client_ok) break;  // cancelled or disconnected while queued or between chunks: read nothing more (admit_finish keeps what was read)
       if (!chunk_begin(J, SIZE_MAX, false)) return false;
       const double tc0 = now_ms();
       const ly::Stats ly0 = rt.layer_yield_stats();
@@ -2971,8 +3106,9 @@ int main(int argc, char** argv) {
       J.ly_n = rt.layer_yield_stats().yields - ly0.yields;
       J.ly_last = J.ly_n > 0 ? tend - rt.layer_yield_resume_ms() : 0;
       const double tc = tend - tc0 - (rt.layer_yield_stats().inner_ms - ly0.inner_ms);
-      last_prefill_tc = tc;
+      last_prefill_tc = tc + owed_tc; owed_tc = 0;
       if (!chunk_end(J, tc, (size_t)J.M)) break;
+      if (tail_first && J.i < J.ids.size() && J.ids.size() - J.i <= 16 && J.all_images.empty()) { owed_tc = last_prefill_tc; continue; }
       if (J.i < J.ids.size() && prefill_yield) yield_after_chunk(tc, 1, prio_class(J.A->prio));
       else if (J.i < J.ids.size() && !active.empty()) decode_between(tc, prio_class(J.A->prio));
     }
@@ -3113,6 +3249,7 @@ int main(int argc, char** argv) {
     };
     add(std::move(first));
     int round = 0;
+    double owed_round = 0;  // HIVE_TAIL_FIRST: the round time whose decode share was skipped before a tails-only round
     bool window_done = !(batch_window_ms > 0 || batch_quiet_ms > 0);  // arrival coalescing uses the same window loop
     while (!jobs.empty()) {
       pull();
@@ -3290,12 +3427,18 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) { admit_error(J.A->r.fd, e, J.A->sid); ended.push_back({j, false}); continue; }
         if (!cont || J.i >= J.ids.size()) ended.push_back({j, true});
       }
-      last_prefill_tc = tc_round;
+      last_prefill_tc = tc_round + owed_round; owed_round = 0;
       std::sort(ended.begin(), ended.end());  // put into active in request order
       for (auto [j, fin] : ended) end_job(j, fin);
       jobs.erase(std::remove(jobs.begin(), jobs.end(), nullptr), jobs.end());
       int pclass = INT_MAX;  // the best class still prefilling (HIVE_PREFILL_PRIORITY_HOLD)
       for (auto& Jp : jobs) pclass = std::min(pclass, prio_class(Jp->A->prio));
+      // HIVE_TAIL_FIRST on the batched path (the one a text request takes from the main loop with HIVE_BATCH_PREFILL): when all that is left
+      //   of every job is its generation-suffix tail, the next round runs first (run_chunks' comment). The time owed is carried into that
+      //   round's last_prefill_tc below.
+      bool tails_only = tail_first && !jobs.empty();
+      for (auto& Jp : jobs) if (Jp->ids.size() - Jp->i > 16 || !Jp->all_images.empty()) { tails_only = false; break; }
+      if (tails_only) { owed_round = last_prefill_tc; continue; }
       if (!jobs.empty() && prefill_yield) yield_after_chunk(tc_round, jobs.size(), pclass);  // HIVE_PREFILL_YIELD: admit short requests separately before the next round (pull)
       else if (!jobs.empty() && !active.empty()) decode_between(tc_round, pclass);
     }
@@ -3311,6 +3454,7 @@ int main(int argc, char** argv) {
   auto emit = [&](Active& A, int32_t tok) -> bool {
     ++A.n;
     A.mstate.feed(tok);
+    A.tool.feed(tok);
     A.pres.feed(tok, (int)c.vocab);
     if (A.think_cap > 0) {  // thinking cap: count tokens in the thinking span (closed by </think>, reopened by <think>)
       if (A.in_think) { if (tok == A.think_end) A.in_think = false; else ++A.think_n; }
@@ -3352,6 +3496,7 @@ int main(int argc, char** argv) {
       if (prio_class(A->prio) > best_prio) { ++A->held_steps; continue; }
       int32_t tok;
       if (A->pending_tok >= 0) tok = A->pending_tok;   // (speculative verification sampled it from its masked row)
+      else if (A->tool.in_span() && !A->logits.empty()) tok = A->tool.sample(A->logits.data(), (int)A->logits.size(), A->temperature, A->top_p, A->top_k, A->min_p, A->rng);
       else if (A->mstate.active() && !A->dev_masked && !A->logits.empty()) {   // a row the device did not mask (after a prefill): the host masks it
         if (A->pres.active()) {   // both: the masked copy, then the presence penalty on the full row
           std::vector<float> l = A->logits;
@@ -3402,6 +3547,11 @@ int main(int argc, char** argv) {
     //   Batches (active >= 2) do not speculate here (forward_verify/rollback handle one sequence) — with HIVE_MTP_BATCH the batch block below
     //   uses forward_verify_batch.
   static const bool mtp_gate2 = env_on("HIVE_MTP_GATE2");
+  // HIVE_MTP_SAMPLE_DRAFTS (env_on, default off): at temperature > 0 the drafts are drawn from the draft head's distribution under the request's
+  //   sampling rule and verified with min(1, p/q) + residual sampling (hive/spec_sample.h) instead of "the target's sample equals the argmax draft".
+  //   Same output distribution (tests/test_sampler_cpu.cpp (6)); more drafts survive when the target distribution is spread (thinking at T 1).
+  //   Not with presence_penalty (its target row is penalised on the host — the greedy rule stays) and never at temperature 0.
+  //   Read per step through sample_drafts_on() ({"op":"set","sample_drafts":…} overrides the environment at run time).
   // HIVE_MTP_GATE3 (env_on, default off; layered on GATE2 — no effect without it): if a CUDA graph was captured during the step
     //   (rt.graph_captures() increased), that step's cost sample is not fed to the gate table. Reason (from the code): run_graph captures and
     //   instantiates all 41 layers on the second use of each (layer, rows, Tb) key — the first two verifies with k+1 rows (and again whenever the
@@ -3434,7 +3584,9 @@ int main(int argc, char** argv) {
       const double td = now_ms();
       std::vector<int32_t> drafts; std::vector<float> conf;
       ForwardStats dst{};
-      rt.mtp_draft(seq, tok, drafts, conf, &dst);
+      const bool want_sd = sample_drafts_on() && A.temperature > 0.f && !A.pres.active() && !A.tool.on;   // (a constrained row samples from its own distribution — the greedy rule stays)
+      std::vector<hive::spec::Dist> qd;   // the distribution each draft was drawn from (empty = greedy drafts)
+      rt_mtp_draft(rt, seq, tok, drafts, conf, &dst, want_sd, A.temperature, A.top_p, A.top_k, A.min_p, A.rng, qd);
       const double tv = now_ms();
       sh_draft += tv - td;
       draft_routed += dst.n_routed; draft_hit += dst.n_hit; draft_cpu += dst.n_cpu; draft_dma_rows += dst.n_dma_rows; draft_ms += tv - td;
@@ -3470,7 +3622,7 @@ int main(int argc, char** argv) {
         sh_f0 = now_ms();
         // greedy request: the device candidates carry the argmax — the runtime skips the rows × vocab logit copy (Qwen: ~0.5 ms per step with
         //   the per-row copies below); the full rows are only a fallback of the sampled path
-        rt_set_verify_logits(rt, A.temperature > 0.f || A.pres.active());   // presence penalty needs the full row even when greedy (2026-10-31 review)
+        rt_set_verify_logits(rt, A.temperature > 0.f || A.pres.active() || A.tool.on);   // presence penalty and the tool-name constraint need the full row even when greedy (2026-10-31 review)
         if (A.mstate.on) { std::vector<float> mf; hive::tmask::verify_flags(A.mstate, ids.data(), (int)ids.size(), mf); rt_set_row_mask(rt, mf); }
         rt.forward_verify(seq, ids.data(), (int)ids.size(), rows, &ds);
         rt_set_verify_logits(rt, true);
@@ -3482,6 +3634,8 @@ int main(int argc, char** argv) {
         bool cont = true;
         Cands rc;
         auto sample_row = [&](int i) {
+          // tool-name constraint: the accepted drafts before this row were emitted, so the state is the one this row predicts from
+          if (A.tool.in_span() && !rows.empty()) return A.tool.sample(rows.data() + (size_t)i * V, V, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
           snapshot_cands(rt, i, rc);
           if (A.pres.active()) {   // presence_penalty: the drafts accepted before this row were emitted, so they count
             std::vector<float> row;
@@ -3492,10 +3646,22 @@ int main(int argc, char** argv) {
           std::vector<float> row(rows.begin() + (size_t)i * V, rows.begin() + (size_t)(i + 1) * V);
           return sample_cands(rc, row, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
         };
+        // Sampled drafts (HIVE_MTP_SAMPLE_DRAFTS): draft i was drawn from qd[i]; row i's target distribution p (the same rule, from the device
+        //   candidates and the full row) accepts it with probability min(1, p/q), else the correction token comes from norm(max(0, p − q)).
+        const bool sd = want_sd && qd.size() >= (size_t)k && !rows.empty();
         for (int i = 0; i < k; ++i) {
-          const int32_t t = sample_row(i);
+          int32_t t;
           ++n_cmp;
-          if (t != drafts[i]) { nxt = t; break; }
+          if (sd) {
+            snapshot_cands(rt, i, rc);
+            const float* rowp = rows.data() + (size_t)i * V;
+            const hive::spec::Dist p = hive::spec::dist_cands(rc, rowp, V, A.temperature, A.top_p, A.top_k, A.min_p);
+            if (!hive::spec::accept(p, qd[i], drafts[i], A.rng)) { nxt = hive::spec::residual_draw(p, qd[i], A.rng); break; }
+            t = drafts[i];
+          } else {
+            t = sample_row(i);
+            if (t != drafts[i]) { nxt = t; break; }
+          }
           ++n_keep;
           cont = emit(A, t);
           if (!cont) break;
@@ -3522,8 +3688,8 @@ int main(int argc, char** argv) {
         if (trace_mtp) {
           std::string cs;
           for (int i = 0; i < (int)conf.size(); ++i) { char b[16]; snprintf(b, sizeof b, "%s%.2f", i ? "," : "", conf[i]); cs += b; }
-          fprintf(stderr, "[mtp] pos %lld draft %.1f ms · verify %d rows %.1f ms · accepted %d/%d · conf [%s] · hit %d cpu %d\n", (long long)seq.pos, tv - td,
-                  k + 1, now_ms() - tv, n_keep - 1, k, cs.c_str(), ds.n_hit, ds.n_cpu);
+          fprintf(stderr, "[mtp] pos %lld draft %.1f ms · verify %d rows %.1f ms · accepted %d/%d · conf [%s] · hit %d cpu %d%s\n", (long long)seq.pos, tv - td,
+                  k + 1, now_ms() - tv, n_keep - 1, k, cs.c_str(), ds.n_hit, ds.n_cpu, sd ? " · sampled" : "");
         }
         for (size_t i = 0; i < active.size();) {
           Active& X = *active[i];
@@ -3572,6 +3738,7 @@ int main(int argc, char** argv) {
       const int S = (int)stepping.size();
       std::vector<std::vector<int32_t>> bdr(S);
       std::vector<std::vector<float>> bcf(S);
+      std::vector<std::vector<hive::spec::Dist>> bqd(S);   // HIVE_MTP_SAMPLE_DRAFTS: the distribution each draft of sequence s was drawn from
       const double td = now_ms();
       int n_drafts_made = 0;
       const bool any_sampled = b_any_sampled;
@@ -3599,7 +3766,9 @@ int main(int argc, char** argv) {
         Seq& q = *stepping[s]->S->seq;
         if (!q.mtp_hidden_valid) continue;  // no hidden state -> one row without drafts
         ForwardStats dst{};
-        rt.mtp_draft(q, step_ids[s], bdr[s], bcf[s], &dst);
+        Active& As = *stepping[s];
+        const bool want_sd = sample_drafts_on() && As.temperature > 0.f && !As.pres.active() && !As.tool.on;
+        rt_mtp_draft(rt, q, step_ids[s], bdr[s], bcf[s], &dst, want_sd, As.temperature, As.top_p, As.top_k, As.min_p, As.rng, bqd[s]);
         draft_routed += dst.n_routed; draft_hit += dst.n_hit; draft_cpu += dst.n_cpu; draft_dma_rows += dst.n_dma_rows;
         ++n_drafts_made;
       }
@@ -3655,7 +3824,7 @@ int main(int argc, char** argv) {
         sh_f0 = now_ms();
         {
           bool any_sampled_v = false;
-          for (Active* X : stepping) any_sampled_v |= X->temperature > 0.f || X->pres.active();   // presence penalty reads the full row
+          for (Active* X : stepping) any_sampled_v |= X->temperature > 0.f || X->pres.active() || X->tool.on;   // presence penalty and the tool-name constraint read the full row
           rt_set_verify_logits(rt, any_sampled_v);
         }
         if (rt_token_mask(rt)) {   // answer-span token filter: each part's rows from its request's state (the parts' rows are concatenated)
@@ -3674,6 +3843,7 @@ int main(int argc, char** argv) {
           Active& A = *stepping[s];
           Cands rc;
           auto sample_at = [&](int r) {
+            if (A.tool.in_span() && !brows.empty()) return A.tool.sample(brows.data() + (size_t)r * V, V, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
             snapshot_cands(rt, r, rc);
             if (A.pres.active()) {
               std::vector<float> rowp;
@@ -3684,10 +3854,20 @@ int main(int argc, char** argv) {
             std::vector<float> rowv(brows.begin() + (size_t)r * V, brows.begin() + (size_t)(r + 1) * V);
             return sample_cands(rc, rowv, A.temperature, A.top_p, A.top_k, A.min_p, A.rng);
           };
+          const bool sd = A.temperature > 0.f && !A.pres.active() && bqd[s].size() >= (size_t)ch.k[s] && !brows.empty();   // bqd[s] is filled only when the drafts were sampled
           for (int i = 0; i < ch.k[s]; ++i) {  // same acceptance rule as the single path
-            const int32_t t = sample_at(brow0[s] + i);
+            int32_t t;
             ++bcmp[s];
-            if (t != bdr[s][i]) { bnxt[s] = t; break; }
+            if (sd) {
+              snapshot_cands(rt, brow0[s] + i, rc);
+              const float* rowp = brows.data() + (size_t)(brow0[s] + i) * V;
+              const hive::spec::Dist p = hive::spec::dist_cands(rc, rowp, V, A.temperature, A.top_p, A.top_k, A.min_p);
+              if (!hive::spec::accept(p, bqd[s][i], bdr[s][i], A.rng)) { bnxt[s] = hive::spec::residual_draw(p, bqd[s][i], A.rng); break; }
+              t = bdr[s][i];
+            } else {
+              t = sample_at(brow0[s] + i);
+              if (t != bdr[s][i]) { bnxt[s] = t; break; }
+            }
             ++bkeep[s];
             bcont[s] = emit(A, t);
             if (!bcont[s]) break;
@@ -3740,7 +3920,7 @@ int main(int argc, char** argv) {
       const long cap_b = rt.graph_captures(), eag_b = rt.graph_eager_runs();  // HIVE_MTP_GATE3 · HIVE_MTP_BATCH (first uses as well)
       sh_f0 = tb;
       bool any_sampled_d = false;
-      for (Active* X : stepping) any_sampled_d |= X->temperature > 0.f || X->pres.active();   // presence penalty reads the full row
+      for (Active* X : stepping) any_sampled_d |= X->temperature > 0.f || X->pres.active() || X->tool.on;   // presence penalty and the tool-name constraint read the full row
       // greedy batch: no rows × vocab copy (16 rows = 16 MB per step) — the device candidates carry the argmax. Only where the runtime has
       //   candidates (n_cands > 0): otherwise sample_cands falls back to the full rows, which must then exist.
       const bool skip_logits = !any_sampled_d && !fake_head && rt.n_cands() > 0;
@@ -4008,7 +4188,7 @@ int main(int argc, char** argv) {
             auto pick = queue.end();
             for (auto it = queue.begin(); it != queue.end(); ++it) {
               const size_t x = ly_rows_of(*it, cap);
-              if (x > 0 && (pick == queue.end() || req_prio(*it) < prio)) { pick = it; rows = x; prio = req_prio(*it); }
+              if (x > 0 && (pick == queue.end() || prio_class(req_prio(*it)) < prio_class(prio))) { pick = it; rows = x; prio = req_prio(*it); }  // by class (the main loop's rule)
             }
             if (pick != queue.end()) { r = std::move(*pick); queue.erase(pick); got = true; }
           }
@@ -4127,11 +4307,36 @@ int main(int argc, char** argv) {
       int slices = slice_turn() ? 1 : 0;
       // Priority hold: while a better-priority request decodes, the yield keeps stepping it until it finishes (more urgent arrivals are
       //   admitted between steps at a layer point, and sliced prefills of a better class get their slices); a stop or sleep request ends the hold
+      //   A better-class request that arrives during the hold but needs more rows than this yield lent (R — the runtime parks only what
+      //   want() asked for when the yield began: the decode floor if nothing was queued then) ends the hold: the paused prefill runs to its
+      //   next layer point, whose want() asks for that request's rows, and the yield there admits it (or starts it as a slice). Measured
+      //   2026-11-03 16:52 (production log, DeepSeek): a conversation turn needing 136 rows (R = 128) waited 35.3 s for another user's
+      //   47 s answer to finish — neither admit_some (rows > R) nor the slice path (it leaves requests up to max(MAX, MID) rows to
+      //   admit_some) took it; again 2026-11-04 05:55, 12.0 s.
+      //   Only for a request a later layer point can take — the runtime lends at most layer_yield_cap() rows (max_chunk on the GPU runtimes,
+      //   a few decode rows on the CPU ones); otherwise the hold stays as it was (the request waits for the forward, as before).
+      auto urgent_beyond_lent = [&]() -> size_t {
+        if (!ly_seat()) return 0;
+        const size_t lend = (size_t)std::max(0, rt.layer_yield_cap());
+        std::lock_guard<std::mutex> lk(mu);
+        if (stop_state.load() != 0 || sleep_asked.load()) return 0;
+        const int pp = paused_prio();
+        for (auto& r : queue) {
+          if (prio_class(req_prio(r)) >= pp || ly_rows_of(r, cap) > 0) continue;
+          if (const size_t x = ly_rows_of(r, std::min(std::max(ly_max, ly_mid), lend))) return x;  // the next layer point's want() asks for it
+          if (const size_t x = slice_rows_of(r); x > 0 && lend >= std::min({x, ly_slice, stream_floor})) return x;  // started as a slice there
+        }
+        return 0;
+      };
       if (!nested && urgent_active()) {
         const double th = now_ms();
         const int s0 = steps;
         while (urgent_active() && stop_state.load() == 0 && !sleep_asked.load()) {
           if (kind == ly::kLayer) admit_some();
+          if (const size_t x = urgent_beyond_lent()) {
+            fprintf(stderr, "[hived] layer yield: priority hold ended — a better-priority request needs %zu rows (lent %d)\n", x, R);
+            break;
+          }
           const int k = slice_pick();
           if (k >= 0 && prio_class(sliced[(size_t)k]->A->prio) < paused_prio() && slice_turn()) { ++slices; continue; }
           decode_step();
@@ -4574,6 +4779,7 @@ int main(int argc, char** argv) {
       continue;
     }
     // 1) take a new request: wait if active is empty, otherwise take one and prefill it only if a seat (max_batch) is free
+    sweep_cancelled_queue();  // a request its client gave up while it waited is answered now, not admitted and read (it was swept only while idle or asleep)
     {
       Request r;
       bool got = false;
@@ -4592,7 +4798,9 @@ int main(int argc, char** argv) {
       if (!queue.empty() && (int)(active.size() + sliced.size()) < max_batch && !sleep_asked.load()) {
         auto pick = queue.begin();
         int pick_prio = req_prio(*pick);
-        for (auto it = std::next(queue.begin()); it != queue.end(); ++it) { const int p = req_prio(*it); if (p < pick_prio) { pick = it; pick_prio = p; } }
+        // by class, like every other comparison here: with HIVE_PRIORITY_SHARED the raw values -1 / 0 / 1 are one class, and comparing
+        //   them raw took a later -1 before an earlier 0 (and could keep a 1 waiting behind a stream of 0s) — not the order of arrival
+        for (auto it = std::next(queue.begin()); it != queue.end(); ++it) { const int p = req_prio(*it); if (prio_class(p) < prio_class(pick_prio)) { pick = it; pick_prio = p; } }
         if (prio_class(pick_prio) <= best_active && prio_class(pick_prio) < sk_prio) { r = std::move(*pick); queue.erase(pick); got = true; }
       }
       if (!got && sk >= 0 && sk_prio <= best_active) cont = sk;

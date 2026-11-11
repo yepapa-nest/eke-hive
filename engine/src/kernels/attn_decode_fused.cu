@@ -147,7 +147,10 @@ __device__ __forceinline__ void stage_row(const DecRowSrc& s, int m, DecRow* tab
   r.dsti = s.dsti ? s.dsti[m] : 0;
   r.pad_[0] = r.pad_[1] = r.pad_[2] = 0;
   tab[m] = r;
-  if (soa) { soa->kptr[m] = r.kptr; soa->trows[m] = r.trows; soa->visible[m] = r.visible; }
+  if (soa) {
+    soa->kptr[m] = r.kptr; soa->trows[m] = r.trows; soa->visible[m] = r.visible;
+    soa->skv[m] = r.skv; soa->ssc[m] = r.ssc; soa->pos[m] = r.pos; soa->ring[m] = s.ring ? s.ring[m] : nullptr;  // HIVE_VERIFY_TAB_DEV (DecSoA)
+  }
 }
 
 // ---- ① q_a ‖ kv: the two GEMVs that consume the same quant(xn) in one launch. Blocks [0, Nqa/8) = wq_a columns, [Nqa/8, Nqa/8 + D/8) = wkv columns.
@@ -938,6 +941,8 @@ bool dec_attention_front(const DecAttnArgs& a, Blas* blas, cudaStream_t st) {
   const bool pack_q = uses_cand && a.idx_mode == 1;  // pack_dec (HIVE_IDX_TC, candidate-pool layers)
   if (pack_q) HIVE_CHECK(a.iqp, "dec idx tc: iqp");
   const bool xf_on = a.ratio > 1 && a.kv_source;
+  const bool vtab_dev = a.vgrp && a.src.ring;  // HIVE_VERIFY_TAB_DEV (the caller stages the ring table only when the switch is on)
+  char* const vsb = reinterpret_cast<char*>(a.soa);
   // v3 bit 1 = new q_a‖kv version (HIVE_DECODE_QKV3) · bit 2 = new sparse-attention version (HIVE_DECODE_SPARSE3) — both bit-identical (test_decode_attn3).
   const int v3 = a.v3 >= 0 ? a.v3 : ((decode_qkv3_on() ? 1 : 0) | (decode_sparse3_on() ? 2 : 0));
   // ① q_a ‖ kv (+ fp32 copy of xn · row table · window indices · ring write)
@@ -979,7 +984,13 @@ bool dec_attention_front(const DecAttnArgs& a, Blas* blas, cudaStream_t st) {
         CUDA_CHECK(cudaMemcpyAsync(a.vsave, a.ckv, (size_t)M * D * 4, cudaMemcpyDeviceToDevice, st));
         CUDA_CHECK(cudaMemcpyAsync(a.vsave + a.vsave_rows * D, a.cscore, (size_t)M * D * 4, cudaMemcpyDeviceToDevice, st));
       }
-      if (vstep) compressor_step_seq(a.ckv, a.cscore, M, D, a.ratio, a.src.pos, a.src.skv, a.src.ssc, a.cout, a.valid, st);
+      // HIVE_VERIFY_TAB_DEV: the same kernel reading the device copies the first kernel of this front staged (DecSoA) — it read the mapped pinned
+      //   pos/skv/ssc tables in each of its D threads for every row (2026-11-11). Same values: the host writes those tables before the front is issued.
+      if (vstep && vtab_dev)
+        compressor_step_seq(a.ckv, a.cscore, M, D, a.ratio, reinterpret_cast<const int32_t*>(vsb + offsetof(DecSoA, pos)),
+                            reinterpret_cast<float* const*>(vsb + offsetof(DecSoA, skv)), reinterpret_cast<float* const*>(vsb + offsetof(DecSoA, ssc)), a.cout,
+                            a.valid, st);
+      else if (vstep) compressor_step_seq(a.ckv, a.cscore, M, D, a.ratio, a.src.pos, a.src.skv, a.src.ssc, a.cout, a.valid, st);
     } else {
       blas->gemm_bf16(a.xn, static_cast<const bf16*>(a.comp_wkv), a.latent, M, D, dim);
     }
@@ -1004,6 +1015,10 @@ bool dec_attention_front(const DecAttnArgs& a, Blas* blas, cudaStream_t st) {
   }
   // ⑥ verify mode: the ring write comes **after** attention (same kernel as attention_verify_dev ③) — all rows have read their windows before a later row of the same sequence overwrites the oldest slot of an earlier row's window
   if (a.vgrp) {
+    if (vtab_dev)  // HIVE_VERIFY_TAB_DEV: positions and ring pointers from the device copy (the kernel read the mapped tables in each of its M*D threads)
+      ring_write_rows(a.kv, M, D, a.win, reinterpret_cast<const int32_t*>(vsb + offsetof(DecSoA, pos)),
+                      reinterpret_cast<bf16* const*>(vsb + offsetof(DecSoA, ring)), st);
+    else
     ring_write_rows(a.kv, M, D, a.win, a.src.pos, a.ring_ptrs, st);
     launch_check("verify ring");
   }

@@ -26,6 +26,19 @@ MUTANTS = [
     ('two-stage rest pass counts the candidates again', '      e[i] = cand ? 0.f : expf((full_logits[i] - c.mx) * it);', '      e[i] = expf((full_logits[i] - c.mx) * it);'),
     ('request_seed uses the clock only', '  return splitmix64(base ^ splitmix64(counter.fetch_add(1, std::memory_order_relaxed) + 1) ^ ns);', '  (void)base; return ns / 1000000;'),
 ]
+# hive/spec_sample.h (HIVE_MTP_SAMPLE_DRAFTS) mutants — run with --spec (its own tests only)
+SPEC_HDR = ROOT / 'engine/include/hive/spec_sample.h'
+SPEC_MUTANTS = [
+    ('accept ignores the ratio p/q', '  return std::uniform_real_distribution<double>(0.0, 1.0)(rng) < px / qx;', '  return true;'),
+    ('sparse residual ignores q', '    for (size_t i = 0; i < p.kept.size(); ++i) { r[i] = std::max(0.0, p.kept[i].second / p.total - q.prob(p.kept[i].first)); sum += r[i]; }',
+     '    for (size_t i = 0; i < p.kept.size(); ++i) { r[i] = p.kept[i].second / p.total; sum += r[i]; }'),
+    ('dense residual ignores q', '    r[t] = (float)std::max(0.0, pt - qt);', '    r[t] = (float)pt;'),
+    ('nucleus cut late', '  if (top_p > 0.f && top_p < 1.f) { double c = 0; int k2 = 0; while (k2 < keep) { c += p[k2].first; ++k2; if (c >= top_p) break; } keep = std::max(1, k2); }\n  return keep;',
+     '  if (top_p > 0.f && top_p < 1.f) { double c = 0; int k2 = 0; while (k2 < keep) { c += p[k2].first; ++k2; if (c >= top_p + 0.04) break; } keep = std::max(1, k2); }\n  return keep;'),
+    ('dist_cands skips the full fallback', '  if (top_k <= 0 && mass < need) return dist_full(logits, V, temperature, top_p, top_k, min_p);  // mass outside the candidates is needed — full path',
+     '  (void)need;'),
+    ('dense draw never leaves the candidates', '    if (u < ec || nvalid >= V) {', '    if (true) {'),
+]
 
 
 def build(td, name, inc):
@@ -56,6 +69,19 @@ def main():
             print(f'  sampler mutant [{name}]: {"DETECTED" if q.returncode != 0 else "NOT DETECTED"}')
             if q.returncode == 0:
                 fails.append(f'mutant [{name}] not detected')
+        stext = SPEC_HDR.read_text()
+        for i, (name, old, new) in enumerate(SPEC_MUTANTS):
+            if stext.count(old) != 1:
+                fails.append(f'spec mutant anchor [{name}]')
+                continue
+            inc = Path(td) / f'sinc{i}'
+            (inc / 'hive').mkdir(parents=True)
+            (inc / 'hive/spec_sample.h').write_text(stext.replace(old, new))
+            mexe = build(td, f'sampler_smut{i}', inc)
+            q = subprocess.run([mexe, '--spec'], capture_output=True, text=True, timeout=3600)
+            print(f'  spec_sample mutant [{name}]: {"DETECTED" if q.returncode != 0 else "NOT DETECTED"}')
+            if q.returncode == 0:
+                fails.append(f'spec mutant [{name}] not detected')
     if fails:
         print('FAILED:', fails)
         sys.exit(1)

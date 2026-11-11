@@ -378,6 +378,41 @@ int main() {
   rs = {{&A, 2601}, {&A, 2602}, {&A, 2603}, {&A, 2604}};
   run_call("verify rows A@2601..2604", rs, false);
 
+  // 2026-11-11 regression (qsa_select under a context cap): one selection row captured into a CUDA graph while the row is still dense
+  //   (position 2046: 511 visible groups) and replayed with the row at a scored position — the MTP draft chain's graph is keyed by its last
+  //   step, so its earlier steps are captured like this around the 2,048-token boundary (qwen_mtp.cpp). Before the fix the capture held no
+  //   scoring launches for such a step and the replay expanded whatever `top` held. The graph's selection must equal the eager one (no cap)
+  //   at both positions: the same scores, the same top-k.
+  {
+    printf("selection graph captured dense, replayed scored\n");
+    int32_t* ig = dev<int32_t>(kQsaSel);
+    const std::vector<QsaRow> dense{QsaRow{A.cache(), 2046}}, scored{QsaRow{A.cache(), 2590}};
+    up(rows_d, dense);
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ex = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+    qsa_select(rows_d, 1, 2046, iq, ig, ws, wsb, st, 4096, true);
+    CUDA_CHECK(cudaStreamEndCapture(st, &g));
+    CUDA_CHECK(cudaGraphInstantiate(&ex, g, 0));
+    CUDA_CHECK(cudaGraphDestroy(g));
+    for (const std::vector<QsaRow>* rv : {&dense, &scored}) {
+      const int pos = (*rv)[0].pos;
+      up(rows_d, *rv);
+      CUDA_CHECK(cudaGraphLaunch(ex, st));
+      CUDA_CHECK(cudaStreamSynchronize(st));
+      const std::vector<int32_t> hg = down(ig, (size_t)kQsaSel);
+      qsa_select(rows_d, 1, pos, iq, idx, ws, wsb, st, 0, true);
+      CUDA_CHECK(cudaStreamSynchronize(st));
+      const std::vector<int32_t> he = down(idx, (size_t)kQsaSel);
+      size_t bad = 0, picked = 0;
+      for (int j = 0; j < kQsaSel; ++j) { bad += hg[j] != he[j]; picked += he[j] >= 0; }
+      printf("  position %d: %zu positions selected · graph vs eager: %zu entries differ\n", pos, picked, bad);
+      EXPECT(bad == 0, "selection graph captured at a dense position differs from the eager selection at position %d", pos);
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(ex));
+    cudaFree(ig);
+  }
+
   printf(g_fail ? "FAIL (%d)\n" : "PASS\n", g_fail);
   return g_fail ? 1 : 0;
 }
