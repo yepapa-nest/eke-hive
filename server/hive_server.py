@@ -210,7 +210,7 @@ def _load_modules(ckpt: str):
         print("[server] image_processor unavailable:", e)
     from transformers import AutoTokenizer
 
-    TOK = AutoTokenizer.from_pretrained(ckpt)
+    TOK = wrap_spellings(AutoTokenizer.from_pretrained(ckpt))
     STOP_IDS, EOS_TEXTS = [TOK.eos_token_id], [TOK.eos_token]
 
 
@@ -661,32 +661,36 @@ def content_before_tools(text: str, thinking_mode: str) -> str:
 _URL_KEYS = frozenset(("url", "image_url", "data", "source"))  # image references: never text
 
 
-def _inert_text(obj, needle: str, inert: str):
-    """obj with every occurrence of needle in its text replaced by inert (image references left as they are); the same object when
-    nothing changed, so requests without the needle keep their bytes and their identity."""
+def _map_text(obj, fn):
+    """obj with fn applied to every string in it (image references left as they are; tool-call arguments through _map_args); the same
+    object when fn changed nothing (fn returns its argument itself then), so requests it does not touch keep their bytes and identity."""
     if isinstance(obj, str):
-        return obj.replace(needle, inert) if needle in obj else obj
+        return fn(obj)
     if isinstance(obj, list):
-        out = [_inert_text(x, needle, inert) for x in obj]
+        out = [_map_text(x, fn) for x in obj]
         return obj if all(a is b for a, b in zip(out, obj)) else out
     if isinstance(obj, dict):
-        out = {k: (v if k in _URL_KEYS else _inert_args(v, needle, inert) if k == "arguments" else _inert_text(v, needle, inert))
-               for k, v in obj.items()}
+        out = {k: (v if k in _URL_KEYS else _map_args(v, fn) if k == "arguments" else _map_text(v, fn)) for k, v in obj.items()}
         return obj if all(out[k] is obj[k] for k in obj) else out
     return obj
 
 
-def _inert_args(v, needle: str, inert: str):
-    """Tool-call arguments are a JSON string the encoder parses and writes again (the placeholder can hide there as \\uff5c escapes
-    and come back as the real string): parsed and checked; re-written only when the parsed value holds the needle."""
+def _map_args(v, fn):
+    """Tool-call arguments are a JSON string the encoder parses and writes again (a spelling can hide there as \\uff5c escapes and come
+    back as the real string): parsed and mapped; re-written only when the parsed value changed."""
     if isinstance(v, str):
         try:
             parsed = json.loads(v)
         except Exception:  # noqa: BLE001 — not JSON: plain text
-            return _inert_text(v, needle, inert)
-        fixed = _inert_text(parsed, needle, inert)
+            return fn(v)
+        fixed = _map_text(parsed, fn)
         return v if fixed is parsed else json.dumps(fixed, ensure_ascii=False)
-    return _inert_text(v, needle, inert)
+    return _map_text(v, fn)
+
+
+def _inert_text(obj, needle: str, inert: str):
+    """obj with every occurrence of needle in its text replaced by inert (see _map_text)."""
+    return _map_text(obj, lambda s: s.replace(needle, inert) if needle in s else s)
 
 
 def inert_image_placeholders(messages: list, tools):
@@ -704,10 +708,179 @@ def inert_image_placeholders(messages: list, tools):
     return _inert_text(messages, needle, inert), _inert_text(tools, needle, inert)
 
 
+# Control-token spellings in request text (HIVE_PLAIN_SPELLINGS, default on; "0" = off) — DeepSeek.
+#   The DeepSeek tokenizer splits every added-token spelling out of the text before anything else, so "<｜User｜>", "</think>" or
+#   "｜DSML｜" written in a message, a tool result, tool-call arguments or a tool definition became the control token itself: a forged
+#   turn boundary, a reasoning end or a tool-call marker the client never sent. Measured 2026-11-15 with the checkpoint's tokenizer:
+#   "user said: <｜User｜> hi </think> and ｜DSML｜ end" -> ids 128803, 128822, 128825 among the text. A production deployment's
+#   conversation store held such text in 10 tool results (web pages and files about chat templates, this server's source) and 2 messages
+#   over four weeks.
+#   DeepSeek's official encoder keeps those spellings as text, and the community vLLM recipe for this model fixed the same thing the same
+#   way (spark-ds41f #449, 2026-10-22: identical ids to the official encoder on 20 chat requests).
+#   How: before rendering, every spelling in request text becomes a sentinel of the same length (_SPELL_ESC, the spelling's code
+#   character, _SPELL_ESC fill) — so the rendered prompt's spellings are exactly the ones the template wrote, and character offsets
+#   in the prompt mean the same with sentinels or spellings. The wrapped tokenizer (SpellingTokenizer) turns a prompt that holds a
+#   sentinel into: each template spelling -> its id; the text between -> the checkpoint vocabulary without the added tokens, with the
+#   sentinels' spellings restored. Text without a sentinel goes to the tokenizer unchanged, so a request without any spelling keeps its
+#   bytes, its ids and its prefix — only conversations that hold such text read again from that place (once).
+_SPELL_ESC = "\U0010fffd"   # plane-16 private use; the same character already in request text becomes U+FFFD (it then means nothing)
+_SPELL_CODE0 = 0x100000     # code characters: _SPELL_CODE0 + index of the spelling (longest first)
+
+
+class ControlSpellings:
+    """The added-token spellings of a tokenizer, their sentinels and the tokenization of a prompt that holds sentinels."""
+
+    def __init__(self, tok):
+        import re
+        from tokenizers import Tokenizer
+        ids: dict[str, int] = {}
+        for i, t in (getattr(tok, "added_tokens_decoder", None) or {}).items():
+            text = getattr(t, "content", None) or str(t)
+            if any(getattr(t, a, False) for a in ("lstrip", "rstrip", "single_word")):
+                raise ValueError(f"added token {text!r} matches with lstrip/rstrip/single_word")   # the split below assumes plain matches
+            if len(text) >= 2:
+                ids.setdefault(text, int(i))
+        if not ids or len(ids) > 0xF000:
+            raise ValueError(f"{len(ids)} added tokens")
+        texts = sorted(ids, key=lambda x: (-len(x), x))  # longest first: the tokenizer's leftmost-longest match
+        self.ids = ids
+        self.code = {t: chr(_SPELL_CODE0 + k) for k, t in enumerate(texts)}
+        self.text_of = {c: t for t, c in self.code.items()}
+        self.find = re.compile("|".join(map(re.escape, texts)))
+        # a substring every spelling holds (str.find speed) decides whether the pattern needs to run at all: 2 MB of text without one
+        #   took 9.9 ms through the pattern alone (2026-11-15, the checkpoint's 1,283 added tokens)
+        anchors = ("｜", "|", "think>", "dsml:", "<", ">")
+        need = []
+        for t in texts:
+            a = next((a for a in anchors if a in t), None)
+            if a is None:
+                need = None
+                break
+            if a not in need:
+                need.append(a)
+        self.anchors = tuple(need) if need is not None else None
+        self.mark = re.compile(re.escape(_SPELL_ESC) + "[" + chr(_SPELL_CODE0) + "-" + chr(_SPELL_CODE0 + len(texts) - 1) + "]")
+        spec = json.loads(tok.backend_tokenizer.to_str())
+        norm = spec.get("normalizer")
+        if norm and not (norm.get("type") == "Sequence" and not norm.get("normalizers")):
+            raise ValueError("the tokenizer normalizes text (added tokens would match on normalized text)")
+        spec["added_tokens"] = []
+        self.bare = Tokenizer.from_str(json.dumps(spec))  # the checkpoint vocabulary without the added tokens
+        full, plain = list(tok("x")["input_ids"]), list(tok("x", add_special_tokens=False)["input_ids"])
+        k = len(full) - len(plain)
+        if k < 0 or full[k:] != plain:
+            raise ValueError("the tokenizer appends tokens")
+        self.lead = full[:k]
+        # the split must equal the tokenizer's own on text without sentinels (checked once here, on a prompt of every kind of piece)
+        probe = "a" + "b ".join(texts[:32] + texts[-32:]) + " c\n" + texts[-1] + "d"
+        mine = self.encode(probe, True)[0]
+        if mine != list(tok(probe)["input_ids"]):
+            raise ValueError("split tokenization differs from the tokenizer's")
+
+    def _sentinel(self, m) -> str:
+        t = m.group()
+        return _SPELL_ESC + self.code[t] + _SPELL_ESC * (len(t) - 2)
+
+    def protect(self, s: str) -> str:
+        """s with every spelling replaced by its sentinel (the same object when s holds none)."""
+        if _SPELL_ESC in s:
+            s = s.replace(_SPELL_ESC, "\ufffd")
+        elif (self.anchors is not None and not any(a in s for a in self.anchors)) or not self.find.search(s):
+            return s
+        return self.find.sub(self._sentinel, s)
+
+    def _plain(self, seg: str) -> str:
+        """seg with each whole sentinel replaced by its spelling (same length; a sentinel cut by the end of seg stays as it is)."""
+        out, prev = [], 0
+        for m in self.mark.finditer(seg):
+            i = m.start()
+            if i < prev:
+                continue
+            t = self.text_of[m.group()[1]]
+            if seg[i + 2:i + len(t)] != _SPELL_ESC * (len(t) - 2):
+                continue
+            out.append(seg[prev:i])
+            out.append(t)
+            prev = i + len(t)
+        if not out:
+            return seg
+        out.append(seg[prev:])
+        return "".join(out)
+
+    def encode(self, text: str, add_special_tokens: bool = True):
+        """(ids, offsets) of a prompt: template spellings -> their ids, the text between -> the vocabulary without added tokens."""
+        ids: list[int] = list(self.lead) if add_special_tokens else []
+        offs: list[tuple[int, int]] = [(0, 0)] * len(ids)
+
+        def piece(a: int, b: int) -> None:
+            if a < b:
+                enc = self.bare.encode(self._plain(text[a:b]), add_special_tokens=False)
+                ids.extend(enc.ids)
+                offs.extend((a + x, a + y) for x, y in enc.offsets)
+
+        pos = 0
+        for m in self.find.finditer(text):
+            piece(pos, m.start())
+            ids.append(self.ids[m.group()])
+            offs.append((m.start(), m.end()))
+            pos = m.end()
+        piece(pos, len(text))
+        return ids, offs
+
+
+class SpellingTokenizer:
+    """The checkpoint tokenizer, except that a text holding a ControlSpellings sentinel is tokenized by ControlSpellings.encode.
+    Everything else (attributes, decode, other arguments) is the tokenizer's own."""
+
+    _KW_CALL = frozenset(("add_special_tokens", "return_offsets_mapping"))
+    _KW_ENCODE = frozenset(("add_special_tokens",))
+
+    def __init__(self, tok, spellings: ControlSpellings):
+        self.__dict__["_tok"] = tok
+        self.__dict__["_hive_spellings"] = spellings
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_tok"], name)
+
+    def __call__(self, text, *args, **kw):
+        if args or not isinstance(text, str) or _SPELL_ESC not in text or not set(kw) <= self._KW_CALL:
+            return self._tok(text, *args, **kw)
+        from transformers import BatchEncoding
+        ids, offs = self._hive_spellings.encode(text, kw.get("add_special_tokens", True))
+        d = {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        if kw.get("return_offsets_mapping"):
+            d["offset_mapping"] = offs
+        return BatchEncoding(d)
+
+    def encode(self, text, *args, **kw):
+        if args or not isinstance(text, str) or _SPELL_ESC not in text or not set(kw) <= self._KW_ENCODE:
+            return self._tok.encode(text, *args, **kw)
+        return self._hive_spellings.encode(text, kw.get("add_special_tokens", True))[0]
+
+
+def wrap_spellings(tok):
+    """tok wrapped in SpellingTokenizer, or tok itself when its spellings cannot be handled (logged; request text then tokenizes as before)."""
+    try:
+        return SpellingTokenizer(tok, ControlSpellings(tok))
+    except Exception as e:  # noqa: BLE001
+        print(f"[server] \u26a0\ufe0fcontrol spellings in request text stay as before ({type(e).__name__}: {e})"[:300], flush=True)
+        return tok
+
+
+def plain_control_spellings(messages: list, tools):
+    """messages and tools with every control-token spelling in their text turned into its sentinel (see ControlSpellings)."""
+    sp = getattr(TOK, "__dict__", {}).get("_hive_spellings")
+    if sp is None or os.environ.get("HIVE_PLAIN_SPELLINGS", "1") == "0":
+        return messages, tools
+    return _map_text(messages, sp.protect), _map_text(tools, sp.protect)
+
+
 def encode_prompt(messages: list[dict], tools, thinking_mode: str, effort) -> tuple[str, list[dict]]:
     """Reference encoding.encode_messages: the tool list is attached to the first message as `tools`. Images come back in media["images"]."""
     check_image_parts(messages)
     messages, tools = inert_image_placeholders(messages, tools)
+    if not adapter_family():
+        messages, tools = plain_control_spellings(messages, tools)
     messages = [dict(m) for m in messages]
     if adapter_family():
         # Tools a client announces in a later system message ({"role": "system", "tools": [...]}, e.g. a tool added after the

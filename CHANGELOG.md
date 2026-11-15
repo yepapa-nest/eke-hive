@@ -1,6 +1,10 @@
 # Changelog
 
 
+## 2026-11-15 — Control-token spellings in request text are text
+
+- The DeepSeek tokenizer splits every added-token spelling out of the text first, so `<｜User｜>`, `</think>` or `｜DSML｜` written in a message, a tool result (a web page or a file about chat templates), tool-call arguments or a tool definition became the control token itself: a forged user turn, a reasoning end or a tool marker the client never sent. DeepSeek's own encoder (deepseek-recipe) keeps them as text. The server now does the same (`HIVE_PLAIN_SPELLINGS`, default on): such spellings become same-length sentinels before rendering, and the text between the template's own control tokens is tokenized without the added vocabulary. Checked against deepseek-recipe on the checkpoint: 16 of 16 requests (chat and thinking) give identical ids, whole and through the token cache; the 4 without a spelling are unchanged from before, the 12 with one differed before. A conversation whose history holds such text reads again once from that place.
+
 ## 2026-11-11 — A value bug in deferred experts, the session store at its budget, the first token under load
 
 Found by reading two days of production records and the whole DeepSeek path (measured on an RTX PRO 6000 at 450 W, side by side with the previous tree in one window).

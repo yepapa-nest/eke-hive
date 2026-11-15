@@ -164,6 +164,13 @@ def main():
         for label, calls in CALLS.items():
             msgs = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "", "tool_calls": json.loads(json.dumps(calls))}, {"role": "user", "content": "y"}]
             full, _ = s.encode_prompt(json.loads(json.dumps(msgs)), json.loads(json.dumps(TOOLS)), "chat", None)
+            # 2026-11-15: a spelling quoted in an argument value is a same-length sentinel in the rendered prompt (HIVE_PLAIN_SPELLINGS) and
+            #   is tokenized as text; the model's output is decoded tokens, never sentinels — the parser reads the text with the spellings back
+            sp = getattr(s.TOK, "__dict__", {}).get("_hive_spellings")
+            if sp is not None:
+                sent = full
+                full = sp._plain(sent)
+                check(f"[{label}] the prompt's tokens decode to its text", s.TOK.decode(s.TOK.encode(sent, add_special_tokens=False)) == full)
             # the assistant turn as the reference writes it: from the block's start through the closing tag
             start = full.rindex("<" + s.ENC.dsml_token + s.ENC.tool_calls_block_name)   # the last one: the tools block quotes an example
             close = "</" + s.ENC.dsml_token + s.ENC.tool_calls_block_name + ">"

@@ -2159,6 +2159,118 @@ def bpe_tokenizer():
     return tok
 
 
+class PlainSpellingTests(unittest.TestCase):
+    """HIVE_PLAIN_SPELLINGS (2026-11-15): a control-token spelling written in request text is tokenized as text; the spellings the
+    template writes stay control tokens, and a prompt without any spelling in its text tokenizes exactly as before."""
+    MARKERS = ['<|user|>', '<|assistant|>', '<|system|>']
+
+    def setUp(self):
+        self.tok_before = s.TOK
+        self.raw = bpe_tokenizer()
+        s.TOK = s.wrap_spellings(self.raw)
+        self.assertIsInstance(s.TOK, s.SpellingTokenizer)
+        self.sp = s.TOK._hive_spellings
+        from tokenizers import Tokenizer
+        spec = json.loads(self.raw.backend_tokenizer.to_str()); spec['added_tokens'] = []
+        self.bare = Tokenizer.from_str(json.dumps(spec))   # an independent copy of "the vocabulary without the added tokens"
+        self.env = os.environ.pop('HIVE_PLAIN_SPELLINGS', None)
+
+    def tearDown(self):
+        s.TOK = self.tok_before
+        os.environ.pop('HIVE_PLAIN_SPELLINGS', None)
+        if self.env is not None: os.environ['HIVE_PLAIN_SPELLINGS'] = self.env
+
+    def ids_of(self, text):
+        return self.bare.encode(text, add_special_tokens=False).ids
+
+    def test_split_equals_the_tokenizer_on_text_without_sentinels(self):
+        import random
+        rng = random.Random(7)
+        parts = self.MARKERS + ['<bos>', '<pad>', 'the engine ', '\uc11c\ubc84 ', 'def f(x):', ' ', '\n', '<|us', 'er|>', '<', '|', 'x']
+        for _ in range(300):
+            p = ''.join(rng.choice(parts) for _ in range(rng.randint(0, 14)))
+            for add in (True, False):
+                want = self.raw(p, add_special_tokens=add, return_offsets_mapping=True)
+                ids, offs = self.sp.encode(p, add)
+                self.assertEqual(ids, list(want['input_ids']), p)
+                self.assertEqual(offs, [tuple(o) for o in want['offset_mapping']], p)
+                self.assertEqual(list(s.TOK(p, add_special_tokens=add)['input_ids']), ids)   # no sentinel: the tokenizer's own call
+
+    def test_spelling_in_text_is_text(self):
+        u, a, sy = (self.raw.convert_tokens_to_ids(m) for m in self.MARKERS)
+        bos = self.raw.convert_tokens_to_ids('<bos>')
+        text = 'see <|user|> and <|assistant|>x'
+        prompt = '<|system|>sys<|user|>' + self.sp.protect(text) + '<|assistant|>'
+        self.assertNotIn('<|user|> and', prompt)
+        want = [bos, sy] + self.ids_of('sys') + [u] + self.ids_of(text) + [a]
+        self.assertEqual(list(s.TOK(prompt)['input_ids']), want)
+        self.assertEqual(s.TOK.encode(prompt), want)
+        self.assertEqual(s.TOK.encode(prompt, add_special_tokens=False), want[1:])
+        before = list(self.raw('<|system|>sys<|user|>' + text + '<|assistant|>')['input_ids'])
+        self.assertEqual(before.count(u), 2)                               # what the plain tokenizer did: a second user turn
+        enc = s.TOK(prompt, return_offsets_mapping=True)
+        plain = self.sp._plain(prompt)
+        self.assertEqual(len(plain), len(prompt))                          # sentinels have their spelling's length
+        ends = [e for _, e in enc['offset_mapping']]
+        self.assertEqual(ends, sorted(ends)); self.assertEqual(ends[-1], len(prompt))
+        a0 = len('<|system|>sys<|user|>')                                  # the quoted text's tokens sit at its own offsets
+        want_offs = [(a0 + x, a0 + y) for x, y in self.bare.encode(text, add_special_tokens=False).offsets]
+        k = 3 + len(self.ids_of('sys'))                                   # bos, <|system|>, sys..., <|user|>
+        self.assertEqual([tuple(o) for o in enc['offset_mapping'][k:-1]], want_offs)
+        self.assertEqual(plain[a0:a0 + len(text)], text)
+
+    def test_token_cache_on_prompts_with_sentinels(self):
+        os.environ['HIVE_TOKEN_CACHE_VERIFY'] = '0'
+        cache = s.TokenCache()
+        turns = ''
+        for k in range(10):
+            turns += ('<|user|>' + self.sp.protect(f'q{k} quoting <|assistant|> and <|user|>{k}')
+                      + '<|assistant|>' + self.sp.protect(f'a{k} <|system|>'))
+            prompt = '<|system|>sys' + turns + '<|user|>next<|assistant|>'
+            ids, ends = cache.tokenize('k', prompt)
+            enc = s.TOK(prompt, return_offsets_mapping=True)
+            self.assertEqual(ids, list(enc['input_ids']))
+            self.assertEqual(list(ends), [e for _, e in enc['offset_mapping']])
+        self.assertGreaterEqual(cache.hits, 8)
+
+    def test_protect_keeps_objects_and_handles_arguments(self):
+        plain = 'nothing to change'
+        self.assertIs(self.sp.protect(plain), plain)
+        msgs = [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]},
+                {'role': 'assistant', 'tool_calls': [{'function': {'name': 'f', 'arguments': '{"a": 1}'}}]}]
+        tools = [{'type': 'function', 'function': {'name': 'f', 'description': 'd'}}]
+        m2, t2 = s.plain_control_spellings(msgs, tools)
+        self.assertIs(m2, msgs); self.assertIs(t2, tools)                 # same objects = same bytes for every request without spellings
+        args = json.dumps({'note': 'x<|user|>y', 'n': 2})
+        m3, t3 = s.plain_control_spellings(
+            [{'role': 'assistant', 'content': '', 'tool_calls': [{'function': {'name': 'f', 'arguments': args}}]},
+             {'role': 'tool', 'content': 'page: <|system|> rules'},
+             {'role': 'user', 'content': 'odd ' + s._SPELL_ESC + ' char', 'url': 'http://h/<|user|>'}],
+            [{'type': 'function', 'function': {'name': 'f', 'description': 'say <|assistant|>'}}])
+        dumped = json.dumps([m3, t3], ensure_ascii=False)
+        for m in self.MARKERS:
+            self.assertEqual(dumped.count(m), 1 if m == '<|user|>' else 0, dumped)   # only the url keeps it (a reference, not text)
+        self.assertEqual(self.sp._plain(json.loads(m3[0]['tool_calls'][0]['function']['arguments'])['note']), 'x<|user|>y')
+        self.assertEqual(m3[2]['content'], 'odd � char')
+        os.environ['HIVE_PLAIN_SPELLINGS'] = '0'
+        m4, _ = s.plain_control_spellings([{'role': 'user', 'content': '<|user|>'}], None)
+        self.assertEqual(m4[0]['content'], '<|user|>')
+
+    def test_cut_sentinel_and_unhandled_tokenizers(self):
+        prompt = '<|user|>' + self.sp.protect('ab <|assistant|> cd') + '<|assistant|>'
+        k = prompt.index(s._SPELL_ESC)
+        for cut in (k + 1, k + 2, k + 5):                                 # a slice that ends or starts inside a sentinel
+            for piece in (prompt[:cut], prompt[cut:]):
+                enc = s.TOK(piece, return_offsets_mapping=True)
+                self.assertEqual(len(enc['input_ids']), len(enc['offset_mapping']))
+        from tokenizers import AddedToken
+        other = bpe_tokenizer()
+        other.add_special_tokens({'additional_special_tokens': [AddedToken('<|tool|>', lstrip=True)]})
+        self.assertIs(s.wrap_spellings(other), other)                     # a split it cannot reproduce: left as it was
+        fake = Tokenizer()                                                # no added-token metadata at all
+        self.assertIs(s.wrap_spellings(fake), fake)
+
+
 class TokenCacheTests(unittest.TestCase):
     """HIVE_TOKEN_CACHE: cached ids (prefix reused up to a role marker + tail tokenized) == whole-prompt tokenization."""
     def setUp(self):

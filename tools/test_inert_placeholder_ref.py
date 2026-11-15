@@ -29,4 +29,7 @@ print("text kept (zero-width space inside):", "\u200b" in prompt)
 plain = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello <｜User｜> literal"}]
 p1, _ = s.encode_prompt(json.loads(json.dumps(plain)), None, "chat", None)
 p0, _ = s.ENC.encode_messages(json.loads(json.dumps(plain)), thinking_mode="chat", return_multi_modal_data=True)
-print("no placeholder -> same bytes as reference:", p1 == p0)
+# (its "<｜User｜>" is request text: since 2026-11-15 the prompt holds a same-length sentinel there and tokenizes it as text —
+#   tools/test_plain_spellings_ref.py — so the text is compared with the sentinels' spellings put back)
+sp = getattr(s.TOK, "__dict__", {}).get("_hive_spellings")
+print("no placeholder -> same text as reference:", (sp._plain(p1) if sp else p1) == p0)
