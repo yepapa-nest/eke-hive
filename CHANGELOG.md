@@ -1,6 +1,13 @@
 # Changelog
 
 
+## 2026-11-16 — The session store keeps the conversations in use; sampling defaults per model
+
+- The session store dropped the least recently used entry first. A client that sent 631 one-off requests in 75 minutes (474 different heads) wrote 225 GB that was never read again and, on a 120 GB budget, pushed out 30 of the 32 conversations over 30K tokens within two hours — each read its whole prompt again on its next turn (6–15 s). Entries never read since they were written now go first; entries in use (read, reused, continued by the next turn's checkpoint, a request with history, a lead snapshot) go first only above 80 % of the budget. The counts are kept on disk.
+- `HIVE_SESSION_STORE_MIN_FREE_GB` (default 32): the store leaves that much free on its filesystem and gives back its own entries first when other files fill the disk.
+- `HIVE_PREFIX_LEAD`: a read that passes the end of a conversation's fixed leading block saves a kept snapshot there, so a conversation compacted later resumes from it instead of reading the block again (FN: 31–33K tokens, ~5 s per turn after compaction).
+- Qwen3.8-Flash-Next: fields a request leaves out take the model card's values per mode (thinking: temperature 1.0 · top_p 0.95 · top_k 20; non-thinking: 0.7 · 0.8 · 20 · presence 1.5). Before, a request without `top_k` sampled the whole vocabulary: a 5,614-token report at 103K context fell apart into fragments of other scripts. A request's own values still win.
+
 ## 2026-11-15 — Control-token spellings in request text are text
 
 - The DeepSeek tokenizer splits every added-token spelling out of the text first, so `<｜User｜>`, `</think>` or `｜DSML｜` written in a message, a tool result (a web page or a file about chat templates), tool-call arguments or a tool definition became the control token itself: a forged user turn, a reasoning end or a tool marker the client never sent. DeepSeek's own encoder (deepseek-recipe) keeps them as text. The server now does the same (`HIVE_PLAIN_SPELLINGS`, default on): such spellings become same-length sentinels before rendering, and the text between the template's own control tokens is tokenized without the added vocabulary. Checked against deepseek-recipe on the checkpoint: 16 of 16 requests (chat and thinking) give identical ids, whole and through the token cache; the 4 without a spelling are unchanged from before, the 12 with one differed before. A conversation whose history holds such text reads again once from that place.

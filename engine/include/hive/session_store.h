@@ -24,6 +24,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -229,9 +230,11 @@ template <class Image> struct Loaded {
 template <class Image>
 class SessionStore {
  public:
-  struct Stats { long writes = 0, write_fail = 0, loads = 0, load_fail = 0, evicted = 0; double write_ms = 0; size_t written = 0; };
+  struct Stats { long writes = 0, write_fail = 0, loads = 0, load_fail = 0, evicted = 0, evicted_unread = 0; double write_ms = 0; size_t written = 0; };
   // dir = HIVE_SESSION_STORE · key = layout key (family, store format, checkpoint config, image shape) · budget in bytes
-  SessionStore(std::string dir, std::string key, size_t budget) : root_(std::move(dir)), budget_(budget) {
+  // min_free = bytes the store leaves free on its filesystem (HIVE_SESSION_STORE_MIN_FREE_GB): the budget shrinks below `budget` when other
+  //   files fill the disk, so the store never takes the last of it (0 = no floor)
+  SessionStore(std::string dir, std::string key, size_t budget, size_t min_free = 0) : root_(std::move(dir)), budget_(budget), min_free_(min_free) {
     dir_ = root_ + "/" + key;
     ::mkdir(root_.c_str(), 0755);
     // the same daemon's directories of another layout (store format, checkpoint, image shape — or the build-keyed directories before the
@@ -252,12 +255,15 @@ class SessionStore {
   }
   const std::string& dir() const { return dir_; }
   // ---- engine thread: enqueue (never waits for the disk) ----
-  void put_ckpt(const std::string& sid, std::shared_ptr<Image> img, const std::vector<float>& logits, std::vector<Sig> sig) {
-    Job j; j.kind = "ckpt"; j.name = sid; j.image = std::move(img); j.logits = logits; j.sig = std::move(sig);
+  // keep = the entry is expected to be read again (a conversation that already has turns, a head many conversations share): it starts in
+  //   the kept class of the budget (evict) instead of the class of entries not read yet
+  void put_ckpt(const std::string& sid, std::shared_ptr<Image> img, const std::vector<float>& logits, std::vector<Sig> sig, bool keep = false) {
+    Job j; j.kind = "ckpt"; j.name = sid; j.image = std::move(img); j.logits = logits; j.sig = std::move(sig); j.hits0 = keep ? 1 : 0;
     enqueue(std::move(j));
   }
-  void put_snap(uint64_t key, std::shared_ptr<Image> img, std::vector<Sig> sig, bool upper_skipped) {
+  void put_snap(uint64_t key, std::shared_ptr<Image> img, std::vector<Sig> sig, bool upper_skipped, bool keep = false) {
     Job j; j.kind = "snap"; j.name = hex16(key); j.key = key; j.image = std::move(img); j.sig = std::move(sig); j.upper_skipped = upper_skipped;
+    j.hits0 = keep ? 1 : 0;
     enqueue(std::move(j));
   }
   // the canary (hived store_canary): kept outside the session index — no session id can name it, the budget never drops it
@@ -272,8 +278,9 @@ class SessionStore {
   // The engine reused the in-memory copy of a stored entry: refresh the disk copy's recency too. Without this the budget ordered entries by
   //   the time they were written, so a head snapshot many conversations resume from every minute — written once, days ago — was the first
   //   to go when the store filled, and the next restart read that head again for every one of them. Index only: any thread.
-  void touch_snap(uint64_t key) { std::lock_guard<std::mutex> lk(im_); auto it = snaps_.find(key); if (it != snaps_.end()) it->second.last_used = wall_ms(); }
-  void touch_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid); if (it != ckpt_.end()) it->second.last_used = wall_ms(); }
+  //   A use also moves the entry to the kept class (Meta::hits).
+  void touch_snap(uint64_t key) { std::lock_guard<std::mutex> lk(im_); auto it = snaps_.find(key); if (it != snaps_.end()) { it->second.last_used = wall_ms(); ++it->second.hits; } }
+  void touch_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid); if (it != ckpt_.end()) { it->second.last_used = wall_ms(); ++it->second.hits; } }
   // position and last token of a session's checkpoint on disk (-1 = none) — the caller checks the token before reading GBs
   std::pair<int64_t, int32_t> ckpt_at(const std::string& sid) {
     std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid);
@@ -309,7 +316,7 @@ class SessionStore {
     std::lock_guard<std::mutex> lk(im_);
     return {{"dir", dir_}, {"ckpts", ckpt_.size()}, {"snaps", snaps_.size()}, {"bytes", disk_bytes_}, {"budget", budget_},
             {"writes", st_.writes}, {"write_fail", st_.write_fail}, {"loads", st_.loads}, {"load_fail", st_.load_fail},
-            {"evicted", st_.evicted}, {"written", st_.written}, {"queue", queued_.load()}, {"canary", !canary_.file.empty()}, {"known", known_.size()}};
+            {"evicted", st_.evicted}, {"evicted_unread", st_.evicted_unread}, {"budget_now", effective_budget()}, {"written", st_.written}, {"queue", queued_.load()}, {"canary", !canary_.file.empty()}, {"known", known_.size()}};
   }
   // Waits until the writer is idle (tests and the flush op).
   void drain() { std::unique_lock<std::mutex> lk(qm_); idle_cv_.wait(lk, [&] { return q_.empty() && !busy_; }); }
@@ -331,10 +338,13 @@ class SessionStore {
   }
 
  private:
-  struct Job { std::string kind, name; uint64_t key = 0; std::shared_ptr<Image> image; std::vector<float> logits; std::vector<Sig> sig; bool upper_skipped = false; };
-  struct Meta { std::string file; int64_t pos = 0; int32_t last_tok = -1; double last_used = 0; std::set<uint64_t> packs; size_t bytes = 0; };  // bytes: in memory only (ckpt_info)
+  struct Job { std::string kind, name; uint64_t key = 0; std::shared_ptr<Image> image; std::vector<float> logits; std::vector<Sig> sig; bool upper_skipped = false; uint32_t hits0 = 0; };
+  // hits = reads of this entry or of the entry it replaced (a conversation's checkpoint is rewritten every turn — the new one inherits the old
+  //   one's count plus one) · 0 = written and never used again (evict drops these first)
+  struct Meta { std::string file; int64_t pos = 0; int32_t last_tok = -1; double last_used = 0; std::set<uint64_t> packs; size_t bytes = 0; uint32_t hits = 0; };  // bytes: in memory only (ckpt_info)
   std::string root_, dir_;
   size_t budget_;
+  size_t min_free_ = 0;
   std::thread th_;
   std::mutex qm_; std::condition_variable qcv_, idle_cv_; std::deque<Job> q_; bool stop_ = false, busy_ = false;
   std::atomic<long> queued_{0};
@@ -358,8 +368,8 @@ class SessionStore {
   // A read refreshes the entry's recency (in memory): the budget drops the least recently *used* entry, not the least recently written one.
   std::string meta_of(const std::string& kind, const std::string& name) {
     std::lock_guard<std::mutex> lk(im_);
-    if (kind == "ckpt") { auto it = ckpt_.find(name); if (it == ckpt_.end()) return ""; it->second.last_used = wall_ms(); return it->second.file; }
-    auto it = snaps_.find(std::stoull(name, nullptr, 16)); if (it == snaps_.end()) return ""; it->second.last_used = wall_ms(); return it->second.file;
+    if (kind == "ckpt") { auto it = ckpt_.find(name); if (it == ckpt_.end()) return ""; it->second.last_used = wall_ms(); ++it->second.hits; return it->second.file; }
+    auto it = snaps_.find(std::stoull(name, nullptr, 16)); if (it == snaps_.end()) return ""; it->second.last_used = wall_ms(); ++it->second.hits; return it->second.file;
   }
   static void collect_packs(const json& j, std::set<uint64_t>& out) {
     if (j.is_array() && j.size() == 4 && j[0].is_string() && j[3].is_string()) { out.insert(std::stoull(j[0].get<std::string>(), nullptr, 16)); return; }
@@ -387,6 +397,7 @@ class SessionStore {
       try { FILE* fp = fopen(path.c_str(), "r"); if (!fp) continue; m = json::parse(fp); fclose(fp); } catch (...) { ::unlink(path.c_str()); continue; }
       Meta e; e.file = path;
       try { e.pos = m.at("pos").get<int64_t>(); e.last_tok = m.at("last_tok").get<int32_t>(); e.last_used = m.at("last_used").get<double>(); } catch (...) { ::unlink(path.c_str()); continue; }
+      e.hits = m.contains("hits") && m["hits"].is_number_unsigned() ? m["hits"].get<uint32_t>() : 0;  // metas written before the count: unread
       collect_packs(m.at("fields"), e.packs); if (m.contains("logits")) collect_packs(m["logits"], e.packs);
       e.bytes = range_bytes(m.at("fields")) + (m.contains("logits") ? range_bytes(m["logits"]) : 0);
       bool ok = true;
@@ -499,7 +510,13 @@ class SessionStore {
       ::unlink(ptmp.c_str());
       std::lock_guard<std::mutex> lk(im_); ++st_.write_fail; return;
     }
-    json m = {{"v", 1}, {"kind", j.kind}, {"pos", j.image->pos}, {"last_used", wall_ms()},
+    uint32_t hits = j.hits0;  // the entry this one replaces (same session or prefix key) was in use: carry its count on, plus this write
+    {
+      std::lock_guard<std::mutex> lk(im_);
+      const Meta* prev = j.kind == "ckpt" ? (ckpt_.count(j.name) ? &ckpt_[j.name] : nullptr) : j.kind == "snap" ? (snaps_.count(j.key) ? &snaps_[j.key] : nullptr) : nullptr;
+      if (prev && !prev->file.empty()) hits = std::max(hits, prev->hits + 1);
+    }
+    json m = {{"v", 1}, {"kind", j.kind}, {"pos", j.image->pos}, {"last_used", wall_ms()}, {"hits", hits},
               {"last_tok", j.image->tokens.empty() ? -1 : j.image->tokens.back()}, {"fields", ar.out}};
     if (j.kind == "ckpt") m["sid"] = j.name; else if (j.kind == "snap") { m["key"] = j.name; m["upper_skipped"] = j.upper_skipped; }
     json sg = json::array(); for (const auto& s : j.sig) sg.push_back(json::array({s.start, s.end, hex16(s.hash)})); m["sig"] = sg;
@@ -508,11 +525,11 @@ class SessionStore {
     if (!write_file_atomic(mpath, m.dump())) { std::lock_guard<std::mutex> lk(im_); ++st_.write_fail; return; }
     // The parsing of this image's references happens before the index lock; under it only map updates remain. Files that leave the index
     //   (a replaced entry's packs, evicted entries and their packs) are removed after the lock is released.
-    Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"];
+    Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"]; e.hits = hits;
     collect_packs(ar.out, e.packs); if (!logit_ref.empty()) e.packs.insert(pack);
     e.bytes = range_bytes(ar.out) + (logit_ref.empty() ? 0 : (size_t)logit_ref[0].len);
     std::vector<std::string> dead;
-    double disk_gb;
+    double disk_gb, budget_gb;
     {
       std::lock_guard<std::mutex> lk(im_);
       if (ar.fresh) { pack_bytes_[pack] = (long long)ar.off; disk_bytes_ += ar.off; }
@@ -524,30 +541,67 @@ class SessionStore {
       slot = std::move(e);
       // a pack written now that nothing refers to (cannot happen: a fresh pack is named by its own entry) would stay until the next start-up scan
       if (j.kind != "canary") { ++st_.writes; st_.written += ar.fresh; st_.write_ms += wall_ms() - t0; }  // the counters are conversation state
-      evict(dead);
+      budget_gb = evict(dead) / 1073741824.0;
       disk_gb = disk_bytes_ / 1073741824.0;
     }
     for (const auto& f : dead) ::unlink(f.c_str());
     fprintf(stderr, "[store] %s %.16s pos %lld · %.1f MB new · %.0f ms · disk %.2f GB / %.0f GB\n", j.kind.c_str(), j.name.c_str(),
-            (long long)j.image->pos, ar.fresh / 1048576.0, wall_ms() - t0, disk_gb, budget_ / 1073741824.0);
+            (long long)j.image->pos, ar.fresh / 1048576.0, wall_ms() - t0, disk_gb, budget_gb);
   }
-  // under im_: least recently used entries first until the packs fit the budget (the newest entry always stays). One pass orders the
-  //   entries; each dropped entry releases its packs through the reference counts (the files go to `dead`, removed by the caller).
-  void evict(std::vector<std::string>& dead) {
-    if (disk_bytes_ <= budget_ || ckpt_.size() + snaps_.size() <= 1) return;
-    struct V { double used; bool snap; const std::string* ck; uint64_t sk; };
-    std::vector<V> order;
-    order.reserve(ckpt_.size() + snaps_.size());
-    for (auto& [k, m] : ckpt_) order.push_back({m.last_used, false, &k, 0});
-    for (auto& [k, m] : snaps_) order.push_back({m.last_used, true, nullptr, k});
+  // The budget now: HIVE_SESSION_STORE_GB, lowered while the filesystem has less than min_free_ left beyond what the store holds (other files
+  //   grew) — the store gives back its own bytes first and never takes the last of the disk. Under im_ (or with the index unchanged).
+  size_t effective_budget() const {
+    if (!min_free_) return budget_;
+    struct statvfs fs;
+    if (::statvfs(dir_.c_str(), &fs) != 0) return budget_;
+    // what the store may hold = its own bytes + the free space, minus the floor (below its own bytes when the disk is short)
+    const size_t total = disk_bytes_ + (size_t)fs.f_bavail * (size_t)fs.f_frsize;
+    return std::min(budget_, total > min_free_ ? total - min_free_ : 0);
+  }
+  // under im_: until the packs fit the budget (the newest entry always stays). Two classes (a segmented LRU):
+  //   unread  — written and never used since (hits 0): a one-off request's checkpoint, a boundary nobody resumed from
+  //   kept    — read at least once, or the continuation of an entry that was (a conversation's checkpoint rewritten each turn)
+  //   Unread entries go first, least recently used first; kept entries go first only once they hold more than kKeptShare of the budget (so new
+  //   conversations still get room), and when no unread entry is left. Measured 2026-11-16 (FN, 120 GB, plain LRU): a client sent 631 one-off
+  //   requests in 75 minutes (474 different heads, ~330 MB of state each) — 225 GB of writes that were never read pushed out 30 of the 32
+  //   conversations over 30K tokens within two hours (each re-reads 6-15 s on its next turn), while 206 of the one-off entries stayed.
+  //   Each dropped entry releases its packs through the reference counts (the files go to `dead`, removed by the caller). Returns the budget used.
+  static constexpr double kKeptShare = 0.8;
+  size_t evict(std::vector<std::string>& dead) {
+    const size_t budget = effective_budget();
+    if (disk_bytes_ <= budget || ckpt_.size() + snaps_.size() <= 1) return budget;
+    struct V { double used; bool snap; const std::string* ck; uint64_t sk; bool kept; size_t bytes; };
+    std::vector<V> unread, kept;
+    size_t kept_bytes = 0;
+    const V* newest = nullptr;
+    auto add = [&](const Meta& m, bool snap, const std::string* ck, uint64_t sk) {
+      V v{m.last_used, snap, ck, sk, m.hits > 0, m.bytes};
+      (v.kept ? kept : unread).push_back(v);
+      if (v.kept) kept_bytes += m.bytes;
+    };
+    for (auto& [k, m] : ckpt_) add(m, false, &k, 0);
+    for (auto& [k, m] : snaps_) add(m, true, nullptr, k);
     // ties: checkpoints before snapshots, then key order — the order the previous scan (strict <, checkpoints first) picked
-    std::stable_sort(order.begin(), order.end(), [](const V& a, const V& b) { return a.used < b.used; });
-    for (size_t i = 0; i + 1 < order.size() && disk_bytes_ > budget_; ++i) {
-      const V& v = order[i];
+    auto by_use = [](const V& a, const V& b) { return a.used < b.used; };
+    std::stable_sort(unread.begin(), unread.end(), by_use);
+    std::stable_sort(kept.begin(), kept.end(), by_use);
+    // the newest entry (the one just written, or the most recently used) always stays
+    for (const auto* list : {&unread, &kept}) if (!list->empty() && (!newest || list->back().used >= newest->used)) newest = &list->back();
+    auto drop = [&](const V& v) {
       if (v.snap) { auto it = snaps_.find(v.sk); dead.push_back(it->second.file); unref_packs(it->second, dead); snaps_.erase(it); }
       else { auto it = ckpt_.find(*v.ck); dead.push_back(it->second.file); unref_packs(it->second, dead); ckpt_.erase(it); }
       ++st_.evicted;
+      if (!v.kept) ++st_.evicted_unread;
+    };
+    size_t iu = 0, ik = 0;
+    while (disk_bytes_ > budget) {
+      const bool u_ok = iu < unread.size() && &unread[iu] != newest, k_ok = ik < kept.size() && &kept[ik] != newest;
+      if (!u_ok && !k_ok) break;
+      const bool take_kept = k_ok && (!u_ok || kept_bytes > (size_t)(kKeptShare * (double)budget));
+      if (take_kept) { kept_bytes -= std::min(kept_bytes, kept[ik].bytes); drop(kept[ik++]); }
+      else drop(unread[iu++]);
     }
+    return budget;
   }
   int pack_fd(uint64_t id, std::map<uint64_t, int>& fds) {
     auto it = fds.find(id);

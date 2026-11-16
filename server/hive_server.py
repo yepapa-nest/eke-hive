@@ -214,9 +214,16 @@ def _load_modules(ckpt: str):
     STOP_IDS, EOS_TEXTS = [TOK.eos_token_id], [TOK.eos_token]
 
 
-def family_default(key: str, fallback):
-    """A sampling default of the adapter family's model (families/*.py defaults()), else the server's fallback."""
-    d = ENC.defaults() if adapter_family() and hasattr(ENC, "defaults") else {}
+def family_default(key: str, fallback, thinking_mode: str | None = None):
+    """A sampling default of the adapter family's model (families/*.py defaults()), else the server's fallback. A family whose
+    recommended values differ by mode takes the request's thinking mode (defaults(thinking_mode)); the others take no argument.
+    A request's own value always wins — this fills only the fields it leaves out."""
+    if not (adapter_family() and hasattr(ENC, "defaults")):
+        return fallback
+    try:
+        d = ENC.defaults(thinking_mode) if getattr(ENC, "DEFAULTS_BY_MODE", False) else ENC.defaults()
+    except Exception:  # noqa: BLE001 — a family default never fails a request
+        d = {}
     return d.get(key, fallback)
 
 
@@ -2120,6 +2127,7 @@ def boundary_hints_start(messages: list[dict], tools, thinking_mode: str, effort
         if m > u + 1:
             probes.append(messages[:m])
         u = m
+    n_lead = len(probes)  # the probes so far end the conversation's fixed leading block (HintList.lead)
     turn_ends = [k for k in range(len(messages) - 1) if messages[k].get("role") == "assistant"]
     for k in turn_ends[-HINT_TURNS:]:
         probes.append(messages[: k + 1])
@@ -2162,7 +2170,14 @@ def boundary_hints_start(messages: list[dict], tools, thinking_mode: str, effort
         #   common with live 24731" with the snapshot at 24732, every follow-up turn cached 0).
         jobs.append((len(pre), [{"role": "user", "content": "\x00"}]))
     pending = render_probes_start(messages, prompt, jobs, tools, thinking_mode, effort)
-    return prompt, gen_cut and bool(messages), j_done, plan, cache, ftools, pending
+    return prompt, gen_cut and bool(messages), j_done, plan, cache, ftools, n_lead, pending  # pending stays last (callers drop st[-1])
+
+
+class HintList(list):
+    """The boundary hints (a sorted list of token offsets) plus `lead`: the deepest of them that ends the conversation's fixed leading block
+    (system/tools and the fixed user blocks before the first question — the first n_lead probes) · 0 = none. hived cuts a snapshot there
+    on a read that passes it (the request's "lead", HIVE_PREFIX_LEAD): a conversation compacted later resumes from it."""
+    lead = 0
 
 
 def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int]:
@@ -2171,7 +2186,7 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
     placeholder's end): renders with images count like any other — their placeholders are the prompt's own text — and a boundary that
     lands inside a span (an adjustment below can step one token back) moves to the span's start. None (text requests) = the rules as
     they were."""
-    prompt, gen, j_done, plan, cache, ftools, pending = st
+    prompt, gen, j_done, plan, cache, ftools, n_lead, pending = st
     media_ok = spans is not None
     if ends is None or len(ends) != len(ids):
         try:
@@ -2250,7 +2265,8 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
                     pass
             if 0 < t < len(ids) and len(ids) - t <= GEN_TAIL_MAX:
                 out.add(t); gen_hints.add(t)
-    for p in plan:
+    lead = 0
+    for pi, p in enumerate(plan):
         if p[0] == "hit":
             kept = p[1]
             if kept is None:  # that probe rendered media: no boundary
@@ -2260,6 +2276,8 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
             t = bisect.bisect_right(ends, _common_prefix_len(kept, prompt))
             if 0 < t < len(ids):
                 out.add(t)
+                if pi < n_lead:
+                    lead = max(lead, t)
             continue
         key, fpre, j = p
         r_text, r_other = rendered[j], rendered[j + 1]
@@ -2276,10 +2294,15 @@ def boundary_hints_finish(st, ids: list[int], ends=None, spans=None) -> list[int
         t = bisect.bisect_right(ends, c)  # number of leading tokens ending at or before c (a prefix, since offsets are monotonic)
         if 0 < t < len(ids):
             out.add(t)
+            if pi < n_lead:
+                lead = max(lead, t)
     if spans:
         # a generation-suffix hint moved out of an image is no longer a free tail cut — it would only take the extra cut from a shared boundary
         out = {u for t in out if 0 < (u := _out_of_spans(t, spans)) < len(ids) and (t not in gen_hints or len(ids) - u <= GEN_TAIL_MAX)}
-    return sorted(out)
+        lead = _out_of_spans(lead, spans) if lead else 0
+    res = HintList(sorted(out))
+    res.lead = lead if lead in out else 0
+    return res
 
 
 def _in_span(t: int, spans) -> bool:
@@ -3839,6 +3862,7 @@ async def chat(request: Request):
         t_prep = time.perf_counter()
         prep_ms["before"] = round(time.time() * 1000.0 - t_recv, 1)  # body read and parse, conversation key and head (before prepare)
         ids, images, blob, hints = await asyncio.to_thread(prepare)
+        lead_at = getattr(hints, "lead", 0)  # HintList.lead — read before any filtering below turns the hints into a plain list
         prep_ms["total"] = round((time.perf_counter() - t_prep) * 1000, 1)
     except Exception as e:
         log_request({"t_recv": t_recv, "t_done": time.time() * 1000.0, "endpoint": endpoint, "status": 400, "outcome": "bad_request", "error": str(e)[:300],
@@ -3892,19 +3916,23 @@ async def chat(request: Request):
         "max_tokens": max(0, int(_num(body.get("max_tokens") or body.get("max_completion_tokens"), 0))) if abs(_num(body.get("max_tokens") or body.get("max_completion_tokens"), 0)) < 2 ** 62 else 0,
         # Normalize: null, bool, non-numeric and non-finite values become the default (a raw null would make hived's json value() throw -> request error)
         # unset fields: the family's model defaults when its adapter has them (Gemma: generation_config.json), else 1.0 / 0.95 / off
-        "temperature": _num(body.get("temperature"), family_default("temperature", 1.0)),
-        "top_p": _num(body.get("top_p"), family_default("top_p", 0.95)),
-        "top_k": int(_num(body.get("top_k"), family_default("top_k", 0))),
+        #   (Qwen3.8-Flash-Next: the model card's values per mode — 2026-11-16 a client that sent temperature 1.0 · top_p 1.0 and no top_k
+        #   got top_k 0, sampling the whole vocabulary: a 5,614-token report at 103K context fell apart into Arabic/Thai/Chinese fragments)
+        "temperature": _num(body.get("temperature"), family_default("temperature", 1.0, thinking_mode)),
+        "top_p": _num(body.get("top_p"), family_default("top_p", 0.95, thinking_mode)),
+        "top_k": int(_num(body.get("top_k"), family_default("top_k", 0, thinking_mode))),
         "min_p": _num(body.get("min_p"), 0.0),
         # presence_penalty (OpenAI: −2..2, subtracted from the logit of every token already in this response — the daemon applies it at every
         #   sampled row, verify rows included; Qwen3.8-Flash-Next only, the other families keep ignoring it as before)
-        **({"presence_penalty": max(-2.0, min(2.0, float(pp)))} if FAMILY == "qwen4_exp" and (pp := _num(body.get("presence_penalty"), 0.0)) else {}),
+        **({"presence_penalty": max(-2.0, min(2.0, float(pp)))} if FAMILY == "qwen4_exp" and (pp := _num(body.get("presence_penalty"), family_default("presence_penalty", 0.0, thinking_mode))) else {}),
         "seed": int(_num(body.get("seed"), 0)) if abs(_num(body.get("seed"), 0)) < 2 ** 62 else 0,
         # ignore_eos (benchmark harnesses measure throughput at a fixed output length): no stop token, run to max_tokens
         "stop_ids": [] if body.get("ignore_eos") else stop_ids(),
         **({"prefix_extra": 1} if prefix_extra else {}),
         # the conversation already has a turn: the daemon keeps a boundary snapshot on a long re-read (hived "history")
         **({"history": True} if hints and has_turns else {}),
+        # HIVE_PREFIX_LEAD: the end of the fixed leading block (HintList.lead) — hived saves a kept snapshot there when this read passes it
+        **({"lead": lead_at} if hints and lead_at and env_on("HIVE_PREFIX_LEAD") else {}),
         **({"priority": prio} if (prio := request_priority(body)) else {}),
     }
     think_cap = think_cap_from_request(body) if thinking_mode == "thinking" else None

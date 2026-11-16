@@ -1257,6 +1257,20 @@ class HintTests(unittest.IsolatedAsyncioTestCase):
         _, _, h3=self.hints_for(self.conv())
         self.assertNotIn(len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>first question')), h3)
 
+    def test_lead_boundary(self):
+        """2026-11-16 (HIVE_PREFIX_LEAD): HintList.lead = the deepest hint that ends the fixed leading block — what a compacted
+        conversation keeps — never an assistant-turn end."""
+        _, _, hints=self.hints_for(self.conv())
+        sys_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>'))
+        self.assertEqual(hints.lead, sys_end)
+        msgs=[{'role':'system','content':self.SYS}, {'role':'user','content':'fixed block'}, {'role':'user','content':'question one'},
+              {'role':'assistant','content':'answer'}, {'role':'user','content':'question two'}]
+        _, _, h2=self.hints_for(msgs)
+        block_end=len(s.TOK.encode('<|system|>'+self.SYS+'<|user|>fixed block<|user|>'))
+        self.assertEqual(h2.lead, block_end); self.assertIn(block_end, h2); self.assertGreater(max(h2), block_end)
+        _, _, h3=self.hints_for([{'role':'user','content':'no system'}, {'role':'assistant','content':'a'}, {'role':'user','content':'b'}])
+        self.assertEqual(h3.lead, 0)
+
     def test_leading_user_block_then_room_notice(self):
         """2026-10-19: a chat client sent [system + tools] [user: per-person block] [system: per-room notice] [user: ...] — the person's
         block had no boundary because a system message, not a user message, followed it."""

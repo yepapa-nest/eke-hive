@@ -7,7 +7,9 @@
 //   (2) the pack files on disk are exactly the indexed ones and their sizes add up to the store's byte count,
 //   (3) the store stays within its budget, every entry it still lists reads back, and a segment whose pack was dropped is written again,
 //   (4) the budget drops the least recently *used* entry: an old entry that was read or touched outlives newer ones that were not,
-//   (5) a write's time does not grow with the number of entries (the full recount it replaced did).
+//   (5) a write's time does not grow with the number of entries (the full recount it replaced did),
+//   (6) entries never read go before entries in use (a flood of one-off requests keeps the conversations), the counts survive a restart, kept
+//       entries over their share give way, and the filesystem floor (min_free) shrinks the budget.
 // Build: g++ -std=c++20 -O1 -pthread -Iengine/include -Iengine/third_party engine/tests/test_session_store_evict_cpu.cpp
 #include <chrono>
 #include <cstdio>
@@ -162,6 +164,55 @@ int main() {
     EXPECT(st.load_snap(3) == nullptr && st.load_snap(4) == nullptr, "snapshots 3 and 4 (never used again) should have been evicted first");
     EXPECT(st.load_snap(5) != nullptr && st.load_snap(6) != nullptr, "the newest snapshots must stay");
     printf("session store evict CPU: recency follows use (touched and read entries outlive newer unused ones)\n");
+  }
+
+  // ---- (6): a flood of one-off entries does not push out the entries in use (2026-11-16, FN: 631 one-off requests evicted 30 of 32 rooms) --
+  {
+    const std::string key = "test-kept";
+    auto mk = [&](int64_t pos) {
+      auto im = std::make_shared<TestImage>();
+      im->pos = pos; im->tokens.assign(2, (int32_t)pos);
+      HostImageBuffer b; b.segments.push_back(segment(8 << 10)); im->bufs.push_back(std::move(b));
+      return im;
+    };
+    {
+      Store st(dir, key, (size_t)100 << 10);  // ~12 of the 8 KB entries
+      auto pause = [] { std::this_thread::sleep_for(std::chrono::milliseconds(2)); };
+      // three rooms: a first read (keep = the conversation has turns), then a later turn (replaces the checkpoint: inherits, stays kept)
+      for (int r = 0; r < 3; ++r) { st.put_ckpt("room" + std::to_string(r), mk(100 + r), {}, {}, true); st.drain(); pause(); }
+      st.put_ckpt("room0", mk(200), {}, {}); st.drain(); pause();  // keep=false, but it continues room0's checkpoint
+      st.put_snap(7777, mk(300), {}, false, true); st.drain(); pause();  // a lead snapshot
+      // the flood: 40 one-off checkpoints, never read
+      for (int i = 0; i < 40; ++i) { st.put_ckpt("oneoff" + std::to_string(i), mk(1000 + i), {}, {}); st.drain(); pause(); }
+      for (int r = 0; r < 3; ++r) EXPECT(st.has_ckpt("room" + std::to_string(r)), "room%d's checkpoint was evicted by one-off entries", r);
+      EXPECT(st.load_snap(7777) != nullptr, "the kept lead snapshot was evicted by one-off entries");
+      EXPECT(st.has_ckpt("oneoff39"), "the newest entry must stay");
+      EXPECT(!st.has_ckpt("oneoff0"), "the oldest one-off entry should have gone");
+      const auto s = st.stats();
+      EXPECT(s["evicted_unread"].get<long>() == s["evicted"].get<long>() && s["evicted"].get<long>() > 0,
+             "only unread entries should have gone (evicted %ld, unread %ld)", s["evicted"].get<long>(), s["evicted_unread"].get<long>());
+    }
+    {  // the counts survive a restart (metas carry them)
+      Store st(dir, key, (size_t)100 << 10);
+      for (int i = 0; i < 20; ++i) { st.put_ckpt("after" + std::to_string(i), mk(5000 + i), {}, {}); st.drain(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+      for (int r = 0; r < 3; ++r) EXPECT(st.has_ckpt("room" + std::to_string(r)), "after a restart room%d's checkpoint lost its kept class", r);
+    }
+    {  // kept entries above their share of the budget give way (new conversations still get room); the oldest kept goes first
+      Store st(dir, key + "-share", (size_t)100 << 10);
+      for (int i = 0; i < 14; ++i) { st.put_ckpt("k" + std::to_string(i), mk(9000 + i), {}, {}, true); st.drain(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+      EXPECT(!st.has_ckpt("k0") && st.has_ckpt("k13"), "kept entries over the budget: the least recently used kept entry should go first");
+      const auto s = st.stats();
+      EXPECT(s["bytes"].get<size_t>() <= ((size_t)100 << 10), "kept entries alone stayed over the budget (%zu bytes)", s["bytes"].get<size_t>());
+    }
+    {  // the filesystem floor: a floor above the disk's free space shrinks the budget below what the store holds — it gives back its own bytes
+      Store st(dir, key + "-floor", (size_t)1 << 30, (size_t)1 << 60);
+      for (int i = 0; i < 5; ++i) { st.put_ckpt("f" + std::to_string(i), mk(7000 + i), {}, {}); st.drain(); }
+      EXPECT(st.entries() == 1 && st.has_ckpt("f4"), "with no room left on the disk the store should keep only its newest entry (%zu entries)", st.entries());
+      EXPECT(st.stats()["budget_now"].get<size_t>() == 0, "budget_now should be 0 with the floor above the free space");
+      Store open(dir, key + "-open", (size_t)1 << 30, 0);
+      EXPECT(open.stats()["budget_now"].get<size_t>() == ((size_t)1 << 30), "no floor: the configured budget");
+    }
+    printf("session store evict CPU: one-off entries go before entries in use · counts survive a restart · kept share · disk floor\n");
   }
 
   // ---- (5): the time of a write does not grow with the entries --------------------------------------------------------------------------

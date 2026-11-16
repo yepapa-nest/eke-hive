@@ -212,6 +212,17 @@ ok(srv.hanja_filter_mode({}, {"x-hanja-filter": "1"})[1] == float("inf"), "defau
 ok(srv.hanja_filter_mode({"hanja_filter": True, "hanja_penalty": -2}, {})[1] == float("inf"), "bad hanja_penalty -> inf")
 srv.FAMILY = "deepseek_v4"
 ok(srv.hanja_filter_wanted({"hanja_filter": True}, {}) is False, "hanja_filter is FN only")
+# ---- sampling defaults for fields a request leaves out (2026-11-16: a client without top_k sampled the whole vocabulary) ----
+ok(qwen.defaults("thinking") == {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0}, f"thinking defaults {qwen.defaults('thinking')}")
+ok(qwen.defaults("chat") == {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}, f"chat defaults {qwen.defaults('chat')}")
+ok(qwen.defaults(None) == qwen.defaults("thinking"), "no mode -> thinking defaults")
+srv.FAMILY, srv.ENC = "qwen4_exp", qwen
+for key, mode, want in [("top_k", "thinking", 20), ("top_p", "thinking", 0.95), ("temperature", "chat", 0.7), ("top_p", "chat", 0.8),
+                        ("presence_penalty", "chat", 1.5), ("presence_penalty", "thinking", 0.0), ("min_p", "chat", 0.0)]:
+    got = srv.family_default(key, 0.0, mode)
+    ok(got == want, f"family_default {key} {mode} -> {got}")
+srv.FAMILY = "deepseek_v4"
+ok(srv.family_default("top_k", 0, "thinking") == 0, "DeepSeek keeps the server fallbacks")
 _m = importlib.util.spec_from_file_location("cjk_mask", Path(__file__).resolve().parents[1] / "tools/build_cjk_mask.py")
 cm = importlib.util.module_from_spec(_m)
 _m.loader.exec_module(cm)

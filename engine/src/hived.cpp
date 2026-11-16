@@ -1128,6 +1128,10 @@ int main(int argc, char** argv) {
   //   Set up here and, when the daemon starts asleep, at the first wake (the shape needs a sequence from the pool).
   const std::string store_root = getenv("HIVE_SESSION_STORE") && strcmp(getenv("HIVE_SESSION_STORE"), "0") != 0 ? getenv("HIVE_SESSION_STORE") : "";  // "" / "0" = off
   const double store_gb = getenv("HIVE_SESSION_STORE_GB") && *getenv("HIVE_SESSION_STORE_GB") ? std::max(0.000001, atof(getenv("HIVE_SESSION_STORE_GB"))) : 64.0;
+  // HIVE_SESSION_STORE_MIN_FREE_GB (default 32, 0 = off): space the store leaves free on its filesystem — when other files fill the disk the
+  //   budget shrinks below HIVE_SESSION_STORE_GB and the store gives back its own oldest entries first (session_store.h effective_budget)
+  const double store_min_free_gb = getenv("HIVE_SESSION_STORE_MIN_FREE_GB") && *getenv("HIVE_SESSION_STORE_MIN_FREE_GB")
+                                       ? std::max(0.0, atof(getenv("HIVE_SESSION_STORE_MIN_FREE_GB"))) : 32.0;
   auto store_init = [&] {
     if (sstore || store_root.empty() || seq_pool.empty()) return;
     SeqImage probe;
@@ -1142,7 +1146,7 @@ int main(int argc, char** argv) {
     const std::string id = "store-format " + std::to_string(kStoreFormat) + "\n" + cfg + "\n" + shape.s;
     const std::string key = daemon + "-" + hive::store::hex16(hive::store::hash_bytes(reinterpret_cast<const uint8_t*>(id.data()), id.size()));
     try {
-      sstore = std::make_unique<hive::store::SessionStore<SeqImage>>(store_root, key, (size_t)(store_gb * 1073741824.0));
+      sstore = std::make_unique<hive::store::SessionStore<SeqImage>>(store_root, key, (size_t)(store_gb * 1073741824.0), (size_t)(store_min_free_gb * 1073741824.0));
     } catch (const std::exception& e) {
       fprintf(stderr, "[hived] session store off: %s\n", e.what());
       return;
@@ -1803,6 +1807,7 @@ int main(int argc, char** argv) {
     std::string sid;
     Session* S = nullptr;
     std::shared_ptr<SeqImage> ckpt_base;  // this request's deepest boundary snapshot — the prompt checkpoint's delta base (shares its rows)
+    bool history = false;  // the request's "history" (the conversation already has a turn): its checkpoint starts in the store's kept class
     std::atomic<bool>* cancel = nullptr;  // = r.cancel.get() (the Request owns its lifetime)
     std::vector<float> logits;
     std::mt19937_64 rng;
@@ -1870,7 +1875,7 @@ int main(int argc, char** argv) {
     S->ckpt = std::move(img);
     S->ckpt_logits = logits;
     S->ckpt_sig = S->img_sig;
-    if (sstore) sstore->put_ckpt(X.sid, S->ckpt, S->ckpt_logits, to_store_sig(S->ckpt_sig));  // written on the store's thread
+    if (sstore) sstore->put_ckpt(X.sid, S->ckpt, S->ckpt_logits, to_store_sig(S->ckpt_sig), X.history);  // written on the store's thread
     host_total();
     archive_trim(X.sid);
   };
@@ -2085,6 +2090,7 @@ int main(int argc, char** argv) {
     size_t last_snap_at = 0;  // HIVE_PREFIX_INTERVAL: position of this request's last snapshot (or where it resumed) · 0 interval = none for this request
     bool interval_ok = false;
     size_t learn_at = 0;  // HIVE_PREFIX_LEARN: the learned boundary still to be cut (one of hints · 0 = none or already cut)
+    size_t lead_at = 0, lead_keep = 0;  // the request's "lead" boundary still to be cut (0 = none or already cut) · its position (the snapshot is kept)
     ForwardStats st{};
     std::unique_ptr<PrefillPending> pending;
     // current chunk (chunk_begin -> chunk_end)
@@ -2192,13 +2198,14 @@ int main(int argc, char** argv) {
     if (hints.empty()) return M;
     size_t deepest = 0;
     for (size_t h : hints) if (h > i && h != J.learn_at && hint_ok(h) && ids.size() - h > 16) deepest = h;  // the deepest conversation boundary (not the generation-suffix hint below)
-    size_t free_cut = 0, extra_cut = 0, gen_cut = 0, learn_cut = 0;
+    size_t free_cut = 0, extra_cut = 0, gen_cut = 0, learn_cut = 0, lead_cut = 0;
     std::array<size_t, 3> nat{};
     bool have_nat = false;
     for (size_t h : hints) {
       if (h <= i || h >= i + (size_t)M || !hint_ok(h)) continue;
       if (last_upper_skipped && !rt.tail_mode_for((int)(h - i))) continue;
       if (h == J.learn_at) { learn_cut = h; continue; }  // HIVE_PREFIX_LEARN: always cut (admit_setup decided it pays)
+      if (h == J.lead_at) { lead_cut = h; }               // the request's lead boundary: always cut (below), and also a candidate as before
       // A generation-suffix hint (the server sends it at most GEN_TAIL_MAX = 16 tokens before the end — hive_server.boundary_hints):
       //   the piece after it is a few tokens on the short path (decode policy, about one decode step), and the chunk before it keeps
       //   its tail mode with the upper layers on (the next chunk is not a tail-mode chunk), so the snapshot there is complete. It is
@@ -2215,6 +2222,8 @@ int main(int argc, char** argv) {
     const int cut = by_extra ? (int)(extra_cut - i) : free_cut ? (int)(free_cut - i) : gen_cut ? (int)(gen_cut - i) : M;
     // the learned boundary first when it comes first (the other cut is chosen again by the next chunk); after it, as before
     if (learn_cut && (int)(learn_cut - i) < cut) { J.learn_at = 0; return (int)(learn_cut - i); }
+    if (lead_cut && (int)(lead_cut - i) < cut) { J.lead_at = 0; return (int)(lead_cut - i); }
+    if (lead_cut && (int)(lead_cut - i) == cut) J.lead_at = 0;
     if (by_extra) --extra_left;
     return cut;
   };
@@ -2236,7 +2245,7 @@ int main(int argc, char** argv) {
     rt.save_image(*S->seq, *img, last_boundary ? last_boundary.get() : S->ckpt.get());
     host_total(img.get());
     shared_snaps[key] = SharedSnap{img, sg, skipped, now_ms()};
-    if (sstore) sstore->put_snap(key, img, to_store_sig(sg), skipped);  // written on the store's thread
+    if (sstore) sstore->put_snap(key, img, to_store_sig(sg), skipped, at == J.lead_keep);  // written on the store's thread (a lead snapshot starts kept)
     last_boundary = img;
     J.last_boundary_full = !skipped;
     J.last_snap_at = at;
@@ -2839,6 +2848,7 @@ int main(int argc, char** argv) {
     //   Only for a conversation that already has a turn (the request's "history": true, from the API server) — a first turn keeps the
     //   server's first-turn policy (HIVE_PREFIX_FIRST_TURN: a system block nobody else sent is not cut).
     const bool history = q.contains("history") && q["history"].is_boolean() && q["history"].get<bool>();
+    A->history = history;
     // A family that rewinds resumes a changed tail from its live state: per-turn boundary snapshots of a conversation would only cost copies
     //   (the first turn's head snapshot, shared by new conversations, is unaffected).
     //   That includes the generation-suffix cut (its point is the next turn re-rendering this prompt's end, which a rewind absorbs).
@@ -2848,6 +2858,21 @@ int main(int argc, char** argv) {
       hints.insert(std::lower_bound(hints.begin(), hints.end(), learned_at), learned_at);
       J.learn_at = learned_at;
       fprintf(stderr, "[hived] %s: shared-prefix boundary learned at %zu (another snapshot shares the head)\n", A->sid.c_str(), learned_at);
+    }
+    // The request's "lead" (HIVE_PREFIX_LEAD on the API server): the end of the conversation's fixed leading block — the system/tools block and
+    //   any fixed user blocks before the first question. A conversation that is later compacted (its turns replaced by a summary) or
+    //   rewritten after that block resumes exactly there, so a read that passes it saves a snapshot there, kept in the store's kept class.
+    //   Measured 2026-11-16 (FN, after the model switch): 5 turns right after compaction shared 31,349-32,525 leading tokens with the
+    //   conversation's previous request, but the only snapshots were at chunk ends (65,536 · the prompt end) — each re-read that block, ~5 s.
+    //   A family that rewinds continues from its live state instead (no snapshot needed); a lead already saved is not cut again (hint_ok).
+    if constexpr (!RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>) {
+      if (prefix_share && !fake_head && (!has_images || image_ckpt) && q.contains("lead") && q["lead"].is_number_integer()) {
+        const int64_t ld = q["lead"].get<int64_t>();
+        if (ld > (int64_t)common && ld < (int64_t)ids.size() - 16 && ld >= (hint_min_tokens >= 0 ? hint_min_tokens : ckpt_min_tokens)) {
+          if (!std::binary_search(hints.begin(), hints.end(), (size_t)ld)) hints.insert(std::lower_bound(hints.begin(), hints.end(), (size_t)ld), (size_t)ld);
+          J.lead_at = J.lead_keep = (size_t)ld;
+        }
+      }
     }
     // HIVE_PREFIX_INTERVAL: the same requests that may take boundary snapshots (a rewinding family continues a changed history from its
     //   live or archived state instead)

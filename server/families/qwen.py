@@ -54,6 +54,19 @@ def init(tok, cfg: dict, ckpt: str | None = None) -> None:
     EOS_TEXTS = [s for s in (tok.convert_ids_to_tokens(i) for i in STOP_IDS) if isinstance(s, str) and s]
 
 
+# Sampling defaults for the fields a request leaves out (hive_server family_default) — the model card's recommended values, per mode
+#   (thinking: temperature 1.0 · top_p 0.95 · top_k 20 · presence 0 / non-thinking: 0.7 · 0.8 · 20 · presence 1.5). A request's own values win.
+DEFAULTS_BY_MODE = True
+_DEFAULTS = {
+    "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0},
+    "chat": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5},
+}
+
+
+def defaults(thinking_mode: str | None = None) -> dict:
+    return dict(_DEFAULTS["chat" if thinking_mode == "chat" else "thinking"])
+
+
 def nothink_mode() -> str:
     return "enable_thinking=false (empty thinking block)"
 
