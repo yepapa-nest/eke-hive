@@ -1428,9 +1428,12 @@ void Runtime::ensure_vision() {
   try {
     vision_ = std::make_unique<Vision>(model_, *blas_, st_, vision_max_patches_);
   } catch (const DeviceOutOfMemory&) {
-    // the room it needs went elsewhere (graph_room keeps it for later instances, not for ones made before): free the graphs and try once more
+    // the room it needs went elsewhere (graph_room keeps it for later instances, not for ones made before): free the graphs,
+    //   trim the CUDA graph memory pool so destroyed graph pages return to cudaMalloc, and try once more
     const int n = evict_graphs(0);
-    fprintf(stderr, "[runtime] ⚠️vision encoder did not fit — destroyed %d graphs and retrying\n", n);
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) (void)cudaDeviceGraphMemTrim(dev);
+    fprintf(stderr, "[runtime] ⚠️vision encoder did not fit — destroyed %d graphs, trimmed graph pool and retrying\n", n);
     cudaMemGetInfo(&fr0, &tot);
     vision_ = std::make_unique<Vision>(model_, *blas_, st_, vision_max_patches_);
   }
@@ -3459,11 +3462,17 @@ int Runtime::evict_graphs(size_t want_free, size_t max_n) {
     live[i]->exec = nullptr;
     live[i]->uses = 0;  // the next use runs eagerly, then captures again (run_graph)
     ++n;
-    if (want_free && (n % 32 == 0 || i + 1 == live.size())) {  // check in batches — the driver returns memory in whole pages
+    if (want_free && (n % 32 == 0 || i + 1 == live.size())) {  // check in batches — trim the graph pool so freed pages return to cudaMemGetInfo / cudaMalloc
+      int dev = 0;
+      if (cudaGetDevice(&dev) == cudaSuccess) (void)cudaDeviceGraphMemTrim(dev);
       size_t fr = 0, tot = 0;
       cudaMemGetInfo(&fr, &tot);
       if (fr >= want_free) break;
     }
+  }
+  if (n > 0 && !want_free) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) (void)cudaDeviceGraphMemTrim(dev);
   }
   graph_evicted_ += n;
   return n;

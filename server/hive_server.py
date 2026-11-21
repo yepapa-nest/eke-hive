@@ -882,8 +882,8 @@ def plain_control_spellings(messages: list, tools):
     return _map_text(messages, sp.protect), _map_text(tools, sp.protect)
 
 
-def encode_prompt(messages: list[dict], tools, thinking_mode: str, effort) -> tuple[str, list[dict]]:
-    """Reference encoding.encode_messages: the tool list is attached to the first message as `tools`. Images come back in media["images"]."""
+def _encode_prompt_full(messages: list[dict], tools, thinking_mode: str, effort) -> tuple[str, list[dict]]:
+    """Reference encoding.encode_messages without incremental prefix caching."""
     check_image_parts(messages)
     messages, tools = inert_image_placeholders(messages, tools)
     if not adapter_family():
@@ -913,6 +913,290 @@ def encode_prompt(messages: list[dict], tools, thinking_mode: str, effort) -> tu
         kwargs["reasoning_effort"] = effort
     prompt, media = ENC.encode_messages(messages, **kwargs)
     images = (media or {}).get("images") or []
+    return prompt, images
+
+
+class TemplateCache:
+    """HIVE_TEMPLATE_CACHE (default on; "0" = off): incremental prefix render cache for DeepSeek's reference encoding.py.
+    On long tool-call conversations (300K-700K tokens, hundreds of messages), each turn re-rendered the entire history once for the
+    prompt (template p50 89 ms / p90 198 ms) and five more times for boundary hints (hints p50 127 ms / p90 331 ms, measured
+    2026-11-21). DeepSeek's encode_messages renders each message independently except for (a) tool-result merging / sorting across
+    adjacent assistant+tool turns, (b) the transition token at the end of a user/mid-system message, and (c) drop_thinking before
+    the last user message when no tools are declared. Keeping the exact rendered string up to a clean boundary P lets follow-up
+    turns and all boundary-hint probes render only the trailing 1-4 messages through ENC.encode_messages(tail, context=[anchor])
+    (~0.2 ms vs ~100 ms, byte-identical). Every store self-verifies prompt.endswith(tail); periodic background verification
+    (HIVE_TEMPLATE_CACHE_VERIFY, default 32) compares against the full render and disables the cache on any mismatch."""
+
+    def __init__(self):
+        self.entries: OrderedDict = OrderedDict()
+        self.size = 0
+        self.lock = threading.Lock()
+        self.bind = None
+        self.disabled = False
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("HIVE_TEMPLATE_CACHE", "1") != "0"
+
+    def usable(self) -> bool:
+        if self.disabled or not self.enabled() or adapter_family() or ENC is None or TOK is None:
+            return False
+        if not hasattr(ENC, "encode_messages"):
+            return False
+        b = (ENC, TOK, os.environ.get("HIVE_PLAIN_SPELLINGS", "1"))
+        with self.lock:
+            if self.bind is None or any(x is not y for x, y in zip(b, self.bind)):
+                self.entries.clear()
+                self.size = 0
+                self.bind = b
+        return True
+
+    @staticmethod
+    def _is_plain_msg(m) -> bool:
+        if not isinstance(m, dict):
+            return False
+        if m.get("role") not in ("system", "user", "assistant", "tool"):
+            return False
+        if m.get("task") is not None or m.get("response_format") is not None or m.get("content_blocks") is not None:
+            return False
+        c = m.get("content")
+        if c is not None:
+            if not isinstance(c, str) or "<image>" in c or "</image>" in c:
+                return False
+        return True
+
+    @staticmethod
+    def _msg_sig(m: dict) -> int:
+        c = m.get("content")
+        rc = m.get("reasoning_content")
+        tcs = m.get("tool_calls")
+        return hash((m.get("role"), c if isinstance(c, str) else None, len(tcs) if isinstance(tcs, list) else 0,
+                     m.get("tool_call_id"), rc if isinstance(rc, str) else None, bool(m.get("tools"))))
+
+    @staticmethod
+    def _tools_sig(tools) -> int:
+        if not tools:
+            return 0
+        if not isinstance(tools, list):
+            return -1
+        f0 = (tools[0].get("function") or {}).get("name") if isinstance(tools[0], dict) else None
+        f1 = (tools[-1].get("function") or {}).get("name") if isinstance(tools[-1], dict) else None
+        return hash((len(tools), f0, f1))
+
+    @staticmethod
+    def _last_user_idx(messages: list[dict]) -> int:
+        for i in range(len(messages) - 1, -1, -1):
+            r = messages[i].get("role")
+            if r in ("user", "tool") or (r == "system" and i > 0):
+                return i
+        return -1
+
+    @staticmethod
+    def _render_tail(tail: list[dict], has_tools: bool, thinking_mode: str, effort) -> tuple[str, list[dict]]:
+        t_msgs, _ = inert_image_placeholders(tail, None)
+        t_msgs, _ = plain_control_spellings(t_msgs, None)
+        t_msgs = [dict(m) for m in t_msgs]
+        anchor = {"role": "system", "content": "", **({"tools": [{}]} if has_tools else {})}
+        kwargs = {"thinking_mode": thinking_mode, "context": [anchor], "add_default_bos_token": False, "return_multi_modal_data": True}
+        if effort is not None and thinking_mode == "thinking":
+            kwargs["reasoning_effort"] = effort
+        txt, media = ENC.encode_messages(t_msgs, **kwargs)
+        return txt, (media or {}).get("images") or []
+
+    def _find_split(self, messages: list[dict], has_tools: bool, thinking_mode: str) -> tuple[int, bool] | None:
+        """Deepest clean split point (P, next_must_be_asst) in messages with 1 <= P < len(messages), or None."""
+        n = len(messages)
+        if n < 3:
+            return None
+        eff_drop = thinking_mode == "thinking" and not has_tools
+        last_u = self._last_user_idx(messages) if eff_drop else n
+        for P in range(n - 1, max(0, n - 12), -1):
+            if eff_drop and P > last_u:
+                continue
+            prev, nxt = messages[P - 1], messages[P]
+            pr, nr = prev.get("role"), nxt.get("role")
+            if pr == "assistant":
+                if prev.get("tool_calls") and nr == "tool":
+                    continue
+                if nr != "tool":
+                    return P, False
+            elif pr == "system" and P - 1 == 0:
+                if nr != "tool":
+                    return P, False
+            elif pr in ("user", "tool") and nr == "assistant":
+                if eff_drop and P - 1 >= last_u:
+                    continue
+                return P, True
+        return None
+
+    def _store_from_prompt(self, messages: list[dict], tools, thinking_mode: str, effort, has_tools: bool, prompt: str,
+                           base_P: int = 0, base_msgs=None, base_tools=None) -> None:
+        split = self._find_split(messages, has_tools, thinking_mode)
+        if split is None:
+            return
+        P, next_asst = split
+        tail = messages[P:]
+        if not all(self._is_plain_msg(m) for m in tail):
+            return
+        try:
+            tail_str, t_media = self._render_tail(tail, has_tools, thinking_mode, effort)
+        except Exception:  # noqa: BLE001
+            return
+        if t_media or not tail_str or not prompt.endswith(tail_str):
+            return
+        prefix_str = prompt[:-len(tail_str)]
+        key = (P, self._msg_sig(messages[P - 1]), self._msg_sig(messages[0]), self._tools_sig(tools), thinking_mode, effort, has_tools)
+        import copy as _copy
+        import sys as _sys
+        if base_msgs is not None and 0 < base_P <= P:
+            msgs_snap = base_msgs + _copy.deepcopy(messages[base_P:P])
+            tools_snap = base_tools
+        else:
+            msgs_snap = _copy.deepcopy(messages[:P])
+            tools_snap = _copy.deepcopy(tools) if tools is not None else None
+        sz = 2 * _sys.getsizeof(prefix_str) + 256 * P
+        try:
+            budget = float(os.environ.get("HIVE_TEMPLATE_CACHE_MB") or 256) * 1024 * 1024
+        except ValueError:
+            budget = 256 * 1024 * 1024
+        with self.lock:
+            old = self.entries.pop(key, None)
+            if old is not None:
+                self.size -= old[4]
+            self.entries[key] = (msgs_snap, tools_snap, prefix_str, next_asst, sz)
+            self.size += sz
+            while len(self.entries) > 1 and (len(self.entries) > 256 or self.size > budget):
+                self.size -= self.entries.popitem(last=False)[1][4]
+
+    def _lookup(self, messages: list[dict], tools, thinking_mode: str, effort, has_tools: bool):
+        n = len(messages)
+        if n < 2:
+            return None
+        m0_sig = self._msg_sig(messages[0])
+        t_sig = self._tools_sig(tools)
+        eff_drop = thinking_mode == "thinking" and not has_tools
+        for P in range(n - 1, max(0, n - 12), -1):
+            key = (P, self._msg_sig(messages[P - 1]), m0_sig, t_sig, thinking_mode, effort, has_tools)
+            with self.lock:
+                entry = self.entries.get(key)
+                if entry is not None:
+                    self.entries.move_to_end(key)
+            if entry is None:
+                continue
+            msgs_snap, tools_snap, prefix_str, next_asst, _ = entry
+            tail = messages[P:]
+            if next_asst:
+                if tail[0].get("role") != "assistant":
+                    continue
+            else:
+                if tail[0].get("role") == "tool":
+                    continue
+            if not all(self._is_plain_msg(m) for m in tail):
+                continue
+            if eff_drop and not any(m.get("role") in ("user", "tool", "system") for m in tail):
+                continue
+            if tools == tools_snap and messages[:P] == msgs_snap:
+                return P, prefix_str, msgs_snap, tools_snap
+        return None
+
+    def can_hit_jobs(self, messages: list[dict], jobs: list, tools, thinking_mode: str, effort) -> bool:
+        """True when every probe render in `jobs` (cut, suffix) is expected to hit this cache inline (no RenderPool needed)."""
+        if not self.usable() or not jobs or len(messages) < 3:
+            return False
+        has_tools = bool(tools) or any(isinstance(m, dict) and m.get("tools") for m in messages)
+        m0_sig = self._msg_sig(messages[0])
+        t_sig = self._tools_sig(tools)
+        eff_drop = thinking_mode == "thinking" and not has_tools
+        with self.lock:
+            for cut, suffix in jobs:
+                n = cut + len(suffix)
+                if n < 2:
+                    return False
+                found = False
+                for P in range(min(cut, n - 1), max(0, n - 12), -1):
+                    key = (P, self._msg_sig(messages[P - 1]), m0_sig, t_sig, thinking_mode, effort, has_tools)
+                    entry = self.entries.get(key)
+                    if entry is None:
+                        continue
+                    next_asst = entry[3]
+                    first_tail = messages[P] if P < cut else suffix[P - cut]
+                    if next_asst and first_tail.get("role") != "assistant":
+                        continue
+                    if not next_asst and first_tail.get("role") == "tool":
+                        continue
+                    if eff_drop:
+                        tail_roles = [messages[i].get("role") for i in range(P, cut)] + [m.get("role") for m in suffix]
+                        if not any(r in ("user", "tool", "system") for r in tail_roles):
+                            continue
+                    found = True
+                    break
+                if not found:
+                    return False
+        return True
+
+    def _verify_later(self, messages: list[dict], tools, thinking_mode: str, effort, prompt: str) -> None:
+        import copy as _copy
+        mc, tc = _copy.deepcopy(messages), _copy.deepcopy(tools) if tools is not None else None
+        def check():
+            try:
+                full, _ = _encode_prompt_full(mc, tc, thinking_mode, effort)
+                if full != prompt:
+                    self.disabled = True
+                    print(f"[server] ⚠️template cache mismatch ({len(prompt)} vs {len(full)} chars) — disabling HIVE_TEMPLATE_CACHE", flush=True)
+                else:
+                    print(f"[server] template cache verify ok · {len(prompt)} chars", flush=True)
+            except Exception:  # noqa: BLE001
+                pass
+        threading.Thread(target=check, daemon=True).start()
+
+    def render(self, messages: list[dict], tools, thinking_mode: str, effort, store: bool = True) -> tuple[str, list[dict]] | None:
+        if not self.usable() or len(messages) < 3:
+            return None
+        has_tools = bool(tools) or any(isinstance(m, dict) and m.get("tools") for m in messages)
+        hit = self._lookup(messages, tools, thinking_mode, effort, has_tools)
+        if hit is not None:
+            P, prefix_str, msgs_snap, tools_snap = hit
+            try:
+                tail_str, t_media = self._render_tail(messages[P:], has_tools, thinking_mode, effort)
+            except Exception:  # noqa: BLE001
+                return None
+            if t_media:
+                return None
+            prompt = prefix_str + tail_str
+            self.hits += 1
+            n = int(os.environ.get("HIVE_TEMPLATE_CACHE_VERIFY", "32") or 0)
+            if n > 0 and self.hits % n == 0:
+                self._verify_later(messages, tools, thinking_mode, effort, prompt)
+            if store and len(messages) - P >= 2:
+                self._store_from_prompt(messages, tools, thinking_mode, effort, has_tools, prompt,
+                                        base_P=P, base_msgs=msgs_snap, base_tools=tools_snap)
+            return prompt, []
+        self.misses += 1
+        return None
+
+    def observe(self, messages: list[dict], tools, thinking_mode: str, effort, prompt: str, media: list) -> None:
+        if media or not self.usable() or len(messages) < 3:
+            return
+        if not all(self._is_plain_msg(m) for m in messages):
+            return
+        has_tools = bool(tools) or any(m.get("tools") for m in messages)
+        self._store_from_prompt(messages, tools, thinking_mode, effort, has_tools, prompt)
+
+
+TEMPLATE_CACHE = TemplateCache()
+
+
+def encode_prompt(messages: list[dict], tools, thinking_mode: str, effort) -> tuple[str, list[dict]]:
+    """Reference encoding.encode_messages: the tool list is attached to the first message as `tools`. Images come back in media["images"]."""
+    if encode_prompt is _ENCODE_PROMPT:
+        got = TEMPLATE_CACHE.render(messages, tools, thinking_mode, effort, store=True)
+        if got is not None:
+            return got
+    prompt, images = _encode_prompt_full(messages, tools, thinking_mode, effort)
+    if encode_prompt is _ENCODE_PROMPT:
+        TEMPLATE_CACHE.observe(messages, tools, thinking_mode, effort, prompt, images)
     return prompt, images
 
 
@@ -2009,10 +2293,9 @@ RENDER_POOL = RenderPool()
 
 def render_probes_start(messages: list, prompt: str, jobs: list, tools, thinking_mode: str, effort):
     """Hand every probe render of a request to RENDER_POOL — jobs = (cut, suffix) for encode_prompt(messages[:cut] + suffix) — when the
-    pool is usable and there is more than one. Returns the pending batch for render_probes_finish (which renders on the calling thread
-    whatever the pool did not take or return)."""
+    pool is usable and there is more than one. Skips the pool when TemplateCache can answer every probe inline (~0.2 ms each)."""
     futs, fd = [], -1
-    if len(jobs) > 1 and RENDER_POOL.usable():
+    if len(jobs) > 1 and RENDER_POOL.usable() and not TEMPLATE_CACHE.can_hit_jobs(messages, jobs, tools, thinking_mode, effort):
         ex = RENDER_POOL.executor()
         try:
             if ex is not None:
@@ -2063,7 +2346,9 @@ def render_probes_finish(pending) -> list:
     for i, (cut, suffix) in enumerate(jobs):
         if not done[i]:
             try:
-                text, media = encode_prompt(list(messages[:cut]) + suffix, tools, thinking_mode, effort)
+                probe_msgs = list(messages[:cut]) + suffix
+                got = TEMPLATE_CACHE.render(probe_msgs, tools, thinking_mode, effort, store=False) if encode_prompt is _ENCODE_PROMPT else None
+                text, media = got if got is not None else encode_prompt(probe_msgs, tools, thinking_mode, effort)
             except Exception:  # noqa: BLE001
                 out[i] = None
                 continue
@@ -2337,15 +2622,27 @@ class Daemon:
 
     async def generate(self, session: str, ids: list[int], images: list[dict], blob: bytes, rid: str = "", boundaries=None, **sampling):
         """Send a request to hived and yield token ids asynchronously; the last item is a done dict."""
-        req = {"op": "generate", "session": session, "ids": ids, "images": images, "bin": len(blob), **sampling}
+        ids_blob = b""
+        if ids and os.environ.get("HIVE_IPC_BIN_IDS", "1") != "0" and sys.byteorder == "little" and array("i").itemsize == 4:
+            try:
+                ids_blob = array("i", ids).tobytes()
+            except (TypeError, OverflowError):
+                ids_blob = b""
+        req = {"op": "generate", "session": session, "images": images, "bin": len(ids_blob) + len(blob), **sampling}
+        if ids_blob:
+            req["ids_n"] = len(ids)
+        else:
+            req["ids"] = ids
         if rid: req["rid"] = rid  # D5: so a cancel reaches only this request (hived rid_flags)
         if boundaries: req["boundaries"] = boundaries  # H5: only when enabled (a hived with it off ignores the unknown field)
         head = (json.dumps(req) + "\n").encode()
-        if len(head) + len(blob) >= self.BLOCKING_SEND_BYTES:
+        if len(head) + len(ids_blob) + len(blob) >= self.BLOCKING_SEND_BYTES:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             def send():
                 s.connect(self.sock_path)
                 s.sendall(head)
+                if ids_blob:
+                    s.sendall(ids_blob)
                 if blob:
                     s.sendall(blob)
             fut = asyncio.get_running_loop().run_in_executor(None, send)
@@ -2358,12 +2655,14 @@ class Daemon:
                 s.close()
                 raise
             reader, writer = await asyncio.open_unix_connection(sock=s)
-            head = blob = b""  # already sent
+            head = ids_blob = blob = b""  # already sent
         else:
             reader, writer = await asyncio.open_unix_connection(self.sock_path)
         try:
             if head:
                 writer.write(head)
+            if ids_blob:
+                writer.write(ids_blob)
             if blob:
                 writer.write(blob)
             await writer.drain()

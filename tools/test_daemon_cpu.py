@@ -1927,6 +1927,51 @@ def run_step_host(exe, td):
     return ck
 
 
+def run_bin_ids(exe, td):
+    """Binary ids_n IPC path: text-only, text+images, follow-up reuse, and malformed ids_n rejection."""
+    from array import array
+    ck = Checker('bin-ids')
+    h = Hived(exe, td, name='binids')
+    def send_bin(sid, ids, max_tokens, images=(), bad_ids_n=None):
+        ids_b = array('i', ids).tobytes()
+        blob = b''.join(b for _, b in images) if images else b''
+        req = {'op': 'generate', 'session': sid, 'ids_n': len(ids) if bad_ids_n is None else bad_ids_n,
+               'bin': len(ids_b) + len(blob), 'max_tokens': max_tokens, 'temperature': 0}
+        if images:
+            req['images'] = [m for m, _ in images]
+        s = h.connect()
+        try:
+            s.sendall((json.dumps(req) + '\n').encode() + ids_b + blob)
+            out = {'tokens': [], 'done': None, 'error': None}
+            for line in s.makefile():
+                m = json.loads(line)
+                if 'id' in m: out['tokens'].append(m['id'])
+                elif m.get('done'): out['done'] = m; break
+                elif 'error' in m: out['error'] = m['error']; break
+            return out
+        finally:
+            s.close()
+    A = tokens(120, 7701)
+    r1 = send_bin('b1', A, 5)
+    done_ok(ck, 'bin ids text first turn', r1, A, 5, 0)
+    B = A + r1['tokens'] + tokens(15, 7702)
+    r2 = send_bin('b1', B, 5)
+    done_ok(ck, 'bin ids text follow-up reuse', r2, B, 5, len(A) + 4)
+    # Binary ids + image patch payload in the same bin frame
+    im, ib = image(20, 2, 2, 7703)
+    C = tokens(80, 7704)
+    r3 = send_bin('b2', C, 4, images=[(im, ib)])
+    done_ok(ck, 'bin ids + image payload', r3, C, 4, 0, [(im, ib)])
+    # Malformed ids_n > bin/4 rejected cleanly without killing the daemon
+    r_bad = send_bin('b3', A, 4, bad_ids_n=len(A) + 10)
+    ck.true('bad ids_n rejected', bool(r_bad['error']), repr(r_bad))
+    # Daemon still healthy after bad ids_n
+    D = B + r2['tokens'] + tokens(5, 7705)
+    done_ok(ck, 'healthy after bad ids_n', send_bin('b1', D, 3), D, 3, len(B) + 4)
+    stop_clean(h, ck)
+    return ck
+
+
 def main():
     if os.environ.get('HIVE_DAEMON_NEGATIVE') == 'mutants':
         with tempfile.TemporaryDirectory(prefix='hive-daemon-mut-') as td:
@@ -1943,7 +1988,7 @@ def main():
             print(f'negative control {kind}: {"DETECTED (expected)" if detected else "NOT DETECTED"}')
             sys.exit(0 if detected else 1)
     names = [n for n in os.environ.get('HIVE_DAEMON_CONFIGS', ','.join(CONFIGS)).split(',') if n]
-    extra = os.environ.get('HIVE_DAEMON_EXTRA', 'failures,sigterm,review,round2,graceful,batch,p1,hosttiles,stephost').split(',')
+    extra = os.environ.get('HIVE_DAEMON_EXTRA', 'failures,sigterm,review,round2,graceful,batch,p1,hosttiles,stephost,binids').split(',')
     with tempfile.TemporaryDirectory(prefix='hive-daemon-test-') as td:
         t0 = time.monotonic()
         exe = build_daemon(td)
@@ -1982,6 +2027,8 @@ def main():
             checkers.append(run_host_tiles(td))
         if 'stephost' in extra:
             checkers.append(run_step_host(exe, td))
+        if 'binids' in extra:
+            checkers.append(run_bin_ids(exe, td))
         for ck in checkers[len(names):]:
             print(f'  {ck.name}: {ck.checks} checks, {len(ck.failures)} failures')
         bad = [(ck.name, f) for ck in checkers for f in ck.failures]

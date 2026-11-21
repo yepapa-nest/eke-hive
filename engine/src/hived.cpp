@@ -297,6 +297,7 @@ uint64_t prefix_key(const int32_t* t, size_t n, const std::vector<Session::ImgSi
 struct Request {
   int fd;
   json req;
+  std::vector<int32_t> ids;  // decoded token ids (binary ids_n payload or integer json "ids" array)
   std::vector<uint8_t> bin;
   std::shared_ptr<std::atomic<bool>> cancel;  // each request has its own cancel flag (a per-session shared flag let a re-request clear the previous request's cancel)
   bool solo = false;  // a request put back after a batched-prefill exception — run alone (single path) only
@@ -440,6 +441,11 @@ size_t cuda_pinned_bytes() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Raise the soft open-file limit up to 65536 when the container's hard limit allows (Docker defaults to 1024/524288).
+  { struct rlimit rl; if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 65536 && rl.rlim_max > rl.rlim_cur) {
+      rl.rlim_cur = std::min<rlim_t>(65536, rl.rlim_max);
+      setrlimit(RLIMIT_NOFILE, &rl);
+  } }
   std::string ckpt = getenv("HIVE_CKPT") ? getenv("HIVE_CKPT") : "", engram_dir, sock_path = "/tmp/hive.sock";
   int max_layer = -1, cpu_threads = 16, max_chunk = 4096, max_sessions = 2;
   int prefill_tile = 1;  // --prefill-tile N (max_chunk x N tokens per tile, experts loaded once per encoder layer)
@@ -1711,7 +1717,30 @@ int main(int argc, char** argv) {
       r.fd = fd;
       r.req = j;
       in.payload.resize(in.bin);
-      r.bin = std::move(in.payload);
+      // Binary token-id prefix inside the binary payload (HIVE_IPC_BIN_IDS: "ids_n": N followed by N little-endian int32 ids, then any image patches).
+      //   Avoids serializing/parsing 500K-integer JSON arrays on every turn (measured 2026-11-21: send->admit 146 ms p50 at 450K-800K -> ~2 ms).
+      if (j.contains("ids_n")) {
+        if (!j["ids_n"].is_number_unsigned()) { send_json(fd, {{"error", "bad ids_n"}}); finish_socket(fd); incoming.erase(fd); continue; }
+        const size_t n_ids = j["ids_n"].get<size_t>();
+        if (n_ids > (kMaxHeaderBytes / 2) || n_ids * sizeof(int32_t) > in.bin) {
+          send_json(fd, {{"error", "bad ids_n"}}); finish_socket(fd); incoming.erase(fd); continue;
+        }
+        const size_t ids_bytes = n_ids * sizeof(int32_t);
+        r.ids.resize(n_ids);
+        if (ids_bytes) std::memcpy(r.ids.data(), in.payload.data(), ids_bytes);
+        if (in.bin > ids_bytes) r.bin.assign(in.payload.begin() + (ptrdiff_t)ids_bytes, in.payload.end());
+      } else {
+        if (const auto it = j.find("ids"); it != j.end() && it->is_array()) {
+          bool all_int = true;
+          r.ids.reserve(it->size());
+          for (const auto& v : *it) {
+            if (!v.is_number_integer()) { all_int = false; r.ids.clear(); break; }
+            r.ids.push_back(v.get<int32_t>());
+          }
+          (void)all_int;
+        }
+        r.bin = std::move(in.payload);
+      }
       {
         std::lock_guard<std::mutex> lk(mu);
         r.cancel = std::make_shared<std::atomic<bool>>(false);
@@ -1807,6 +1836,8 @@ int main(int argc, char** argv) {
     std::string sid;
     Session* S = nullptr;
     std::shared_ptr<SeqImage> ckpt_base;  // this request's deepest boundary snapshot — the prompt checkpoint's delta base (shares its rows)
+    std::shared_ptr<SeqImage> near_snap;  // full boundary snapshot within <= 16 tokens of prompt end (reused as the disk ckpt -> 0 new pack bytes)
+    std::vector<Session::ImgSig> near_snap_sig;
     bool history = false;  // the request's "history" (the conversation already has a turn): its checkpoint starts in the store's kept class
     std::atomic<bool>* cancel = nullptr;  // = r.cancel.get() (the Request owns its lifetime)
     std::vector<float> logits;
@@ -1875,7 +1906,18 @@ int main(int argc, char** argv) {
     S->ckpt = std::move(img);
     S->ckpt_logits = logits;
     S->ckpt_sig = S->img_sig;
-    if (sstore) sstore->put_ckpt(X.sid, S->ckpt, S->ckpt_logits, to_store_sig(S->ckpt_sig), X.history);  // written on the store's thread
+    // HIVE_STORE_REUSE_NEAR_SNAP (default on; "0" = off): when a full boundary snapshot (typically the generation-suffix cut at N-3) was just
+    //   persisted within <= 16 tokens of prompt end, write the disk ckpt metadata against that snapshot's already-stored image (0 new pack bytes,
+    //   no extra pack fsync, half the SSD churn) while keeping the full prompt-end checkpoint and logits in RAM.
+    static const bool reuse_near_snap = !(getenv("HIVE_STORE_REUSE_NEAR_SNAP") && strcmp(getenv("HIVE_STORE_REUSE_NEAR_SNAP"), "0") == 0);
+    if (sstore) {
+      if (reuse_near_snap && X.near_snap)
+        sstore->put_ckpt(X.sid, X.near_snap, {}, to_store_sig(X.near_snap_sig), X.history);
+      else
+        sstore->put_ckpt(X.sid, S->ckpt, S->ckpt_logits, to_store_sig(S->ckpt_sig), X.history);  // written on the store's thread
+    }
+    X.near_snap.reset();
+    X.near_snap_sig.clear();
     host_total();
     archive_trim(X.sid);
   };
@@ -1978,17 +2020,16 @@ int main(int argc, char** argv) {
   //   Cost: one token comparison over the matching prefix (json ids) per queued text request per yield point.
   //   rsig: the request's image signatures (request_img_sig) — an image request resumes only where the saved images up to that point are its
   //   own (the same rule as admit_setup's images_match); nullptr = a text request.
-  auto reuse_lower_bound = [&](const std::string& sid, const json& q, const std::vector<Request::ImgSig>* rsig = nullptr) -> size_t {
-    const auto ids_it = q.find("ids");
-    if (ids_it == q.end() || !ids_it->is_array() || ids_it->empty()) return 0;
-    const json& ids = *ids_it;
+  auto reuse_lower_bound = [&](const std::string& sid, const Request& req, const std::vector<Request::ImgSig>* rsig = nullptr) -> size_t {
+    const auto& ids = req.ids;
+    if (ids.empty()) return 0;
     const Session* S = nullptr;
     if (auto it = sessions.find(sid); it != sessions.end()) S = &it->second;
     else if (auto ar = archived.find(sid); ar != archived.end()) S = &ar->second;
     if (!S) return 0;
     auto lcp = [&](const std::vector<int32_t>& a) {
       size_t k = 0; const size_t n = std::min(a.size(), ids.size());
-      while (k < n && ids[k].is_number_integer() && (int64_t)a[k] == ids[k].get<int64_t>()) ++k;
+      while (k < n && a[k] == ids[k]) ++k;
       return k;
     };
     auto clear_upto = [&](const std::vector<Session::ImgSig>& sig, size_t pos) {  // no saved image may straddle pos; up to pos the saved images are the request's
@@ -2017,10 +2058,9 @@ int main(int argc, char** argv) {
     if (S->live) { const size_t k = lcp(S->live->tokens); if (k == (size_t)S->live->pos && ids.size() > k && clear_upto(S->live_sig, k)) best = std::max(best, k); }
     return best;
   };
-  auto rows_to_prefill = [&](const std::string& sid, const json& q, const std::vector<Request::ImgSig>* rsig = nullptr) -> size_t {
-    const auto ids_it = q.find("ids");
-    const size_t rows = ids_it != q.end() && ids_it->is_array() ? ids_it->size() : 0;
-    return rows ? rows - std::min(rows, reuse_lower_bound(sid, q, rsig)) : 0;
+  auto rows_to_prefill = [&](const std::string& sid, const Request& req, const std::vector<Request::ImgSig>* rsig = nullptr) -> size_t {
+    const size_t rows = req.ids.size();
+    return rows ? rows - std::min(rows, reuse_lower_bound(sid, req, rsig)) : 0;
   };
   std::set<std::string> prefilling_sids;  // sessions in a batched prefill (not active yet) — excluded from LRU eviction
   std::set<std::string> admitting_sids;   // sessions whose prefill runs now (excluded from the KV reclaim below)
@@ -2086,6 +2126,7 @@ int main(int argc, char** argv) {
     bool has_images = false, last_upper_skipped = false;
     std::vector<size_t> hints;
     std::shared_ptr<SeqImage> last_boundary;
+    std::vector<Session::ImgSig> last_boundary_sig;
     bool last_boundary_full = false;  // last_boundary was taken with the upper layers on (a complete state — usable as the checkpoint's base)
     size_t last_snap_at = 0;  // HIVE_PREFIX_INTERVAL: position of this request's last snapshot (or where it resumed) · 0 interval = none for this request
     bool interval_ok = false;
@@ -2247,6 +2288,7 @@ int main(int argc, char** argv) {
     shared_snaps[key] = SharedSnap{img, sg, skipped, now_ms()};
     if (sstore) sstore->put_snap(key, img, to_store_sig(sg), skipped, at == J.lead_keep);  // written on the store's thread (a lead snapshot starts kept)
     last_boundary = img;
+    J.last_boundary_sig = sg;
     J.last_boundary_full = !skipped;
     J.last_snap_at = at;
     ++shared_saves;
@@ -2267,7 +2309,8 @@ int main(int argc, char** argv) {
     const json& q = A->r.req;
     A->sid = q.value("session", "default");
     auto& ids = J.ids;
-    ids = q.value("ids", std::vector<int32_t>{});
+    if (!A->r.ids.empty() || q.contains("ids_n")) ids = A->r.ids;
+    else ids = q.value("ids", std::vector<int32_t>{});
     A->temperature = q.value("temperature", 1.0f); A->top_p = q.value("top_p", 1.0f); A->min_p = q.value("min_p", 0.f);
     A->top_k = q.value("top_k", 0);
     A->stop_ids = q.value("stop_ids", std::vector<int32_t>{1});
@@ -3036,7 +3079,13 @@ int main(int argc, char** argv) {
     //   from 56 to ~230 ms; one-token turn judgments over 256 tokens checkpointed too and stalled the engine 2.4 s.
     constexpr bool kRewinds = RtHasRewind<std::remove_cvref_t<decltype(rt)>, std::remove_cvref_t<decltype(*S->seq)>>;
     if (!kRewinds && prefill_complete && !reused_exact && (all_images.empty() || image_ckpt) && (int)ids.size() >= ckpt_min_tokens && !fake_head) {
-      if (J.last_boundary_full) A->ckpt_base = J.last_boundary;  // a snapshot with skipped upper layers holds unfinished rows — never a base
+      if (J.last_boundary_full) {
+        A->ckpt_base = J.last_boundary;  // a snapshot with skipped upper layers holds unfinished rows — never a base
+        if (J.last_boundary && ids.size() > (size_t)J.last_boundary->pos && ids.size() - (size_t)J.last_boundary->pos <= 16) {
+          A->near_snap = J.last_boundary;
+          A->near_snap_sig = J.last_boundary_sig;
+        }
+      }
       if (defer_ckpt) A->defer_ckpt = true;  // HIVE_DEFER_CKPT: after the first token (decode_step)
       else save_prompt_ckpt(*A, A->logits);
     }
@@ -3172,7 +3221,7 @@ int main(int argc, char** argv) {
           for (auto it = queue.begin(); it != queue.end(); ++it) {
             const json& q = it->req;
             const std::string sid = q.value("session", "default");
-            const size_t rows = rows_to_prefill(sid, q);  // ids minus the reusable prefix (lower bound) — a follow-up turn counts only its new tokens
+            const size_t rows = rows_to_prefill(sid, *it);  // ids minus the reusable prefix (lower bound) — a follow-up turn counts only its new tokens
             if (rows == 0 || rows > yield_max || active_sids.count(sid) || prefilling_sids.count(sid)) continue;
             r = std::move(*it); queue.erase(it); got = true;
             break;
@@ -3247,7 +3296,7 @@ int main(int argc, char** argv) {
     //   Admission order only — no request is refused, values and forwards per request are unchanged.
     auto pull_ok = [&](const Request& r) {
       const json& q = r.req;
-      if (rows_to_prefill(q.value("session", "default"), q) < stream_floor) return !layer_yield;
+      if (rows_to_prefill(q.value("session", "default"), r) < stream_floor) return !layer_yield;
       int best = INT_MAX;
       for (const auto& Jp : jobs) {
         if (!Jp) continue;
@@ -4119,9 +4168,9 @@ int main(int argc, char** argv) {
         try { rsig = request_img_sig(r); } catch (const std::exception&) { return 0; }  // a malformed image entry: admission answers it later
         if (!rsig) return 0;
       }
-      const size_t rows = rows_to_prefill(sid, q, rsig);
+      const size_t rows = rows_to_prefill(sid, r, rsig);
       if (rsig && !(encode_ok && rt_vision_loaded(rt))) {
-        const size_t from = q["ids"].size() - rows;  // every image must end inside the reusable prefix
+        const size_t from = r.ids.size() - rows;  // every image must end inside the reusable prefix
         for (const auto& s : *rsig) if ((size_t)s.end > from) return 0;
       }
       return rows;

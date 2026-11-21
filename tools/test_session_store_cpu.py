@@ -210,7 +210,43 @@ def run(exe, td):
     h.generate('Q', t.tokens(300, 1608), 2); st = wait_writes(h, 2)
     ck.true('the budget dropped the oldest entry', st.get('evicted', 0) >= 1 and st.get('ckpts', 0) + st.get('snaps', 0) <= 1, json.dumps(st))
     kill(h)
-    # 8. negative control: no store, nothing reused after a restart
+    # 8. near-snap ckpt reuse: a generation-suffix snap within <= 16 tokens of prompt end reuses the snap's already-stored image for the disk ckpt (0 new pack bytes)
+    near_env = {**env, 'HIVE_SESSION_STORE': str(Path(td) / 'store-near')}
+    h = t.Hived(exe, td, near_env, name='st8n')
+    G = t.tokens(300, 1611)
+    h.generate('NS', G, 3, boundaries=[297])
+    st_near = wait_writes(h, 2)
+    # 1 snap + 1 ckpt -> written bytes equal the snap alone (no extra pack for the ckpt 3 tokens later), yet ckpt metadata is present
+    packs_near = list((Path(td) / 'store-near').glob('*/packs/*.pack'))
+    ck.true('near-snap ckpt wrote no second pack (reused snap image)', len(packs_near) <= 2, f'packs={len(packs_near)} st={st_near}')
+    ck.true('near-snap ckpt metadata recorded', st_near.get('ckpts', 0) == 1 and st_near.get('snaps', 0) >= 1, json.dumps(st_near))
+    kill(h)
+    h = t.Hived(exe, td, near_env, name='st8n2')
+    G2 = G[:297] + t.tokens(20, 1612)
+    r = h.generate('NS', G2, 3)
+    t.done_ok(ck, 'after restart, follow-up resumes from near-snap ckpt at 297', r, G2, 3, 297)
+    kill(h)
+    # 8b. many-pack restore: an image spanning dozens of incremental packs restores cleanly with zero leaked pack fds
+    mp_env = {**env, 'HIVE_SESSION_STORE': str(Path(td) / 'store-manypack')}
+    h = t.Hived(exe, td, mp_env, name='st8mp1')
+    M = t.tokens(300, 1620)
+    for k in range(30):
+        M = M + t.tokens(12, 1621 + k)
+        h.generate('MP', M, 2)
+        wait_writes(h, k + 1)
+    packs_mp = list((Path(td) / 'store-manypack').glob('*/packs/*.pack'))
+    ck.true('many-pack setup wrote >= 20 packs', len(packs_mp) >= 20, f'packs={len(packs_mp)}')
+    kill(h)
+    h = t.Hived(exe, td, mp_env, name='st8mp2')
+    M2 = M + t.tokens(10, 1699)
+    r = h.generate('MP', M2, 3)
+    t.done_ok(ck, 'many-pack checkpoint restores after restart', r, M2, 3, len(M))
+    st_mp = store_stats(h)
+    ck.true('many-pack restore had 0 load_fail', st_mp.get('load_fail', -1) == 0 and st_mp.get('loads', 0) >= 1, json.dumps(st_mp))
+    open_packs = [p for p in Path(f'/proc/{h.proc.pid}/fd').iterdir() if '.pack' in str(os.readlink(p))]
+    ck.true('zero pack fds remain open after load', len(open_packs) == 0, f'open_packs={len(open_packs)}')
+    kill(h)
+    # 9. negative control: no store, nothing reused after a restart
     h = t.Hived(exe, td, {'HIVE_PREFIX_SHARE': '1'}, name='st8')
     h.generate('N', A, 3); kill(h)
     h = t.Hived(exe, td, {'HIVE_PREFIX_SHARE': '1'}, name='st9')

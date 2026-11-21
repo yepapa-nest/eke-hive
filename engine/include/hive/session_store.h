@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -130,12 +131,16 @@ inline bool ref_from(const json& j, Ref& r) {
 struct WriteAr {
   struct Known { std::weak_ptr<uint8_t> owner; Ref ref; };
   std::function<bool(const uint8_t*, Ref&)> find;  // where an allocation already is on disk (locks the store index per lookup)
-  int fd; uint64_t pack; uint64_t off = 0; size_t fresh = 0; bool ok = true;
+  std::function<int()> open_pack;                  // lazy pack-file open on the first fresh byte (0 fresh bytes -> no tmp pack opened/synced)
+  int fd = -1; uint64_t pack = 0; uint64_t off = 0; size_t fresh = 0; bool ok = true;
   json out = json::array();
   std::vector<std::pair<std::shared_ptr<uint8_t>, Ref>> made;  // segments written now (registered as known once the pack is renamed)
   Ref put(const uint8_t* p, size_t n) {
     Ref r{pack, off, n, hash_bytes(p, n)};
-    if (n && !write_all(fd, p, n)) ok = false;
+    if (n) {
+      if (fd < 0 && open_pack) fd = open_pack();
+      if (fd < 0 || !write_all(fd, p, n)) ok = false;
+    }
     off += n; fresh += n;
     return r;
   }
@@ -251,7 +256,6 @@ class SessionStore {
   ~SessionStore() {
     { std::lock_guard<std::mutex> lk(qm_); stop_ = true; } qcv_.notify_all();
     if (th_.joinable()) th_.join();
-    for (auto& [id, fd] : fds_) ::close(fd);
   }
   const std::string& dir() const { return dir_; }
   // ---- engine thread: enqueue (never waits for the disk) ----
@@ -272,7 +276,7 @@ class SessionStore {
     enqueue(std::move(j));
   }
   bool has_canary() { std::lock_guard<std::mutex> lk(im_); return !canary_.file.empty(); }
-  std::unique_ptr<Loaded<Image>> load_canary() { std::string f; { std::lock_guard<std::mutex> lk(im_); f = canary_.file; } return load(f, fds_); }
+  std::unique_ptr<Loaded<Image>> load_canary() { std::string f; { std::lock_guard<std::mutex> lk(im_); f = canary_.file; } return load(f); }
   size_t entries() { std::lock_guard<std::mutex> lk(im_); return ckpt_.size() + snaps_.size(); }
   bool has_ckpt(const std::string& sid) { std::lock_guard<std::mutex> lk(im_); return ckpt_.count(sid) > 0; }
   // The engine reused the in-memory copy of a stored entry: refresh the disk copy's recency too. Without this the budget ordered entries by
@@ -301,17 +305,10 @@ class SessionStore {
     std::lock_guard<std::mutex> lk(im_); auto it = ckpt_.find(sid);
     return it == ckpt_.end() ? CkptInfo{} : CkptInfo{it->second.pos, it->second.bytes};
   }
-  // ---- engine thread: load (reads the disk) ----
-  std::unique_ptr<Loaded<Image>> load_ckpt(const std::string& sid) { return load(meta_of("ckpt", sid), fds_); }
-  std::unique_ptr<Loaded<Image>> load_snap(uint64_t key) { return load(meta_of("snap", hex16(key)), fds_); }
-  // ---- any thread: the same checkpoint load with its own pack descriptors (hived's {"op":"load"} reads on a loader thread while the engine
-  //   thread may load through fds_) — opened for this load and closed after it ----
-  std::unique_ptr<Loaded<Image>> load_ckpt_detached(const std::string& sid) {
-    std::map<uint64_t, int> fds;
-    auto out = load(meta_of("ckpt", sid), fds);
-    for (auto& [id, fd] : fds) ::close(fd);
-    return out;
-  }
+  // ---- any thread: load (reads the disk, opening at most one pack fd per worker thread and closing it immediately) ----
+  std::unique_ptr<Loaded<Image>> load_ckpt(const std::string& sid) { return load(meta_of("ckpt", sid)); }
+  std::unique_ptr<Loaded<Image>> load_snap(uint64_t key) { return load(meta_of("snap", hex16(key))); }
+  std::unique_ptr<Loaded<Image>> load_ckpt_detached(const std::string& sid) { return load(meta_of("ckpt", sid)); }
   json stats() {
     std::lock_guard<std::mutex> lk(im_);
     return {{"dir", dir_}, {"ckpts", ckpt_.size()}, {"snaps", snaps_.size()}, {"bytes", disk_bytes_}, {"budget", budget_},
@@ -325,14 +322,12 @@ class SessionStore {
   size_t clear(bool with_canary = false) {
     { std::lock_guard<std::mutex> lk(qm_); queued_ -= (long)q_.size(); q_.clear(); }
     drain();
-    for (auto& [id, fd] : fds_) ::close(fd);
-    fds_.clear();
     std::lock_guard<std::mutex> lk(im_);
     const size_t n = ckpt_.size() + snaps_.size();
     for (auto& [k, m] : ckpt_) ::unlink(m.file.c_str());
     for (auto& [k, m] : snaps_) ::unlink(m.file.c_str());
     if (with_canary && !canary_.file.empty()) { ::unlink(canary_.file.c_str()); canary_ = Meta{}; }
-    ckpt_.clear(); snaps_.clear(); known_.clear();
+    ckpt_.clear(); snaps_.clear(); known_.clear(); saved_fields_.clear();
     gc_packs();  // rebuilds pack_refs_ (the canary's packs stay unless it was dropped above)
     return n;
   }
@@ -355,8 +350,9 @@ class SessionStore {
   std::map<uint64_t, long long> pack_bytes_;    // pack id -> size
   std::map<uint64_t, long> pack_refs_;          // pack id -> number of entries (ckpt_, snaps_, canary_) that refer to it
   size_t disk_bytes_ = 0;
+  struct SavedFields { std::weak_ptr<Image> owner; json fields; std::set<uint64_t> packs; };
   std::map<const uint8_t*, typename WriteAr::Known> known_;
-  std::map<uint64_t, int> fds_;                 // engine thread only (load_ckpt / load_snap / load_canary; load_ckpt_detached has its own)
+  std::map<const Image*, SavedFields> saved_fields_;  // immutable images already written (same shared_ptr reused for snap + ckpt -> 0 fresh bytes)
   uint64_t next_pack_ = 0;
   Stats st_;
 
@@ -426,6 +422,11 @@ class SessionStore {
       it = it->second.owner.expired() || !pack_bytes_.count(it->second.ref.pack) ? known_.erase(it) : std::next(it);
     }
     prune_from_ = it == known_.end() ? nullptr : it->first;
+    for (auto sf = saved_fields_.begin(); sf != saved_fields_.end();) {
+      bool alive = !sf->second.owner.expired();
+      for (uint64_t p : sf->second.packs) if (alive && !pack_bytes_.count(p)) alive = false;
+      sf = alive ? std::next(sf) : saved_fields_.erase(sf);
+    }
   }
   // Reference counts per pack, kept as entries come and go.
   //   Measured 2026-11-11 (the reference machine's store, 22,107 entries · 34,920 packs · 960,378 pack references · 8.8 M segments): every
@@ -463,7 +464,14 @@ class SessionStore {
       it = pack_bytes_.erase(it);
       dropped = true;
     }
-    if (dropped) for (auto k = known_.begin(); k != known_.end();) k = pack_bytes_.count(k->second.ref.pack) ? std::next(k) : known_.erase(k);
+    if (dropped) {
+      for (auto k = known_.begin(); k != known_.end();) k = pack_bytes_.count(k->second.ref.pack) ? std::next(k) : known_.erase(k);
+      for (auto sf = saved_fields_.begin(); sf != saved_fields_.end();) {
+        bool alive = !sf->second.owner.expired();
+        for (uint64_t p : sf->second.packs) if (alive && !pack_bytes_.count(p)) alive = false;
+        sf = alive ? std::next(sf) : saved_fields_.erase(sf);
+      }
+    }
   }
   void enqueue(Job j) {
     { std::lock_guard<std::mutex> lk(qm_); q_.push_back(std::move(j)); ++queued_; }
@@ -487,13 +495,22 @@ class SessionStore {
   void write(Job& j) {
     const double t0 = wall_ms();
     j.image->wait_ready();  // device-to-host copies of the image still in flight
-    uint64_t pack;
-    { std::lock_guard<std::mutex> lk(im_); pack = next_pack_++; }
-    const std::string ppath = pack_path(pack), ptmp = ppath + ".tmp";
-    const int fd = ::open(ptmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { std::lock_guard<std::mutex> lk(im_); ++st_.write_fail; return; }
+    uint64_t pack = 0;
+    bool reused_image = false;
     WriteAr ar;
-    ar.fd = fd; ar.pack = pack;
+    {
+      std::lock_guard<std::mutex> lk(im_);
+      auto it = saved_fields_.find(j.image.get());
+      if (it != saved_fields_.end() && !it->second.owner.expired()) {
+        bool all_ok = true;
+        for (uint64_t p : it->second.packs) if (!pack_bytes_.count(p)) { all_ok = false; break; }
+        if (all_ok) { ar.out = it->second.fields; reused_image = true; }
+      }
+      if (!reused_image || !j.logits.empty()) pack = next_pack_++;
+    }
+    const std::string ppath = pack_path(pack), ptmp = ppath + ".tmp";
+    ar.pack = pack;
+    ar.open_pack = [&]() -> int { return ::open(ptmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644); };
     ar.find = [this](const uint8_t* p, Ref& r) {  // the index lock only per lookup — the engine thread reads the index while this writes GBs
       std::lock_guard<std::mutex> lk(im_);
       auto it = known_.find(p);
@@ -501,13 +518,19 @@ class SessionStore {
       r = it->second.ref;
       return true;
     };
-    j.image->fields(ar);
+    if (!reused_image) j.image->fields(ar);
     std::vector<Ref> logit_ref;
     if (!j.logits.empty()) logit_ref.push_back(ar.put(reinterpret_cast<const uint8_t*>(j.logits.data()), j.logits.size() * 4));
-    const bool synced = ar.ok && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!synced || (ar.fresh ? ::rename(ptmp.c_str(), ppath.c_str()) != 0 : (::unlink(ptmp.c_str()), false))) {
-      ::unlink(ptmp.c_str());
+    bool synced = ar.ok;
+    if (ar.fd >= 0) {
+      synced = synced && ::fsync(ar.fd) == 0;
+      ::close(ar.fd);
+      ar.fd = -1;
+      if (!synced || (ar.fresh ? ::rename(ptmp.c_str(), ppath.c_str()) != 0 : (::unlink(ptmp.c_str()), false))) {
+        ::unlink(ptmp.c_str());
+        std::lock_guard<std::mutex> lk(im_); ++st_.write_fail; return;
+      }
+    } else if (!synced) {
       std::lock_guard<std::mutex> lk(im_); ++st_.write_fail; return;
     }
     uint32_t hits = j.hits0;  // the entry this one replaces (same session or prefix key) was in use: carry its count on, plus this write
@@ -526,7 +549,9 @@ class SessionStore {
     // The parsing of this image's references happens before the index lock; under it only map updates remain. Files that leave the index
     //   (a replaced entry's packs, evicted entries and their packs) are removed after the lock is released.
     Meta e; e.file = mpath; e.pos = j.image->pos; e.last_tok = j.image->tokens.empty() ? -1 : j.image->tokens.back(); e.last_used = m["last_used"]; e.hits = hits;
-    collect_packs(ar.out, e.packs); if (!logit_ref.empty()) e.packs.insert(pack);
+    collect_packs(ar.out, e.packs);
+    std::set<uint64_t> field_packs = e.packs;
+    if (!logit_ref.empty()) e.packs.insert(pack);
     e.bytes = range_bytes(ar.out) + (logit_ref.empty() ? 0 : (size_t)logit_ref[0].len);
     std::vector<std::string> dead;
     double disk_gb, budget_gb;
@@ -534,6 +559,7 @@ class SessionStore {
       std::lock_guard<std::mutex> lk(im_);
       if (ar.fresh) { pack_bytes_[pack] = (long long)ar.off; disk_bytes_ += ar.off; }
       for (auto& [owner, r] : ar.made) known_[owner.get()] = {owner, r};
+      if (!reused_image && j.kind != "canary") saved_fields_[j.image.get()] = {j.image, ar.out, std::move(field_packs)};
       prune_known(2 * ar.made.size() + 64);
       Meta& slot = j.kind == "ckpt" ? ckpt_[j.name] : j.kind == "snap" ? snaps_[j.key] : canary_;
       ref_packs(e);              // the new entry first: packs it shares with the one it replaces never reach zero
@@ -603,60 +629,75 @@ class SessionStore {
     }
     return budget;
   }
-  int pack_fd(uint64_t id, std::map<uint64_t, int>& fds) {
-    auto it = fds.find(id);
-    if (it != fds.end()) return it->second;
-    const int fd = ::open(pack_path(id).c_str(), O_RDONLY);
-    if (fd >= 0) fds[id] = fd;
-    return fd;
-  }
-  std::unique_ptr<Loaded<Image>> load(const std::string& path, std::map<uint64_t, int>& fds) {
+  std::unique_ptr<Loaded<Image>> load(const std::string& path) {
     if (path.empty()) return nullptr;
-    try { return load_file(path, fds); } catch (...) { std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr; }
+    try { return load_file(path); } catch (const std::exception& e) {
+      fprintf(stderr, "[store] load failed (%s): %s\n", path.c_str(), e.what());
+      std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr;
+    } catch (...) {
+      fprintf(stderr, "[store] load failed (%s): unknown exception\n", path.c_str());
+      std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr;
+    }
   }
-  std::unique_ptr<Loaded<Image>> load_file(const std::string& path, std::map<uint64_t, int>& fds) {
-    if (fds.size() > 256) { for (auto& [id, fd] : fds) ::close(fd); fds.clear(); }
+  std::unique_ptr<Loaded<Image>> load_file(const std::string& path) {
     const double t0 = wall_ms();
-    auto fail = [&]() -> std::unique_ptr<Loaded<Image>> { std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr; };
+    auto fail = [&](const char* why) -> std::unique_ptr<Loaded<Image>> {
+      fprintf(stderr, "[store] load failed (%s): %s\n", path.c_str(), why);
+      std::lock_guard<std::mutex> lk(im_); ++st_.load_fail; return nullptr;
+    };
     json m;
-    try { FILE* fp = fopen(path.c_str(), "r"); if (!fp) return fail(); m = json::parse(fp); fclose(fp); } catch (...) { return fail(); }
+    try { FILE* fp = fopen(path.c_str(), "r"); if (!fp) return fail("open meta"); m = json::parse(fp); fclose(fp); } catch (...) { return fail("parse meta"); }
     auto out = std::make_unique<Loaded<Image>>();
     out->image = std::make_shared<Image>();
-    // The field walk only allocates and records what to read; the reads and hash checks then run on several threads (measured 2026-10-15:
-    //   one by one, 4.94 GB took 4.7 s — about 1 GB/s on a disk that reads 6.5 GB/s; an image is thousands of segments)
-    struct Job { Ref r; uint8_t* dst; int fd; };
-    std::vector<Job> jobs;
-    bool fd_ok = true;
+    // Group segment reads by pack id before opening any pack file: a long conversation can span 1,000+ incremental packs (exceeding a
+    //   container's default RLIMIT_NOFILE=1024 if all packs are held open simultaneously). Each worker thread opens one pack at a time,
+    //   reads and hashes all its segments, and closes the descriptor immediately (peak <= 8 fds regardless of pack count, zero fd leaks).
+    struct Job { Ref r; uint8_t* dst; };
+    std::map<uint64_t, std::vector<Job>> by_pack;
     auto read = [&](const Ref& r, uint8_t* dst) {
-      const int fd = pack_fd(r.pack, fds);
-      if (fd < 0) { fd_ok = false; return false; }
-      jobs.push_back({r, dst, fd});
+      by_pack[r.pack].push_back({r, dst});
       return true;
     };
     ReadAr ar{m.at("fields")};
     ar.read = read;
     out->image->fields(ar);
-    if (!ar.ok || !fd_ok || ar.i != m["fields"].size()) return fail();
+    if (!ar.ok || ar.i != m["fields"].size()) return fail("fields");
     if (m.contains("logits")) {
-      Ref r; if (!ref_from(m["logits"], r) || r.len % 4) return fail();
+      Ref r; if (!ref_from(m["logits"], r) || r.len % 4) return fail("logits ref");
       out->logits.resize(r.len / 4);
-      if (r.len && !read(r, reinterpret_cast<uint8_t*>(out->logits.data()))) return fail();
+      if (r.len && !read(r, reinterpret_cast<uint8_t*>(out->logits.data()))) return fail("logits read");
     }
-    {
-      const unsigned nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    if (!by_pack.empty()) {
+      std::vector<std::pair<uint64_t, std::vector<Job>>> groups;
+      groups.reserve(by_pack.size());
+      for (auto& kv : by_pack) groups.emplace_back(kv.first, std::move(kv.second));
+      const unsigned hw = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+      const unsigned nt = (unsigned)std::min<size_t>(hw, groups.size());
       std::atomic<size_t> next{0};
       std::atomic<bool> bad{false};
+      std::mutex err_mu;
+      std::string err_msg;
+      auto set_err = [&](const std::string& msg) {
+        if (!bad.exchange(true)) { std::lock_guard<std::mutex> lk(err_mu); err_msg = msg; }
+      };
       auto work = [&] {
-        for (size_t k; (k = next.fetch_add(1)) < jobs.size() && !bad.load();) {
-          const Job& j = jobs[k];
-          if (!read_at(j.fd, j.dst, j.r.len, (off_t)j.r.off) || hash_bytes(j.dst, j.r.len) != j.r.hash) bad = true;
+        for (size_t g; (g = next.fetch_add(1)) < groups.size() && !bad.load();) {
+          const uint64_t pid = groups[g].first;
+          const int fd = ::open(pack_path(pid).c_str(), O_RDONLY);
+          if (fd < 0) { set_err("open pack " + hex16(pid) + ": " + strerror(errno)); break; }
+          for (const Job& j : groups[g].second) {
+            if (bad.load()) break;
+            if (!read_at(fd, j.dst, j.r.len, (off_t)j.r.off)) { set_err("read pack " + hex16(pid)); break; }
+            if (hash_bytes(j.dst, j.r.len) != j.r.hash) { set_err("hash mismatch pack " + hex16(pid)); break; }
+          }
+          ::close(fd);
         }
       };
       std::vector<std::thread> ths;
       for (unsigned t = 1; t < nt; ++t) ths.emplace_back(work);
       work();
       for (auto& th : ths) th.join();
-      if (bad) return fail();
+      if (bad) return fail(err_msg.empty() ? "read/hash" : err_msg.c_str());
     }
     for (const auto& s : m.value("sig", json::array())) out->sig.push_back({s[0].get<int>(), s[1].get<int>(), std::stoull(s[2].get<std::string>(), nullptr, 16)});
     out->upper_skipped = m.value("upper_skipped", false);

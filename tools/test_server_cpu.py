@@ -173,6 +173,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         got = {}
         async def peer(reader, writer):
             head = json.loads(await reader.readline())
+            got['head'] = head
             got['bin'] = head['bin']
             got['blob'] = await reader.readexactly(head['bin'])
             writer.write(b'{"id":7}\n{"done":true,"n":1}\n'); await writer.drain()
@@ -182,9 +183,32 @@ class Tests(unittest.IsolatedAsyncioTestCase):
             server=await asyncio.start_unix_server(peer,path)
             async with server:
                 out=[x async for x in s.Daemon(path).generate('test',[1,2,3],[{'start':0}],blob)]
-        self.assertEqual(got['bin'], len(blob))
-        self.assertEqual(hashlib.sha256(got['blob']).digest(), hashlib.sha256(blob).digest())
+        from array import array
+        ids_b = array('i', [1, 2, 3]).tobytes()
+        self.assertEqual(got['head'].get('ids_n'), 3)
+        self.assertNotIn('ids', got['head'])
+        self.assertEqual(got['bin'], len(ids_b) + len(blob))
+        self.assertEqual(got['blob'][:len(ids_b)], ids_b)
+        self.assertEqual(hashlib.sha256(got['blob'][len(ids_b):]).digest(), hashlib.sha256(blob).digest())
         self.assertEqual(out, [{'id':7}, {'done':True,'n':1}])
+        # HIVE_IPC_BIN_IDS=0 falls back to JSON ids
+        prev = os.environ.get('HIVE_IPC_BIN_IDS')
+        os.environ['HIVE_IPC_BIN_IDS'] = '0'
+        try:
+            got.clear()
+            with tempfile.TemporaryDirectory() as directory:
+                path=str(Path(directory)/'test2.sock')
+                server=await asyncio.start_unix_server(peer,path)
+                async with server:
+                    out2=[x async for x in s.Daemon(path).generate('test',[1,2,3],[{'start':0}],blob[:1024])]
+            self.assertEqual(got['head'].get('ids'), [1, 2, 3])
+            self.assertNotIn('ids_n', got['head'])
+            self.assertEqual(got['bin'], 1024)
+            self.assertEqual(got['blob'], blob[:1024])
+            self.assertEqual(out2, [{'id':7}, {'done':True,'n':1}])
+        finally:
+            if prev is None: os.environ.pop('HIVE_IPC_BIN_IDS', None)
+            else: os.environ['HIVE_IPC_BIN_IDS'] = prev
         with self.assertRaises(OSError):
             [x async for x in s.Daemon('/nonexistent-hive-test-socket').generate('test',[1],[],blob)]
 
